@@ -1,0 +1,24 @@
+{
+  "appId": "com.pix.app",
+  "productName": "PiX",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "index.html",
+    "package.json"
+  ],
+  "win": {
+    "target": "nsis",
+    "icon": null
+  },
+  "mac": {
+    "target": "dmg",
+    "icon": null
+  },
+  "linux": {
+    "target": "AppImage",
+    "icon": null
+  }
+}

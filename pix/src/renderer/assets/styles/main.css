@@ -1,0 +1,160 @@
+/**
+ * PiX Global Styles
+ */
+
+@import "./variables.css";
+
+/* Reset */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--pix-font-ui);
+  font-size: var(--pix-text-base);
+  line-height: var(--pix-leading-base);
+  color: var(--pix-text-primary);
+  background: var(--pix-bg-app);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  height: 100%;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pix-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pix-text-muted);
+}
+
+/* Links */
+a {
+  color: var(--pix-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Selection */
+::selection {
+  background: var(--pix-accent-light);
+  color: var(--pix-text-primary);
+}
+
+/* Code blocks */
+code {
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-sm);
+  background: var(--pix-bg-code);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+pre {
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-sm);
+  background: var(--pix-bg-code);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-md);
+  padding: var(--pix-space-md);
+  overflow-x: auto;
+  line-height: var(--pix-leading-tight);
+}
+
+pre code {
+  padding: 0;
+  background: none;
+}
+
+/* Focus styles */
+:focus-visible {
+  outline: 2px solid var(--pix-accent);
+  outline-offset: 2px;
+}
+
+/* Button base */
+button {
+  font-family: var(--pix-font-ui);
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-size: var(--pix-text-base);
+  color: var(--pix-text-primary);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Input base */
+input,
+textarea {
+  font-family: var(--pix-font-ui);
+  font-size: var(--pix-text-base);
+  color: var(--pix-text-primary);
+}
+
+/* Utility: visually responsive */
+.responsive-container {
+  width: 100%;
+  height: 100%;
+}
+
+/* Utility: truncate text */
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Fade transition */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity var(--pix-transition-base);
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* Animation: spinner */
+@keyframes pix-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--pix-border);
+  border-top-color: var(--pix-accent);
+  border-radius: 50%;
+  animation: pix-spin 0.6s linear infinite;
+}

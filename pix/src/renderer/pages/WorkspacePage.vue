@@ -1,0 +1,70 @@
+<script setup lang="ts">
+/**
+ * Workspace Page
+ *
+ * The main four-panel layout with:
+ * - Left: project & session navigation
+ * - Center: session content area
+ * - Right: status summary
+ * - Bottom: input area
+ */
+import { onMounted, onUnmounted } from "vue";
+import { useRouter } from "vue-router";
+import { useSessionStore } from "../stores/session-store";
+import { useRpc } from "../composables/useRpc";
+import { useProjectStore } from "../stores/project-store";
+import AppLayout from "../components/layout/AppLayout.vue";
+import LeftPanel from "../components/layout/LeftPanel.vue";
+import CenterPanel from "../components/layout/CenterPanel.vue";
+import RightPanel from "../components/layout/RightPanel.vue";
+import BottomBar from "../components/layout/BottomBar.vue";
+
+const router = useRouter();
+const sessionStore = useSessionStore();
+const projectStore = useProjectStore();
+const rpc = useRpc();
+let unsubscribeEvent: (() => void) | null = null;
+
+onMounted(async () => {
+  if (!rpc.isConnected.value) {
+    const attached = await rpc.attachToRunningSession();
+    if (!attached) {
+      router.push("/");
+      return;
+    }
+  }
+
+  await projectStore.listSessions();
+
+  unsubscribeEvent = window.pixApi.onPiEvent((event) => {
+    sessionStore.addEvent(event);
+    if (event.type === "agent_end") {
+      void projectStore.listSessions();
+    }
+  });
+});
+
+onUnmounted(() => {
+  if (unsubscribeEvent) {
+    unsubscribeEvent();
+    unsubscribeEvent = null;
+  }
+});
+</script>
+
+<template>
+  <AppLayout>
+    <template #left>
+      <LeftPanel />
+    </template>
+    <template #center>
+      <CenterPanel />
+    </template>
+    <template #right>
+      <RightPanel />
+    </template>
+    <template #bottom>
+      <BottomBar />
+    </template>
+  </AppLayout>
+</template>

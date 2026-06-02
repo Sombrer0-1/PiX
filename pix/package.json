@@ -1,0 +1,58 @@
+{
+  "name": "pix",
+  "version": "1.0.0",
+  "description": "PiX - Desktop GUI for Pi AI coding agent",
+  "type": "module",
+  "main": "dist/main/main/index.js",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev:renderer": "vite",
+    "dev:electron": "electron .",
+    "build:renderer": "vite build",
+    "build:main": "tsc -p tsconfig.main.json && tsc src/main/preload.ts --outDir dist/main --module CommonJS --target ES2022 --esModuleInterop --skipLibCheck --rootDir src && mv dist/main/main/preload.js dist/main/main/preload.cjs",
+    "build": "npm run build:main && npm run build:renderer",
+    "start": "electron .",
+    "package": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "file:../packages/coding-agent",
+    "@earendil-works/pi-agent-core": "file:../packages/agent",
+    "@earendil-works/pi-ai": "file:../packages/ai",
+    "electron-store": "^8.1.0",
+    "marked": "^12.0.0",
+    "highlight.js": "^11.9.0",
+    "vue": "^3.4.0",
+    "vue-router": "^4.3.0",
+    "pinia": "^2.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "concurrently": "^8.2.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0",
+    "typescript": "^5.5.0",
+    "vite": "^5.4.0",
+    "wait-on": "^7.2.0",
+    "@types/node": "^22.0.0"
+  },
+  "build": {
+    "appId": "com.pix.app",
+    "productName": "PiX",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "index.html"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}
