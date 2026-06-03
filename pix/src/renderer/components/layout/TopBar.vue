@@ -1,31 +1,45 @@
 <script setup lang="ts">
 /**
- * TopBar - Minimal title bar
+ * TopBar - Compact workspace header
+ *
+ * Now lives inside CenterPanel, not spanning the full window.
+ * Shows project breadcrumb, connection status, session name, and actions
+ * all in one tight 28px bar.
  */
+import { computed } from "vue";
 import { useRpc } from "../../composables/useRpc";
 import { useProjectStore } from "../../stores/project-store";
 
 const rpc = useRpc();
 const projectStore = useProjectStore();
+
+const projectName = computed(() => projectStore.currentProject?.name || "");
+const sessionName = computed(() => rpc.sessionState.value?.sessionName || "");
 </script>
 
 <template>
   <div class="topbar">
     <div class="topbar-left">
-      <span class="app-name">PiX</span>
-      <span v-if="projectStore.currentProject" class="topbar-separator">/</span>
-      <span v-if="projectStore.currentProject" class="project-name">{{ projectStore.currentProject.name }}</span>
-    </div>
-
-    <div class="topbar-center">
-      <div class="pi-indicator" :class="{ connected: rpc.isConnected.value }">
-        <span class="pi-dot"></span>
-        <span class="pi-text">{{ rpc.isConnected.value ? 'Pi Connected' : 'Disconnected' }}</span>
-      </div>
+      <span class="topbar-brand">PiX</span>
+      <template v-if="projectName">
+        <span class="topbar-sep">&rsaquo;</span>
+        <span class="topbar-project">{{ projectName }}</span>
+      </template>
+      <template v-if="sessionName">
+        <span class="topbar-sep">&rsaquo;</span>
+        <span class="topbar-session">{{ sessionName }}</span>
+      </template>
     </div>
 
     <div class="topbar-right">
-      <!-- Reserved for future minimal controls -->
+      <span
+        class="topbar-status"
+        :class="{ connected: rpc.isConnected.value }"
+        :title="rpc.isConnected.value ? 'Pi connected' : 'Disconnected'"
+      >
+        <span class="topbar-dot"></span>
+        {{ rpc.isConnected.value ? 'Pi' : 'Offline' }}
+      </span>
     </div>
   </div>
 </template>
@@ -35,68 +49,70 @@ const projectStore = useProjectStore();
   display: flex;
   align-items: center;
   justify-content: space-between;
-  width: 100%;
-  height: 100%;
+  height: var(--pix-topbar-height);
+  min-height: var(--pix-topbar-height);
+  padding: 0 var(--pix-space-lg);
+  background: var(--pix-bg-topbar);
+  border-bottom: 1px solid var(--pix-border-light);
+  -webkit-app-region: drag;
+  user-select: none;
+  flex-shrink: 0;
 }
 
 .topbar-left {
   display: flex;
   align-items: center;
   gap: var(--pix-space-sm);
+  min-width: 0;
+  overflow: hidden;
 }
 
-.app-name {
+.topbar-brand {
   font-size: var(--pix-text-sm);
   font-weight: 600;
   color: var(--pix-text-primary);
+  flex-shrink: 0;
 }
 
-.topbar-separator {
-  color: var(--pix-text-muted);
+.topbar-sep {
   font-size: var(--pix-text-sm);
+  color: var(--pix-text-muted);
+  flex-shrink: 0;
 }
 
-.project-name {
+.topbar-project,
+.topbar-session {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-secondary);
-}
-
-.topbar-center {
-  display: flex;
-  align-items: center;
-}
-
-.pi-indicator {
-  display: flex;
-  align-items: center;
-  gap: var(--pix-space-xs);
-  padding: 2px var(--pix-space-md);
-  border-radius: var(--pix-radius-sm);
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
-}
-
-.pi-indicator.connected {
-  color: var(--pix-success);
-}
-
-.pi-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--pix-text-muted);
-}
-
-.pi-indicator.connected .pi-dot {
-  background: var(--pix-success);
-}
-
-.pi-text {
-  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .topbar-right {
   display: flex;
   align-items: center;
+  gap: var(--pix-space-md);
+  flex-shrink: 0;
+}
+
+.topbar-status {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-xs);
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-muted);
+  -webkit-app-region: no-drag;
+}
+
+.topbar-status.connected {
+  color: var(--pix-success);
+}
+
+.topbar-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
 }
 </style>

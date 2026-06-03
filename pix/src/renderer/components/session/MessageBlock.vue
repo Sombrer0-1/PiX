@@ -21,7 +21,7 @@ function formatTime(ts: number): string {
 <template>
   <div class="message-block">
     <div class="message-indicator">
-      <span class="message-label">You</span>
+      <span class="message-label">你</span>
       <span class="message-time">{{ formatTime(timestamp) }}</span>
     </div>
     <div class="message-content">{{ text }}</div>

@@ -33,6 +33,16 @@ function api(): PixApi {
       onPiError: () => () => {},
       onPiReady: () => () => {},
       listSessions: async () => [],
+      windowMinimize: async () => {},
+      windowMaximize: async () => {},
+      windowClose: async () => {},
+      windowIsMaximized: async () => false,
+      onWindowMaximizeChange: () => () => {},
+      deleteSession: async () => ({ success: false }),
+      mcpGetServers: async () => [],
+      mcpGetConfig: async () => ({ configPaths: [], errors: [] }),
+      mcpListResources: async () => [],
+      mcpReadResource: async () => ({ server: "", contents: [] }),
     } as PixApi;
   }
   return window.pixApi;

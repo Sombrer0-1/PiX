@@ -2,11 +2,10 @@
 /**
  * Workspace Page
  *
- * The main four-panel layout with:
- * - Left: project & session navigation
- * - Center: session content area
- * - Right: status summary
- * - Bottom: input area
+ * Three-panel layout:
+ * - Left: session navigation
+ * - Center: session content + composer
+ * - Right: inspector (status, tokens, errors)
  */
 import { onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
@@ -17,7 +16,6 @@ import AppLayout from "../components/layout/AppLayout.vue";
 import LeftPanel from "../components/layout/LeftPanel.vue";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import RightPanel from "../components/layout/RightPanel.vue";
-import BottomBar from "../components/layout/BottomBar.vue";
 
 const router = useRouter();
 const sessionStore = useSessionStore();
@@ -62,9 +60,6 @@ onUnmounted(() => {
     </template>
     <template #right>
       <RightPanel />
-    </template>
-    <template #bottom>
-      <BottomBar />
     </template>
   </AppLayout>
 </template>

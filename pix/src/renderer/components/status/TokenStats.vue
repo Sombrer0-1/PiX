@@ -28,32 +28,32 @@ function formatCost(c: number): string {
   <div class="token-stats">
     <div v-if="stats" class="stats-grid">
       <div class="stat-item">
-        <div class="stat-label">Input</div>
+        <div class="stat-label">输入</div>
         <div class="stat-value">{{ formatNumber(stats.tokens.input) }}</div>
       </div>
       <div class="stat-item">
-        <div class="stat-label">Output</div>
+        <div class="stat-label">输出</div>
         <div class="stat-value">{{ formatNumber(stats.tokens.output) }}</div>
       </div>
       <div class="stat-item">
-        <div class="stat-label">Cache Read</div>
+        <div class="stat-label">缓存读取</div>
         <div class="stat-value">{{ formatNumber(stats.tokens.cacheRead) }}</div>
       </div>
       <div class="stat-item">
-        <div class="stat-label">Cache Write</div>
+        <div class="stat-label">缓存写入</div>
         <div class="stat-value">{{ formatNumber(stats.tokens.cacheWrite) }}</div>
       </div>
       <div class="stat-item total">
-        <div class="stat-label">Total</div>
+        <div class="stat-label">总计</div>
         <div class="stat-value">{{ formatNumber(stats.tokens.total) }}</div>
       </div>
       <div class="stat-item cost">
-        <div class="stat-label">Cost</div>
+        <div class="stat-label">费用</div>
         <div class="stat-value">{{ formatCost(stats.cost) }}</div>
       </div>
     </div>
     <div v-else class="no-stats">
-      No token data available yet. Send a prompt to see statistics.
+      暂无 Token 数据。
     </div>
   </div>
 </template>
@@ -66,18 +66,18 @@ function formatCost(c: number): string {
 .stats-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: var(--pix-space-sm);
+  gap: var(--pix-space-xs) var(--pix-space-md);
 }
 
 .stat-item {
-  padding: var(--pix-space-xs);
+  padding: 1px 0;
 }
 
 .stat-item.total,
 .stat-item.cost {
   grid-column: span 2;
   border-top: 1px solid var(--pix-border-light);
-  padding-top: var(--pix-space-sm);
+  padding-top: var(--pix-space-xs);
   margin-top: var(--pix-space-xs);
 }
 

@@ -5,7 +5,7 @@
  * No more subprocess spawning; the coding agent runs in-process.
  */
 
-import { BrowserWindow, app, shell } from "electron";
+import { BrowserWindow, Menu, app, shell } from "electron";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { registerIpcHandlers, setupEventForwarding } from "./ipc-handlers.js";
@@ -29,7 +29,8 @@ function createWindow(): void {
     minWidth: 1000,
     minHeight: 600,
     title: "PiX",
-    backgroundColor: "#f5f6f8",
+    backgroundColor: "#f0f0f0",
+    frame: false,
     webPreferences: {
       preload: join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -74,6 +75,9 @@ function cleanup(): void {
 }
 
 app.whenReady().then(() => {
+  // Remove default Electron menu bar (File, Edit, View, Window, Help)
+  Menu.setApplicationMenu(null);
+
   console.log("[main] app.whenReady() callback executing");
 
   try {
