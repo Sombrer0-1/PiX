@@ -1,12 +1,26 @@
 <script setup lang="ts">
 /**
- * ModelSelector - Dropdown to select or cycle models
+ * ModelSelector - 模型选择下拉框
  *
- * Shows available models with auth status, search, and provider grouping.
+ * 显示可用模型列表，支持搜索、提供商筛选、
+ * 以及为支持推理的模型切换思考深度。
  */
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { useRpc } from "../../composables/useRpc";
 import { useAuthStore } from "../../stores/auth-store";
+
+// Thinking levels — kept inline to avoid cross-package type dependencies in SFC
+const ALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+type ThinkingLevel = (typeof ALL_THINKING_LEVELS)[number];
+
+const THINKING_LEVEL_LABELS: Record<string, string> = {
+  off: "关闭",
+  minimal: "极简",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "极高",
+};
 
 const emit = defineEmits<{
   close: [];
@@ -17,9 +31,20 @@ const authStore = useAuthStore();
 
 const searchQuery = ref("");
 const showOnlyConfigured = ref(false);
+const availableThinkingLevels = ref<string[]>([]);
 
 const allModels = computed(() => rpc.availableModels.value);
 const currentModel = computed(() => rpc.sessionState.value?.model);
+const currentThinkingLevel = computed(() => rpc.sessionState.value?.thinkingLevel ?? "medium");
+const isConnected = computed(() => rpc.isConnected.value);
+
+const modelSupportsThinking = computed(() => {
+  if (!currentModel.value) return false;
+  const found = allModels.value.find(
+    m => m.provider === currentModel.value!.provider && m.id === currentModel.value!.id,
+  );
+  return !!found?.reasoning;
+});
 
 const filteredModels = computed(() => {
   let models = allModels.value;
@@ -47,9 +72,27 @@ const groupedModels = computed(() => {
   return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
 });
 
+async function loadThinkingLevels(): Promise<void> {
+  if (!isConnected.value) return;
+  try {
+    const levels = await rpc.getAvailableThinkingLevels();
+    if (levels && levels.length > 0) {
+      availableThinkingLevels.value = levels;
+    }
+  } catch {
+    // Silently ignore — levels will be loaded on next open
+  }
+}
+
 async function selectModel(model: { provider: string; id: string }): Promise<void> {
   await rpc.setModel(model.provider, model.id);
   emit("close");
+}
+
+async function selectThinkingLevel(level: string): Promise<void> {
+  if (ALL_THINKING_LEVELS.includes(level as ThinkingLevel)) {
+    await rpc.setThinkingLevel(level as ThinkingLevel);
+  }
 }
 
 async function cycleModel(direction: "forward" | "backward" = "forward"): Promise<void> {
@@ -67,17 +110,24 @@ function formatContext(ctx?: number): string {
   if (ctx >= 1000) return `${Math.round(ctx / 1000)}k ctx`;
   return `${ctx} ctx`;
 }
+
+// Load thinking levels when dropdown opens or model changes.
+// immediate: true is required because the component is created via v-if each time
+// and isConnected/currentModel are already set by the time the watch registers.
+watch([isConnected, currentModel], ([connected]) => {
+  if (connected) void loadThinkingLevels();
+}, { immediate: true });
 </script>
 
 <template>
   <div class="model-selector">
     <div class="model-dropdown">
       <div class="dropdown-header">
-        <span class="dropdown-title">Select Model</span>
+        <span class="dropdown-title">选择模型</span>
         <div class="header-actions">
-          <label class="configured-toggle" title="Show only configured providers">
+          <label class="configured-toggle" title="仅显示已配置的提供商">
             <input v-model="showOnlyConfigured" type="checkbox" />
-            <span>Configured only</span>
+            <span>仅已配置</span>
           </label>
           <button class="dropdown-close" @click="emit('close')">&times;</button>
         </div>
@@ -88,14 +138,30 @@ function formatContext(ctx?: number): string {
           v-model="searchQuery"
           type="text"
           class="search-input"
-          placeholder="Search models..."
+          placeholder="搜索模型..."
           spellcheck="false"
         />
       </div>
 
+      <!-- 思考深度选择器 -->
+      <div v-if="modelSupportsThinking && availableThinkingLevels.length > 0" class="thinking-row">
+        <span class="thinking-label">思考深度</span>
+        <div class="thinking-chips">
+          <button
+            v-for="level in availableThinkingLevels"
+            :key="level"
+            class="thinking-chip"
+            :class="{ active: currentThinkingLevel === level }"
+            @click="selectThinkingLevel(level)"
+          >
+            {{ THINKING_LEVEL_LABELS[level] }}
+          </button>
+        </div>
+      </div>
+
       <div class="dropdown-list">
         <template v-if="filteredModels.length === 0">
-          <div class="empty-message">No models found</div>
+          <div class="empty-message">未找到模型</div>
         </template>
         <template v-else>
           <div v-for="[provider, models] in groupedModels" :key="provider" class="provider-group">
@@ -105,7 +171,7 @@ function formatContext(ctx?: number): string {
                 class="provider-auth"
                 :class="{ configured: getAuthStatus(provider).configured }"
               >
-                {{ getAuthStatus(provider).configured ? '✓' : 'Login required' }}
+                {{ getAuthStatus(provider).configured ? '✓' : '需登录' }}
               </span>
             </div>
             <button
@@ -119,13 +185,13 @@ function formatContext(ctx?: number): string {
                 <span class="model-name">{{ model.id }}</span>
                 <span class="model-meta">
                   <span v-if="model.contextWindow" class="model-ctx">{{ formatContext(model.contextWindow) }}</span>
-                  <span v-if="model.reasoning" class="model-thinking">thinking</span>
+                  <span v-if="model.reasoning" class="model-thinking">推理</span>
                 </span>
               </div>
               <span
                 v-if="!getAuthStatus(model.provider).configured"
                 class="model-auth-warn"
-                title="Provider not configured"
+                title="提供商未配置"
               >!</span>
             </button>
           </div>
@@ -133,9 +199,9 @@ function formatContext(ctx?: number): string {
       </div>
 
       <div class="dropdown-footer">
-        <button class="cycle-btn" @click="cycleModel('backward')">&larr; Prev</button>
+        <button class="cycle-btn" @click="cycleModel('backward')">&larr; 上一个</button>
         <span class="cycle-separator"></span>
-        <button class="cycle-btn" @click="cycleModel('forward')">Next &rarr;</button>
+        <button class="cycle-btn" @click="cycleModel('forward')">下一个 &rarr;</button>
       </div>
     </div>
     <div class="dropdown-backdrop" @click="emit('close')"></div>
@@ -362,6 +428,55 @@ function formatContext(ctx?: number): string {
   width: 1px;
   background: var(--pix-border-light);
   margin: 0 var(--pix-space-sm);
+}
+
+/* Thinking level row */
+.thinking-row {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-sm);
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  border-bottom: 1px solid var(--pix-border-light);
+}
+
+.thinking-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--pix-text-muted);
+  text-transform: uppercase;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.thinking-chips {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.thinking-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--pix-border);
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--pix-font-ui);
+  color: var(--pix-text-secondary);
+  background: var(--pix-bg-app);
+  cursor: pointer;
+  transition: background var(--pix-transition-fast), border-color var(--pix-transition-fast), color var(--pix-transition-fast);
+}
+
+.thinking-chip:hover {
+  background: var(--pix-bg-hover);
+  border-color: var(--pix-border-focus);
+  color: var(--pix-text-primary);
+}
+
+.thinking-chip.active {
+  background: var(--pix-accent-light);
+  border-color: var(--pix-accent);
+  color: var(--pix-accent);
+  font-weight: 600;
 }
 
 /* Backdrop */
