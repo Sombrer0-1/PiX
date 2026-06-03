@@ -1,236 +1,250 @@
 <script setup lang="ts">
 /**
- * RightPanel - Status summary panel
- *
- * Shows lightweight, real information about the current session.
- * Only shows what pi actually provides.
+ * RightPanel - Session inspector
  */
-import { computed } from "vue";
+import { computed, ref, onMounted, watch } from "vue";
+import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { useProjectStore } from "../../stores/project-store";
 import TokenStats from "../status/TokenStats.vue";
+import type { McpServerInfo } from "../../../shared/types";
 
 const rpc = useRpc();
 const projectStore = useProjectStore();
 
 const modelDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  if (!model) return "Not set";
+  if (!model) return "未设置";
   return `${model.provider}/${model.id}`;
 });
 
 const thinkingLevel = computed(() => rpc.sessionState.value?.thinkingLevel || "medium");
-
 const sessionId = computed(() => rpc.sessionState.value?.sessionId || "-");
-
 const sessionName = computed(() => rpc.sessionState.value?.sessionName);
-
 const isStreaming = computed(() => rpc.isStreaming.value);
 const isError = computed(() => rpc.lastError.value !== null);
-
-const statusLabel = computed(() => {
-  if (isStreaming.value) return "Running";
-  if (isError.value) return "Error";
-  return "Idle";
-});
-
-const statusClass = computed(() => {
-  if (isStreaming.value) return "status-running";
-  if (isError.value) return "status-error";
-  return "status-idle";
-});
-
+const messageCount = computed(() => rpc.sessionState.value?.messageCount || 0);
 const projectPath = computed(() => projectStore.currentProject?.path || "-");
 
-const messageCount = computed(() => rpc.sessionState.value?.messageCount || 0);
+const statusLabel = computed(() => {
+  if (isStreaming.value) return "运行中";
+  if (isError.value) return "错误";
+  return "空闲";
+});
+
+const statusColor = computed(() => {
+  if (isStreaming.value) return "primary";
+  if (isError.value) return "error";
+  return undefined;
+});
+
+const statusVariant = computed(() => {
+  if (isStreaming.value) return "tonal";
+  if (isError.value) return "tonal";
+  return "text";
+});
+
+// ---- MCP status ----
+const router = useRouter();
+const mcpServers = ref<McpServerInfo[]>([]);
+const mcpConnected = computed(() => mcpServers.value.filter((s) => s.status === "connected").length);
+const mcpFailed = computed(() => mcpServers.value.filter((s) => s.status === "failed").length);
+const mcpTotal = computed(() => mcpServers.value.length);
+
+async function refreshMcp(): Promise<void> {
+  try {
+    mcpServers.value = await window.pixApi.mcpGetServers();
+  } catch {
+    mcpServers.value = [];
+  }
+}
+
+function goToMcpSettings(): void {
+  router.push("/settings");
+  // settings page defaults to "general", we trigger via store or just navigate
+}
+
+onMounted(refreshMcp);
+watch(() => rpc.isConnected.value, (connected) => {
+  if (connected) refreshMcp();
+});
 </script>
 
 <template>
   <div class="right-panel">
-    <!-- Status Card -->
-    <div class="status-card">
-      <div class="status-indicator" :class="statusClass">
-        <span class="status-dot"></span>
+    <!-- Status -->
+    <div class="inspector-section">
+      <v-chip
+        size="small"
+        :color="statusColor"
+        :variant="statusVariant"
+        class="status-chip"
+      >
         {{ statusLabel }}
-      </div>
+      </v-chip>
     </div>
 
-    <!-- Session Info -->
-    <div class="info-section">
-      <div class="info-item">
-        <div class="info-label">Model</div>
-        <div class="info-value mono">{{ modelDisplay }}</div>
-      </div>
+    <v-divider class="my-2" />
 
-      <div class="info-item">
-        <div class="info-label">Thinking</div>
-        <div class="info-value">{{ thinkingLevel }}</div>
-      </div>
-
-      <div class="info-item">
-        <div class="info-label">Session</div>
-        <div class="info-value mono" :title="sessionId">
-          {{ sessionName || sessionId.slice(0, 12) }}
-        </div>
-      </div>
-
-      <div class="info-item">
-        <div class="info-label">Messages</div>
-        <div class="info-value">{{ messageCount }}</div>
-      </div>
-
-      <div class="info-item">
-        <div class="info-label">Project</div>
-        <div class="info-value mono" :title="projectPath">{{ projectPath.split(/[/\\]/).pop() }}</div>
-      </div>
-
-      <div class="info-item">
-        <div class="info-label">Pi Status</div>
-        <div class="info-value">
-          <span v-if="rpc.isConnected.value" class="pi-ok">Connected</span>
-          <span v-else class="pi-nok">Disconnected</span>
-        </div>
-      </div>
+    <!-- Session info -->
+    <div class="inspector-section">
+      <v-list density="default" bg-color="transparent" class="info-list">
+        <v-list-item density="default">
+          <template #title>
+            <span class="info-key">模型</span>
+          </template>
+          <template #append>
+            <span class="info-mono">{{ modelDisplay }}</span>
+          </template>
+        </v-list-item>
+        <v-list-item density="default">
+          <template #title>
+            <span class="info-key">思考级别</span>
+          </template>
+          <template #append>
+            <span class="info-val">{{ thinkingLevel }}</span>
+          </template>
+        </v-list-item>
+        <v-list-item density="default">
+          <template #title>
+            <span class="info-key">会话</span>
+          </template>
+          <template #append>
+            <span class="info-mono" :title="sessionId">{{ sessionName || sessionId.slice(0, 12) }}</span>
+          </template>
+        </v-list-item>
+        <v-list-item density="default">
+          <template #title>
+            <span class="info-key">消息数</span>
+          </template>
+          <template #append>
+            <span class="info-val">{{ messageCount }}</span>
+          </template>
+        </v-list-item>
+        <v-list-item density="default">
+          <template #title>
+            <span class="info-key">项目</span>
+          </template>
+          <template #append>
+            <span class="info-mono">{{ projectPath.split(/[/\\]/).pop() }}</span>
+          </template>
+        </v-list-item>
+      </v-list>
     </div>
 
-    <!-- Token Stats -->
-    <div class="info-section">
-      <div class="section-title">Token Usage</div>
+    <v-divider class="my-2" />
+
+    <!-- Token stats -->
+    <div class="inspector-section">
+      <div class="section-label">Token 用量</div>
       <TokenStats />
     </div>
 
-    <!-- Error Summary -->
-    <div v-if="rpc.lastError.value" class="info-section error-section">
-      <div class="section-title">Last Error</div>
-      <div class="error-text">{{ rpc.lastError.value }}</div>
-    </div>
+    <!-- MCP servers -->
+    <template v-if="mcpTotal > 0">
+      <v-divider class="my-2" />
+      <div class="inspector-section">
+        <div class="d-flex align-center justify-space-between mb-1">
+          <span class="section-label">MCP 服务器</span>
+          <v-btn
+            variant="text"
+            size="x-small"
+            icon="mdi-open-in-new"
+            @click="goToMcpSettings"
+          />
+        </div>
+        <v-chip
+          size="x-small"
+          :color="mcpFailed > 0 ? 'warning' : 'success'"
+          variant="tonal"
+          class="mb-1"
+        >
+          {{ mcpConnected }}/{{ mcpTotal }} 已连接
+        </v-chip>
+        <v-chip
+          v-if="mcpFailed > 0"
+          size="x-small"
+          color="error"
+          variant="tonal"
+        >
+          {{ mcpFailed }} 失败
+        </v-chip>
+      </div>
+    </template>
+
+    <!-- Error -->
+    <template v-if="rpc.lastError.value">
+      <v-divider class="my-2" />
+      <div class="inspector-section">
+        <div class="section-label error-label">最近错误</div>
+        <div class="error-text">{{ rpc.lastError.value }}</div>
+      </div>
+    </template>
   </div>
 </template>
 
 <style scoped>
 .right-panel {
-  padding: var(--pix-space-lg);
   display: flex;
   flex-direction: column;
-  gap: var(--pix-space-lg);
-}
-
-.status-card {
+  height: 100%;
   padding: var(--pix-space-md);
-  background: var(--pix-bg-content);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
+  gap: 0;
 }
 
-.status-indicator {
-  display: flex;
-  align-items: center;
-  gap: var(--pix-space-sm);
-  font-size: var(--pix-text-sm);
-  font-weight: 500;
+.inspector-section {
+  padding: var(--pix-space-sm) 0;
 }
 
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.status-running .status-dot {
-  background: var(--pix-accent);
-  animation: pulse 1.5s ease-in-out infinite;
-}
-
-.status-error .status-dot {
-  background: var(--pix-error);
-}
-
-.status-idle .status-dot {
-  background: var(--pix-text-muted);
-}
-
-.status-running {
-  color: var(--pix-accent);
-}
-
-.status-error {
-  color: var(--pix-error);
-}
-
-.status-idle {
-  color: var(--pix-text-muted);
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-
-.info-section {
-  padding: var(--pix-space-md);
-  background: var(--pix-bg-content);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
-}
-
-.section-title {
+.section-label {
   font-size: var(--pix-text-xs);
   font-weight: 600;
   color: var(--pix-text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-bottom: var(--pix-space-md);
-}
-
-.info-item {
+  letter-spacing: 0.3px;
   margin-bottom: var(--pix-space-sm);
 }
 
-.info-item:last-child {
-  margin-bottom: 0;
+.status-chip {
+  width: 100%;
 }
 
-.info-label {
-  font-size: var(--pix-text-xs);
+.info-list :deep(.v-list-item) {
+  padding-left: 0;
+  padding-right: 0;
+  min-height: 30px;
+}
+
+.info-key {
+  font-size: var(--pix-text-sm);
   color: var(--pix-text-muted);
-  margin-bottom: 1px;
 }
 
-.info-value {
+.info-val {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-primary);
   font-weight: 500;
 }
 
-.info-value.mono {
+.info-mono {
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-xs);
-  font-weight: 400;
+  color: var(--pix-text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  max-width: 140px;
 }
 
-.pi-ok {
-  color: var(--pix-success);
-  font-size: var(--pix-text-sm);
-}
-
-.pi-nok {
-  color: var(--pix-error);
-  font-size: var(--pix-text-sm);
-}
-
-.error-section {
-  border-color: #e8d0d0;
+.error-label {
+  color: var(--pix-error) !important;
 }
 
 .error-text {
-  font-size: var(--pix-text-xs);
+  font-size: var(--pix-text-sm);
   color: var(--pix-error);
   line-height: var(--pix-leading-base);
-  max-height: 100px;
+  max-height: 120px;
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;

@@ -7,8 +7,10 @@
  * v2: Uses SessionBridge for direct AgentSession integration (no RPC subprocess).
  */
 
+import { existsSync, rmSync } from "fs";
+import { join, resolve } from "path";
 import { BrowserWindow, ipcMain } from "electron";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
@@ -229,6 +231,81 @@ export function registerIpcHandlers(
 
   ipcMain.handle("is-pi-running", () => {
     return sessionBridge.isRunning();
+  });
+
+
+  // =========================================================================
+  // MCP Queries
+  // =========================================================================
+
+  ipcMain.handle("mcp-get-servers", () => {
+    return sessionBridge.mcpGetServers();
+  });
+
+  ipcMain.handle("mcp-get-config", () => {
+    return sessionBridge.mcpGetConfig();
+  });
+
+  ipcMain.handle("mcp-list-resources", async (_event, serverName?: string) => {
+    return sessionBridge.mcpListResources(serverName);
+  });
+
+  ipcMain.handle("mcp-read-resource", async (_event, serverName: string | undefined, uri: string) => {
+    return sessionBridge.mcpReadResource(serverName, uri);
+  });
+  // =========================================================================
+  // Window Controls (frameless window)
+  // =========================================================================
+
+  ipcMain.handle("window-minimize", () => {
+    win.minimize();
+  });
+
+  ipcMain.handle("window-maximize", () => {
+    if (win.isMaximized()) {
+      win.unmaximize();
+    } else {
+      win.maximize();
+    }
+  });
+
+  ipcMain.handle("window-close", () => {
+    win.close();
+  });
+
+  ipcMain.handle("window-is-maximized", () => {
+    return win.isMaximized();
+  });
+
+  // =========================================================================
+  // Session Management (delete, pin)
+  // =========================================================================
+
+  ipcMain.handle("delete-session", async (_event, sessionPath: string) => {
+    try {
+      const resolved = resolve(sessionPath);
+      // Guard: only delete session files, never arbitrary paths
+      const agentDir = resolve(getAgentDir());
+      const sessionsDir = join(agentDir, "sessions");
+      if (!resolved.startsWith(sessionsDir)) {
+        return { success: false, error: "Invalid session path" };
+      }
+      if (existsSync(resolved)) {
+        rmSync(resolved, { recursive: true, force: true });
+        return { success: true };
+      }
+      return { success: false, error: "Session file not found" };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  // Forward maximize/unmaximize events so the renderer can update the button icon
+  win.on("maximize", () => {
+    win.webContents.send("window-maximize-change", true);
+  });
+  win.on("unmaximize", () => {
+    win.webContents.send("window-maximize-change", false);
   });
 }
 

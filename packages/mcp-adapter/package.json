@@ -1,0 +1,50 @@
+{
+	"name": "pi-mcp-adapter",
+	"version": "0.1.0",
+	"description": "MCP client adapter extension for Pi and PiX",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"pi": {
+		"extensions": [
+			"dist/index.js"
+		]
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.29.0",
+		"typebox": "1.1.38"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.78.0"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.78.0",
+		"@types/node": "24.12.4",
+		"shx": "0.4.0",
+		"typescript": "5.9.3"
+	},
+	"keywords": [
+		"pi",
+		"mcp",
+		"model-context-protocol",
+		"extension"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

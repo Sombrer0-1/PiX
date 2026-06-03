@@ -5,7 +5,7 @@
  */
 
 import { contextBridge, ipcRenderer } from "electron";
-import type { AgentSessionEvent, GuiSettings, RpcCommand, SessionInfo } from "../shared/types.js";
+import type { AgentSessionEvent, GuiSettings, McpConfigInfo, McpResourceContent, McpResourceInfo, McpServerInfo, RpcCommand, SessionInfo } from "../shared/types.js";
 
 export interface PixApi {
   // File dialogs
@@ -39,6 +39,22 @@ export interface PixApi {
 
   // Session management
   listSessions: (projectDir: string) => Promise<SessionInfo[]>;
+
+  // Window controls (frameless window)
+  windowMinimize: () => Promise<void>;
+  windowMaximize: () => Promise<void>;
+  windowClose: () => Promise<void>;
+  windowIsMaximized: () => Promise<boolean>;
+  onWindowMaximizeChange: (callback: (maximized: boolean) => void) => () => void;
+
+  // Session management
+  deleteSession: (sessionPath: string) => Promise<{ success: boolean; error?: string }>;
+
+  // MCP queries
+  mcpGetServers: () => Promise<McpServerInfo[]>;
+  mcpGetConfig: () => Promise<McpConfigInfo>;
+  mcpListResources: (serverName?: string) => Promise<McpResourceInfo[]>;
+  mcpReadResource: (serverName: string | undefined, uri: string) => Promise<McpResourceContent>;
 }
 
 const api: PixApi = {
@@ -89,6 +105,27 @@ const api: PixApi = {
   },
 
   listSessions: (projectDir: string) => ipcRenderer.invoke("list-sessions", projectDir),
+
+  // Window controls
+  windowMinimize: () => ipcRenderer.invoke("window-minimize"),
+  windowMaximize: () => ipcRenderer.invoke("window-maximize"),
+  windowClose: () => ipcRenderer.invoke("window-close"),
+  windowIsMaximized: () => ipcRenderer.invoke("window-is-maximized"),
+  onWindowMaximizeChange: (callback: (maximized: boolean) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, maximized: boolean) => callback(maximized);
+    ipcRenderer.on("window-maximize-change", handler);
+    return () => ipcRenderer.removeListener("window-maximize-change", handler);
+  },
+
+  deleteSession: (sessionPath: string) =>
+    ipcRenderer.invoke("delete-session", sessionPath) as Promise<{ success: boolean; error?: string }>,
+
+  // MCP queries
+  mcpGetServers: () => ipcRenderer.invoke("mcp-get-servers"),
+  mcpGetConfig: () => ipcRenderer.invoke("mcp-get-config"),
+  mcpListResources: (serverName?: string) => ipcRenderer.invoke("mcp-list-resources", serverName),
+  mcpReadResource: (serverName: string | undefined, uri: string) =>
+    ipcRenderer.invoke("mcp-read-resource", serverName, uri),
 };
 
 contextBridge.exposeInMainWorld("pixApi", api);

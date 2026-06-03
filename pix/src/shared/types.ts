@@ -151,10 +151,18 @@ export interface AgentMessage {
 // Display Block Types (derived from events for rendering)
 // ============================================================================
 
+export interface ToolWorkItem {
+  toolCallId: string;
+  toolName: string;
+  args: unknown;
+  result: unknown;
+  isError: boolean;
+}
+
 export type DisplayBlock =
   | { id: string; type: "user-message"; text: string; timestamp: number }
   | { id: string; type: "agent-message"; content: string; isStreaming: boolean; timestamp: number }
-  | { id: string; type: "tool-execution"; toolCallId: string; toolName: string; args: unknown; result: unknown; isError: boolean; isStreaming: boolean; timestamp: number }
+  | { id: string; type: "work-status"; tools: ToolWorkItem[]; isStreaming: boolean; timestamp: number }
   | { id: string; type: "error"; message: string; source?: string; timestamp: number }
   | { id: string; type: "compaction"; reason: string; result: string; aborted: boolean; timestamp: number }
   | { id: string; type: "retry"; success: boolean; attempt: number; maxAttempts: number; delayMs?: number; timestamp: number }
@@ -246,6 +254,37 @@ export interface ResourceStatus {
   skills: { loaded: number };
   prompts: { loaded: number };
   themes: { loaded: number };
+}
+
+// ============================================================================
+// MCP Types
+// ============================================================================
+
+export interface McpServerInfo {
+  name: string;
+  status: "disconnected" | "connecting" | "connected" | "failed";
+  error?: string;
+  toolCount: number;
+  tools: string[];
+  transport: "stdio" | "http" | "sse";
+  required: boolean;
+  stderr?: string;
+}
+
+export interface McpConfigInfo {
+  configPaths: string[];
+  errors: string[];
+}
+
+export interface McpResourceInfo {
+  server: string;
+  resources: unknown[];
+}
+
+export interface McpResourceContent {
+  server: string;
+  contents: unknown[];
+  errors?: string[];
 }
 
 // ============================================================================

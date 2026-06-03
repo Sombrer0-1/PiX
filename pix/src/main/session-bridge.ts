@@ -13,11 +13,17 @@ import {
 	SessionManager,
 	SettingsManager,
 	AuthStorage,
+	DefaultResourceLoader,
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
+import { McpAdapter } from "pi-mcp-adapter";
 import type {
 	AgentSessionEvent,
 	GuiSettings,
+	McpConfigInfo,
+	McpResourceContent,
+	McpResourceInfo,
+	McpServerInfo,
 	ModelInfo,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -53,6 +59,7 @@ export class SessionBridge {
 	private _session: AgentSession | null = null;
 	private _sessionManager: SessionManager | null = null;
 	private _authStorage: AuthStorage | null = null;
+	private _mcpAdapter: McpAdapter | null = null;
 	private _cwd = "";
 	private _guiSettings: GuiSettings | undefined;
 	private _unsubscribe: (() => void) | null = null;
@@ -587,6 +594,28 @@ export class SessionBridge {
 			};
 		}
 	}
+	// =========================================================================
+	// MCP Queries
+	// =========================================================================
+
+	mcpGetServers(): McpServerInfo[] {
+		return this._mcpAdapter?.getServers() ?? [];
+	}
+
+	mcpGetConfig(): McpConfigInfo {
+		return this._mcpAdapter?.getConfigInfo() ?? { configPaths: [], errors: [] };
+	}
+
+	async mcpListResources(serverName?: string): Promise<McpResourceInfo[]> {
+		if (!this._mcpAdapter) return [];
+		const { results, errors } = await this._mcpAdapter.listResources(serverName);
+		return results.map((r) => ({ server: r.server, resources: r.resources }));
+	}
+
+	async mcpReadResource(serverName: string | undefined, uri: string): Promise<McpResourceContent> {
+		if (!this._mcpAdapter) throw new Error("MCP adapter not available");
+		return this._mcpAdapter.readResource(serverName, uri);
+	}
 
 	// =========================================================================
 	// Event subscriptions
@@ -621,10 +650,22 @@ export class SessionBridge {
 		sessionManager: SessionManager,
 		sessionStartEvent: SessionStartEvent,
 	): Promise<CreateAgentSessionResult> {
+		const settingsManager = this._createSettingsManager(cwd);
+		const mcpAdapter = new McpAdapter();
+		this._mcpAdapter = mcpAdapter;
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir: getAgentDir(),
+			settingsManager,
+			extensionFactories: [(pi) => { mcpAdapter.register(pi); }],
+		});
+		await resourceLoader.reload();
+
 		return createAgentSession({
 			cwd,
 			sessionManager,
-			settingsManager: this._createSettingsManager(cwd),
+			settingsManager,
+			resourceLoader,
 			authStorage: this._authStorage ?? undefined,
 			sessionStartEvent,
 		});
@@ -645,6 +686,7 @@ export class SessionBridge {
 		this._sessionManager = null;
 		this._isCompacting = false;
 		this._pendingMessageCount = 0;
+		this._mcpAdapter = null;
 
 		if (!session) {
 			return false;

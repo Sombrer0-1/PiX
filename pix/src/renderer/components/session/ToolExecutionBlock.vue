@@ -71,6 +71,11 @@ const argsSummary = computed(() => {
   return `${first}: ${val.length > 60 ? val.slice(0, 60) + "..." : val}`;
 });
 
+const mcpServer = computed(() => {
+  const match = props.toolName.match(/^mcp__([^_]+(?:_[^_]+)*?)__/);
+  return match ? match[1] : null;
+});
+
 function toggleExpand(): void {
   expanded.value = !expanded.value;
 }
@@ -85,6 +90,7 @@ function toggleExpand(): void {
         <span v-else class="status-mark success-mark" aria-label="Succeeded"></span>
       </span>
       <span class="tool-name">{{ toolName }}</span>
+      <span v-if="mcpServer" class="mcp-chip" :title="'MCP server: ' + mcpServer">MCP:{{ mcpServer }}</span>
       <span v-if="argsSummary" class="tool-args">{{ argsSummary }}</span>
       <span class="tool-time">{{ formatTime(timestamp) }}</span>
       <span class="tool-toggle">{{ expanded ? 'v' : '>' }}</span>
@@ -174,6 +180,19 @@ function toggleExpand(): void {
   font-size: var(--pix-text-xs);
   font-weight: 600;
   color: var(--pix-accent);
+}
+
+.mcp-chip {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  font-family: var(--pix-font-mono);
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(0, 150, 136, 0.12);
+  color: #00897b;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .tool-args {
