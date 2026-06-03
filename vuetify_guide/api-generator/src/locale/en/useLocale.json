@@ -1,0 +1,15 @@
+{
+  "exposed": {
+    "current": "Current locale.",
+    "fallback": "Fallback locale.",
+    "isRtl": "Indicates if RTL is currently active or not.",
+    "messages": "Locale messages.",
+    "n": "Function to localize numbers.",
+    "name": "Name of the locale adapter used.",
+    "provide": "**FOR INTERNAL USE ONLY**",
+    "rtl": "**FOR INTERNAL USE ONLY**",
+    "rtlClasses": "**FOR INTERNAL USE ONLY**",
+    "t": "Function to localize strings.",
+    "decimalSeparator": "The decimal separator character for the current locale (e.g. `.` for en, `,` for de)."
+  }
+}

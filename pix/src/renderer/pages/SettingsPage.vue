@@ -22,15 +22,15 @@ const rpc = useRpc();
 type SettingsSection = "general" | "display" | "model" | "terminal" | "shell" | "resources" | "mcp" | "auth" | "advanced";
 const activeSection = ref<SettingsSection>("general");
 const sections: { key: SettingsSection; label: string; icon: string }[] = [
-  { key: "general", label: "General", icon: "mdi-cog-outline" },
-  { key: "display", label: "Display", icon: "mdi-monitor" },
-  { key: "model", label: "Model", icon: "mdi-cube-outline" },
-  { key: "terminal", label: "Terminal", icon: "mdi-console" },
+  { key: "general", label: "常规", icon: "mdi-cog-outline" },
+  { key: "display", label: "显示", icon: "mdi-monitor" },
+  { key: "model", label: "模型", icon: "mdi-cube-outline" },
+  { key: "terminal", label: "终端", icon: "mdi-console" },
   { key: "shell", label: "Shell", icon: "mdi-bash" },
-  { key: "resources", label: "Resources", icon: "mdi-package-variant" },
+  { key: "resources", label: "资源", icon: "mdi-package-variant" },
   { key: "mcp", label: "MCP", icon: "mdi-puzzle-outline" },
-  { key: "auth", label: "Auth", icon: "mdi-shield-key" },
-  { key: "advanced", label: "Advanced", icon: "mdi-tune" },
+  { key: "auth", label: "认证", icon: "mdi-shield-key" },
+  { key: "advanced", label: "高级", icon: "mdi-tune" },
 ];
 
 // ---- Form state ----
@@ -230,7 +230,7 @@ function goBack(): void { router.back(); }
       <!-- Sidebar -->
       <nav class="settings-sidebar">
         <div class="sidebar-header">
-          <v-btn variant="text" prepend-icon="mdi-arrow-left" @click="goBack">Back</v-btn>
+          <v-btn variant="text" prepend-icon="mdi-arrow-left" @click="goBack">返回</v-btn>
         </div>
         <v-list density="default" nav bg-color="transparent">
           <v-list-item
@@ -249,85 +249,85 @@ function goBack(): void { router.back(); }
 
       <!-- Content -->
       <div class="settings-content">
-        <!-- ============ General ============ -->
+        <!-- ============ 常规 ============ -->
         <div v-show="activeSection === 'general'" class="section-panel">
-          <h2 class="section-title">General</h2>
-          <p class="section-desc">Default model and session behavior.</p>
+          <h2 class="section-title">常规</h2>
+          <p class="section-desc">默认模型与会话行为设置。</p>
           <div class="form-fields">
-            <v-text-field v-model="defaultProvider" label="Default Provider" placeholder="e.g., anthropic, openai" hint="Provider name for new sessions." persistent-hint class="mb-4" />
-            <v-text-field v-model="defaultModel" label="Default Model" placeholder="e.g., claude-sonnet-4-6" hint="Model ID for new sessions." persistent-hint class="mb-4" />
-            <v-select v-model="defaultThinkingLevel" label="Default Thinking Level" :items="thinkingLevels" class="mb-4" />
-            <v-select v-model="steeringMode" label="Steering Mode" :items="steeringModes" hint="How steering messages are queued during streaming." persistent-hint class="mb-4" />
-            <v-select v-model="followUpMode" label="Follow-Up Mode" :items="steeringModes" hint="How follow-up messages are sent during streaming." persistent-hint class="mb-4" />
-            <v-switch v-model="autoCompact" label="Auto Compact" hint="Automatically compact context when threshold is reached." persistent-hint class="mb-4" />
-            <v-switch v-model="quietStartup" label="Quiet Startup" hint="Suppress startup messages." persistent-hint class="mb-4" />
-            <v-switch v-model="enableInstallTelemetry" label="Install Telemetry" hint="Send anonymous install attribution." persistent-hint class="mb-4" />
+            <v-text-field v-model="defaultProvider" label="默认提供商" placeholder="例如 anthropic, openai" hint="新会话使用的提供商名称。" persistent-hint class="mb-4" />
+            <v-text-field v-model="defaultModel" label="默认模型" placeholder="例如 claude-sonnet-4-6" hint="新会话使用的模型 ID。" persistent-hint class="mb-4" />
+            <v-select v-model="defaultThinkingLevel" label="默认思考级别" :items="thinkingLevels" class="mb-4" />
+            <v-select v-model="steeringMode" label="操控模式" :items="steeringModes" hint="流式输出期间操控消息的排队方式。" persistent-hint class="mb-4" />
+            <v-select v-model="followUpMode" label="跟进模式" :items="steeringModes" hint="流式输出期间跟进消息的发送方式。" persistent-hint class="mb-4" />
+            <v-switch v-model="autoCompact" label="自动压缩" hint="达到阈值时自动压缩上下文。" persistent-hint class="mb-4" />
+            <v-switch v-model="quietStartup" label="静默启动" hint="隐藏启动消息。" persistent-hint class="mb-4" />
+            <v-switch v-model="enableInstallTelemetry" label="安装统计" hint="发送匿名安装归因数据。" persistent-hint class="mb-4" />
           </div>
         </div>
 
-        <!-- ============ Display ============ -->
+        <!-- ============ 显示 ============ -->
         <div v-show="activeSection === 'display'" class="section-panel">
-          <h2 class="section-title">Display</h2>
-          <p class="section-desc">Terminal and editor visual preferences.</p>
+          <h2 class="section-title">显示</h2>
+          <p class="section-desc">终端与编辑器视觉偏好。</p>
           <div class="form-fields">
-            <v-text-field v-model="piTheme" label="Pi Terminal Theme" placeholder="default" hint="Pi TUI theme name (affects CLI/TUI mode only)." persistent-hint class="mb-4" />
-            <v-switch v-model="hideThinkingBlock" label="Hide Thinking Block" hint="Collapse the agent thinking section." persistent-hint class="mb-4" />
-            <v-switch v-model="collapseChangelog" label="Collapse Changelog" hint="Collapse changelog on startup." persistent-hint class="mb-4" />
-            <v-switch v-model="showHardwareCursor" label="Show Hardware Cursor" hint="Use the terminal hardware cursor." persistent-hint class="mb-4" />
-            <v-text-field v-model.number="editorPaddingX" label="Editor Padding X" type="number" min="0" max="3" hint="Horizontal padding in editor cells (0-3)." persistent-hint style="max-width:200px" class="mb-4" />
+            <v-text-field v-model="piTheme" label="Pi 终端主题" placeholder="default" hint="Pi TUI 主题名称（仅影响 CLI/TUI 模式）。" persistent-hint class="mb-4" />
+            <v-switch v-model="hideThinkingBlock" label="隐藏思考块" hint="折叠 agent 思考区域。" persistent-hint class="mb-4" />
+            <v-switch v-model="collapseChangelog" label="折叠更新日志" hint="启动时折叠更新日志。" persistent-hint class="mb-4" />
+            <v-switch v-model="showHardwareCursor" label="显示硬件光标" hint="使用终端硬件光标。" persistent-hint class="mb-4" />
+            <v-text-field v-model.number="editorPaddingX" label="编辑器水平内边距" type="number" min="0" max="3" hint="编辑器单元格的水平内边距 (0-3)。" persistent-hint style="max-width:200px" class="mb-4" />
           </div>
         </div>
 
-        <!-- ============ Model ============ -->
+        <!-- ============ 模型 ============ -->
         <div v-show="activeSection === 'model'" class="section-panel">
-          <h2 class="section-title">Model</h2>
-          <p class="section-desc">Model availability and transport configuration.</p>
+          <h2 class="section-title">模型</h2>
+          <p class="section-desc">模型可用性与传输配置。</p>
           <div class="form-fields">
-            <v-text-field v-model="enabledModels" label="Enabled Models (glob patterns)" placeholder="anthropic/*, openai/gpt-5*" hint="Comma-separated glob patterns. Leave empty for all models." persistent-hint class="mb-4" />
-            <v-select v-model="transport" label="Transport" :items="transportOptions" hint="HTTP transport method for API requests." persistent-hint class="mb-4" />
-            <v-switch v-model="retryEnabled" label="Auto Retry" hint="Automatically retry failed API requests." persistent-hint class="mb-4" />
+            <v-text-field v-model="enabledModels" label="启用的模型（glob 模式）" placeholder="anthropic/*, openai/gpt-5*" hint="逗号分隔的 glob 模式。留空则启用所有模型。" persistent-hint class="mb-4" />
+            <v-select v-model="transport" label="传输方式" :items="transportOptions" hint="API 请求的 HTTP 传输方式。" persistent-hint class="mb-4" />
+            <v-switch v-model="retryEnabled" label="自动重试" hint="自动重试失败的 API 请求。" persistent-hint class="mb-4" />
           </div>
         </div>
 
-        <!-- ============ Terminal ============ -->
+        <!-- ============ 终端 ============ -->
         <div v-show="activeSection === 'terminal'" class="section-panel">
-          <h2 class="section-title">Terminal</h2>
-          <p class="section-desc">Image display and terminal behavior.</p>
+          <h2 class="section-title">终端</h2>
+          <p class="section-desc">图片显示与终端行为。</p>
           <div class="form-fields">
-            <v-switch v-model="showImages" label="Show Images" hint="Display inline images in the terminal (TUI mode)." persistent-hint class="mb-4" />
-            <v-text-field v-model.number="imageWidthCells" label="Image Width (cells)" type="number" min="10" max="200" hint="Width of displayed images in terminal cells." persistent-hint style="max-width:200px" class="mb-4" />
-            <v-switch v-model="imageAutoResize" label="Auto-Resize Images" hint="Automatically resize large images before sending to model." persistent-hint class="mb-4" />
-            <v-switch v-model="blockImages" label="Block Images" hint="Block images from being sent to the model entirely." persistent-hint class="mb-4" />
-            <v-switch v-model="clearOnShrink" label="Clear on Shrink" hint="Clear terminal when it shrinks below a threshold." persistent-hint class="mb-4" />
-            <v-switch v-model="showTerminalProgress" label="Show Terminal Progress" hint="Show progress indicators in the terminal." persistent-hint class="mb-4" />
+            <v-switch v-model="showImages" label="显示图片" hint="在终端中显示内联图片（TUI 模式）。" persistent-hint class="mb-4" />
+            <v-text-field v-model.number="imageWidthCells" label="图片宽度（单元格）" type="number" min="10" max="200" hint="终端中图片显示的宽度（单元格数）。" persistent-hint style="max-width:200px" class="mb-4" />
+            <v-switch v-model="imageAutoResize" label="自动调整图片大小" hint="发送给模型前自动调整大图片尺寸。" persistent-hint class="mb-4" />
+            <v-switch v-model="blockImages" label="阻止图片" hint="完全阻止将图片发送给模型。" persistent-hint class="mb-4" />
+            <v-switch v-model="clearOnShrink" label="缩小时清屏" hint="终端缩小到阈值以下时清屏。" persistent-hint class="mb-4" />
+            <v-switch v-model="showTerminalProgress" label="显示终端进度" hint="在终端中显示进度指示器。" persistent-hint class="mb-4" />
           </div>
         </div>
 
         <!-- ============ Shell ============ -->
         <div v-show="activeSection === 'shell'" class="section-panel">
           <h2 class="section-title">Shell</h2>
-          <p class="section-desc">Bash execution and networking configuration.</p>
+          <p class="section-desc">Bash 执行与网络配置。</p>
           <div class="form-fields">
-            <v-text-field v-model="shellPath" label="Shell Path" placeholder="Auto-detected" hint="Path to shell executable." persistent-hint class="mb-4" />
-            <v-text-field v-model="shellCommandPrefix" label="Shell Command Prefix" placeholder="None" hint="Prefix prepended to every bash command (e.g., wsl)." persistent-hint class="mb-4" />
-            <v-text-field v-model="npmCommand" label="npm Command" placeholder="npm" hint="Space-separated npm command and arguments." persistent-hint class="mb-4" />
-            <v-text-field v-model.number="httpIdleTimeoutMs" label="HTTP Idle Timeout (ms)" type="number" min="0" placeholder="Server default" hint="HTTP idle timeout in milliseconds. 0 = server default." persistent-hint style="max-width:240px" class="mb-4" />
+            <v-text-field v-model="shellPath" label="Shell 路径" placeholder="自动检测" hint="Shell 可执行文件路径。" persistent-hint class="mb-4" />
+            <v-text-field v-model="shellCommandPrefix" label="Shell 命令前缀" placeholder="无" hint="每个 bash 命令的前缀（例如 wsl）。" persistent-hint class="mb-4" />
+            <v-text-field v-model="npmCommand" label="npm 命令" placeholder="npm" hint="空格分隔的 npm 命令及参数。" persistent-hint class="mb-4" />
+            <v-text-field v-model.number="httpIdleTimeoutMs" label="HTTP 空闲超时（毫秒）" type="number" min="0" placeholder="服务器默认" hint="HTTP 空闲超时毫秒数。0 = 服务器默认值。" persistent-hint style="max-width:240px" class="mb-4" />
           </div>
         </div>
 
-        <!-- ============ Resources ============ -->
+        <!-- ============ 资源 ============ -->
         <div v-show="activeSection === 'resources'" class="section-panel">
-          <h2 class="section-title">Resources</h2>
-          <p class="section-desc">Extensions, skills, prompt templates, and themes.</p>
+          <h2 class="section-title">资源</h2>
+          <p class="section-desc">扩展、技能、提示模板与主题。</p>
           <div class="form-fields">
-            <v-text-field v-model="extensionPaths" label="Extension Paths" placeholder="/path/to/ext1, /path/to/ext2" hint="Comma-separated paths to extension files or directories." persistent-hint class="mb-4" />
-            <v-text-field v-model="skillPaths" label="Skill Paths" placeholder="/path/to/skills1, /path/to/skills2" hint="Comma-separated paths to skill directories." persistent-hint class="mb-4" />
-            <v-text-field v-model="promptTemplatePaths" label="Prompt Template Paths" placeholder="/path/to/prompts1, /path/to/prompts2" hint="Comma-separated paths to prompt template directories." persistent-hint class="mb-4" />
-            <v-text-field v-model="themePaths" label="Theme Paths" placeholder="/path/to/themes1, /path/to/themes2" hint="Comma-separated paths to custom theme directories." persistent-hint class="mb-4" />
-            <v-switch v-model="enableSkillCommands" label="Enable Skill Commands" hint="Allow skills to register slash commands." persistent-hint class="mb-4" />
+            <v-text-field v-model="extensionPaths" label="扩展路径" placeholder="/path/to/ext1, /path/to/ext2" hint="逗号分隔的扩展文件或目录路径。" persistent-hint class="mb-4" />
+            <v-text-field v-model="skillPaths" label="技能路径" placeholder="/path/to/skills1, /path/to/skills2" hint="逗号分隔的技能目录路径。" persistent-hint class="mb-4" />
+            <v-text-field v-model="promptTemplatePaths" label="提示模板路径" placeholder="/path/to/prompts1, /path/to/prompts2" hint="逗号分隔的提示模板目录路径。" persistent-hint class="mb-4" />
+            <v-text-field v-model="themePaths" label="主题路径" placeholder="/path/to/themes1, /path/to/themes2" hint="逗号分隔的自定义主题目录路径。" persistent-hint class="mb-4" />
+            <v-switch v-model="enableSkillCommands" label="启用技能命令" hint="允许技能注册斜杠命令。" persistent-hint class="mb-4" />
             <div class="resource-actions">
-              <v-btn variant="outlined" :disabled="!rpc.isConnected.value" @click="async () => { await rpc.reloadResources(); }">Reload Resources</v-btn>
-              <span class="inline-hint">Reload all extensions, skills, prompts, and themes.</span>
+              <v-btn variant="outlined" :disabled="!rpc.isConnected.value" @click="async () => { await rpc.reloadResources(); }">重新加载资源</v-btn>
+              <span class="inline-hint">重新加载所有扩展、技能、提示和主题。</span>
             </div>
           </div>
         </div>
@@ -337,12 +337,12 @@ function goBack(): void { router.back(); }
           <McpSettings />
         </div>
 
-        <!-- ============ Auth ============ -->
+        <!-- ============ 认证 ============ -->
         <div v-show="activeSection === 'auth'" class="section-panel">
-          <h2 class="section-title">Authentication</h2>
-          <p class="section-desc">Configure API keys for each model provider. Keys are stored in <code>~/.pi/agent/auth.json</code>.</p>
-          <div v-if="!rpc.isConnected.value" class="auth-notice"><p>Start a session first to configure API keys.</p></div>
-          <div v-else-if="authStore.providerCount === 0" class="auth-notice"><p>No model providers detected.</p></div>
+          <h2 class="section-title">认证</h2>
+          <p class="section-desc">配置各模型提供商的 API 密钥。密钥存储在 <code>~/.pi/agent/auth.json</code>。</p>
+          <div v-if="!rpc.isConnected.value" class="auth-notice"><p>请先启动会话再配置 API 密钥。</p></div>
+          <div v-else-if="authStore.providerCount === 0" class="auth-notice"><p>未检测到模型提供商。</p></div>
           <div v-else class="auth-list">
             <v-card v-for="(status, provider) in authStore.authStatus" :key="provider" :border="status.configured ? 'success' : undefined" variant="outlined" class="auth-card mb-3">
               <div class="auth-provider-row" @click="toggleEditProvider(provider)">
@@ -352,37 +352,37 @@ function goBack(): void { router.back(); }
                 </div>
                 <div class="auth-status-info">
                   <v-icon size="small" :color="status.configured ? 'success' : undefined" :icon="status.configured ? 'mdi-check-circle' : 'mdi-circle-outline'" />
-                  <span class="auth-status-text">{{ status.configured ? 'Configured' : 'Not configured' }}</span>
-                  <span v-if="status.source" class="auth-source">via {{ status.source }}</span>
+                  <span class="auth-status-text">{{ status.configured ? '已配置' : '未配置' }}</span>
+                  <span v-if="status.source" class="auth-source">来源 {{ status.source }}</span>
                   <v-icon size="small" class="ml-2">{{ editingProvider === provider ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
                 </div>
               </div>
               <div v-if="editingProvider === provider" class="auth-edit-row">
-                <v-text-field v-model="editingKeys[provider]" type="password" :placeholder="status.configured ? 'Enter new key to replace...' : 'Paste your API key...'" hide-details density="comfortable" @keydown.enter="saveKey(provider)" class="mb-3" />
+                <v-text-field v-model="editingKeys[provider]" type="password" :placeholder="status.configured ? '输入新密钥以替换...' : '粘贴 API 密钥...'" hide-details density="comfortable" @keydown.enter="saveKey(provider)" class="mb-3" />
                 <div class="auth-btn-group">
-                  <v-btn size="small" color="primary" variant="tonal" :disabled="!editingKeys[provider]?.trim()" @click="saveKey(provider)">Save</v-btn>
-                  <v-btn v-if="status.configured" size="small" color="error" variant="text" @click="deleteKey(provider)">Delete</v-btn>
+                  <v-btn size="small" color="primary" variant="tonal" :disabled="!editingKeys[provider]?.trim()" @click="saveKey(provider)">保存</v-btn>
+                  <v-btn v-if="status.configured" size="small" color="error" variant="text" @click="deleteKey(provider)">删除</v-btn>
                 </div>
               </div>
             </v-card>
           </div>
         </div>
 
-        <!-- ============ Advanced ============ -->
+        <!-- ============ 高级 ============ -->
         <div v-show="activeSection === 'advanced'" class="section-panel">
-          <h2 class="section-title">Advanced</h2>
-          <p class="section-desc">Session storage, navigation, and UI behavior.</p>
+          <h2 class="section-title">高级</h2>
+          <p class="section-desc">会话存储、导航与 UI 行为。</p>
           <div class="form-fields">
-            <v-text-field v-model="sessionDir" label="Session Directory" placeholder="~/.pi/agent/sessions/" hint="Custom session storage directory." persistent-hint class="mb-4" />
-            <v-select v-model="doubleEscapeAction" label="Double Escape Action" :items="escapeActions" hint="Action on double Escape key press." persistent-hint class="mb-4" />
-            <v-select v-model="treeFilterMode" label="Tree Filter Mode" :items="treeFilterModes" hint="Default filter mode for session tree view." persistent-hint class="mb-4" />
-            <v-text-field v-model.number="autocompleteMaxVisible" label="Autocomplete Max Visible" type="number" min="3" max="20" hint="Maximum visible autocomplete suggestions (3-20)." persistent-hint style="max-width:200px" class="mb-4" />
+            <v-text-field v-model="sessionDir" label="会话目录" placeholder="~/.pi/agent/sessions/" hint="自定义会话存储目录。" persistent-hint class="mb-4" />
+            <v-select v-model="doubleEscapeAction" label="双击 Esc 操作" :items="escapeActions" hint="双击 Escape 键时的操作。" persistent-hint class="mb-4" />
+            <v-select v-model="treeFilterMode" label="树过滤器模式" :items="treeFilterModes" hint="会话树视图的默认过滤器模式。" persistent-hint class="mb-4" />
+            <v-text-field v-model.number="autocompleteMaxVisible" label="自动补全最大显示数" type="number" min="3" max="20" hint="自动补全建议的最大显示数量 (3-20)。" persistent-hint style="max-width:200px" class="mb-4" />
             <div class="advanced-info">
-              <h3>Diagnostic Information</h3>
-              <div class="info-row"><span>Integration</span><span>Direct (AgentSession in-process)</span></div>
-              <div class="info-row"><span>Data Directory</span><code>~/.pi/agent/</code></div>
-              <div class="info-row"><span>Session Storage</span><code>~/.pi/agent/sessions/</code></div>
-              <div class="info-row"><span>Settings File</span><code>~/.pi/agent/settings.json</code></div>
+              <h3>诊断信息</h3>
+              <div class="info-row"><span>集成方式</span><span>Direct (AgentSession in-process)</span></div>
+              <div class="info-row"><span>数据目录</span><code>~/.pi/agent/</code></div>
+              <div class="info-row"><span>会话存储</span><code>~/.pi/agent/sessions/</code></div>
+              <div class="info-row"><span>设置文件</span><code>~/.pi/agent/settings.json</code></div>
             </div>
           </div>
         </div>
@@ -390,7 +390,7 @@ function goBack(): void { router.back(); }
         <!-- Save -->
         <div class="settings-actions">
           <v-btn color="primary" variant="tonal" size="large" :loading="saving" @click="saveSettings">
-            {{ saved ? 'Saved!' : 'Save Settings' }}
+            {{ saved ? '已保存！' : '保存设置' }}
           </v-btn>
         </div>
       </div>

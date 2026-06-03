@@ -21,10 +21,10 @@ const statusColor: Record<string, string> = {
 };
 
 const statusLabel: Record<string, string> = {
-  connected: "Connected",
-  connecting: "Connecting",
-  failed: "Failed",
-  disconnected: "Disconnected",
+  connected: "已连接",
+  connecting: "连接中",
+  failed: "失败",
+  disconnected: "未连接",
 };
 
 async function load(): Promise<void> {
@@ -67,11 +67,11 @@ onMounted(load);
   <div class="section-panel">
     <div class="d-flex align-center justify-space-between mb-4">
       <div>
-        <h2 class="section-title">MCP Servers</h2>
+        <h2 class="section-title">MCP 服务器</h2>
         <p class="section-desc">
-          Model Context Protocol server status and diagnostics.
-          Configure servers by editing
-          <code>~/.pi/agent/mcp.json</code> or <code>.mcp.json</code>.
+          MCP 服务器状态与诊断。
+          通过编辑
+          <code>~/.pi/agent/mcp.json</code> 或 <code>.mcp.json</code> 来配置服务器。
         </p>
       </div>
       <v-btn
@@ -80,7 +80,7 @@ onMounted(load);
         :loading="loading"
         @click="refresh"
       >
-        Refresh
+        刷新
       </v-btn>
     </div>
 
@@ -111,9 +111,9 @@ onMounted(load);
       density="compact"
       class="mb-4"
     >
-      No MCP servers configured.
-      Add server entries to <code>~/.pi/agent/mcp.json</code>
-      or a project-level <code>.mcp.json</code> file.
+      未配置 MCP 服务器。
+      添加服务器配置到 <code>~/.pi/agent/mcp.json</code>
+      或项目级 <code>.mcp.json</code> 文件。
     </v-alert>
 
     <!-- Server list -->
@@ -137,13 +137,13 @@ onMounted(load);
             />
             <v-chip
               v-if="server.required"
-              text="required"
+              text="必需"
               size="x-small"
               color="warning"
               variant="tonal"
             />
             <span class="text-caption text-medium-emphasis">
-              {{ server.transport }} &middot; {{ server.toolCount }} tools
+              {{ server.transport }} &middot; {{ server.toolCount }} 个工具
             </span>
           </div>
         </v-expansion-panel-title>
@@ -159,13 +159,13 @@ onMounted(load);
             {{ server.error }}
           </v-alert>
 
-          <!-- Tools list -->
+          <!-- 工具列表 -->
           <div class="mb-3">
-            <div class="text-caption font-weight-bold text-medium-emphasis mb-1">
-              Tools
+            <div class="text-caption font-weight-bold mb-1" style="color: var(--pix-text-primary)">
+              工具
             </div>
             <div v-if="server.tools.length === 0" class="text-caption text-medium-emphasis">
-              No tools exposed
+              未暴露工具
             </div>
             <div v-else class="d-flex flex-wrap ga-1">
               <v-chip
@@ -179,10 +179,10 @@ onMounted(load);
             </div>
           </div>
 
-          <!-- Stderr (stdio only) -->
+          <!-- 标准错误输出（仅 stdio） -->
           <div v-if="server.stderr">
-            <div class="text-caption font-weight-bold text-medium-emphasis mb-1">
-              Stderr
+            <div class="text-caption font-weight-bold mb-1" style="color: var(--pix-text-primary)">
+              标准错误
             </div>
             <pre class="stderr-block text-caption">{{ truncatedStderr(server.stderr) }}</pre>
           </div>
@@ -190,15 +190,15 @@ onMounted(load);
       </v-expansion-panel>
     </v-expansion-panels>
 
-    <!-- Config paths -->
+    <!-- 配置文件 -->
     <div class="mb-2">
-      <div class="text-caption font-weight-bold text-medium-emphasis mb-1">
-        Configuration Files
+      <div class="text-caption font-weight-bold mb-1" style="color: var(--pix-text-primary)">
+        配置文件
       </div>
       <div v-if="configInfo.configPaths.length === 0" class="text-caption text-medium-emphasis">
-        No MCP config files found. Default search paths:
-        <code>~/.pi/agent/mcp.json</code>,
-        <code>.mcp.json</code>,
+        未找到 MCP 配置文件。默认搜索路径：
+        <code>~/.pi/agent/mcp.json</code>、
+        <code>.mcp.json</code>、
         <code>.pi/mcp.json</code>
       </div>
       <v-list v-else density="compact" bg-color="transparent" class="config-list">

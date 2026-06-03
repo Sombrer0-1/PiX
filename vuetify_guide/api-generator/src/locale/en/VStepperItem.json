@@ -1,0 +1,8 @@
+{
+  "description": "Subcomponent for `v-stepper` that represents an individual step.",
+  "props": {},
+  "events": {},
+  "slots": {
+    "icon": "Slot for customizing all stepper item icons."
+  }
+}

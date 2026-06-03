@@ -6,7 +6,7 @@
 
 <template>
   <div class="model-settings">
-    <p class="settings-note">Model settings are configured through the PiX settings page. You can also change the model during a session using the model selector in the bottom bar.</p>
+    <p class="settings-note">模型设置通过 PiX 设置页面进行配置。您也可以在会话过程中使用底部栏的模型选择器切换模型。</p>
   </div>
 </template>
 

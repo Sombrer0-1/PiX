@@ -1,0 +1,28 @@
+{
+  "description": "A baseline component for building custom field components to work inside `v-form` with validation rules, error messages, typical slots, and loading states.",
+  "props": {
+    "baseColor": "Sets the color of the input when it is not focused.",
+    "centerAffix": "Vertically align **appendInner**, **prependInner**, **clearIcon** and **label** in the center.",
+    "direction": "Changes the direction of the input.",
+    "hideDetails": "Hides hint and validation errors. When set to `auto` messages will be rendered only if there's a message (hint, error message, counter value etc) to display.",
+    "hideSpinButtons": "Hides spin buttons on the input when type is set to `number`.",
+    "glow": "Makes prepend/append icons full opacity when the input is focused and apply color.",
+    "hint": "Displays hint text below the input when focused. Force this always open with the [persistent-hint](#props-persistent-hint) property.",
+    "iconColor": "Sets the color of the prepend/append icons.",
+    "id": "Sets the DOM id on the component.",
+    "indentDetails": "Adds / removes inline padding in inputs details. Useful when trying to align different variants of fields and selection controls.",
+    "persistentHint": "Forces [hint](#props-hint) to always be visible.",
+    "prependIcon": "Prepends an icon to the component, uses the same syntax as `v-icon`."
+  },
+  "events": {
+    "click:append": "Emitted when appended icon is clicked.",
+    "click:prepend": "Emitted when prepended icon is clicked."
+  },
+  "exposed": {
+    "errorMessages": "An array of error messages that were set by the `setErrors` method.",
+    "isValid": "Boolean indicating if the input is valid.",
+    "reset": "Resets the input value.",
+    "resetValidation": "Resets validation of the input without modifying its value.",
+    "validate": "Validates the input's value."
+  }
+}

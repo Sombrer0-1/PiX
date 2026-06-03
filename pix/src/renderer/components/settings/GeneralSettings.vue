@@ -23,18 +23,18 @@ async function detect(): Promise<void> {
 <template>
   <div class="general-settings">
     <div class="setting-group">
-      <label class="setting-label">Agent Integration</label>
+      <label class="setting-label">Agent 集成</label>
       <p class="setting-desc">
-        PiX runs pi in-process via direct AgentSession integration.
-        No external pi binary is needed.
+        PiX 通过直接 AgentSession 集成在进程内运行 Pi。
+        无需外部 Pi 二进制文件。
       </p>
 
       <div v-if="detection" class="detect-result" :class="detection.found ? 'found' : 'not-found'">
         <template v-if="detection.found">
-          Direct integration active - {{ detection.note || detection.path }}
+          直接集成已激活 - {{ detection.note || detection.path }}
         </template>
         <template v-else>
-          {{ detection.note || 'Integration not available' }}
+          {{ detection.note || '集成不可用' }}
         </template>
       </div>
     </div>

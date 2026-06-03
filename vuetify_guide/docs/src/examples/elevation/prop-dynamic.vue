@@ -1,0 +1,27 @@
+<template>
+  <div class="text--primary">
+    <!-- Using the elevation prop -->
+    <v-hover v-slot="{ isHovering, props }">
+      <v-card
+        v-bind="props"
+        :elevation="isHovering ? 5 : 1"
+        class="mx-auto pa-6"
+      >
+        Prop based elevation
+      </v-card>
+    </v-hover>
+
+    <div class="my-6"></div>
+
+    <!-- Using a dynamic class -->
+    <v-hover v-slot="{ isHovering, props }">
+      <div
+        v-bind="props"
+        :class="`bg-surface elevation-${isHovering ? 5 : 1}`"
+        class="mx-auto pa-6"
+      >
+        Class based elevation
+      </div>
+    </v-hover>
+  </div>
+</template>

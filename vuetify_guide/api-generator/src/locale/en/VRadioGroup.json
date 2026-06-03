@@ -1,0 +1,6 @@
+{
+  "description": "A wrapper for `v-radio` components. It manages the selection state.",
+  "props": {
+    "inline": "Displays radio buttons in row."
+  }
+}

@@ -15,7 +15,7 @@ async function showStderr(): Promise<void> {
     stderrOutput.value = await window.pixApi.getPiStderr();
     showingStderr.value = true;
   } catch {
-    stderrOutput.value = "Failed to retrieve stderr.";
+    stderrOutput.value = "获取标准错误输出失败。";
   }
 }
 </script>
@@ -24,37 +24,37 @@ async function showStderr(): Promise<void> {
   <div class="advanced-settings">
     <div class="setting-item">
       <div class="item-info">
-        <div class="item-label">Pi Data Directory</div>
+        <div class="item-label">Pi 数据目录</div>
         <div class="item-value mono">~/.pi/agent/</div>
       </div>
     </div>
 
     <div class="setting-item">
       <div class="item-info">
-        <div class="item-label">Session Storage</div>
+        <div class="item-label">会话存储</div>
         <div class="item-value mono">~/.pi/agent/sessions/</div>
       </div>
     </div>
 
     <div class="setting-item">
       <div class="item-info">
-        <div class="item-label">Settings File</div>
+        <div class="item-label">设置文件</div>
         <div class="item-value mono">~/.pi/agent/settings.json</div>
       </div>
     </div>
 
     <div class="setting-item">
       <div class="item-info">
-        <div class="item-label">Pi Stderr Output</div>
-        <button class="btn btn-sm" @click="showStderr">View Stderr</button>
+        <div class="item-label">Pi 标准错误输出</div>
+        <button class="btn btn-sm" @click="showStderr">查看标准错误</button>
       </div>
       <pre v-if="showingStderr && stderrOutput" class="stderr-block">{{ stderrOutput }}</pre>
     </div>
 
     <div class="setting-item">
       <div class="item-info">
-        <div class="item-label">Pi Status</div>
-        <div class="item-value">{{ rpc.isRunning.value ? 'Running' : (rpc.piStatus.value === 'error' ? 'Error' : 'Stopped') }}</div>
+        <div class="item-label">Pi 状态</div>
+        <div class="item-value">{{ rpc.isRunning.value ? '运行中' : (rpc.piStatus.value === 'error' ? '错误' : '已停止') }}</div>
       </div>
     </div>
   </div>

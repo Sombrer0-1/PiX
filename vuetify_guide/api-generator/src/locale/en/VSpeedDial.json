@@ -1,0 +1,6 @@
+{
+  "description": "Typically combined with `v-fab` to reveal additional actions when clicked.",
+  "props": {
+    "openOnHover": "Opens speed-dial on hover."
+  }
+}

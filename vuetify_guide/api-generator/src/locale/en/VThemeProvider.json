@@ -1,0 +1,9 @@
+{
+  "description": "Allows to override theme for a part of the application.",
+  "props": {
+    "withBackground": "Wraps its children in an element and applies the current theme's background color to it."
+  },
+  "slots": {
+    "default": "All child components will have their theme overridden. Must have exactly one root element."
+  }
+}
