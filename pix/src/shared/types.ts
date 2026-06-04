@@ -9,10 +9,11 @@
 
 export type RpcCommand =
   // Prompting
-  | { id?: string; type: "prompt"; message: string }
-  | { id?: string; type: "steer"; message: string }
-  | { id?: string; type: "follow_up"; message: string }
+  | { id?: string; type: "prompt"; message: string; filePaths?: string[] }
+  | { id?: string; type: "steer"; message: string; filePaths?: string[] }
+  | { id?: string; type: "follow_up"; message: string; filePaths?: string[] }
   | { id?: string; type: "abort" }
+  | { id?: string; type: "respond_user_input"; response: RequestUserInputResponse }
   | { id?: string; type: "new_session"; parentSession?: string }
   // State
   | { id?: string; type: "get_state" }
@@ -80,17 +81,31 @@ export interface RpcSessionState {
   autoCompactionEnabled: boolean;
   messageCount: number;
   pendingMessageCount: number;
+  goal?: ThreadGoal;
 }
 
 export interface RpcSlashCommand {
   name: string;
   description?: string;
-  source: "extension" | "prompt" | "skill";
+  source: "builtin" | "extension" | "prompt" | "skill";
   sourceInfo: {
     path?: string;
     package?: string;
     name?: string;
   };
+}
+
+export type ThreadGoalStatus = "active" | "paused" | "blocked" | "usage_limited" | "budget_limited" | "complete";
+
+export interface ThreadGoal {
+  id: string;
+  objective: string;
+  status: ThreadGoalStatus;
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedMs: number;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface SessionStats {
@@ -109,6 +124,11 @@ export interface SessionStats {
     total: number;
   };
   cost: number;
+  contextUsage?: {
+    tokens: number | null;
+    contextWindow: number;
+    percent: number | null;
+  };
 }
 
 export interface ModelInfo {
@@ -138,6 +158,7 @@ export type AgentSessionEvent =
   | { type: "compaction_end"; reason: "manual" | "threshold" | "overflow"; result?: unknown; aborted: boolean; willRetry: boolean; errorMessage?: string }
   | { type: "session_info_changed"; name: string | undefined }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
+  | { type: "goal_update"; goal: ThreadGoal | undefined }
   | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
   | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
 
@@ -145,6 +166,14 @@ export interface AgentMessage {
   role: string;
   content: string | Array<{ type: string; text?: string }>;
   [key: string]: unknown;
+}
+
+export interface ChatMessageAttachment {
+  path: string;
+  name: string;
+  kind: "text" | "image" | "file";
+  size?: number;
+  content?: string;
 }
 
 // ============================================================================
@@ -160,12 +189,13 @@ export interface ToolWorkItem {
 }
 
 export type DisplayBlock =
-  | { id: string; type: "user-message"; text: string; timestamp: number }
+  | { id: string; type: "user-message"; text: string; attachments?: ChatMessageAttachment[]; timestamp: number }
   | { id: string; type: "agent-message"; content: string; isStreaming: boolean; timestamp: number }
   | { id: string; type: "work-status"; tools: ToolWorkItem[]; isStreaming: boolean; timestamp: number }
   | { id: string; type: "error"; message: string; source?: string; timestamp: number }
   | { id: string; type: "compaction"; reason: string; result: string; aborted: boolean; timestamp: number }
   | { id: string; type: "retry"; success: boolean; attempt: number; maxAttempts: number; delayMs?: number; timestamp: number }
+  | { id: string; type: "note"; text: string; timestamp: number }
   | { id: string; type: "status"; status: "running" | "idle" | "error" | "compacting"; timestamp: number };
 
 // ============================================================================
@@ -202,6 +232,33 @@ export interface GuiSettings {
   defaultProvider?: string;
   defaultModel?: string;
   defaultThinkingLevel?: ThinkingLevel;
+}
+
+// ============================================================================
+// Model-initiated User Input
+// ============================================================================
+
+export interface RequestUserInputOption {
+  label: string;
+  description?: string;
+}
+
+export interface RequestUserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options?: RequestUserInputOption[];
+}
+
+export interface RequestUserInputRequest {
+  id: string;
+  questions: RequestUserInputQuestion[];
+}
+
+export interface RequestUserInputResponse {
+  id: string;
+  answers: Record<string, string>;
+  cancelled?: boolean;
 }
 
 // ============================================================================

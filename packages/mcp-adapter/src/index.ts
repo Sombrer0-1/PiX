@@ -874,6 +874,11 @@ export class McpAdapter {
 		return { configPaths: this.configPaths, errors: this.configErrors };
 	}
 
+	async dispose(): Promise<void> {
+		this.activePi = undefined;
+		await this.stop();
+	}
+
 	async listResources(serverName?: string, signal?: AbortSignal): Promise<McpResourceQueryResult> {
 		const { results, errors } = await this.forSelectedConnections(serverName, async (connection) => {
 			const result = await connection.listResources(undefined, signal);

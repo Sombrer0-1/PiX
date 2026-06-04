@@ -30,6 +30,9 @@ watch(results, () => {
 });
 
 function handleKeydown(e: KeyboardEvent): void {
+  if (!["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(e.key)) return;
+  e.stopPropagation();
+  e.stopImmediatePropagation();
   switch (e.key) {
     case "ArrowDown":
       e.preventDefault();
@@ -62,6 +65,7 @@ onUnmounted(() => {
 
 function getSourceLabel(source: string): string {
   switch (source) {
+    case "builtin": return "built-in";
     case "skill": return "skill";
     case "prompt": return "prompt";
     case "extension": return "ext";
@@ -98,10 +102,10 @@ function getSourceLabel(source: string): string {
   left: 0;
   right: 0;
   margin-bottom: var(--pix-space-sm);
-  background: var(--pix-bg-content);
-  border: 1px solid var(--pix-border);
+  background: var(--pix-bg-elevated);
+  border: 1px solid var(--pix-border-light);
   border-radius: var(--pix-radius-md);
-  box-shadow: var(--pix-shadow-md);
+  box-shadow: var(--pix-shadow-lg);
   max-height: 240px;
   display: flex;
   flex-direction: column;

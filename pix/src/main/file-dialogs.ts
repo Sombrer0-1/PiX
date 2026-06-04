@@ -46,3 +46,22 @@ export async function selectSessionFile(parent: BrowserWindow): Promise<string |
 
   return result.filePaths[0];
 }
+
+/**
+ * Open a native multi-file picker for chat attachments.
+ */
+export async function selectChatFiles(parent: BrowserWindow): Promise<string[]> {
+  const result = await dialog.showOpenDialog(parent, {
+    title: "Select Files",
+    properties: ["openFile", "multiSelections"],
+    filters: [
+      { name: "All Files", extensions: ["*"] },
+    ],
+  });
+
+  if (result.canceled) {
+    return [];
+  }
+
+  return result.filePaths;
+}

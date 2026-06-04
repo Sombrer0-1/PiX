@@ -26,7 +26,7 @@ defineProps<{
   margin-bottom: var(--pix-space-xl);
   padding: var(--pix-space-md);
   background: var(--pix-error-bg);
-  border: 1px solid #e8d0d0;
+  border: 1px solid var(--pix-error-light);
   border-radius: var(--pix-radius-md);
 }
 
@@ -52,7 +52,7 @@ defineProps<{
 
 .error-source {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
   font-family: var(--pix-font-mono);
 }
 

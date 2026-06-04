@@ -84,6 +84,15 @@ async function loadThinkingLevels(): Promise<void> {
   }
 }
 
+async function refreshModelData(): Promise<void> {
+  if (!isConnected.value) return;
+  await Promise.all([
+    rpc.refreshModels(),
+    authStore.refreshStatus(),
+    loadThinkingLevels(),
+  ]);
+}
+
 async function selectModel(model: { provider: string; id: string }): Promise<void> {
   await rpc.setModel(model.provider, model.id);
   emit("close");
@@ -111,46 +120,58 @@ function formatContext(ctx?: number): string {
   return `${ctx} ctx`;
 }
 
-// Load thinking levels when dropdown opens or model changes.
-// immediate: true is required because the component is created via v-if each time
-// and isConnected/currentModel are already set by the time the watch registers.
-watch([isConnected, currentModel], ([connected]) => {
-  if (connected) void loadThinkingLevels();
+// The component is created via v-if, so immediate watchers refresh stale auth/model
+// state every time the selector opens.
+watch(isConnected, (connected) => {
+  if (connected) void refreshModelData();
+}, { immediate: true });
+
+watch(currentModel, () => {
+  if (isConnected.value) void loadThinkingLevels();
 }, { immediate: true });
 </script>
 
 <template>
   <div class="model-selector">
-    <div class="model-dropdown">
-      <div class="dropdown-header">
-        <span class="dropdown-title">选择模型</span>
+    <div class="model-panel">
+      <!-- Header -->
+      <div class="panel-header">
+        <span class="panel-title">选择模型</span>
         <div class="header-actions">
-          <label class="configured-toggle" title="仅显示已配置的提供商">
+          <label class="toggle-label" title="仅显示已配置的提供商">
             <input v-model="showOnlyConfigured" type="checkbox" />
-            <span>仅已配置</span>
+            <span class="toggle-text">仅已配置</span>
           </label>
-          <button class="dropdown-close" @click="emit('close')">&times;</button>
+          <button class="close-btn" @click="emit('close')" title="关闭">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
         </div>
       </div>
 
-      <div class="dropdown-search">
-        <input
-          v-model="searchQuery"
-          type="text"
-          class="search-input"
-          placeholder="搜索模型..."
-          spellcheck="false"
-        />
+      <!-- Search -->
+      <div class="search-row">
+        <div class="search-wrapper">
+          <span class="search-icon">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </span>
+          <input
+            v-model="searchQuery"
+            type="text"
+            class="search-input"
+            placeholder="搜索模型..."
+            spellcheck="false"
+          />
+        </div>
       </div>
 
-      <!-- 思考深度选择器 -->
+      <!-- Thinking level selector -->
       <div v-if="modelSupportsThinking && availableThinkingLevels.length > 0" class="thinking-row">
         <span class="thinking-label">思考深度</span>
-        <div class="thinking-chips">
+        <div class="thinking-segments">
           <button
             v-for="level in availableThinkingLevels"
             :key="level"
-            class="thinking-chip"
+            class="segment-btn"
             :class="{ active: currentThinkingLevel === level }"
             @click="selectThinkingLevel(level)"
           >
@@ -159,7 +180,8 @@ watch([isConnected, currentModel], ([connected]) => {
         </div>
       </div>
 
-      <div class="dropdown-list">
+      <!-- Model list -->
+      <div class="model-list">
         <template v-if="filteredModels.length === 0">
           <div class="empty-message">未找到模型</div>
         </template>
@@ -171,7 +193,7 @@ watch([isConnected, currentModel], ([connected]) => {
                 class="provider-auth"
                 :class="{ configured: getAuthStatus(provider).configured }"
               >
-                {{ getAuthStatus(provider).configured ? '✓' : '需登录' }}
+                {{ getAuthStatus(provider).configured ? '已配置' : '需登录' }}
               </span>
             </div>
             <button
@@ -181,15 +203,18 @@ watch([isConnected, currentModel], ([connected]) => {
               :class="{ active: currentModel?.provider === model.provider && currentModel?.id === model.id }"
               @click="selectModel(model)"
             >
-              <div class="model-info">
-                <span class="model-name">{{ model.id }}</span>
-                <span class="model-meta">
-                  <span v-if="model.contextWindow" class="model-ctx">{{ formatContext(model.contextWindow) }}</span>
-                  <span v-if="model.reasoning" class="model-thinking">推理</span>
-                </span>
+              <div class="model-main">
+                <span class="model-id">{{ model.id }}</span>
+                <div class="model-tags">
+                  <span v-if="model.contextWindow" class="model-tag ctx">{{ formatContext(model.contextWindow) }}</span>
+                  <span v-if="model.reasoning" class="model-tag reasoning">推理</span>
+                </div>
               </div>
+              <span class="model-check" v-if="currentModel?.provider === model.provider && currentModel?.id === model.id">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+              </span>
               <span
-                v-if="!getAuthStatus(model.provider).configured"
+                v-else-if="!getAuthStatus(model.provider).configured"
                 class="model-auth-warn"
                 title="提供商未配置"
               >!</span>
@@ -198,10 +223,17 @@ watch([isConnected, currentModel], ([connected]) => {
         </template>
       </div>
 
-      <div class="dropdown-footer">
-        <button class="cycle-btn" @click="cycleModel('backward')">&larr; 上一个</button>
-        <span class="cycle-separator"></span>
-        <button class="cycle-btn" @click="cycleModel('forward')">下一个 &rarr;</button>
+      <!-- Footer -->
+      <div class="panel-footer">
+        <button class="footer-btn" @click="cycleModel('backward')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+          <span>上一个</span>
+        </button>
+        <span class="footer-sep"></span>
+        <button class="footer-btn" @click="cycleModel('forward')">
+          <span>下一个</span>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        </button>
       </div>
     </div>
     <div class="dropdown-backdrop" @click="emit('close')"></div>
@@ -216,33 +248,34 @@ watch([isConnected, currentModel], ([connected]) => {
   z-index: 100;
 }
 
-.model-dropdown {
+.model-panel {
   position: relative;
   z-index: 101;
-  background: var(--pix-bg-content);
+  background: var(--pix-bg-elevated);
   border: 1px solid var(--pix-border);
-  border-radius: var(--pix-radius-md);
-  box-shadow: var(--pix-shadow-md);
-  min-width: 340px;
+  border-radius: var(--pix-radius-lg);
+  box-shadow: var(--pix-shadow-lg);
+  min-width: 360px;
+  max-width: 400px;
   max-height: 480px;
   display: flex;
   flex-direction: column;
   margin-bottom: var(--pix-space-sm);
 }
 
-.dropdown-header {
+/* ── Header ── */
+.panel-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  border-bottom: 1px solid var(--pix-border-light);
+  padding: var(--pix-space-md) var(--pix-space-md) var(--pix-space-sm);
+  flex-shrink: 0;
 }
 
-.dropdown-title {
-  font-size: var(--pix-text-xs);
-  font-weight: 600;
-  color: var(--pix-text-muted);
-  text-transform: uppercase;
+.panel-title {
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-semibold);
+  color: var(--pix-text-primary);
 }
 
 .header-actions {
@@ -251,98 +284,186 @@ watch([isConnected, currentModel], ([connected]) => {
   gap: var(--pix-space-sm);
 }
 
-.configured-toggle {
+.toggle-label {
   display: flex;
   align-items: center;
-  gap: 4px;
-  font-size: 10px;
-  color: var(--pix-text-muted);
+  gap: 5px;
+  cursor: pointer;
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-secondary);
+  user-select: none;
+}
+
+.toggle-label input {
+  width: 13px;
+  height: 13px;
+  accent-color: var(--pix-accent);
   cursor: pointer;
 }
 
-.configured-toggle input {
-  width: 12px;
-  height: 12px;
-  accent-color: var(--pix-accent);
+.toggle-text {
+  color: var(--pix-text-secondary);
 }
 
-.dropdown-close {
-  font-size: var(--pix-text-lg);
-  color: var(--pix-text-muted);
-  line-height: 1;
+.close-btn {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--pix-radius-xs);
+  color: var(--pix-text-secondary);
+  cursor: pointer;
+  transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
 }
 
-.dropdown-close:hover {
+.close-btn:hover {
   color: var(--pix-text-primary);
+  background: var(--pix-bg-hover);
 }
 
-/* Search */
-.dropdown-search {
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  border-bottom: 1px solid var(--pix-border-light);
+/* ── Search ── */
+.search-row {
+  padding: 0 var(--pix-space-md) var(--pix-space-sm);
+  flex-shrink: 0;
+}
+
+.search-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.search-icon {
+  position: absolute;
+  left: 10px;
+  color: var(--pix-text-secondary);
+  pointer-events: none;
+  line-height: 0;
 }
 
 .search-input {
   width: 100%;
-  padding: 4px 8px;
-  border: 1px solid var(--pix-border);
+  padding: 7px var(--pix-space-sm) 7px 30px;
+  border: 1px solid var(--pix-border-light);
   border-radius: var(--pix-radius-sm);
-  font-size: var(--pix-text-xs);
-  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-sm);
+  font-family: var(--pix-font-ui);
   background: var(--pix-bg-input);
   color: var(--pix-text-primary);
+  transition: border-color var(--pix-transition-fast), box-shadow var(--pix-transition-fast);
+}
+
+.search-input::placeholder {
+  color: var(--pix-text-muted);
 }
 
 .search-input:focus {
   outline: none;
-  border-color: var(--pix-border-focus);
+  border-color: var(--pix-accent);
+  box-shadow: 0 0 0 2px var(--pix-accent-light);
 }
 
-/* List */
-.dropdown-list {
+/* ── Thinking level ── */
+.thinking-row {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-sm);
+  padding: var(--pix-space-xs) var(--pix-space-md) var(--pix-space-sm);
+  flex-shrink: 0;
+}
+
+.thinking-label {
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  color: var(--pix-text-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.thinking-segments {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-sm);
+  overflow: hidden;
+}
+
+.segment-btn {
+  padding: 3px 10px;
+  font-size: var(--pix-text-xs);
+  font-family: var(--pix-font-ui);
+  color: var(--pix-text-secondary);
+  background: transparent;
+  cursor: pointer;
+  transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
+  border-right: 1px solid var(--pix-border-light);
+  font-weight: var(--pix-weight-normal);
+}
+
+.segment-btn:last-child {
+  border-right: none;
+}
+
+.segment-btn:hover {
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-primary);
+}
+
+.segment-btn.active {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+  font-weight: var(--pix-weight-semibold);
+}
+
+/* ── Model list ── */
+.model-list {
   flex: 1;
   overflow-y: auto;
-  padding: var(--pix-space-xs);
+  padding: 0 var(--pix-space-xs) var(--pix-space-xs);
 }
 
 .empty-message {
   padding: var(--pix-space-xl);
   text-align: center;
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
   font-size: var(--pix-text-sm);
 }
 
-/* Provider groups */
 .provider-group {
-  margin-bottom: var(--pix-space-xs);
+  margin-bottom: 2px;
 }
 
 .provider-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: var(--pix-space-xs) var(--pix-space-md);
-  border-bottom: 1px solid var(--pix-border-light);
+  padding: var(--pix-space-sm) var(--pix-space-md) var(--pix-space-xs);
 }
 
 .provider-name {
-  font-size: 11px;
-  font-weight: 600;
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
 
 .provider-auth {
-  font-size: 10px;
-  color: var(--pix-text-muted);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-secondary);
 }
 
 .provider-auth.configured {
+  background: var(--pix-success-bg);
   color: var(--pix-success);
 }
 
-/* Model options */
+/* Model option */
 .model-option {
   display: flex;
   justify-content: space-between;
@@ -351,7 +472,9 @@ watch([isConnected, currentModel], ([connected]) => {
   padding: var(--pix-space-sm) var(--pix-space-md);
   border-radius: var(--pix-radius-sm);
   text-align: left;
-  font-size: var(--pix-text-sm);
+  cursor: pointer;
+  transition: background var(--pix-transition-fast);
+  gap: var(--pix-space-sm);
 }
 
 .model-option:hover {
@@ -362,124 +485,118 @@ watch([isConnected, currentModel], ([connected]) => {
   background: var(--pix-accent-light);
 }
 
-.model-info {
+.model-option.active:hover {
+  background: var(--pix-accent-light-hover);
+}
+
+.model-main {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+  min-width: 0;
 }
 
-.model-name {
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
+.model-id {
+  font-family: var(--pix-font-ui);
+  font-size: var(--pix-text-sm);
   color: var(--pix-text-primary);
+  font-weight: var(--pix-weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.model-meta {
-  display: flex;
-  gap: var(--pix-space-sm);
-}
-
-.model-ctx {
-  font-size: 10px;
-  color: var(--pix-text-muted);
-}
-
-.model-thinking {
-  font-size: 10px;
+.model-option.active .model-id {
   color: var(--pix-accent);
-  background: var(--pix-accent-light);
-  padding: 0 4px;
-  border-radius: 3px;
 }
 
+.model-tags {
+  display: flex;
+  gap: 6px;
+}
+
+.model-tag {
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  padding: 0 5px;
+  border-radius: 3px;
+  line-height: 16px;
+}
+
+.model-tag.ctx {
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-secondary);
+}
+
+.model-option.active .model-tag.ctx {
+  background: rgba(58, 109, 165, 0.12);
+  color: var(--pix-accent);
+}
+
+.model-tag.reasoning {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+}
+
+/* Checkmark */
+.model-check {
+  color: var(--pix-accent);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* Auth warning */
 .model-auth-warn {
   font-size: 10px;
-  font-weight: 700;
+  font-weight: var(--pix-weight-bold);
   color: var(--pix-warning);
   background: var(--pix-warning-bg);
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-}
-
-/* Footer */
-.dropdown-footer {
-  display: flex;
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  border-top: 1px solid var(--pix-border-light);
-}
-
-.cycle-btn {
-  flex: 1;
-  padding: var(--pix-space-xs) 0;
-  font-size: var(--pix-text-sm);
-  color: var(--pix-accent);
-  text-align: center;
-}
-
-.cycle-btn:hover {
-  text-decoration: underline;
-}
-
-.cycle-separator {
-  width: 1px;
-  background: var(--pix-border-light);
-  margin: 0 var(--pix-space-sm);
-}
-
-/* Thinking level row */
-.thinking-row {
-  display: flex;
-  align-items: center;
-  gap: var(--pix-space-sm);
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  border-bottom: 1px solid var(--pix-border-light);
-}
-
-.thinking-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--pix-text-muted);
-  text-transform: uppercase;
-  white-space: nowrap;
   flex-shrink: 0;
 }
 
-.thinking-chips {
+/* ── Footer ── */
+.panel-footer {
   display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
+  align-items: center;
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  border-top: 1px solid var(--pix-border-light);
+  flex-shrink: 0;
 }
 
-.thinking-chip {
-  padding: 2px 8px;
-  border: 1px solid var(--pix-border);
-  border-radius: 4px;
-  font-size: 11px;
+.footer-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: var(--pix-space-xs) 0;
+  font-size: var(--pix-text-sm);
   font-family: var(--pix-font-ui);
-  color: var(--pix-text-secondary);
-  background: var(--pix-bg-app);
-  cursor: pointer;
-  transition: background var(--pix-transition-fast), border-color var(--pix-transition-fast), color var(--pix-transition-fast);
-}
-
-.thinking-chip:hover {
-  background: var(--pix-bg-hover);
-  border-color: var(--pix-border-focus);
-  color: var(--pix-text-primary);
-}
-
-.thinking-chip.active {
-  background: var(--pix-accent-light);
-  border-color: var(--pix-accent);
   color: var(--pix-accent);
-  font-weight: 600;
+  cursor: pointer;
+  border-radius: var(--pix-radius-sm);
+  transition: background var(--pix-transition-fast);
 }
 
-/* Backdrop */
+.footer-btn:hover {
+  background: var(--pix-bg-hover);
+}
+
+.footer-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--pix-border-light);
+  flex-shrink: 0;
+}
+
+/* ── Backdrop ── */
 .dropdown-backdrop {
   position: fixed;
   inset: 0;

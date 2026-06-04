@@ -2,12 +2,15 @@ import { existsSync, statSync } from "fs";
 import { join } from "path";
 import { shell } from "electron";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type CreateAgentSessionResult,
 	type ExtensionCommandContextActions,
 	type ExtensionError,
+	type RequestUserInputRequest,
+	type RequestUserInputResponse,
+	type SessionShutdownEvent,
 	type SessionStartEvent,
 	createAgentSession,
 	SessionManager,
@@ -34,7 +37,9 @@ import type {
 	UserMessageForForking,
 	ThemeInfo,
 	ResourceStatus,
+	ChatMessageAttachment,
 } from "../shared/types.js";
+import { processChatFiles } from "./chat-files.js";
 
 interface ExitPayload {
 	code: number | null;
@@ -51,6 +56,7 @@ interface LifecycleEvents {
 type LifecycleEvent = keyof LifecycleEvents;
 type LifecycleListener<TEvent extends LifecycleEvent> = (...args: LifecycleEvents[TEvent]) => void;
 type CommandResult = { cancelled: boolean };
+type UserInputRequestListener = (request: RequestUserInputRequest) => void;
 type WithSessionCallback = NonNullable<
 	NonNullable<Parameters<ExtensionCommandContextActions["newSession"]>[0]>["withSession"]
 >;
@@ -65,6 +71,14 @@ export class SessionBridge {
 	private _unsubscribe: (() => void) | null = null;
 
 	private _eventListeners: Array<(event: AgentSessionEvent) => void> = [];
+	private _userInputRequestListeners: UserInputRequestListener[] = [];
+	private _pendingUserInputRequests = new Map<
+		string,
+		{
+			resolve: (response: RequestUserInputResponse) => void;
+			reject: (error: Error) => void;
+		}
+	>();
 	private _lifecycleListeners: {
 		[TEvent in LifecycleEvent]: Array<LifecycleListener<TEvent>>;
 	} = {
@@ -78,7 +92,7 @@ export class SessionBridge {
 
 	async start(projectDir: string, guiSettings?: GuiSettings): Promise<void> {
 		this._assertProjectDirectory(projectDir);
-		this._closeCurrentSession();
+		await this._closeCurrentSession("quit");
 
 		this._cwd = projectDir;
 		this._guiSettings = guiSettings;
@@ -97,23 +111,38 @@ export class SessionBridge {
 		await this._activateSession(result.session);
 	}
 
-	dispose(): void {
-		const hadSession = this._closeCurrentSession();
+	async dispose(): Promise<void> {
+		const hadSession = await this._closeCurrentSession("quit");
 		if (hadSession) {
 			this._emitLifecycle("exit", { code: 0, signal: null, stderr: "" });
 		}
 	}
 
-	async prompt(text: string): Promise<void> {
-		await this._getSession().prompt(text);
+	async prompt(text: string, filePaths?: string[]): Promise<void> {
+		const prepared = await this._preparePromptInput(text, filePaths);
+		await this._getSession().prompt(prepared.text, {
+			images: prepared.images,
+			displayText: prepared.displayText,
+			attachments: prepared.attachments,
+		});
 	}
 
-	async steer(text: string): Promise<void> {
-		await this._getSession().steer(text);
+	async steer(text: string, filePaths?: string[]): Promise<void> {
+		const prepared = await this._preparePromptInput(text, filePaths);
+		await this._getSession().steer(prepared.text, {
+			images: prepared.images,
+			displayText: prepared.displayText,
+			attachments: prepared.attachments,
+		});
 	}
 
-	async followUp(text: string): Promise<void> {
-		await this._getSession().followUp(text);
+	async followUp(text: string, filePaths?: string[]): Promise<void> {
+		const prepared = await this._preparePromptInput(text, filePaths);
+		await this._getSession().followUp(prepared.text, {
+			images: prepared.images,
+			displayText: prepared.displayText,
+			attachments: prepared.attachments,
+		});
 	}
 
 	async abort(): Promise<void> {
@@ -123,7 +152,7 @@ export class SessionBridge {
 	async newSession(parentSession?: string): Promise<CommandResult> {
 		const previousSessionFile = this._session?.sessionFile;
 		const sessionDir = this._sessionManager?.getSessionDir();
-		this._closeCurrentSession();
+		await this._closeCurrentSession("new");
 
 		this._sessionManager = SessionManager.create(this._cwd, sessionDir);
 		if (parentSession) {
@@ -141,7 +170,7 @@ export class SessionBridge {
 
 	async switchSession(sessionPath: string): Promise<CommandResult> {
 		const previousSessionFile = this._session?.sessionFile;
-		this._closeCurrentSession();
+		await this._closeCurrentSession("resume", sessionPath);
 
 		this._sessionManager = SessionManager.open(sessionPath, undefined, this._cwd);
 		this._cwd = this._sessionManager.getCwd();
@@ -186,7 +215,7 @@ export class SessionBridge {
 		if (!targetLeafId) {
 			const newSessionManager = SessionManager.create(this._cwd, sessionDir);
 			newSessionManager.newSession({ parentSession: currentSessionFile });
-			this._closeCurrentSession();
+			await this._closeCurrentSession("fork");
 			this._sessionManager = newSessionManager;
 
 			const result = await this._createSession(this._cwd, this._sessionManager, {
@@ -207,7 +236,7 @@ export class SessionBridge {
 			throw new Error("Failed to create forked session");
 		}
 
-		this._closeCurrentSession();
+		await this._closeCurrentSession("fork", forkedSessionPath);
 		this._sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
 		if (label) {
 			this._sessionManager.appendLabelChange(targetLeafId, label);
@@ -353,6 +382,7 @@ export class SessionBridge {
 			throw new Error("Auth storage not initialized. Start a session first.");
 		}
 		this._authStorage.set(provider, { type: "api_key", key });
+		this._getSession().modelRegistry.refresh();
 	}
 
 	removeAuth(provider: string): void {
@@ -360,6 +390,7 @@ export class SessionBridge {
 			throw new Error("Auth storage not initialized. Start a session first.");
 		}
 		this._authStorage.remove(provider);
+		this._getSession().modelRegistry.refresh();
 	}
 
 	// =========================================================================
@@ -448,6 +479,7 @@ export class SessionBridge {
 			autoCompactionEnabled: session.settingsManager.getCompactionEnabled(),
 			messageCount: session.messages.length,
 			pendingMessageCount: this._pendingMessageCount,
+			goal: session.goal,
 		};
 	}
 
@@ -463,6 +495,7 @@ export class SessionBridge {
 			totalMessages: stats.totalMessages,
 			tokens: stats.tokens,
 			cost: stats.cost,
+			contextUsage: stats.contextUsage,
 		};
 	}
 
@@ -480,6 +513,15 @@ export class SessionBridge {
 	async getCommands(): Promise<RpcSlashCommand[]> {
 		try {
 			const session = this._getSession();
+			const builtInCommands: RpcSlashCommand[] = [
+				{
+					name: "goal",
+					description: "创建、查看、暂停、恢复或完成持续目标",
+					source: "builtin",
+					sourceInfo: { path: "<builtin:goal>" },
+				},
+			];
+
 			const extensionCommands: RpcSlashCommand[] = session.extensionRunner.getRegisteredCommands().map((command) => ({
 				name: command.invocationName,
 				description: command.description,
@@ -507,7 +549,7 @@ export class SessionBridge {
 				},
 			}));
 
-			return [...extensionCommands, ...promptTemplates, ...skills].map((command) => ({
+			return [...builtInCommands, ...extensionCommands, ...promptTemplates, ...skills].map((command) => ({
 					name: command.name,
 					description: command.description,
 					source: command.source,
@@ -638,11 +680,104 @@ export class SessionBridge {
 		};
 	}
 
+	onUserInputRequest(listener: UserInputRequestListener): () => void {
+		this._userInputRequestListeners.push(listener);
+		return () => {
+			const idx = this._userInputRequestListeners.indexOf(listener);
+			if (idx !== -1) this._userInputRequestListeners.splice(idx, 1);
+		};
+	}
+
+	respondUserInput(response: RequestUserInputResponse): void {
+		const pending = this._pendingUserInputRequests.get(response.id);
+		if (!pending) {
+			throw new Error(`No pending user input request: ${response.id}`);
+		}
+		this._pendingUserInputRequests.delete(response.id);
+		pending.resolve(response);
+	}
+
 	private _getSession(): AgentSession {
 		if (!this._session) {
 			throw new Error("Session not started. Call start() first.");
 		}
 		return this._session;
+	}
+
+	private _requestUserInput(
+		request: RequestUserInputRequest,
+		signal?: AbortSignal,
+	): Promise<RequestUserInputResponse> {
+		if (signal?.aborted) {
+			return Promise.reject(new Error("request_user_input was aborted."));
+		}
+
+		return new Promise((resolve, reject) => {
+			const cleanup = () => {
+				signal?.removeEventListener("abort", onAbort);
+				this._pendingUserInputRequests.delete(request.id);
+			};
+			const onAbort = () => {
+				cleanup();
+				reject(new Error("request_user_input was aborted."));
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+			this._pendingUserInputRequests.set(request.id, {
+				resolve: (response) => {
+					cleanup();
+					resolve(response);
+				},
+				reject: (error) => {
+					cleanup();
+					reject(error);
+				},
+			});
+
+			for (const listener of this._userInputRequestListeners) {
+				try {
+					listener(request);
+				} catch (err) {
+					console.error("[SessionBridge] User input request listener error:", err);
+				}
+			}
+		});
+	}
+
+	private _rejectPendingUserInputRequests(error: Error): void {
+		const requests = Array.from(this._pendingUserInputRequests.values());
+		this._pendingUserInputRequests.clear();
+		for (const pending of requests) {
+			pending.reject(error);
+		}
+	}
+
+	private async _preparePromptInput(
+		text: string,
+		filePaths?: readonly string[],
+	): Promise<{
+		text: string;
+		images?: ImageContent[];
+		displayText?: string;
+		attachments?: ChatMessageAttachment[];
+	}> {
+		if (!filePaths || filePaths.length === 0) {
+			return { text };
+		}
+
+		const session = this._getSession();
+		const processed = await processChatFiles(filePaths, this._cwd, {
+			autoResizeImages: session.settingsManager.getImageAutoResize(),
+		});
+		const parts: string[] = [];
+		if (processed.text) parts.push(processed.text);
+		if (text) parts.push(text);
+
+		return {
+			text: parts.join(""),
+			images: processed.images.length > 0 ? processed.images : undefined,
+			displayText: text,
+			attachments: processed.attachments,
+		};
 	}
 
 	private async _createSession(
@@ -668,6 +803,7 @@ export class SessionBridge {
 			resourceLoader,
 			authStorage: this._authStorage ?? undefined,
 			sessionStartEvent,
+			requestUserInput: (request, signal) => this._requestUserInput(request, signal),
 		});
 	}
 
@@ -678,8 +814,12 @@ export class SessionBridge {
 		this._emitLifecycle("ready");
 	}
 
-	private _closeCurrentSession(): boolean {
+	private async _closeCurrentSession(
+		reason: SessionShutdownEvent["reason"],
+		targetSessionFile?: string,
+	): Promise<boolean> {
 		const session = this._session;
+		const mcpAdapter = this._mcpAdapter;
 		this._unsubscribe?.();
 		this._unsubscribe = null;
 		this._session = null;
@@ -687,15 +827,21 @@ export class SessionBridge {
 		this._isCompacting = false;
 		this._pendingMessageCount = 0;
 		this._mcpAdapter = null;
+		this._rejectPendingUserInputRequests(new Error("Session closed before user input was provided."));
 
 		if (!session) {
 			return false;
 		}
 
 		try {
-			session.dispose();
+			await session.dispose({ reason, targetSessionFile });
 		} catch (err) {
 			console.error("[SessionBridge] Error during session dispose:", err);
+		}
+		try {
+			await mcpAdapter?.dispose();
+		} catch (err) {
+			console.error("[SessionBridge] Error during MCP adapter dispose:", err);
 		}
 		return true;
 	}

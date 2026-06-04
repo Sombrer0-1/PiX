@@ -44,12 +44,12 @@ const statusClass = computed(() => {
 
 .status-panel.status-running {
   background: var(--pix-accent-light);
-  border-color: #d0dde8;
+  border-color: var(--pix-accent-light);
 }
 
 .status-panel.status-error {
   background: var(--pix-error-bg);
-  border-color: #e8d0d0;
+  border-color: var(--pix-error-light);
 }
 
 .status-panel.status-idle {
@@ -79,7 +79,7 @@ const statusClass = computed(() => {
 }
 
 .status-idle .status-dot {
-  background: var(--pix-text-muted);
+  background: var(--pix-text-secondary);
 }
 
 @keyframes pulse {
@@ -101,7 +101,7 @@ const statusClass = computed(() => {
 }
 
 .status-idle .status-label {
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
 }
 
 .status-error {

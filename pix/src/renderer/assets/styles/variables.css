@@ -1,87 +1,111 @@
 /**
  * PiX CSS Custom Properties
  *
- * Clean, light, spacious design language.
+ * Clean, light, modern design language.
+ * White theme with subtle depth and clear visual hierarchy.
  */
 
 :root {
-  /* Background colors */
-  --pix-bg-app: #f0f0f0;
-  --pix-bg-left: #e8e8e8;
+  /* ── Background colors ── */
+  --pix-bg-app: #f6f7f9;
+  --pix-bg-left: #fbfcfe;
   --pix-bg-content: #ffffff;
-  --pix-bg-right: #f5f5f5;
+  --pix-bg-right: #fbfcfe;
   --pix-bg-bottom: #ffffff;
-  --pix-bg-topbar: #f0f0f0;
-  --pix-bg-hover: #e0e0e0;
-  --pix-bg-active: #d6d6d6;
+  --pix-bg-topbar: #ffffff;
+  --pix-bg-hover: #eef2f6;
+  --pix-bg-active: #e4ebf3;
   --pix-bg-card: #ffffff;
-  --pix-bg-code: #f3f3f3;
+  --pix-bg-code: #f3f5f7;
   --pix-bg-input: #ffffff;
+  --pix-bg-elevated: #ffffff;
 
-  /* Border colors */
-  --pix-border: #d4d4d4;
-  --pix-border-light: #e8e8e8;
-  --pix-border-focus: #a0a0a0;
+  /* ── Border colors ── */
+  --pix-border: #d6dbe3;
+  --pix-border-light: #e5e9ef;
+  --pix-border-focus: #8b96a8;
+  --pix-border-subtle: #edf1f5;
 
-  /* Text colors */
-  --pix-text-primary: #1a1a1a;
-  --pix-text-secondary: #3a3a3a;
-  --pix-text-muted: #909090;
+  /* ── Text colors ── */
+  --pix-text-primary: #111827;
+  --pix-text-secondary: #344054;
+  --pix-text-muted: #667085;
   --pix-text-inverse: #ffffff;
+  --pix-text-link: #2563a8;
 
-  /* Accent */
-  --pix-accent: #3a6da5;
-  --pix-accent-light: #e6f0fa;
+  /* ── Accent ── */
+  --pix-accent: #2563a8;
+  --pix-accent-hover: #1e4f86;
+  --pix-accent-light: #e7f0fb;
+  --pix-accent-light-hover: #d8e7f7;
 
-  /* Status colors */
-  --pix-success: #3d7a4f;
-  --pix-success-bg: #edf5f0;
-  --pix-error: #b84a4a;
-  --pix-error-bg: #faf0f0;
-  --pix-warning: #b8953a;
-  --pix-warning-bg: #faf6ed;
+  /* ── Status colors ── */
+  --pix-success: #2b8a3e;
+  --pix-success-bg: #ebfbee;
+  --pix-success-light: #d3f9d8;
+  --pix-error: #c92a2a;
+  --pix-error-bg: #fff5f5;
+  --pix-error-light: #ffe0e0;
+  --pix-warning: #e67700;
+  --pix-warning-bg: #fff9db;
+  --pix-warning-light: #fff3bf;
 
-  /* Spacing — generous for readability */
+  /* ── Spacing scale ── */
   --pix-space-xs: 6px;
   --pix-space-sm: 10px;
   --pix-space-md: 14px;
   --pix-space-lg: 20px;
   --pix-space-xl: 24px;
   --pix-space-2xl: 32px;
+  --pix-space-3xl: 40px;
 
-  /* Fonts — Segoe UI for Latin, Microsoft YaHei for CJK */
-  --pix-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft YaHei", "微软雅黑", Helvetica, Arial, sans-serif;
-  --pix-font-mono: "Cascadia Code", "Fira Code", "SF Mono", Menlo, Consolas, monospace;
+  /* ── Typography ── */
+  --pix-font-ui: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --pix-font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
 
-  /* Font sizes — roomy */
+  /* Font sizes */
   --pix-text-xs: 12px;
-  --pix-text-sm: 13px;
-  --pix-text-base: 15px;
-  --pix-text-md: 16px;
-  --pix-text-lg: 18px;
-  --pix-text-xl: 24px;
+  --pix-text-sm: 14px;
+  --pix-text-base: 16px;
+  --pix-text-md: 17px;
+  --pix-text-lg: 19px;
+  --pix-text-xl: 23px;
+  --pix-text-2xl: 28px;
 
   /* Line heights */
-  --pix-leading-tight: 1.4;
-  --pix-leading-base: 1.55;
-  --pix-leading-relaxed: 1.65;
+  --pix-leading-tight: 1.45;
+  --pix-leading-base: 1.6;
+  --pix-leading-relaxed: 1.75;
 
-  /* Borders */
+  /* Font weights */
+  --pix-weight-normal: 400;
+  --pix-weight-medium: 500;
+  --pix-weight-semibold: 600;
+  --pix-weight-bold: 700;
+
+  /* ── Border radii ── */
+  --pix-radius-xs: 4px;
   --pix-radius-sm: 6px;
   --pix-radius-md: 8px;
   --pix-radius-lg: 10px;
+  --pix-radius-xl: 12px;
 
-  /* Shadows */
-  --pix-shadow-sm: none;
-  --pix-shadow-md: 0 1px 4px rgba(0, 0, 0, 0.06);
+  /* ── Shadows ── */
+  --pix-shadow-none: none;
+  --pix-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --pix-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --pix-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --pix-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
+  --pix-shadow-xl: 0 12px 36px rgba(0, 0, 0, 0.10), 0 4px 12px rgba(0, 0, 0, 0.04);
 
-  /* Transitions */
-  --pix-transition-fast: 100ms ease;
-  --pix-transition-base: 150ms ease;
+  /* ── Transitions ── */
+  --pix-transition-fast: 120ms ease;
+  --pix-transition-base: 180ms ease;
+  --pix-transition-slow: 250ms ease;
 
-  /* Layout — wider, taller */
+  /* ── Layout ── */
   --pix-left-width: 280px;
   --pix-right-width: 320px;
   --pix-topbar-height: 48px;
-  --pix-content-max-width: none;
+  --pix-content-max-width: 860px;
 }

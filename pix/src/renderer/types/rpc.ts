@@ -12,4 +12,8 @@ export type {
   AgentSessionEvent,
   AgentMessage,
   ThinkingLevel,
+  ThreadGoal,
+  ThreadGoalStatus,
+  RequestUserInputRequest,
+  RequestUserInputResponse,
 } from "../../shared/types";

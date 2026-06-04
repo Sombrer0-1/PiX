@@ -36,7 +36,7 @@ const sections: { key: SettingsSection; label: string; icon: string }[] = [
 // ---- Form state ----
 const defaultProvider = ref("");
 const defaultModel = ref("");
-const defaultThinkingLevel = ref<ThinkingLevel>("medium");
+const defaultThinkingLevel = ref<ThinkingLevel>("xhigh");
 const steeringMode = ref<"all" | "one-at-a-time">("one-at-a-time");
 const followUpMode = ref<"all" | "one-at-a-time">("one-at-a-time");
 const autoCompact = ref(true);
@@ -130,7 +130,7 @@ onMounted(async () => {
   await settingsStore.load();
   defaultProvider.value = settingsStore.settings.defaultProvider || "";
   defaultModel.value = settingsStore.settings.defaultModel || "";
-  defaultThinkingLevel.value = settingsStore.settings.defaultThinkingLevel || "medium";
+  defaultThinkingLevel.value = settingsStore.settings.defaultThinkingLevel || "xhigh";
 
   if (rpc.isConnected.value) {
     try {
@@ -464,7 +464,7 @@ function goBack(): void { router.back(); }
 
 .section-desc {
   font-size: var(--pix-text-sm);
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
   margin-bottom: var(--pix-space-2xl);
 }
 
@@ -487,7 +487,7 @@ function goBack(): void { router.back(); }
 
 .inline-hint {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
 }
 
 .advanced-info {
@@ -522,7 +522,7 @@ function goBack(): void { router.back(); }
 .auth-notice {
   padding: var(--pix-space-2xl);
   text-align: center;
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
   font-size: var(--pix-text-sm);
 }
 
@@ -553,12 +553,12 @@ function goBack(): void { router.back(); }
 .auth-provider-name {
   font-weight: 600;
   font-size: var(--pix-text-md);
-  font-family: var(--pix-font-mono);
+  font-family: var(--pix-font-ui);
 }
 
 .auth-provider-label {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
 }
 
 .auth-status-info {
@@ -574,7 +574,7 @@ function goBack(): void { router.back(); }
 
 .auth-source {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
 }
 
 .auth-edit-row {

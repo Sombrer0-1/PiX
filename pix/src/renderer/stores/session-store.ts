@@ -11,13 +11,43 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import type { AgentMessage, AgentSessionEvent } from "@/types/rpc";
-import type { DisplayBlock, ToolWorkItem } from "@/types/session";
+import type { ChatMessageAttachment, DisplayBlock, ToolWorkItem } from "@/types/session";
 
 function nextBlockId(): string {
   return `block_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 }
 
-function extractMessageText(message: AgentMessage): string {
+interface MessageDisplay {
+  text: string;
+  attachments: ChatMessageAttachment[];
+  noteKind?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object";
+}
+
+function messageTimestamp(message: AgentMessage): number {
+  return typeof message.timestamp === "number" ? message.timestamp : Date.now();
+}
+
+function attachmentName(path: string): string {
+  return path.split(/[/\\]/).pop() || path;
+}
+
+function normalizeAttachment(value: unknown): ChatMessageAttachment | null {
+  if (!isRecord(value) || typeof value.path !== "string") return null;
+  const kind = value.kind === "image" || value.kind === "file" || value.kind === "text" ? value.kind : "file";
+  return {
+    path: value.path,
+    name: typeof value.name === "string" ? value.name : attachmentName(value.path),
+    kind,
+    size: typeof value.size === "number" ? value.size : undefined,
+    content: typeof value.content === "string" ? value.content : undefined,
+  };
+}
+
+function extractContentText(message: AgentMessage): string {
   const content = message.content;
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -28,6 +58,61 @@ function extractMessageText(message: AgentMessage): string {
       .join("");
   }
   return "";
+}
+
+function parseEmbeddedFileBlocks(text: string): { text: string; attachments: ChatMessageAttachment[] } {
+  const attachments: ChatMessageAttachment[] = [];
+  const stripped = text.replace(/<file name="([^"]*)">\r?\n?([\s\S]*?)\r?\n?<\/file>\r?\n?/g, (_match, path, content) => {
+    const filePath = String(path);
+    const body = String(content);
+    attachments.push({
+      path: filePath,
+      name: attachmentName(filePath),
+      kind: body.trim().startsWith("[Image ") || body.trim().startsWith("Image ") ? "image" : "text",
+      content: body,
+    });
+    return "";
+  });
+  return { text: stripped.trim(), attachments };
+}
+
+function mergeAttachments(...groups: ChatMessageAttachment[][]): ChatMessageAttachment[] {
+  const merged = new Map<string, ChatMessageAttachment>();
+  for (const group of groups) {
+    for (const attachment of group) {
+      const key = attachment.path || attachment.name;
+      const existing = merged.get(key);
+      merged.set(key, {
+        ...attachment,
+        ...existing,
+        content: existing?.content ?? attachment.content,
+        size: existing?.size ?? attachment.size,
+      });
+    }
+  }
+  return Array.from(merged.values());
+}
+
+function extractMessageDisplay(message: AgentMessage): MessageDisplay {
+  if (message.role === "custom" && message.customType === "pi.ui_note" && isRecord(message.details)) {
+    return {
+      text: typeof message.details.text === "string" ? message.details.text : "",
+      attachments: [],
+      noteKind: typeof message.details.kind === "string" ? message.details.kind : undefined,
+    };
+  }
+
+  const rawText = extractContentText(message);
+  const parsed = parseEmbeddedFileBlocks(rawText);
+  const metadataAttachments = Array.isArray(message.attachments)
+    ? message.attachments.map(normalizeAttachment).filter((a): a is ChatMessageAttachment => a !== null)
+    : [];
+
+  const displayText = typeof message.displayText === "string" ? message.displayText : undefined;
+  return {
+    text: displayText !== undefined ? displayText : parsed.text,
+    attachments: mergeAttachments(metadataAttachments, parsed.attachments),
+  };
 }
 
 const MAX_EVENTS = 50000;
@@ -41,6 +126,88 @@ export const useSessionStore = defineStore("session", () => {
 
   let currentAgentBlockId: string | null = null;
   let currentWorkStatusId: string | null = null;
+
+  function appendUserOrNoteMessage(msg: AgentMessage): void {
+    const display = extractMessageDisplay(msg);
+    if (msg.role === "custom" && display.noteKind && display.noteKind !== "user_command") {
+      if (display.text) {
+        displayBlocks.value.push({
+          id: nextBlockId(),
+          type: "note",
+          text: display.text,
+          timestamp: messageTimestamp(msg),
+        });
+      }
+      return;
+    }
+
+    if (display.text || display.attachments.length > 0) {
+      currentWorkStatusId = null;
+      displayBlocks.value.push({
+        id: nextBlockId(),
+        type: "user-message",
+        text: display.text,
+        attachments: display.attachments,
+        timestamp: messageTimestamp(msg),
+      });
+    }
+  }
+
+  function closeCurrentWorkStatus(): void {
+    const ws = currentWorkStatusId
+      ? displayBlocks.value.find((b) => b.id === currentWorkStatusId && b.type === "work-status")
+      : null;
+    if (ws && ws.type === "work-status" && ws.tools.length === 0) {
+      displayBlocks.value = displayBlocks.value.filter((block) => block.id !== ws.id);
+    } else if (ws && ws.type === "work-status" && !ws.tools.some((tool) => tool.result === null)) {
+      ws.isStreaming = false;
+    }
+    currentWorkStatusId = null;
+  }
+
+  function createAgentBlock(text: string, isStreamingBlock: boolean, timestamp = Date.now()): string {
+    closeCurrentWorkStatus();
+    const block: DisplayBlock = {
+      id: nextBlockId(),
+      type: "agent-message",
+      content: text,
+      isStreaming: isStreamingBlock,
+      timestamp,
+    };
+    displayBlocks.value.push(block);
+    return block.id;
+  }
+
+  function ensureWorkStatusBlock(timestamp = Date.now()): Extract<DisplayBlock, { type: "work-status" }> {
+    if (!currentWorkStatusId) {
+      const wsBlock: DisplayBlock = {
+        id: nextBlockId(),
+        type: "work-status",
+        tools: [],
+        isStreaming: true,
+        timestamp,
+      };
+      currentWorkStatusId = wsBlock.id;
+      displayBlocks.value.push(wsBlock);
+    }
+    const ws = displayBlocks.value.find(
+      (b) => b.id === currentWorkStatusId && b.type === "work-status"
+    );
+    if (!ws || ws.type !== "work-status") {
+      throw new Error("Failed to create work status block");
+    }
+    return ws;
+  }
+
+  function findWorkStatusForTool(toolCallId: string): Extract<DisplayBlock, { type: "work-status" }> | null {
+    for (let i = displayBlocks.value.length - 1; i >= 0; i--) {
+      const block = displayBlocks.value[i];
+      if (block.type === "work-status" && block.tools.some((tool) => tool.toolCallId === toolCallId)) {
+        return block;
+      }
+    }
+    return null;
+  }
 
   function addEvent(event: AgentSessionEvent): void {
     if (events.value.length >= MAX_EVENTS) {
@@ -64,12 +231,13 @@ export const useSessionStore = defineStore("session", () => {
           status: "running",
           timestamp: Date.now(),
         });
+        ensureWorkStatusBlock();
         break;
       }
       case "agent_end": {
         isStreaming.value = false;
         currentAgentBlockId = null;
-        currentWorkStatusId = null;
+        closeCurrentWorkStatus();
         displayBlocks.value.push({
           id: nextBlockId(),
           type: "status",
@@ -82,30 +250,13 @@ export const useSessionStore = defineStore("session", () => {
       case "message_start": {
         const msg = event.message;
         if (msg.role === "user" || msg.role === "custom") {
-          // New user message = new conversation turn
-          currentWorkStatusId = null;
-          const text = extractMessageText(msg);
-          if (text) {
-            displayBlocks.value.push({
-              id: nextBlockId(),
-              type: "user-message",
-              text,
-              timestamp: Date.now(),
-            });
-          }
+          if (msg.role === "custom" && msg.display === false) break;
+          appendUserOrNoteMessage(msg);
         } else if (msg.role === "assistant") {
-          const text = extractMessageText(msg);
+          const text = extractContentText(msg);
           // Only create agent block when there's real text — skip empty tool-call-only messages
           if (text) {
-            const block: DisplayBlock = {
-              id: nextBlockId(),
-              type: "agent-message",
-              content: text,
-              isStreaming: true,
-              timestamp: Date.now(),
-            };
-            currentAgentBlockId = block.id;
-            displayBlocks.value.push(block);
+            currentAgentBlockId = createAgentBlock(text, true);
           }
         }
         break;
@@ -113,19 +264,11 @@ export const useSessionStore = defineStore("session", () => {
       case "message_update": {
         const msg = event.message;
         if (msg.role === "assistant") {
-          const text = extractMessageText(msg);
+          const text = extractContentText(msg);
           if (!text) return;
           if (!currentAgentBlockId) {
             // First text in this response — create the agent block now
-            const block: DisplayBlock = {
-              id: nextBlockId(),
-              type: "agent-message",
-              content: text,
-              isStreaming: true,
-              timestamp: Date.now(),
-            };
-            currentAgentBlockId = block.id;
-            displayBlocks.value.push(block);
+            currentAgentBlockId = createAgentBlock(text, true);
           } else {
             const block = displayBlocks.value.find((b) => b.id === currentAgentBlockId);
             if (block && block.type === "agent-message") {
@@ -148,35 +291,17 @@ export const useSessionStore = defineStore("session", () => {
 
       // Tool lifecycle — aggregate into a single work-status block
       case "tool_execution_start": {
-        if (!currentWorkStatusId) {
-          const wsBlock: DisplayBlock = {
-            id: nextBlockId(),
-            type: "work-status",
-            tools: [],
-            isStreaming: true,
-            timestamp: Date.now(),
-          };
-          currentWorkStatusId = wsBlock.id;
-          displayBlocks.value.push(wsBlock);
-        }
-        const ws = displayBlocks.value.find(
-          (b) => b.id === currentWorkStatusId && b.type === "work-status"
-        );
-        if (ws && ws.type === "work-status") {
-          ws.tools.push({
-            toolCallId: event.toolCallId,
-            toolName: event.toolName,
-            args: event.args,
-            result: null,
-            isError: false,
-          });
-        }
+        ensureWorkStatusBlock().tools.push({
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          args: event.args,
+          result: null,
+          isError: false,
+        });
         break;
       }
       case "tool_execution_update": {
-        const ws = currentWorkStatusId
-          ? displayBlocks.value.find((b) => b.id === currentWorkStatusId && b.type === "work-status")
-          : null;
+        const ws = findWorkStatusForTool(event.toolCallId);
         if (ws && ws.type === "work-status") {
           const tool = ws.tools.find((t) => t.toolCallId === event.toolCallId);
           if (tool) tool.result = event.partialResult;
@@ -184,9 +309,7 @@ export const useSessionStore = defineStore("session", () => {
         break;
       }
       case "tool_execution_end": {
-        const ws = currentWorkStatusId
-          ? displayBlocks.value.find((b) => b.id === currentWorkStatusId && b.type === "work-status")
-          : null;
+        const ws = findWorkStatusForTool(event.toolCallId);
         if (ws && ws.type === "work-status") {
           const tool = ws.tools.find((t) => t.toolCallId === event.toolCallId);
           if (tool) {
@@ -279,67 +402,51 @@ export const useSessionStore = defineStore("session", () => {
   function loadMessages(messages: AgentMessage[]): void {
     clearSession();
 
-    // Collect ALL tool calls across a full conversation turn (between user messages)
-    let turnTools: ToolWorkItem[] = [];
-    let turnText = "";
+    const toolsById = new Map<string, ToolWorkItem>();
 
-    function emitTurn(): void {
-      if (turnTools.length > 0) {
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "work-status",
-          tools: [...turnTools],
-          isStreaming: false,
-          timestamp: Date.now(),
-        });
+    function appendToolCall(block: { type: string; id?: string; name?: string; arguments?: unknown }, timestamp: number): void {
+      const toolCallId = block.id || nextBlockId();
+      const ws = ensureWorkStatusBlock(timestamp);
+      const item: ToolWorkItem = {
+        toolCallId,
+        toolName: block.name || "task",
+        args: block.arguments,
+        result: null,
+        isError: false,
+      };
+      ws.tools.push(item);
+      toolsById.set(toolCallId, item);
+    }
+
+    function finalizeWorkBlocks(): void {
+      for (const block of displayBlocks.value) {
+        if (block.type === "work-status") {
+          block.isStreaming = false;
+        }
       }
-      if (turnText) {
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "agent-message",
-          content: turnText,
-          isStreaming: false,
-          timestamp: Date.now(),
-        });
-      }
-      turnTools = [];
-      turnText = "";
+      currentWorkStatusId = null;
     }
 
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
 
       if (msg.role === "user" || msg.role === "custom") {
-        const text = extractMessageText(msg);
-        if (text) {
-          // User message with real text starts a new turn
-          emitTurn();
-          displayBlocks.value.push({
-            id: nextBlockId(),
-            type: "user-message",
-            text,
-            timestamp: Date.now(),
-          });
-        }
+        if (msg.role === "custom" && msg.display === false) continue;
+        appendUserOrNoteMessage(msg);
       } else if (msg.role === "assistant") {
-        // Collect tool calls
+        const timestamp = messageTimestamp(msg);
         if (Array.isArray(msg.content)) {
           for (const block of msg.content) {
-            if (block.type === "toolCall") {
-              const tc = block as { type: string; id: string; name: string; arguments: unknown };
-              turnTools.push({
-                toolCallId: tc.id,
-                toolName: tc.name,
-                args: tc.arguments,
-                result: null,
-                isError: false,
-              });
+            if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+              createAgentBlock(block.text, false, timestamp);
+            } else if (block.type === "toolCall") {
+              appendToolCall(block as { type: string; id?: string; name?: string; arguments?: unknown }, timestamp);
             }
           }
+        } else {
+          const text = extractContentText(msg);
+          if (text) createAgentBlock(text, false, timestamp);
         }
-        // Collect text (last assistant message with text wins)
-        const text = extractMessageText(msg);
-        if (text) turnText = text;
       } else if (msg.role === "toolResult") {
         // Match tool result to pending tool
         const tr = msg as {
@@ -347,7 +454,7 @@ export const useSessionStore = defineStore("session", () => {
           content: Array<{ type: string; text?: string }>;
           isError: boolean;
         };
-        const tool = turnTools.find((t) => t.toolCallId === tr.toolCallId);
+        const tool = toolsById.get(tr.toolCallId);
         if (tool) {
           tool.result = tr.content;
           tool.isError = tr.isError;
@@ -356,8 +463,7 @@ export const useSessionStore = defineStore("session", () => {
       }
     }
 
-    // Emit final turn
-    emitTurn();
+    finalizeWorkBlocks();
   }
 
   function clearSession(): void {

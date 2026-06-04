@@ -11,7 +11,7 @@ import { existsSync, rmSync } from "fs";
 import { join, resolve } from "path";
 import { BrowserWindow, ipcMain } from "electron";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
+import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
 import type { GuiSettings, ProjectInfo, RpcCommand, ThinkingLevel } from "../shared/types.js";
@@ -132,6 +132,12 @@ export function registerIpcHandlers(
     return selectSessionFile(callerWin);
   });
 
+  ipcMain.handle("select-chat-files", async (event) => {
+    const callerWin = BrowserWindow.fromWebContents(event.sender);
+    if (!callerWin) return [];
+    return selectChatFiles(callerWin);
+  });
+
   // =========================================================================
   // Session Lifecycle
   // =========================================================================
@@ -147,7 +153,7 @@ export function registerIpcHandlers(
 
   ipcMain.handle("stop-pi", async () => {
     try {
-      sessionBridge.dispose();
+      await sessionBridge.dispose();
     } catch (err) {
       console.error("[ipc] Error during session dispose:", err);
     }
@@ -326,16 +332,19 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
   switch (cmd.type) {
     // Prompting
     case "prompt":
-      await bridge.prompt(cmd.message);
+      await bridge.prompt(cmd.message, cmd.filePaths);
       return null;
     case "steer":
-      await bridge.steer(cmd.message);
+      await bridge.steer(cmd.message, cmd.filePaths);
       return null;
     case "follow_up":
-      await bridge.followUp(cmd.message);
+      await bridge.followUp(cmd.message, cmd.filePaths);
       return null;
     case "abort":
       await bridge.abort();
+      return null;
+    case "respond_user_input":
+      bridge.respondUserInput(cmd.response);
       return null;
 
     // State
@@ -471,6 +480,13 @@ export function setupEventForwarding(
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-event", event);
+    }
+  });
+
+  sessionBridge.onUserInputRequest((request) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("user-input-request", request);
     }
   });
 

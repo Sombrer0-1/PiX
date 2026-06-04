@@ -12,6 +12,8 @@ import ErrorBlock from "./ErrorBlock.vue";
 import { marked } from "marked";
 
 marked.setOptions({ breaks: true, gfm: true });
+const markdownRenderer = new marked.Renderer();
+markdownRenderer.html = (html: string) => escapeHtml(html);
 
 function escapeHtml(text: string): string {
   return text
@@ -25,11 +27,22 @@ function escapeHtml(text: string): string {
 function renderMarkdown(text: string): string {
   if (!text) return "&nbsp;";
   try {
-    const result = marked.parse(escapeHtml(text), { async: false });
-    return typeof result === "string" ? result : text;
+    const result = marked.parse(text, { async: false, renderer: markdownRenderer });
+    return typeof result === "string" ? enhanceCodeBlocks(result) : text;
   } catch {
     return escapeHtml(text);
   }
+}
+
+const codeCopyIcon =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+const codeCheckIcon =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+function enhanceCodeBlocks(html: string): string {
+  return html
+    .replace(/<pre><code([^>]*)>/g, `<div class="code-block"><button class="code-copy-btn" type="button" data-copy-code="true" title="复制代码" aria-label="复制代码">${codeCopyIcon}</button><pre><code$1>`)
+    .replace(/<\/code><\/pre>/g, "</code></pre></div>");
 }
 
 function formatTime(ts: number): string {
@@ -54,11 +67,136 @@ function resultText(result: unknown): string {
   return JSON.stringify(result, null, 2);
 }
 
+function compactWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function truncate(text: string, maxLength: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= maxLength) return text;
+  return `${chars.slice(0, maxLength).join("")}...`;
+}
+
+function argsText(args: unknown): string {
+  if (args === null || args === undefined) return "";
+  if (typeof args === "string") return args;
+  return JSON.stringify(args, null, 2);
+}
+
+function argsSummary(args: unknown): string {
+  if (!args || typeof args !== "object") return truncate(compactWhitespace(argsText(args)), 90);
+
+  const value = args as Record<string, unknown>;
+  const preferredKeys = ["command", "cmd", "path", "file", "query", "pattern"];
+  const key = preferredKeys.find((name) => typeof value[name] === "string") ??
+    Object.keys(value).find((name) => typeof value[name] === "string");
+
+  if (key) {
+    return truncate(compactWhitespace(String(value[key])), 110);
+  }
+
+  return truncate(compactWhitespace(JSON.stringify(value)), 110);
+}
+
+interface DiffSummary {
+  added: number;
+  removed: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function getStringValue(value: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const item = value[key];
+    if (typeof item === "string") return item;
+  }
+  return undefined;
+}
+
+function countContentLines(text: string | undefined): number {
+  if (!text) return 0;
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!normalized) return 0;
+  const trimmedEnd = normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
+  return trimmedEnd ? trimmedEnd.split("\n").length : 0;
+}
+
+function countUnifiedDiff(text: string): DiffSummary {
+  let added = 0;
+  let removed = 0;
+  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) added++;
+    else if (line.startsWith("-")) removed++;
+  }
+  return { added, removed };
+}
+
+function diffSummaryFromArgs(toolName: string, args: unknown): DiffSummary {
+  if (!isRecord(args)) return { added: 0, removed: 0 };
+
+  const lowerToolName = toolName.toLowerCase();
+  if (lowerToolName.includes("write")) {
+    const content = getStringValue(args, ["content", "contents", "text", "data"]);
+    return { added: countContentLines(content), removed: 0 };
+  }
+
+  if (lowerToolName.includes("edit")) {
+    const oldText = getStringValue(args, ["old_string", "oldString", "old_text", "oldText", "from"]);
+    const newText = getStringValue(args, ["new_string", "newString", "new_text", "newText", "to"]);
+    if (oldText !== undefined || newText !== undefined) {
+      return {
+        added: countContentLines(newText),
+        removed: countContentLines(oldText),
+      };
+    }
+  }
+
+  return { added: 0, removed: 0 };
+}
+
+function toolDiff(tool: ToolWorkItem): DiffSummary {
+  const fromArgs = diffSummaryFromArgs(tool.toolName || "", tool.args);
+  if (fromArgs.added || fromArgs.removed) return fromArgs;
+
+  const fromResult = countUnifiedDiff(resultText(tool.result));
+  return fromResult.added || fromResult.removed ? fromResult : { added: 0, removed: 0 };
+}
+
+function workDiff(tools: ToolWorkItem[]): DiffSummary {
+  return tools.reduce<DiffSummary>(
+    (total, tool) => {
+      const diff = toolDiff(tool);
+      total.added += diff.added;
+      total.removed += diff.removed;
+      return total;
+    },
+    { added: 0, removed: 0 }
+  );
+}
+
+function formatDiff(diff: DiffSummary): string {
+  if (!diff.added && !diff.removed) return "";
+  return `+${diff.added} -${diff.removed}`;
+}
+
+function resultPreview(result: unknown): string {
+  return truncate(compactWhitespace(resultText(result)), 120);
+}
+
 const props = defineProps<{
   blocks: DisplayBlock[];
 }>();
 
 const expandedWorkStatus = ref<Set<string>>(new Set());
+const expandedTools = ref<Set<string>>(new Set());
+const copiedKeys = ref<Set<string>>(new Set());
+
+function toolKey(blockId: string, toolCallId: string): string {
+  return `${blockId}:${toolCallId}`;
+}
 
 function toggleExpand(blockId: string): void {
   const next = new Set(expandedWorkStatus.value);
@@ -66,15 +204,94 @@ function toggleExpand(blockId: string): void {
   else next.add(blockId);
   expandedWorkStatus.value = next;
 }
+
+function toggleTool(blockId: string, toolCallId: string): void {
+  const key = toolKey(blockId, toolCallId);
+  const next = new Set(expandedTools.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  expandedTools.value = next;
+}
+
+function isToolExpanded(blockId: string, toolCallId: string): boolean {
+  return expandedTools.value.has(toolKey(blockId, toolCallId));
+}
+
+async function copyText(text: string, key: string): Promise<void> {
+  if (!text.trim()) return;
+  const copied = await writeClipboardText(text);
+  if (!copied) return;
+  const next = new Set(copiedKeys.value);
+  next.add(key);
+  copiedKeys.value = next;
+  window.setTimeout(() => {
+    const updated = new Set(copiedKeys.value);
+    updated.delete(key);
+    copiedKeys.value = updated;
+  }, 1400);
+}
+
+async function writeClipboardText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall back to a temporary textarea below.
+  }
+
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return copied;
+  } catch (err) {
+    console.error("[SessionView] Copy failed:", err);
+    return false;
+  }
+}
+
+async function handleSessionClick(event: MouseEvent): Promise<void> {
+  const target = event.target as HTMLElement | null;
+  const button = target?.closest<HTMLButtonElement>("[data-copy-code='true']");
+  if (!button) return;
+
+  const wrapper = button.closest(".code-block");
+  const code = wrapper?.querySelector("code");
+  const text = code?.textContent ?? "";
+  if (!text) return;
+
+  const copied = await writeClipboardText(text);
+  if (!copied) return;
+  button.classList.add("copied");
+  button.setAttribute("title", "已复制");
+  button.setAttribute("aria-label", "已复制");
+  button.innerHTML = codeCheckIcon;
+  window.setTimeout(() => {
+    button.classList.remove("copied");
+    button.setAttribute("title", "复制代码");
+    button.setAttribute("aria-label", "复制代码");
+    button.innerHTML = codeCopyIcon;
+  }, 1200);
+}
 </script>
 
 <template>
-  <div class="session-view">
+  <div class="session-view" @click="handleSessionClick">
     <template v-for="block in blocks" :key="block.id">
       <!-- User Message -->
       <MessageBlock
         v-if="block.type === 'user-message'"
         :text="block.text"
+        :attachments="block.attachments || []"
         :timestamp="block.timestamp"
       />
 
@@ -88,13 +305,52 @@ function toggleExpand(blockId: string): void {
           :class="{ streaming: block.isStreaming }"
           v-html="renderMarkdown(block.content)"
         ></div>
+        <div v-if="block.content.trim()" class="agent-actions">
+          <button
+            class="copy-response-btn"
+            type="button"
+            :title="copiedKeys.has(block.id) ? '已复制' : '复制回复'"
+            :aria-label="copiedKeys.has(block.id) ? '已复制' : '复制回复'"
+            @click.stop="copyText(block.content, block.id)"
+          >
+            <svg
+              v-if="copiedKeys.has(block.id)"
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+            <svg
+              v-else
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       <!-- Work Status - aggregated tool executions -->
       <div
         v-else-if="block.type === 'work-status'"
         class="work-status-block"
-        :class="{ streaming: block.isStreaming }"
+        :class="{ streaming: block.isStreaming, expanded: expandedWorkStatus.has(block.id) }"
       >
         <button class="ws-header" @click="toggleExpand(block.id)">
           <span class="ws-icon">
@@ -107,22 +363,29 @@ function toggleExpand(blockId: string): void {
             <template v-else>已运行 {{ block.tools.length }} 条命令</template>
           </span>
           <span class="ws-tool-names">{{ toolSummary(block.tools) }}</span>
+          <span v-if="formatDiff(workDiff(block.tools))" class="ws-diff">{{ formatDiff(workDiff(block.tools)) }}</span>
           <span class="ws-toggle">{{ expandedWorkStatus.has(block.id) ? '收起' : '展开' }}</span>
         </button>
 
         <div v-if="expandedWorkStatus.has(block.id)" class="ws-body">
           <div v-for="tool in block.tools" :key="tool.toolCallId" class="ws-tool-item" :class="{ error: tool.isError }">
-            <div class="ws-tool-header">
+            <button class="ws-tool-header" @click="toggleTool(block.id, tool.toolCallId)">
               <span class="ws-tool-dot" :class="tool.isError ? 'err' : 'ok'"></span>
               <span class="ws-tool-name">{{ tool.toolName || 'task' }}</span>
-            </div>
-            <div v-if="tool.args" class="ws-tool-section">
-              <div class="ws-tool-label">参数</div>
-              <pre class="ws-tool-code">{{ JSON.stringify(tool.args, null, 2) }}</pre>
-            </div>
-            <div v-if="tool.result !== null" class="ws-tool-section">
-              <div class="ws-tool-label">结果</div>
-              <pre class="ws-tool-code">{{ resultText(tool.result) }}</pre>
+              <span v-if="tool.args" class="ws-tool-preview">{{ argsSummary(tool.args) }}</span>
+              <span v-else-if="tool.result !== null" class="ws-tool-preview">{{ resultPreview(tool.result) }}</span>
+              <span v-if="formatDiff(toolDiff(tool))" class="ws-tool-diff">{{ formatDiff(toolDiff(tool)) }}</span>
+              <span class="ws-tool-toggle">{{ isToolExpanded(block.id, tool.toolCallId) ? '收起' : '展开' }}</span>
+            </button>
+            <div v-if="isToolExpanded(block.id, tool.toolCallId)" class="ws-tool-details">
+              <details v-if="tool.args" class="ws-tool-section">
+                <summary class="ws-tool-label">参数</summary>
+                <pre class="ws-tool-code">{{ argsText(tool.args) }}</pre>
+              </details>
+              <details v-if="tool.result !== null" class="ws-tool-section">
+                <summary class="ws-tool-label">结果</summary>
+                <pre class="ws-tool-code">{{ resultText(tool.result) }}</pre>
+              </details>
             </div>
           </div>
         </div>
@@ -149,6 +412,10 @@ function toggleExpand(blockId: string): void {
         <span v-else>重试失败，已尝试 {{ block.attempt }} 次</span>
       </div>
 
+      <div v-else-if="block.type === 'note'" class="notice-block">
+        <span>{{ block.text }}</span>
+      </div>
+
       <!-- Status Indicator -->
       <div v-else-if="block.type === 'status'" class="notice-block" :class="block.status">
         <span v-if="block.status === 'running'">AI 开始工作</span>
@@ -164,62 +431,167 @@ function toggleExpand(blockId: string): void {
 .session-view {
   max-width: var(--pix-content-max-width);
   margin: 0 auto;
+  font-size: var(--pix-text-sm);
 }
 
+/* ── Agent message block ── */
 .agent-block {
   margin-bottom: var(--pix-space-xl);
-  padding-left: var(--pix-space-md);
-  border-left: 2px solid var(--pix-border-light);
+  animation: block-in 0.18s ease-out;
 }
 
 .agent-content {
-  font-size: var(--pix-text-md);
+  font-size: var(--pix-text-sm);
   line-height: var(--pix-leading-relaxed);
   color: var(--pix-text-primary);
 }
 
-.agent-content :deep(p) { margin-bottom: var(--pix-space-md); }
+.agent-content :deep(p) { margin-bottom: var(--pix-space-sm); }
 .agent-content :deep(p:last-child) { margin-bottom: 0; }
 .agent-content :deep(ul), .agent-content :deep(ol) { margin: var(--pix-space-sm) 0; padding-left: var(--pix-space-xl); }
 .agent-content :deep(li) { margin-bottom: var(--pix-space-xs); }
-.agent-content :deep(h1), .agent-content :deep(h2), .agent-content :deep(h3), .agent-content :deep(h4) { margin: var(--pix-space-lg) 0 var(--pix-space-sm); font-weight: 600; }
-.agent-content :deep(h1) { font-size: var(--pix-text-lg); }
-.agent-content :deep(h2) { font-size: var(--pix-text-md); }
-.agent-content :deep(h3) { font-size: var(--pix-text-base); }
+.agent-content :deep(h1), .agent-content :deep(h2), .agent-content :deep(h3), .agent-content :deep(h4) { margin: var(--pix-space-lg) 0 var(--pix-space-sm); font-weight: var(--pix-weight-semibold); line-height: var(--pix-leading-tight); }
+.agent-content :deep(h1) { font-size: var(--pix-text-xl); }
+.agent-content :deep(h2) { font-size: var(--pix-text-lg); }
+.agent-content :deep(h3) { font-size: var(--pix-text-md); }
+.agent-content :deep(h4) { font-size: var(--pix-text-base); }
 .agent-content :deep(blockquote) { border-left: 3px solid var(--pix-border); padding-left: var(--pix-space-md); color: var(--pix-text-secondary); margin: var(--pix-space-md) 0; }
-.agent-content :deep(table) { border-collapse: collapse; margin: var(--pix-space-md) 0; font-size: var(--pix-text-sm); }
-.agent-content :deep(th), .agent-content :deep(td) { border: 1px solid var(--pix-border); padding: var(--pix-space-xs) var(--pix-space-md); text-align: left; }
-.agent-content :deep(th) { background: var(--pix-bg-code); font-weight: 600; }
+.agent-content :deep(table) { border-collapse: collapse; margin: var(--pix-space-md) 0; font-size: var(--pix-text-sm); width: 100%; }
+.agent-content :deep(th), .agent-content :deep(td) { border: 1px solid var(--pix-border-light); padding: var(--pix-space-xs) var(--pix-space-md); text-align: left; }
+.agent-content :deep(th) { background: var(--pix-bg-code); font-weight: var(--pix-weight-semibold); }
 .agent-content :deep(hr) { border: none; border-top: 1px solid var(--pix-border-light); margin: var(--pix-space-lg) 0; }
-
-/* Work Status Block */
-.work-status-block {
-  margin-bottom: var(--pix-space-md);
+.agent-content :deep(strong) { font-weight: var(--pix-weight-semibold); }
+.agent-content :deep(a) { color: var(--pix-accent); }
+.agent-content :deep(code) {
+  font-size: 0.94em;
+}
+.agent-content :deep(.code-block) {
+  position: relative;
+  margin: var(--pix-space-md) 0;
+}
+.agent-content :deep(.code-block pre) {
+  margin: 0;
+  padding: var(--pix-space-lg);
+  padding-top: 38px;
+  background: #f8fafc;
+  border-color: var(--pix-border);
+  color: #172033;
+  font-size: var(--pix-text-sm);
+  line-height: 1.65;
+}
+.agent-content :deep(.code-block code) {
+  font-size: inherit;
+  color: inherit;
+}
+.agent-content :deep(.code-copy-btn) {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--pix-radius-sm);
+  background: #ffffff;
   border: 1px solid var(--pix-border);
-  border-radius: var(--pix-radius-md);
-  overflow: hidden;
-  background: var(--pix-bg-content);
+  color: var(--pix-text-secondary);
+  box-shadow: var(--pix-shadow-xs);
+}
+.agent-content :deep(.code-copy-btn:hover) {
+  color: var(--pix-text-primary);
+  background: var(--pix-bg-hover);
+}
+.agent-content :deep(.code-copy-btn.copied) {
+  color: var(--pix-success);
+  border-color: #bbf7d0;
 }
 
-/* No extra gap between work-status and following agent reply */
+.agent-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--pix-space-xs);
+}
+
+.copy-response-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--pix-radius-sm);
+  color: var(--pix-text-secondary);
+  border: 1px solid var(--pix-border-light);
+  background: var(--pix-bg-content);
+  transition:
+    color var(--pix-transition-fast),
+    border-color var(--pix-transition-fast),
+    background var(--pix-transition-fast),
+    transform var(--pix-transition-fast);
+}
+
+.copy-response-btn:hover {
+  color: var(--pix-text-primary);
+  border-color: var(--pix-border);
+  background: var(--pix-bg-hover);
+  transform: translateY(-1px);
+}
+
+.agent-content.streaming :deep(p:last-child::after) {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 14px;
+  background: var(--pix-accent);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: cursor-blink 1s step-end infinite;
+}
+
+@keyframes cursor-blink {
+  50% { opacity: 0; }
+}
+
+/* ── Work Status Block ── */
+.work-status-block {
+  width: fit-content;
+  max-width: 100%;
+  margin-bottom: var(--pix-space-md);
+  border: 1px solid var(--pix-border);
+  border-radius: var(--pix-radius-sm);
+  overflow: hidden;
+  background: var(--pix-bg-content);
+  box-shadow: none;
+  animation: block-in 0.16s ease-out;
+  transition:
+    border-color var(--pix-transition-fast),
+    transform var(--pix-transition-fast),
+    opacity var(--pix-transition-fast);
+}
+
+.work-status-block.expanded {
+  width: min(760px, 100%);
+}
+
 .work-status-block + .agent-block {
   margin-top: 0;
 }
 
 .work-status-block.streaming {
-  border-color: var(--pix-accent);
-  box-shadow: 0 0 0 1px var(--pix-accent-light);
+  border-color: var(--pix-border);
 }
 
 .ws-header {
   display: flex;
   align-items: center;
-  gap: var(--pix-space-sm);
+  gap: 8px;
   width: 100%;
-  padding: var(--pix-space-md);
+  min-height: 30px;
+  padding: 5px 10px;
   text-align: left;
-  font-size: var(--pix-text-sm);
-  background: var(--pix-bg-code);
+  font-size: var(--pix-text-xs);
+  background: var(--pix-bg-content);
   cursor: pointer;
   border: none;
   color: var(--pix-text-primary);
@@ -233,21 +605,22 @@ function toggleExpand(blockId: string): void {
 
 .ws-icon {
   flex-shrink: 0;
-  width: 16px;
+  width: 14px;
   display: flex;
   align-items: center;
 }
 
 .ws-dot.done {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--pix-success);
 }
 
 .ws-summary {
-  font-weight: 600;
+  font-weight: var(--pix-weight-medium);
   white-space: nowrap;
+  font-size: var(--pix-text-xs);
 }
 
 .work-status-block.streaming .ws-summary {
@@ -257,31 +630,49 @@ function toggleExpand(blockId: string): void {
 .ws-tool-names {
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
-  flex: 1;
+  color: var(--pix-text-secondary);
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  max-width: 360px;
+}
+
+.ws-diff,
+.ws-tool-diff {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: 1px solid #bbf7d0;
+  border-radius: 999px;
+  background: #f0fdf4;
+  color: #047857;
+  font-family: var(--pix-font-mono);
+  font-size: 11px;
+  font-weight: var(--pix-weight-semibold);
+  line-height: 16px;
 }
 
 .ws-toggle {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
+  color: var(--pix-text-secondary);
   flex-shrink: 0;
+  font-weight: var(--pix-weight-medium);
 }
 
 .ws-body {
   border-top: 1px solid var(--pix-border-light);
-  padding: var(--pix-space-md);
+  padding: var(--pix-space-sm);
   background: var(--pix-bg-content);
 }
 
 .ws-tool-item {
   border: 1px solid var(--pix-border-light);
   border-radius: var(--pix-radius-sm);
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  margin-bottom: var(--pix-space-sm);
+  overflow: hidden;
+  margin-bottom: var(--pix-space-xs);
+  background: var(--pix-bg-content);
+  animation: tool-row-in 0.18s ease-out;
 }
 
 .ws-tool-item:last-child {
@@ -289,7 +680,7 @@ function toggleExpand(blockId: string): void {
 }
 
 .ws-tool-item.error {
-  border-color: #e8d0d0;
+  border-color: var(--pix-error-light);
   background: var(--pix-error-bg);
 }
 
@@ -297,7 +688,15 @@ function toggleExpand(blockId: string): void {
   display: flex;
   align-items: center;
   gap: var(--pix-space-sm);
-  margin-bottom: var(--pix-space-sm);
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  text-align: left;
+  color: var(--pix-text-primary);
+}
+
+.ws-tool-header:hover {
+  background: var(--pix-bg-hover);
 }
 
 .ws-tool-dot {
@@ -313,8 +712,32 @@ function toggleExpand(blockId: string): void {
 .ws-tool-name {
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-xs);
-  font-weight: 600;
+  font-weight: var(--pix-weight-semibold);
   color: var(--pix-accent);
+  flex-shrink: 0;
+}
+
+.ws-tool-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-secondary);
+}
+
+.ws-tool-toggle {
+  flex-shrink: 0;
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-secondary);
+  font-weight: var(--pix-weight-medium);
+}
+
+.ws-tool-details {
+  padding: 0 10px 10px;
+  border-top: 1px solid var(--pix-border-light);
+  background: var(--pix-bg-content);
 }
 
 .ws-tool-section {
@@ -323,11 +746,13 @@ function toggleExpand(blockId: string): void {
 
 .ws-tool-label {
   font-size: var(--pix-text-xs);
-  font-weight: 600;
-  color: var(--pix-text-muted);
+  font-weight: var(--pix-weight-semibold);
+  color: var(--pix-text-secondary);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   margin-bottom: var(--pix-space-xs);
+  cursor: pointer;
+  user-select: none;
 }
 
 .ws-tool-code {
@@ -346,12 +771,12 @@ function toggleExpand(blockId: string): void {
   color: var(--pix-text-primary);
 }
 
-/* Spinner */
+/* ── Spinner ── */
 .spinner {
   display: inline-block;
-  width: 14px;
-  height: 14px;
-  border: 2px solid var(--pix-border);
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--pix-border-light);
   border-top-color: var(--pix-accent);
   border-radius: 50%;
   animation: pix-spin 0.6s linear infinite;
@@ -362,16 +787,39 @@ function toggleExpand(blockId: string): void {
   to { transform: rotate(360deg); }
 }
 
-/* Notices */
+@keyframes block-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes tool-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Notice blocks ── */
 .notice-block {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: var(--pix-space-xs);
-  padding: var(--pix-space-xs) 0;
-  margin-bottom: var(--pix-space-md);
+  padding: var(--pix-space-sm) 0;
+  margin-bottom: var(--pix-space-lg);
   font-size: var(--pix-text-xs);
   color: var(--pix-text-muted);
+  font-weight: var(--pix-weight-medium);
 }
 
 .notice-error { color: var(--pix-error); }

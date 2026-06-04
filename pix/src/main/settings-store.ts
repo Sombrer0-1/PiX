@@ -12,7 +12,7 @@ const defaultSettings: GuiSettings = {
   recentProjects: [],
   defaultProvider: undefined,
   defaultModel: undefined,
-  defaultThinkingLevel: "medium",
+  defaultThinkingLevel: "xhigh",
 };
 
 export class SettingsStore {

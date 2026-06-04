@@ -4,14 +4,26 @@
  * Exposes a typed API to the renderer process via contextBridge.
  */
 
-import { contextBridge, ipcRenderer } from "electron";
-import type { AgentSessionEvent, GuiSettings, McpConfigInfo, McpResourceContent, McpResourceInfo, McpServerInfo, RpcCommand, SessionInfo } from "../shared/types.js";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
+import type {
+  AgentSessionEvent,
+  GuiSettings,
+  McpConfigInfo,
+  McpResourceContent,
+  McpResourceInfo,
+  McpServerInfo,
+  RequestUserInputRequest,
+  RpcCommand,
+  SessionInfo,
+} from "../shared/types.js";
 
 export interface PixApi {
   // File dialogs
   selectProject: () => Promise<string | null>;
   selectPiPath: () => Promise<string | null>;
   selectSessionFile: () => Promise<string | null>;
+  selectChatFiles: () => Promise<string[]>;
+  getPathForFile: (file: File) => string;
 
   // Pi lifecycle
   startPi: (projectDir: string) => Promise<{ success: boolean; error?: string }>;
@@ -36,6 +48,7 @@ export interface PixApi {
   onPiExit: (callback: (data: { code: number | null; signal: string | null; stderr: string }) => void) => () => void;
   onPiError: (callback: (err: { message: string }) => void) => () => void;
   onPiReady: (callback: () => void) => () => void;
+  onUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => () => void;
 
   // Session management
   listSessions: (projectDir: string) => Promise<SessionInfo[]>;
@@ -64,6 +77,8 @@ const api: PixApi = {
   },
   selectPiPath: () => ipcRenderer.invoke("select-pi-path"),
   selectSessionFile: () => ipcRenderer.invoke("select-session-file"),
+  selectChatFiles: () => ipcRenderer.invoke("select-chat-files"),
+  getPathForFile: (file: File) => webUtils.getPathForFile(file),
 
   startPi: (projectDir: string) => ipcRenderer.invoke("start-pi", projectDir),
   stopPi: () => ipcRenderer.invoke("stop-pi"),
@@ -102,6 +117,11 @@ const api: PixApi = {
   onPiReady: (callback: () => void) => {
     ipcRenderer.on("pi-ready", callback);
     return () => ipcRenderer.removeListener("pi-ready", callback);
+  },
+  onUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: RequestUserInputRequest) => callback(data);
+    ipcRenderer.on("user-input-request", handler);
+    return () => ipcRenderer.removeListener("user-input-request", handler);
   },
 
   listSessions: (projectDir: string) => ipcRenderer.invoke("list-sessions", projectDir),

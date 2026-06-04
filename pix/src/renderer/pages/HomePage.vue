@@ -6,12 +6,14 @@ import { ref, onMounted, computed } from "vue";
 import { useRouter } from "vue-router";
 import { useSettingsStore } from "../stores/settings-store";
 import { useProjectStore } from "../stores/project-store";
+import { useSessionStore } from "../stores/session-store";
 import { useRpc } from "../composables/useRpc";
 import type { ProjectInfo } from "@/types/session";
 
 const router = useRouter();
 const settingsStore = useSettingsStore();
 const projectStore = useProjectStore();
+const sessionStore = useSessionStore();
 const rpc = useRpc();
 
 const piDetection = ref<{ found: boolean; path: string; note?: string } | null>(null);
@@ -27,24 +29,34 @@ onMounted(async () => {
 
 const recentProjects = computed(() => projectStore.recentProjects);
 
-async function openProject(): Promise<void> {
-  const dirPath = await window.pixApi.selectProject();
-  if (!dirPath) return;
+async function startFreshWorkspace(dirPath: string): Promise<void> {
   if (await rpc.startPi(dirPath)) {
     await projectStore.openProject(dirPath);
+    const result = await rpc.newSession();
+    if (!result || result.cancelled) {
+      alert(`Failed to create a new session: ${rpc.lastError.value || "Unknown error"}`);
+      return;
+    }
+    sessionStore.clearSession();
+    await projectStore.listSessions();
+    projectStore.syncCurrentSession(
+      rpc.sessionState.value?.sessionFile,
+      rpc.sessionState.value?.sessionId
+    );
     router.push("/workspace");
   } else {
     alert(`Failed to start Pi: ${rpc.lastError.value || "Unknown error"}`);
   }
 }
 
+async function openProject(): Promise<void> {
+  const dirPath = await window.pixApi.selectProject();
+  if (!dirPath) return;
+  await startFreshWorkspace(dirPath);
+}
+
 async function openRecentProject(project: ProjectInfo): Promise<void> {
-  if (await rpc.startPi(project.path)) {
-    await projectStore.openProject(project.path);
-    router.push("/workspace");
-  } else {
-    alert(`Failed to start Pi: ${rpc.lastError.value || "Unknown error"}`);
-  }
+  await startFreshWorkspace(project.path);
 }
 
 function formatDate(timestamp: number): string {

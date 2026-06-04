@@ -163,6 +163,7 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let firstTurn = true;
+	let sampleCount = 0;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
@@ -178,19 +179,23 @@ async function runLoop(
 				firstTurn = false;
 			}
 
-			// Process pending messages (inject before next assistant response)
 			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
+				await injectPendingMessages(pendingMessages, currentContext, newMessages, emit);
 				pendingMessages = [];
+			}
+
+			// Poll again immediately before subsequent provider requests. This catches
+			// user steering submitted after the post-tool drain but before sampling.
+			if (sampleCount > 0) {
+				const justInTimeMessages = (await config.getSteeringMessages?.()) || [];
+				if (justInTimeMessages.length > 0) {
+					await injectPendingMessages(justInTimeMessages, currentContext, newMessages, emit);
+				}
 			}
 
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			sampleCount++;
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -266,6 +271,20 @@ async function runLoop(
 	}
 
 	await emit({ type: "agent_end", messages: newMessages });
+}
+
+async function injectPendingMessages(
+	messages: AgentMessage[],
+	currentContext: AgentContext,
+	newMessages: AgentMessage[],
+	emit: AgentEventSink,
+): Promise<void> {
+	for (const message of messages) {
+		await emit({ type: "message_start", message });
+		await emit({ type: "message_end", message });
+		currentContext.messages.push(message);
+		newMessages.push(message);
+	}
 }
 
 /**

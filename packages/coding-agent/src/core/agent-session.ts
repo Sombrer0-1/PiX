@@ -36,6 +36,7 @@ import {
 import { theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
+import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
@@ -65,6 +66,7 @@ import {
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
+	type SessionShutdownEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
 	type ToolDefinition,
@@ -78,6 +80,22 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import {
+	createGoalContinuationPrompt,
+	createGoalToolDefinitions,
+	createGoalUpdatedPrompt,
+	formatGoalForTool,
+	GOAL_TOOL_NAMES,
+	GoalRuntime,
+	type CreateGoalOptions,
+	type ThreadGoal,
+	type UpdateGoalOptions,
+} from "./goal-runtime.ts";
+import {
+	createRequestUserInputToolDefinitions,
+	type RequestUserInputHandler,
+	type UserInputAttachment,
+} from "./request-user-input-tool.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
@@ -85,7 +103,7 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.t
 import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
-import type { SlashCommandInfo } from "./slash-commands.ts";
+import { BUILTIN_SLASH_COMMANDS, type SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
@@ -135,6 +153,7 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "goal_update"; goal: ThreadGoal | undefined }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -183,6 +202,10 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional host callback for the model-initiated request_user_input tool. */
+	requestUserInput?: RequestUserInputHandler;
+	/** Whether built-in enhancement tools such as goal and request_user_input should be registered. */
+	enableBuiltInEnhancementTools?: boolean;
 }
 
 export interface ExtensionBindings {
@@ -205,6 +228,31 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
+	/** Text shown in UI history when it should differ from the full model context. */
+	displayText?: string;
+	/** Attachments shown in UI history without expanding their content inline. */
+	attachments?: UserInputAttachment[];
+}
+
+interface QueueDisplayOptions {
+	images?: ImageContent[];
+	displayText?: string;
+	attachments?: UserInputAttachment[];
+}
+
+function formatGoalStatusNote(goal: ThreadGoal): string {
+	switch (goal.status) {
+		case "complete":
+			return `目标已完成：${goal.objective}`;
+		case "blocked":
+			return `目标已阻塞：${goal.objective}`;
+		case "usage_limited":
+			return `目标因用量限制暂停：${goal.objective}`;
+		case "budget_limited":
+			return `目标因 token 预算耗尽暂停：${goal.objective}`;
+		default:
+			return `目标状态已更新为 ${goal.status}：${goal.objective}`;
+	}
 }
 
 /** Result from cycleModel() */
@@ -281,6 +329,13 @@ export class AgentSession {
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
 
+	// Goal state
+	private _goalRuntime: GoalRuntime;
+	private _goalContinuationInFlightId: string | undefined = undefined;
+	private _goalProgressSinceContinuation = false;
+	private _goalAutoContinueSuspendedFor: string | undefined = undefined;
+	private _disposed = false;
+
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
@@ -325,7 +380,18 @@ export class AgentSession {
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
-		this._customTools = config.customTools ?? [];
+		this._goalRuntime = new GoalRuntime(config.sessionManager);
+		const builtInEnhancementTools =
+			config.enableBuiltInEnhancementTools === false
+				? []
+				: [
+						...createRequestUserInputToolDefinitions(config.requestUserInput),
+						...createGoalToolDefinitions(this),
+					];
+		this._customTools = [
+			...(config.customTools ?? []),
+			...builtInEnhancementTools,
+		];
 		this._cwd = config.cwd;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
@@ -475,6 +541,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			this._goalAutoContinueSuspendedFor = undefined;
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
 				// Check steering queue first
@@ -491,6 +558,10 @@ export class AgentSession {
 					}
 				}
 			}
+		}
+
+		if (event.type === "tool_execution_end" && !event.isError && !GOAL_TOOL_NAMES.has(event.toolName)) {
+			this._markGoalProgress();
 		}
 
 		// Emit to extensions first
@@ -527,6 +598,15 @@ export class AgentSession {
 				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecoveryAttempted = false;
+				}
+
+				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+					const previousGoal = this.goal;
+					const updatedGoal = this._goalRuntime.accountAssistantUsage(assistantMsg);
+					if (updatedGoal) {
+						this._recordGoalStatusNote(previousGoal, updatedGoal);
+						this._emitGoalUpdate(updatedGoal);
+					}
 				}
 
 				// Reset retry counter immediately on successful assistant response
@@ -711,13 +791,37 @@ export class AgentSession {
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): void {
+	async dispose(options: {
+		reason?: SessionShutdownEvent["reason"];
+		targetSessionFile?: string;
+		emitSessionShutdown?: boolean;
+	} = {}): Promise<void> {
+		if (this._disposed) return;
+		this._disposed = true;
+
+		if (options.emitSessionShutdown !== false) {
+			try {
+				await emitSessionShutdownEvent(this._extensionRunner, {
+					type: "session_shutdown",
+					reason: options.reason ?? "quit",
+					targetSessionFile: options.targetSessionFile,
+				});
+			} catch (err) {
+				this._extensionRunner.emitError({
+					extensionPath: "<runtime>",
+					event: "session_shutdown",
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
 		try {
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
 			this.agent.abort();
+			killTrackedDetachedChildren();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
 		}
@@ -968,7 +1072,165 @@ export class AgentSession {
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
+		if (this.agent.hasQueuedMessages()) {
+			return true;
+		}
+
+		return this._prepareGoalContinuationIfNeeded();
+	}
+
+	get goal(): ThreadGoal | undefined {
+		return this._goalRuntime.getGoal();
+	}
+
+	getGoal(): ThreadGoal | undefined {
+		return this.goal;
+	}
+
+	createGoal(options: CreateGoalOptions): ThreadGoal {
+		const goal = this._goalRuntime.createGoal(options);
+		this._goalAutoContinueSuspendedFor = undefined;
+		this._goalContinuationInFlightId = undefined;
+		this._goalProgressSinceContinuation = true;
+		this._emitGoalUpdate(goal);
+		return goal;
+	}
+
+	updateGoal(options: UpdateGoalOptions): ThreadGoal {
+		const previousGoal = this.goal;
+		const goal = this._goalRuntime.updateGoal(options);
+		this._markGoalProgress();
+		if (goal.status === "active") {
+			this._goalAutoContinueSuspendedFor = undefined;
+			if (previousGoal?.objective !== goal.objective && this.isStreaming) {
+				this.agent.steer(this._createGoalContextMessage(goal, "updated"));
+			}
+		} else {
+			this._goalContinuationInFlightId = undefined;
+			this._goalAutoContinueSuspendedFor = goal.id;
+		}
+		this._recordGoalStatusNote(previousGoal, goal);
+		this._emitGoalUpdate(goal);
+		return goal;
+	}
+
+	async continueActiveGoalIfIdle(): Promise<void> {
+		if (this.isStreaming) return;
+		const goal = this.goal;
+		if (!goal || goal.status !== "active") return;
+		this._assertGoalContinuationReady();
+
+		this._goalAutoContinueSuspendedFor = undefined;
+		this._goalContinuationInFlightId = goal.id;
+		this._goalProgressSinceContinuation = false;
+		await this._runAgentPrompt(this._createGoalContextMessage(goal, "continuation"));
+	}
+
+	private _prepareGoalContinuationIfNeeded(): boolean {
+		const goal = this.goal;
+		if (!goal || goal.status !== "active") {
+			this._goalContinuationInFlightId = undefined;
+			return false;
+		}
+
+		if (this._goalContinuationInFlightId) {
+			const previousGoalId = this._goalContinuationInFlightId;
+			this._goalContinuationInFlightId = undefined;
+			if (!this._goalProgressSinceContinuation) {
+				this._goalAutoContinueSuspendedFor = previousGoalId;
+				return false;
+			}
+		}
+
+		if (this._goalAutoContinueSuspendedFor === goal.id) {
+			return false;
+		}
+
+		this._goalContinuationInFlightId = goal.id;
+		this._goalProgressSinceContinuation = false;
+		this.agent.followUp(this._createGoalContextMessage(goal, "continuation"));
 		return this.agent.hasQueuedMessages();
+	}
+
+	private _createGoalContextMessage(goal: ThreadGoal, kind: "continuation" | "updated"): CustomMessage {
+		return {
+			role: "custom",
+			customType: "pi.goal_context",
+			content: kind === "updated" ? createGoalUpdatedPrompt(goal) : createGoalContinuationPrompt(goal),
+			display: false,
+			details: { goalId: goal.id, kind },
+			timestamp: Date.now(),
+		};
+	}
+
+	private _markGoalProgress(): void {
+		this._goalProgressSinceContinuation = true;
+		this._goalAutoContinueSuspendedFor = undefined;
+	}
+
+	private _emitGoalUpdate(goal: ThreadGoal | undefined = this.goal): void {
+		this._emit({ type: "goal_update", goal });
+	}
+
+	private _recordGoalStatusNote(previousGoal: ThreadGoal | undefined, goal: ThreadGoal): void {
+		if (previousGoal?.status === goal.status) return;
+		if (goal.status === "active" || goal.status === "paused") return;
+		this._appendUiNote(formatGoalStatusNote(goal), {
+			kind: "goal_status",
+			goalId: goal.id,
+			status: goal.status,
+			objective: goal.objective,
+		});
+	}
+
+	private _appendUiNote(text: string, details?: Record<string, unknown>): void {
+		const message = {
+			role: "custom" as const,
+			customType: "pi.ui_note",
+			content: "",
+			display: true,
+			details: {
+				...details,
+				text,
+			},
+			timestamp: Date.now(),
+		} satisfies CustomMessage<Record<string, unknown>>;
+		this.agent.state.messages.push(message);
+		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
+	}
+
+	private _assertGoalContinuationReady(): void {
+		if (!this.model) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
+		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
+			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
+			if (isOAuth) {
+				throw new Error(
+					`Authentication failed for "${this.model.provider}". ` +
+						`Credentials may have expired or network is unavailable. ` +
+						`Run '/login ${this.model.provider}' to re-authenticate.`,
+				);
+			}
+			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+		}
+	}
+
+	private _scheduleGoalContinuation(): void {
+		try {
+			this._assertGoalContinuationReady();
+			void this.continueActiveGoalIfIdle().catch((err) => {
+				this._extensionRunner.emitError({
+					extensionPath: "<goal>",
+					event: "goal_continuation",
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+		} catch (err) {
+			throw err;
+		}
 	}
 
 	/**
@@ -992,6 +1254,11 @@ export class AgentSession {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
+					preflightResult?.(true);
+					return;
+				}
+				const builtInHandled = await this._tryExecuteBuiltInCommand(text);
+				if (builtInHandled) {
 					preflightResult?.(true);
 					return;
 				}
@@ -1032,9 +1299,17 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, {
+						images: currentImages,
+						displayText: options.displayText,
+						attachments: options.attachments,
+					});
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, {
+						images: currentImages,
+						displayText: options.displayText,
+						attachments: options.attachments,
+					});
 				}
 				preflightResult?.(true);
 				return;
@@ -1042,6 +1317,7 @@ export class AgentSession {
 
 			// Flush any pending bash messages before the new prompt
 			this._flushPendingBashMessages();
+			this._goalAutoContinueSuspendedFor = undefined;
 
 			// Validate model
 			if (!this.model) {
@@ -1084,8 +1360,10 @@ export class AgentSession {
 			messages.push({
 				role: "user",
 				content: userContent,
+				displayText: options?.displayText,
+				attachments: options?.attachments,
 				timestamp: Date.now(),
-			});
+			} as AgentMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -1162,6 +1440,52 @@ export class AgentSession {
 		}
 	}
 
+	private async _tryExecuteBuiltInCommand(text: string): Promise<boolean> {
+		const spaceIndex = text.indexOf(" ");
+		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		if (commandName !== "goal") return false;
+
+		this._appendUiNote(text, { kind: "user_command", command: "goal" });
+
+		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+		if (!args || args === "status" || args === "get") {
+			this._emitGoalUpdate();
+			return true;
+		}
+
+		const [subcommand, ...rest] = args.split(/\s+/);
+		const remainder = rest.join(" ").trim();
+		if (subcommand === "create") {
+			this._assertGoalContinuationReady();
+			this.createGoal({ objective: remainder });
+			this._scheduleGoalContinuation();
+			return true;
+		}
+		if (subcommand === "complete") {
+			this.updateGoal({ status: "complete" });
+			return true;
+		}
+		if (subcommand === "blocked") {
+			this.updateGoal({ status: "blocked" });
+			return true;
+		}
+		if (subcommand === "pause" || subcommand === "paused") {
+			this.updateGoal({ status: "paused" });
+			return true;
+		}
+		if (subcommand === "resume" || subcommand === "active") {
+			this._assertGoalContinuationReady();
+			this.updateGoal({ status: "active" });
+			this._scheduleGoalContinuation();
+			return true;
+		}
+
+		this._assertGoalContinuationReady();
+		this.createGoal({ objective: args });
+		this._scheduleGoalContinuation();
+		return true;
+	}
+
 	/**
 	 * Expand skill commands (/skill:name args) to their full content.
 	 * Returns the expanded text, or the original text if not a skill command or skill not found.
@@ -1201,7 +1525,8 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
+	async steer(text: string, options?: ImageContent[] | QueueDisplayOptions): Promise<void> {
+		const queueOptions = Array.isArray(options) ? { images: options } : options;
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1211,7 +1536,7 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueSteer(expandedText, images);
+		await this._queueSteer(expandedText, queueOptions);
 	}
 
 	/**
@@ -1221,7 +1546,8 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+	async followUp(text: string, options?: ImageContent[] | QueueDisplayOptions): Promise<void> {
+		const queueOptions = Array.isArray(options) ? { images: options } : options;
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1231,41 +1557,45 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueFollowUp(expandedText, images);
+		await this._queueFollowUp(expandedText, queueOptions);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(text: string, options?: QueueDisplayOptions): Promise<void> {
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
+		if (options?.images) {
+			content.push(...options.images);
 		}
 		this.agent.steer({
 			role: "user",
 			content,
+			displayText: options?.displayText,
+			attachments: options?.attachments,
 			timestamp: Date.now(),
-		});
+		} as AgentMessage);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(text: string, options?: QueueDisplayOptions): Promise<void> {
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
+		if (options?.images) {
+			content.push(...options.images);
 		}
 		this.agent.followUp({
 			role: "user",
 			content,
+			displayText: options?.displayText,
+			attachments: options?.attachments,
 			timestamp: Date.now(),
-		});
+		} as AgentMessage);
 	}
 
 	/**
@@ -2161,6 +2491,13 @@ export class AgentSession {
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
 		const getCommands = (): SlashCommandInfo[] => {
+			const builtInCommands: SlashCommandInfo[] = BUILTIN_SLASH_COMMANDS.map((command) => ({
+				name: command.name,
+				description: command.description,
+				source: "builtin",
+				sourceInfo: createSyntheticSourceInfo("<builtin:slash>", { source: "builtin" }),
+			}));
+
 			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
 				name: command.invocationName,
 				description: command.description,
@@ -2182,7 +2519,7 @@ export class AgentSession {
 				sourceInfo: skill.sourceInfo,
 			}));
 
-			return [...extensionCommands, ...templates, ...skills];
+			return [...builtInCommands, ...extensionCommands, ...templates, ...skills];
 		};
 
 		runner.bindCore(

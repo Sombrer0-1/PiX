@@ -165,7 +165,7 @@ export class AgentSessionRuntime {
 			targetSessionFile,
 		});
 		this.beforeSessionInvalidate?.();
-		this.session.dispose();
+		await this.session.dispose({ emitSessionShutdown: false });
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -380,7 +380,7 @@ export class AgentSessionRuntime {
 			reason: "quit",
 		});
 		this.beforeSessionInvalidate?.();
-		this.session.dispose();
+		await this.session.dispose({ emitSessionShutdown: false });
 	}
 }
 

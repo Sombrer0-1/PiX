@@ -18,6 +18,8 @@ function api(): PixApi {
       selectProject: async () => null,
       selectPiPath: async () => null,
       selectSessionFile: async () => null,
+      selectChatFiles: async () => [],
+      getPathForFile: () => "",
       startPi: async () => ({ success: false }),
       stopPi: async () => ({ success: false }),
       sendCommand: async () => ({ success: false }),
@@ -32,6 +34,7 @@ function api(): PixApi {
       onPiExit: () => () => {},
       onPiError: () => () => {},
       onPiReady: () => () => {},
+      onUserInputRequest: () => () => {},
       listSessions: async () => [],
       windowMinimize: async () => {},
       windowMaximize: async () => {},
@@ -46,6 +49,10 @@ function api(): PixApi {
     } as PixApi;
   }
   return window.pixApi;
+}
+
+function normalizePath(path: string | undefined): string {
+  return (path || "").replace(/\\/g, "/").toLowerCase();
 }
 
 export const useProjectStore = defineStore("project", () => {
@@ -125,6 +132,17 @@ export const useProjectStore = defineStore("project", () => {
     currentSession.value = session;
   }
 
+  function syncCurrentSession(sessionFile: string | undefined, sessionId: string | undefined): SessionInfo | null {
+    const normalizedSessionFile = normalizePath(sessionFile);
+    const match = sessions.value.find((session) => {
+      if (normalizedSessionFile && normalizePath(session.path) === normalizedSessionFile) return true;
+      return !!sessionId && session.id === sessionId;
+    });
+
+    currentSession.value = match ?? null;
+    return currentSession.value;
+  }
+
   function addSession(session: SessionInfo): void {
     const existing = sessions.value.findIndex((s) => s.id === session.id);
     if (existing !== -1) {
@@ -148,6 +166,7 @@ export const useProjectStore = defineStore("project", () => {
     setCurrentProject,
     listSessions,
     setCurrentSession,
+    syncCurrentSession,
     addSession,
   };
 });

@@ -19,6 +19,7 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import {
 	flushRawStdout,
 	takeOverStdout,
@@ -26,6 +27,7 @@ import {
 	writeRawStdout,
 } from "../../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
+import { createSyntheticSourceInfo } from "../../core/source-info.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
@@ -452,6 +454,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,
 					pendingMessageCount: session.pendingMessageCount,
+					goal: session.goal,
 				};
 				return success(id, "get_state", state);
 			}
@@ -633,6 +636,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "get_commands": {
 				const commands: RpcSlashCommand[] = [];
+
+				for (const command of BUILTIN_SLASH_COMMANDS) {
+					commands.push({
+						name: command.name,
+						description: command.description,
+						source: "builtin",
+						sourceInfo: createSyntheticSourceInfo("<builtin:slash>", { source: "builtin" }),
+					});
+				}
 
 				for (const command of session.extensionRunner.getRegisteredCommands()) {
 					commands.push({

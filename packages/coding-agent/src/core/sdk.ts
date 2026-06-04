@@ -11,6 +11,7 @@ import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefi
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import { findInitialModel } from "./model-resolver.ts";
+import type { RequestUserInputHandler } from "./request-user-input-tool.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
@@ -69,6 +70,8 @@ export interface CreateAgentSessionOptions {
 	excludeTools?: string[];
 	/** Custom tools to register (in addition to built-in tools). */
 	customTools?: ToolDefinition[];
+	/** Optional host callback for the model-initiated request_user_input tool. */
+	requestUserInput?: RequestUserInputHandler;
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
@@ -286,6 +289,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const initialActiveToolNames: string[] = (
 		options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames
 	).filter((name) => !excludedToolNameSet?.has(name));
+	const enableBuiltInEnhancementTools =
+		options.tools !== undefined ? true : options.noTools !== "all" && options.noTools !== "builtin";
 
 	let agent: Agent;
 
@@ -415,10 +420,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		scopedModels: options.scopedModels,
 		resourceLoader,
 		customTools: options.customTools,
+		requestUserInput: options.requestUserInput,
 		modelRegistry,
 		initialActiveToolNames,
 		allowedToolNames,
 		excludedToolNames,
+		enableBuiltInEnhancementTools,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});

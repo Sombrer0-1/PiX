@@ -4,7 +4,7 @@
 
 @import "./variables.css";
 
-/* Reset */
+/* ── Reset ── */
 *,
 *::before,
 *::after {
@@ -30,12 +30,12 @@ body {
   height: 100%;
 }
 
-/* Vuetify font override — Segoe UI for Latin, Microsoft YaHei for CJK */
+/* ── Vuetify font override ── */
 .v-application {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft YaHei", "微软雅黑", Helvetica, Arial, sans-serif !important;
+  font-family: var(--pix-font-ui) !important;
 }
 
-/* Vuetify global border-radius — softer corners */
+/* ── Vuetify border-radius overrides ── */
 :root {
   --v-border-radius: 6px;
 }
@@ -56,10 +56,10 @@ body {
   --v-sheet-border-radius: 8px;
 }
 
-/* Scrollbar styling */
+/* ── Scrollbar styling ── */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 
 ::-webkit-scrollbar-track {
@@ -67,15 +67,15 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--pix-border);
+  background: var(--pix-border-light);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--pix-text-muted);
+  background: var(--pix-border);
 }
 
-/* Links */
+/* ── Links ── */
 a {
   color: var(--pix-accent);
   text-decoration: none;
@@ -85,30 +85,32 @@ a:hover {
   text-decoration: underline;
 }
 
-/* Selection */
+/* ── Selection ── */
 ::selection {
   background: var(--pix-accent-light);
   color: var(--pix-text-primary);
 }
 
-/* Code blocks */
+/* ── Code ── */
 code {
   font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
+  font-size: 0.94em;
   background: var(--pix-bg-code);
-  padding: 1px 4px;
-  border-radius: 3px;
+  padding: 2px 5px;
+  border-radius: var(--pix-radius-xs);
+  color: var(--pix-text-primary);
 }
 
 pre {
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-sm);
   background: var(--pix-bg-code);
-  border: 1px solid var(--pix-border-light);
+  border: 1px solid var(--pix-border);
   border-radius: var(--pix-radius-sm);
   padding: var(--pix-space-md);
   overflow-x: auto;
-  line-height: var(--pix-leading-tight);
+  line-height: 1.65;
+  color: var(--pix-text-primary);
 }
 
 pre code {
@@ -116,13 +118,13 @@ pre code {
   background: none;
 }
 
-/* Focus styles */
+/* ── Focus ── */
 :focus-visible {
   outline: 2px solid var(--pix-accent);
   outline-offset: 2px;
 }
 
-/* Legacy button base — overridden by Vuetify v-btn */
+/* ── Button base ── */
 button {
   font-family: var(--pix-font-ui);
   cursor: pointer;
@@ -137,7 +139,7 @@ button:disabled {
   opacity: 0.4;
 }
 
-/* Input base */
+/* ── Input / textarea base ── */
 input,
 textarea {
   font-family: var(--pix-font-ui);
@@ -145,26 +147,38 @@ textarea {
   color: var(--pix-text-primary);
 }
 
-/* Vuetify text field / textarea font consistency */
+input::placeholder,
+textarea::placeholder {
+  color: var(--pix-text-muted);
+}
+
+/* ── Vuetify overrides ── */
 .v-field__input,
 .v-field {
   font-family: var(--pix-font-ui) !important;
 }
 
-/* Utility: visually responsive */
+.v-list-item__title {
+  font-size: var(--pix-text-sm);
+}
+
+.v-divider {
+  border-color: var(--pix-border-light) !important;
+}
+
+/* ── Utility classes ── */
 .responsive-container {
   width: 100%;
   height: 100%;
 }
 
-/* Utility: truncate text */
 .truncate {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* Fade transition */
+/* ── Fade transition ── */
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity var(--pix-transition-base);
@@ -175,7 +189,7 @@ textarea {
   opacity: 0;
 }
 
-/* Animation: spinner */
+/* ── Spinner animation ── */
 @keyframes pix-spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
@@ -185,7 +199,7 @@ textarea {
   display: inline-block;
   width: 12px;
   height: 12px;
-  border: 2px solid var(--pix-border);
+  border: 2px solid var(--pix-border-light);
   border-top-color: var(--pix-accent);
   border-radius: 50%;
   animation: pix-spin 0.6s linear infinite;

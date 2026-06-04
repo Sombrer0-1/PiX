@@ -122,6 +122,7 @@ function setupEventListeners(): void {
 				if (sessionState.value) {
 					sessionState.value = { ...sessionState.value, isStreaming: true };
 				}
+				void refreshSessionStats();
 				return;
 			}
 
@@ -129,6 +130,12 @@ function setupEventListeners(): void {
 				if (sessionState.value) {
 					sessionState.value = { ...sessionState.value, isStreaming: false };
 				}
+				void refreshState();
+				void refreshSessionStats();
+				return;
+			}
+
+			if (event.type === "message_end" || event.type === "tool_execution_end") {
 				void refreshSessionStats();
 				return;
 			}
@@ -143,6 +150,13 @@ function setupEventListeners(): void {
 			if (event.type === "thinking_level_changed") {
 				if (sessionState.value) {
 					sessionState.value = { ...sessionState.value, thinkingLevel: event.level };
+				}
+				return;
+			}
+
+			if (event.type === "goal_update") {
+				if (sessionState.value) {
+					sessionState.value = { ...sessionState.value, goal: event.goal };
 				}
 				return;
 			}
@@ -219,8 +233,8 @@ async function stopPi(): Promise<void> {
 	sessionStats.value = null;
 }
 
-async function sendPrompt(message: string): Promise<void> {
-	await sendCommand({ type: "prompt", message });
+async function sendPrompt(message: string, filePaths?: string[]): Promise<void> {
+	await sendCommand({ type: "prompt", message, filePaths });
 }
 
 async function abort(): Promise<void> {
@@ -228,11 +242,19 @@ async function abort(): Promise<void> {
 }
 
 async function newSession(): Promise<{ cancelled: boolean } | null> {
-	return sendCommand<{ cancelled: boolean }>({ type: "new_session" });
+	const result = await sendCommand<{ cancelled: boolean }>({ type: "new_session" });
+	if (result && !result.cancelled) {
+		await refreshSessionData();
+	}
+	return result;
 }
 
 async function switchSession(sessionPath: string): Promise<{ cancelled: boolean } | null> {
-	return sendCommand<{ cancelled: boolean }>({ type: "switch_session", sessionPath });
+	const result = await sendCommand<{ cancelled: boolean }>({ type: "switch_session", sessionPath });
+	if (result && !result.cancelled) {
+		await refreshSessionData();
+	}
+	return result;
 }
 
 async function getMessages(): Promise<unknown[] | null> {
@@ -241,16 +263,22 @@ async function getMessages(): Promise<unknown[] | null> {
 
 async function setModel(provider: string, modelId: string): Promise<void> {
 	await sendCommand({ type: "set_model", provider, modelId });
+	await api().setSettings({ defaultProvider: provider, defaultModel: modelId });
 	await refreshState();
 }
 
 async function cycleModel(direction: "forward" | "backward" = "forward"): Promise<void> {
 	await sendCommand({ type: "cycle_model", direction });
 	await refreshState();
+	const model = sessionState.value?.model;
+	if (model) {
+		await api().setSettings({ defaultProvider: model.provider, defaultModel: model.id });
+	}
 }
 
 async function setThinkingLevel(level: ThinkingLevel): Promise<void> {
 	await sendCommand({ type: "set_thinking_level", level });
+	await api().setSettings({ defaultThinkingLevel: level });
 	await refreshState();
 }
 
@@ -289,10 +317,12 @@ async function getAuthStatus(): Promise<AuthStatusMap | null> {
 
 async function setApiKey(provider: string, key: string): Promise<void> {
 	await sendCommand({ type: "set_api_key", provider, key });
+	await Promise.all([refreshModels(), refreshState()]);
 }
 
 async function removeAuth(provider: string): Promise<void> {
 	await sendCommand({ type: "remove_auth", provider });
+	await Promise.all([refreshModels(), refreshState()]);
 }
 
 // =========================================================================
@@ -363,6 +393,7 @@ async function setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
 
 async function reloadResources(): Promise<void> {
 	await sendCommand({ type: "reload_resources" });
+	await Promise.all([refreshCommands(), refreshModels(), refreshState()]);
 }
 
 async function getThemes(): Promise<ThemeInfo[] | null> {

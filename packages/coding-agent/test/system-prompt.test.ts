@@ -27,6 +27,22 @@ describe("buildSystemPrompt", () => {
 	});
 
 	describe("default tools", () => {
+		test("renders core instructions as structured prompt fragments", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("<role_and_scope>");
+			expect(prompt).toContain("<instruction_hierarchy>");
+			expect(prompt).toContain("<task_execution>");
+			expect(prompt).toContain("<tool_use>");
+			expect(prompt).toContain("<context_boundaries>");
+			expect(prompt).toContain("<runtime_context>");
+			expect(prompt).toContain("adapt to the user's actual task");
+		});
+
 		test("includes all default tools when snippets are provided", () => {
 			const prompt = buildSystemPrompt({
 				toolSnippets: {
@@ -56,6 +72,20 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain(
 				"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
 			);
+		});
+
+		test("marks project instructions as scoped context", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [{ path: "AGENTS.md", content: "Prefer local conventions." }],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("<project_context>");
+			expect(prompt).toContain(
+				"Treat these as task/project context rather than immutable system rules.",
+			);
+			expect(prompt).toContain('<project_instructions path="AGENTS.md">');
 		});
 	});
 

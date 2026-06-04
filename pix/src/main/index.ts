@@ -64,10 +64,10 @@ function createWindow(): void {
   });
 }
 
-function cleanup(): void {
+async function cleanup(): Promise<void> {
   if (sessionBridge) {
     try {
-      sessionBridge.dispose();
+      await sessionBridge.dispose();
     } catch (err) {
       console.error("[main] Error during session bridge cleanup:", err);
     }
@@ -128,8 +128,7 @@ app.on("window-all-closed", () => {
   // On other platforms, quit when all windows close.
   if (process.platform !== "darwin") {
     quitting = true;
-    cleanup();
-    app.quit();
+    void cleanup().finally(() => app.quit());
   }
 });
 

@@ -40,7 +40,7 @@
   width: var(--pix-left-width);
   min-width: var(--pix-left-width);
   background: var(--pix-bg-left);
-  border-right: 1px solid var(--pix-border);
+  border-right: 1px solid var(--pix-border-light);
   overflow-y: auto;
   overflow-x: hidden;
   display: flex;
@@ -54,13 +54,17 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Subtle inner shadow for depth separation from side panels */
+  box-shadow: 1px 0 0 rgba(0, 0, 0, 0.02), -1px 0 0 rgba(0, 0, 0, 0.02);
+  position: relative;
+  z-index: 1;
 }
 
 .layout-right {
   width: var(--pix-right-width);
   min-width: var(--pix-right-width);
   background: var(--pix-bg-right);
-  border-left: 1px solid var(--pix-border);
+  border-left: 1px solid var(--pix-border-light);
   overflow-y: auto;
   overflow-x: hidden;
   display: flex;
