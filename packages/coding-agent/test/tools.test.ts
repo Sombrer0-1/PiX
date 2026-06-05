@@ -34,6 +34,16 @@ function getTextOutput(result: any): string {
 	);
 }
 
+function countDiffLines(diff: string): { added: number; removed: number } {
+	let added = 0;
+	let removed = 0;
+	for (const line of diff.split("\n")) {
+		if (line.startsWith("+")) added++;
+		else if (line.startsWith("-")) removed++;
+	}
+	return { added, removed };
+}
+
 describe("Coding Agent Tools", () => {
 	let testDir: string;
 
@@ -211,7 +221,40 @@ describe("Coding Agent Tools", () => {
 
 			expect(getTextOutput(result)).toContain("Successfully wrote");
 			expect(getTextOutput(result)).toContain(testFile);
-			expect(result.details).toBeUndefined();
+			expect(result.details?.diff).toBeDefined();
+			expect(countDiffLines(result.details?.diff ?? "")).toEqual({ added: 1, removed: 0 });
+		});
+
+		it("should include true diff details when overwriting a file with unrelated content", async () => {
+			const testFile = join(testDir, "write-overwrite-replace.txt");
+			const oldContent = Array.from({ length: 100 }, (_, i) => `old line ${i + 1}`).join("\n");
+			const newContent = Array.from({ length: 10 }, (_, i) => `new line ${i + 1}`).join("\n");
+			writeFileSync(testFile, oldContent);
+
+			const result = await writeTool.execute("test-call-write-overwrite-replace", {
+				path: testFile,
+				content: newContent,
+			});
+
+			expect(result.details?.diff).toBeDefined();
+			expect(result.details?.patch).toContain("--- ");
+			expect(result.details?.patch).toContain("+++ ");
+			expect(countDiffLines(result.details?.diff ?? "")).toEqual({ added: 10, removed: 100 });
+		});
+
+		it("should count only removed lines when overwriting a file with a shortened prefix", async () => {
+			const testFile = join(testDir, "write-overwrite-truncate.txt");
+			const oldLines = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`);
+			const newContent = oldLines.slice(0, 10).join("\n");
+			writeFileSync(testFile, oldLines.join("\n"));
+
+			const result = await writeTool.execute("test-call-write-overwrite-truncate", {
+				path: testFile,
+				content: newContent,
+			});
+
+			expect(result.details?.diff).toBeDefined();
+			expect(countDiffLines(result.details?.diff ?? "")).toEqual({ added: 0, removed: 90 });
 		});
 
 		it("should create parent directories", async () => {
@@ -558,6 +601,27 @@ describe("Coding Agent Tools", () => {
 
 			const result = await bashWithoutPrefix.execute("test-prefix-3", { command: "echo no-prefix" });
 			expect(getTextOutput(result).trim()).toBe("no-prefix");
+		});
+
+		it("should normalize Windows nul redirects for POSIX shells", () => {
+			const shell = "C:\\Program Files\\Git\\bin\\bash.exe";
+
+			expect(shellModule.normalizeWindowsNullDeviceRedirects("echo ok >nul", shell, "win32")).toBe(
+				"echo ok >/dev/null",
+			);
+			expect(shellModule.normalizeWindowsNullDeviceRedirects("tool 2> nul >>NUL", shell, "win32")).toBe(
+				"tool 2> /dev/null >>/dev/null",
+			);
+			expect(shellModule.normalizeWindowsNullDeviceRedirects("echo '>nul' && echo ok", shell, "win32")).toBe(
+				"echo '>nul' && echo ok",
+			);
+			expect(shellModule.normalizeWindowsNullDeviceRedirects("echo ok >nul.log", shell, "win32")).toBe(
+				"echo ok >nul.log",
+			);
+			expect(shellModule.normalizeWindowsNullDeviceRedirects("echo ok >nul", "cmd.exe", "win32")).toBe(
+				"echo ok >nul",
+			);
+			expect(shellModule.normalizeWindowsNullDeviceRedirects("echo ok >nul", shell, "linux")).toBe("echo ok >nul");
 		});
 
 		it("should coalesce streaming updates for chatty output", async () => {

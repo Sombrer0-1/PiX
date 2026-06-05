@@ -8,8 +8,8 @@
  */
 
 import { existsSync, rmSync } from "fs";
-import { join, resolve } from "path";
-import { BrowserWindow, ipcMain } from "electron";
+import { isAbsolute, join, relative, resolve } from "path";
+import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import type { SessionBridge } from "./session-bridge.js";
@@ -18,6 +18,8 @@ import type { GuiSettings, ProjectInfo, RpcCommand, ThinkingLevel } from "../sha
 
 let handlersRegistered = false;
 let eventForwardingSetup = false;
+let currentWindow: BrowserWindow | null = null;
+let detachWindowStateListeners: (() => void) | null = null;
 
 const SETTING_KEYS = new Set([
   "piPath",
@@ -88,11 +90,55 @@ function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSetting
   return sanitized;
 }
 
+function getUsableWindow(win: BrowserWindow | null | undefined): BrowserWindow | null {
+  return win && !win.isDestroyed() ? win : null;
+}
+
+function getWindowFromEvent(event: IpcMainInvokeEvent): BrowserWindow | null {
+  return getUsableWindow(BrowserWindow.fromWebContents(event.sender)) ?? getUsableWindow(currentWindow);
+}
+
+function sendWindowMaximizeChange(win: BrowserWindow, maximized: boolean): void {
+  if (!win.isDestroyed()) {
+    win.webContents.send("window-maximize-change", maximized);
+  }
+}
+
+function setCurrentWindow(win: BrowserWindow): void {
+  currentWindow = win;
+  detachWindowStateListeners?.();
+
+  const onMaximize = () => sendWindowMaximizeChange(win, true);
+	const onUnmaximize = () => sendWindowMaximizeChange(win, false);
+	const onClosed = () => {
+		if (currentWindow === win) {
+			currentWindow = null;
+			detachWindowStateListeners = null;
+		}
+	};
+
+  win.on("maximize", onMaximize);
+  win.on("unmaximize", onUnmaximize);
+  win.on("closed", onClosed);
+  detachWindowStateListeners = () => {
+    win.off("maximize", onMaximize);
+    win.off("unmaximize", onUnmaximize);
+    win.off("closed", onClosed);
+  };
+}
+
+function isPathInsideDirectory(candidatePath: string, directoryPath: string): boolean {
+  const relativePath = relative(directoryPath, candidatePath);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
 export function registerIpcHandlers(
   win: BrowserWindow,
   sessionBridge: SessionBridge,
   settingsStore: SettingsStore
 ): void {
+  setCurrentWindow(win);
+
   // Prevent duplicate registration (e.g. macOS activate)
   if (handlersRegistered) {
     console.log("[ipc-handlers] Already registered, skipping");
@@ -263,24 +309,26 @@ export function registerIpcHandlers(
   // Window Controls (frameless window)
   // =========================================================================
 
-  ipcMain.handle("window-minimize", () => {
-    win.minimize();
+  ipcMain.handle("window-minimize", (event) => {
+    getWindowFromEvent(event)?.minimize();
   });
 
-  ipcMain.handle("window-maximize", () => {
-    if (win.isMaximized()) {
-      win.unmaximize();
+  ipcMain.handle("window-maximize", (event) => {
+    const targetWin = getWindowFromEvent(event);
+    if (!targetWin) return;
+    if (targetWin.isMaximized()) {
+      targetWin.unmaximize();
     } else {
-      win.maximize();
+      targetWin.maximize();
     }
   });
 
-  ipcMain.handle("window-close", () => {
-    win.close();
+  ipcMain.handle("window-close", (event) => {
+    getWindowFromEvent(event)?.close();
   });
 
-  ipcMain.handle("window-is-maximized", () => {
-    return win.isMaximized();
+  ipcMain.handle("window-is-maximized", (event) => {
+    return getWindowFromEvent(event)?.isMaximized() ?? false;
   });
 
   // =========================================================================
@@ -292,8 +340,8 @@ export function registerIpcHandlers(
       const resolved = resolve(sessionPath);
       // Guard: only delete session files, never arbitrary paths
       const agentDir = resolve(getAgentDir());
-      const sessionsDir = join(agentDir, "sessions");
-      if (!resolved.startsWith(sessionsDir)) {
+      const sessionsDir = resolve(join(agentDir, "sessions"));
+      if (!isPathInsideDirectory(resolved, sessionsDir)) {
         return { success: false, error: "Invalid session path" };
       }
       if (existsSync(resolved)) {
@@ -304,14 +352,6 @@ export function registerIpcHandlers(
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
-  });
-
-  // Forward maximize/unmaximize events so the renderer can update the button icon
-  win.on("maximize", () => {
-    win.webContents.send("window-maximize-change", true);
-  });
-  win.on("unmaximize", () => {
-    win.webContents.send("window-maximize-change", false);
   });
 }
 
@@ -390,6 +430,13 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       return bridge.switchSession(cmd.sessionPath);
     case "fork":
       return bridge.fork(cmd.entryId, cmd.position ?? "before", cmd.label);
+    case "navigate_tree":
+      return bridge.navigateTree(cmd.targetId, {
+        summarize: cmd.summarize,
+        customInstructions: cmd.customInstructions,
+        replaceInstructions: cmd.replaceInstructions,
+        label: cmd.label,
+      });
     case "clone":
       return bridge.clone();
     case "get_last_assistant_text":

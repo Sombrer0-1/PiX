@@ -34,6 +34,15 @@ export type RpcCommand =
   | { id?: string; type: "get_session_stats" }
   | { id?: string; type: "switch_session"; sessionPath: string }
   | { id?: string; type: "fork"; entryId: string; position?: "before" | "at"; label?: string }
+  | {
+      id?: string;
+      type: "navigate_tree";
+      targetId: string;
+      summarize?: boolean;
+      customInstructions?: string;
+      replaceInstructions?: boolean;
+      label?: string;
+    }
   | { id?: string; type: "clone" }
   | { id?: string; type: "get_last_assistant_text" }
   | { id?: string; type: "set_session_name"; name: string }
@@ -73,6 +82,7 @@ export interface RpcSessionState {
   thinkingLevel: ThinkingLevel;
   isStreaming: boolean;
   isCompacting: boolean;
+  executionMode: "approval" | "unattended";
   steeringMode: "all" | "one-at-a-time";
   followUpMode: "all" | "one-at-a-time";
   sessionFile?: string;
@@ -153,6 +163,8 @@ export type AgentSessionEvent =
   | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: unknown }
   | { type: "tool_execution_update"; toolCallId: string; toolName: string; args: unknown; partialResult: unknown }
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: unknown; isError: boolean }
+  | { type: "file_change"; toolCallId: string; toolName: string; change: FileChangeSummary; aggregate: TurnDiffSummary }
+  | { type: "verification_gate"; reason: "file_changes"; summary: TurnDiffSummary }
   | { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
   | { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
   | { type: "compaction_end"; reason: "manual" | "threshold" | "overflow"; result?: unknown; aborted: boolean; willRetry: boolean; errorMessage?: string }
@@ -186,12 +198,35 @@ export interface ToolWorkItem {
   args: unknown;
   result: unknown;
   isError: boolean;
+  diff?: DiffSummary;
+  fileChange?: FileChangeSummary;
+}
+
+export interface DiffSummary {
+  added: number;
+  removed: number;
+}
+
+export interface FileChangeSummary extends DiffSummary {
+  path?: string;
+  toolCallId: string;
+  toolName: string;
+  diff?: string;
+  patch?: string;
+  firstChangedLine?: number;
+}
+
+export interface TurnDiffSummary extends DiffSummary {
+  files: number;
+  changes: FileChangeSummary[];
 }
 
 export type DisplayBlock =
   | { id: string; type: "user-message"; text: string; attachments?: ChatMessageAttachment[]; timestamp: number }
   | { id: string; type: "agent-message"; content: string; isStreaming: boolean; timestamp: number }
+  | { id: string; type: "thinking"; timestamp: number }
   | { id: string; type: "work-status"; tools: ToolWorkItem[]; isStreaming: boolean; timestamp: number }
+  | { id: string; type: "turn-separator"; timestamp: number }
   | { id: string; type: "error"; message: string; source?: string; timestamp: number }
   | { id: string; type: "compaction"; reason: string; result: string; aborted: boolean; timestamp: number }
   | { id: string; type: "retry"; success: boolean; attempt: number; maxAttempts: number; delayMs?: number; timestamp: number }
@@ -356,6 +391,10 @@ export interface PiSettings {
   transport?: string;
   steeringMode?: "all" | "one-at-a-time";
   followUpMode?: "all" | "one-at-a-time";
+  execution?: {
+    mode?: "approval" | "unattended";
+    verificationGate?: boolean;
+  };
   theme?: string;
   hideThinkingBlock?: boolean;
   shellPath?: string;

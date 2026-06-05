@@ -211,7 +211,9 @@ function normalizeServerConfig(value: unknown, configPath: string): McpServerCon
 	};
 }
 
-async function loadConfigFile(configPath: string): Promise<{ servers: Record<string, McpServerConfig>; errors: string[] }> {
+async function loadConfigFile(
+	configPath: string,
+): Promise<{ servers: Record<string, McpServerConfig>; errors: string[] }> {
 	let raw: string;
 	try {
 		raw = await readFile(configPath, "utf-8");
@@ -615,8 +617,12 @@ class McpServerConnection {
 		try {
 			await client.connect(transport, makeRequestOptions(signal, this.startupTimeoutMs));
 			if (this.status !== "connecting") {
-				try { await client.close(); } catch {}
-				try { await transport.close(); } catch {}
+				try {
+					await client.close();
+				} catch {}
+				try {
+					await transport.close();
+				} catch {}
 				return;
 			}
 			this.client = client;
@@ -625,8 +631,12 @@ class McpServerConnection {
 			log("info", `"${this.name}" connected, listing tools`);
 			this.tools = await this.listAllTools(client, signal);
 			if (this.status !== "connected") {
-				try { await client.close(); } catch {}
-				try { await transport.close(); } catch {}
+				try {
+					await client.close();
+				} catch {}
+				try {
+					await transport.close();
+				} catch {}
 				return;
 			}
 			this.startHealthCheck();
@@ -707,7 +717,10 @@ class McpServerConnection {
 				throw error;
 			}
 			this.lastReconnectAttempt = now;
-			log("warn", `"${this.name}" request failed, reconnecting: ${error instanceof Error ? error.message : String(error)}`);
+			log(
+				"warn",
+				`"${this.name}" request failed, reconnecting: ${error instanceof Error ? error.message : String(error)}`,
+			);
 			await this.disconnect();
 			await this.connect(signal);
 			if (!this.client) {
@@ -733,7 +746,10 @@ class McpServerConnection {
 						log("debug", `"${this.name}" health check: ping not supported by server, skipping`);
 						return;
 					}
-					log("warn", `"${this.name}" health check failed: ${error instanceof Error ? error.message : String(error)}`);
+					log(
+						"warn",
+						`"${this.name}" health check failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
 					this.disconnect();
 				});
 		}, this.HEALTH_CHECK_INTERVAL_MS);
@@ -1099,7 +1115,10 @@ export class McpAdapter {
 					const result = await connection.listResources(cursor, signal);
 					return { server: connection.name, ...result };
 				});
-				return makeTextResult(jsonText({ resources: results, errors: errors.length > 0 ? errors : undefined }), { resources: results, errors });
+				return makeTextResult(jsonText({ resources: results, errors: errors.length > 0 ? errors : undefined }), {
+					resources: results,
+					errors,
+				});
 			},
 		});
 
@@ -1119,7 +1138,10 @@ export class McpAdapter {
 					const result = await connection.listResourceTemplates(cursor, signal);
 					return { server: connection.name, ...result };
 				});
-				return makeTextResult(jsonText({ resourceTemplates: results, errors: errors.length > 0 ? errors : undefined }), { resourceTemplates: results, errors });
+				return makeTextResult(
+					jsonText({ resourceTemplates: results, errors: errors.length > 0 ? errors : undefined }),
+					{ resourceTemplates: results, errors },
+				);
 			},
 		});
 

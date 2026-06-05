@@ -14,7 +14,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import {
 	type ExecutionEnv,
@@ -50,7 +50,7 @@ function fileInfoFromStats(
 	const kind = fileKindFromStats(stats);
 	if (!kind) return err(new FileError("invalid", "Unsupported file type", path));
 	return ok({
-		name: path.replace(/\/+$/, "").split("/").pop() ?? path,
+		name: basename(path),
 		path,
 		kind,
 		size: stats.size,
@@ -142,6 +142,83 @@ async function findBashOnPath(): Promise<string | null> {
 	if (result.status !== 0 || !result.stdout) return null;
 	const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
 	return firstMatch && (await pathExists(firstMatch)) ? firstMatch : null;
+}
+
+function isPosixLikeShell(shell: string): boolean {
+	const normalized = shell.replace(/\\/g, "/").toLowerCase();
+	const basename = normalized.split("/").pop() ?? normalized;
+	return /^(ba|da|k|z)?sh(?:\.exe)?$/.test(basename) || basename === "fish.exe" || basename === "fish";
+}
+
+function isShellWordContinuation(ch: string | undefined): boolean {
+	return ch !== undefined && !/[\s;&|()<>]/.test(ch);
+}
+
+export function normalizeWindowsNullDeviceRedirects(
+	command: string,
+	shell: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	if (platform !== "win32" || !isPosixLikeShell(shell)) return command;
+
+	let result = "";
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+
+		if (escaped) {
+			result += ch;
+			escaped = false;
+			continue;
+		}
+
+		if (ch === "\\" && quote !== "'") {
+			result += ch;
+			escaped = true;
+			continue;
+		}
+
+		if (quote) {
+			if (ch === quote) quote = undefined;
+			result += ch;
+			continue;
+		}
+
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			result += ch;
+			continue;
+		}
+
+		if (ch !== ">") {
+			result += ch;
+			continue;
+		}
+
+		result += ch;
+		if (command[i + 1] === ">" || command[i + 1] === "|") {
+			result += command[++i]!;
+		}
+
+		let whitespace = "";
+		while (command[i + 1] === " " || command[i + 1] === "\t") {
+			whitespace += command[++i]!;
+		}
+
+		const targetStart = i + 1;
+		const target = command.slice(targetStart, targetStart + 3);
+		if (target.toLowerCase() === "nul" && !isShellWordContinuation(command[targetStart + 3])) {
+			result += `${whitespace}/dev/null`;
+			i += 3;
+			continue;
+		}
+
+		result += whitespace;
+	}
+
+	return result;
 }
 
 async function getShellConfig(
@@ -274,7 +351,8 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			};
 
 			try {
-				child = spawn(shellConfig.value.shell, [...shellConfig.value.args, command], {
+				const commandForShell = normalizeWindowsNullDeviceRedirects(command, shellConfig.value.shell);
+				child = spawn(shellConfig.value.shell, [...shellConfig.value.args, commandForShell], {
 					cwd,
 					detached: process.platform !== "win32",
 					env: getShellEnv(this.shellEnv, options?.env),

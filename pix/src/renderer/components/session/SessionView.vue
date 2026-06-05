@@ -28,10 +28,22 @@ function renderMarkdown(text: string): string {
   if (!text) return "&nbsp;";
   try {
     const result = marked.parse(text, { async: false, renderer: markdownRenderer });
-    return typeof result === "string" ? enhanceCodeBlocks(result) : text;
+    if (typeof result !== "string") return text;
+    return enhanceCodeBlocks(stripTrailingWhitespace(result));
   } catch {
     return escapeHtml(text);
   }
+}
+
+/**
+ * Strip trailing <br> tags and empty trailing <p> blocks that marked
+ * generates from trailing newlines in the source text.  Without this,
+ * short AI responses appear with an unwanted blank line underneath.
+ */
+function stripTrailingWhitespace(html: string): string {
+  return html
+    .replace(/(<br\s*\/?>)+\s*<\/p>/gi, "</p>")
+    .replace(/<p>\s*(<br\s*\/?>|\s|&nbsp;)*<\/p>\s*$/gi, "");
 }
 
 const codeCopyIcon =
@@ -134,6 +146,10 @@ function countUnifiedDiff(text: string): DiffSummary {
   return { added, removed };
 }
 
+function hasDiff(diff: DiffSummary): boolean {
+  return diff.added > 0 || diff.removed > 0;
+}
+
 function diffSummaryFromArgs(toolName: string, args: unknown): DiffSummary {
   if (!isRecord(args)) return { added: 0, removed: 0 };
 
@@ -144,6 +160,19 @@ function diffSummaryFromArgs(toolName: string, args: unknown): DiffSummary {
   }
 
   if (lowerToolName.includes("edit")) {
+    // Current format: { path, edits: [{ oldText, newText }] }
+    if (Array.isArray(args.edits)) {
+      let added = 0;
+      let removed = 0;
+      for (const edit of args.edits) {
+        if (isRecord(edit)) {
+          if (typeof edit.oldText === "string") removed += countContentLines(edit.oldText);
+          if (typeof edit.newText === "string") added += countContentLines(edit.newText);
+        }
+      }
+      if (added || removed) return { added, removed };
+    }
+    // Legacy format: { old_string/new_string or oldText/newText at top level }
     const oldText = getStringValue(args, ["old_string", "oldString", "old_text", "oldText", "from"]);
     const newText = getStringValue(args, ["new_string", "newString", "new_text", "newText", "to"]);
     if (oldText !== undefined || newText !== undefined) {
@@ -157,12 +186,32 @@ function diffSummaryFromArgs(toolName: string, args: unknown): DiffSummary {
   return { added: 0, removed: 0 };
 }
 
-function toolDiff(tool: ToolWorkItem): DiffSummary {
-  const fromArgs = diffSummaryFromArgs(tool.toolName || "", tool.args);
-  if (fromArgs.added || fromArgs.removed) return fromArgs;
+function diffSummaryFromResult(result: unknown): DiffSummary {
+  // Tool details carry the authoritative post-execution diff. This matters for
+  // write-overwrite calls, where args only show the new content and cannot know
+  // how many old lines were removed.
+  if (isRecord(result) && isRecord(result.details) && typeof result.details.diff === "string") {
+    const fromDetails = countUnifiedDiff(result.details.diff);
+    if (hasDiff(fromDetails)) return fromDetails;
+  }
 
-  const fromResult = countUnifiedDiff(resultText(tool.result));
-  return fromResult.added || fromResult.removed ? fromResult : { added: 0, removed: 0 };
+  // Fallback: parse unified diff from result text.
+  const fromResultText = countUnifiedDiff(resultText(result));
+  if (hasDiff(fromResultText)) return fromResultText;
+
+  return { added: 0, removed: 0 };
+}
+
+function toolDiff(tool: ToolWorkItem): DiffSummary {
+  if (tool.diff && hasDiff(tool.diff)) return tool.diff;
+
+  const fromResult = diffSummaryFromResult(tool.result);
+  if (hasDiff(fromResult)) return fromResult;
+
+  const fromArgs = diffSummaryFromArgs(tool.toolName || "", tool.args);
+  if (hasDiff(fromArgs)) return fromArgs;
+
+  return { added: 0, removed: 0 };
 }
 
 function workDiff(tools: ToolWorkItem[]): DiffSummary {
@@ -175,11 +224,6 @@ function workDiff(tools: ToolWorkItem[]): DiffSummary {
     },
     { added: 0, removed: 0 }
   );
-}
-
-function formatDiff(diff: DiffSummary): string {
-  if (!diff.added && !diff.removed) return "";
-  return `+${diff.added} -${diff.removed}`;
 }
 
 function resultPreview(result: unknown): string {
@@ -287,9 +331,16 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 <template>
   <div class="session-view" @click="handleSessionClick">
     <template v-for="block in blocks" :key="block.id">
+      <!-- Turn separator -->
+      <div
+        v-if="block.type === 'turn-separator'"
+        class="turn-separator"
+        aria-hidden="true"
+      ></div>
+
       <!-- User Message -->
       <MessageBlock
-        v-if="block.type === 'user-message'"
+        v-else-if="block.type === 'user-message'"
         :text="block.text"
         :attachments="block.attachments || []"
         :timestamp="block.timestamp"
@@ -346,35 +397,49 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         </div>
       </div>
 
+      <!-- Thinking indicator - waits for the first assistant text or tool call -->
+      <div
+        v-else-if="block.type === 'thinking'"
+        class="thinking-block"
+      >
+        <span class="thinking-spinner" aria-hidden="true"></span>
+        <span>AI 正在思考...</span>
+      </div>
+
       <!-- Work Status - aggregated tool executions -->
       <div
         v-else-if="block.type === 'work-status'"
         class="work-status-block"
         :class="{ streaming: block.isStreaming, expanded: expandedWorkStatus.has(block.id) }"
       >
-        <button class="ws-header" @click="toggleExpand(block.id)">
+        <button class="ws-header" @click="block.tools.length > 0 && toggleExpand(block.id)">
           <span class="ws-icon">
             <span v-if="block.isStreaming" class="spinner"></span>
             <span v-else class="ws-dot done"></span>
           </span>
           <span class="ws-summary">
-            <template v-if="block.isStreaming && block.tools.length === 0">AI 正在思考...</template>
-            <template v-else-if="block.isStreaming">已运行 {{ block.tools.length }} 条命令...</template>
+            <template v-if="block.isStreaming">已运行 {{ block.tools.length }} 条命令...</template>
             <template v-else>已运行 {{ block.tools.length }} 条命令</template>
           </span>
           <span class="ws-tool-names">{{ toolSummary(block.tools) }}</span>
-          <span v-if="formatDiff(workDiff(block.tools))" class="ws-diff">{{ formatDiff(workDiff(block.tools)) }}</span>
-          <span class="ws-toggle">{{ expandedWorkStatus.has(block.id) ? '收起' : '展开' }}</span>
+          <span v-if="hasDiff(workDiff(block.tools))" class="ws-diff">
+            <span class="diff-added">+{{ workDiff(block.tools).added }}</span>
+            <span class="diff-removed">-{{ workDiff(block.tools).removed }}</span>
+          </span>
+          <span v-if="block.tools.length > 0" class="ws-toggle">{{ expandedWorkStatus.has(block.id) ? '收起' : '展开' }}</span>
         </button>
 
-        <div v-if="expandedWorkStatus.has(block.id)" class="ws-body">
+        <div v-if="expandedWorkStatus.has(block.id) && block.tools.length > 0" class="ws-body">
           <div v-for="tool in block.tools" :key="tool.toolCallId" class="ws-tool-item" :class="{ error: tool.isError }">
             <button class="ws-tool-header" @click="toggleTool(block.id, tool.toolCallId)">
               <span class="ws-tool-dot" :class="tool.isError ? 'err' : 'ok'"></span>
               <span class="ws-tool-name">{{ tool.toolName || 'task' }}</span>
               <span v-if="tool.args" class="ws-tool-preview">{{ argsSummary(tool.args) }}</span>
               <span v-else-if="tool.result !== null" class="ws-tool-preview">{{ resultPreview(tool.result) }}</span>
-              <span v-if="formatDiff(toolDiff(tool))" class="ws-tool-diff">{{ formatDiff(toolDiff(tool)) }}</span>
+              <span v-if="hasDiff(toolDiff(tool))" class="ws-tool-diff">
+                <span class="diff-added">+{{ toolDiff(tool).added }}</span>
+                <span class="diff-removed">-{{ toolDiff(tool).removed }}</span>
+              </span>
               <span class="ws-tool-toggle">{{ isToolExpanded(block.id, tool.toolCallId) ? '收起' : '展开' }}</span>
             </button>
             <div v-if="isToolExpanded(block.id, tool.toolCallId)" class="ws-tool-details">
@@ -418,9 +483,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 
       <!-- Status Indicator -->
       <div v-else-if="block.type === 'status'" class="notice-block" :class="block.status">
-        <span v-if="block.status === 'running'">AI 开始工作</span>
-        <span v-else-if="block.status === 'idle'">AI 已完成</span>
-        <span v-else-if="block.status === 'error'">错误</span>
+        <span v-if="block.status === 'error'">错误</span>
         <span v-else-if="block.status === 'compacting'">正在压缩上下文</span>
       </div>
     </template>
@@ -432,6 +495,13 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   max-width: var(--pix-content-max-width);
   margin: 0 auto;
   font-size: var(--pix-text-sm);
+}
+
+.turn-separator {
+  width: min(360px, 52%);
+  height: 1px;
+  margin: var(--pix-space-xl) auto var(--pix-space-lg);
+  background: linear-gradient(90deg, transparent, var(--pix-border), transparent);
 }
 
 /* ── Agent message block ── */
@@ -553,6 +623,31 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   50% { opacity: 0; }
 }
 
+/* ── Thinking indicator ── */
+.thinking-block {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 var(--pix-space-xl);
+  padding: 5px 10px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-content);
+  color: var(--pix-accent);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  animation: block-in 0.16s ease-out;
+}
+
+.thinking-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--pix-border-light);
+  border-top-color: var(--pix-accent);
+  border-radius: 50%;
+  animation: pix-spin 0.7s linear infinite;
+}
+
 /* ── Work Status Block ── */
 .work-status-block {
   width: fit-content;
@@ -641,16 +736,28 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 
 .ws-diff,
 .ws-tool-diff {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   flex-shrink: 0;
-  padding: 1px 6px;
-  border: 1px solid #bbf7d0;
+  padding: 1px 7px;
+  border: 1px solid var(--pix-border-light);
   border-radius: 999px;
-  background: #f0fdf4;
-  color: #047857;
+  background: var(--pix-bg-content);
   font-family: var(--pix-font-mono);
   font-size: 11px;
   font-weight: var(--pix-weight-semibold);
   line-height: 16px;
+}
+
+.diff-added {
+  color: #047857;
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-removed {
+  color: #dc2626;
+  font-variant-numeric: tabular-nums;
 }
 
 .ws-toggle {

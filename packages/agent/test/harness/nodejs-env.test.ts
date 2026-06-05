@@ -1,7 +1,7 @@
 import { access, chmod, realpath, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
+import { NodeExecutionEnv, normalizeWindowsNullDeviceRedirects } from "../../src/harness/env/nodejs.ts";
 import { FileError, getOrThrow } from "../../src/harness/types.ts";
 import { executeShellWithCapture } from "../../src/harness/utils/shell-output.ts";
 import { createTempDir } from "./session-test-utils.ts";
@@ -194,11 +194,26 @@ describe("NodeExecutionEnv", () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });
 		const result = getOrThrow(
-			await env.exec('printf \'%s:%s\' "$PWD" "$NODE_ENV_TEST"', {
+			await env.exec("node -e 'process.stdout.write(process.cwd()+\":\"+process.env.NODE_ENV_TEST)'", {
 				env: { NODE_ENV_TEST: "ok" },
 			}),
 		);
 		expect(result).toEqual({ stdout: `${await realpath(root)}:ok`, stderr: "", exitCode: 0 });
+	});
+
+	it("normalizes Windows nul redirects for POSIX shells", () => {
+		const shell = "C:\\Program Files\\Git\\bin\\bash.exe";
+
+		expect(normalizeWindowsNullDeviceRedirects("echo ok >nul", shell, "win32")).toBe("echo ok >/dev/null");
+		expect(normalizeWindowsNullDeviceRedirects("tool 2> nul >>NUL", shell, "win32")).toBe(
+			"tool 2> /dev/null >>/dev/null",
+		);
+		expect(normalizeWindowsNullDeviceRedirects("echo '>nul' && echo ok", shell, "win32")).toBe(
+			"echo '>nul' && echo ok",
+		);
+		expect(normalizeWindowsNullDeviceRedirects("echo ok >nul.log", shell, "win32")).toBe("echo ok >nul.log");
+		expect(normalizeWindowsNullDeviceRedirects("echo ok >nul", "cmd.exe", "win32")).toBe("echo ok >nul");
+		expect(normalizeWindowsNullDeviceRedirects("echo ok >nul", shell, "linux")).toBe("echo ok >nul");
 	});
 
 	it("streams stdout and stderr chunks", async () => {

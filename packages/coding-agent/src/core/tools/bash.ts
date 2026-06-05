@@ -12,6 +12,7 @@ import {
 	getShellConfig,
 	getShellEnv,
 	killProcessTree,
+	normalizeWindowsNullDeviceRedirects,
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
@@ -76,7 +77,8 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 				throw new Error("aborted");
 			}
 
-			const child = spawn(shell, [...args, command], {
+			const commandForShell = normalizeWindowsNullDeviceRedirects(command, shell);
+			const child = spawn(shell, [...args, commandForShell], {
 				cwd,
 				detached: process.platform !== "win32",
 				env: env ?? getShellEnv(),

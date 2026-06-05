@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Type, type Static } from "typebox";
+import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "./extensions/types.ts";
 import { defineTool } from "./extensions/types.ts";
 

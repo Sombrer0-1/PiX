@@ -56,10 +56,21 @@ interface LifecycleEvents {
 type LifecycleEvent = keyof LifecycleEvents;
 type LifecycleListener<TEvent extends LifecycleEvent> = (...args: LifecycleEvents[TEvent]) => void;
 type CommandResult = { cancelled: boolean };
+type NavigateTreeOptions = {
+	summarize?: boolean;
+	customInstructions?: string;
+	replaceInstructions?: boolean;
+	label?: string;
+};
 type UserInputRequestListener = (request: RequestUserInputRequest) => void;
 type WithSessionCallback = NonNullable<
 	NonNullable<Parameters<ExtensionCommandContextActions["newSession"]>[0]>["withSession"]
 >;
+
+function globPatternToRegExp(pattern: string): RegExp {
+	const escaped = pattern.trim().replace(/[\\^$+?.()|[\]{}]/g, "\\$&").replace(/\*/g, ".*");
+	return new RegExp(`^${escaped}$`, "i");
+}
 
 export class SessionBridge {
 	private _session: AgentSession | null = null;
@@ -213,6 +224,9 @@ export class SessionBridge {
 
 		const sessionDir = sessionManager.getSessionDir();
 		if (!targetLeafId) {
+			if (label) {
+				sessionManager.appendLabelChange(selectedEntry.id, label);
+			}
 			const newSessionManager = SessionManager.create(this._cwd, sessionDir);
 			newSessionManager.newSession({ parentSession: currentSessionFile });
 			await this._closeCurrentSession("fork");
@@ -223,9 +237,6 @@ export class SessionBridge {
 				reason: "fork",
 				previousSessionFile,
 			});
-			if (label && targetLeafId) {
-				this._sessionManager.appendLabelChange(targetLeafId, label);
-			}
 			await this._activateSession(result.session);
 			return { cancelled: false };
 		}
@@ -249,6 +260,16 @@ export class SessionBridge {
 		});
 		await this._activateSession(result.session);
 		return { cancelled: false };
+	}
+
+	async navigateTree(targetId: string, options?: NavigateTreeOptions): Promise<CommandResult> {
+		const result = await this._getSession().navigateTree(targetId, {
+			summarize: options?.summarize,
+			customInstructions: options?.customInstructions,
+			replaceInstructions: options?.replaceInstructions,
+			label: options?.label,
+		});
+		return { cancelled: result.cancelled };
 	}
 
 	async clone(): Promise<CommandResult> {
@@ -333,12 +354,10 @@ export class SessionBridge {
 	async setScopedModels(patterns: string[]): Promise<void> {
 		const session = this._getSession();
 		const allModels = session.modelRegistry.getAvailable();
+		const regexes = patterns.map((pattern) => pattern.trim()).filter(Boolean).map(globPatternToRegExp);
 		const matching = allModels.filter((m: Model<Api>) => {
 			const id = `${m.provider}/${m.id}`;
-			return patterns.some((pattern) => {
-				const regex = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$", "i");
-				return regex.test(id) || regex.test(m.id);
-			});
+			return regexes.some((regex) => regex.test(id) || regex.test(m.id));
 		});
 		session.setScopedModels(matching.map((m: Model<Api>) => ({ model: m })));
 	}
@@ -415,7 +434,10 @@ export class SessionBridge {
 			case "followUpMode": session.setFollowUpMode(value as "all" | "one-at-a-time"); return;
 			case "theme": return sm.setTheme(value as string);
 			case "hideThinkingBlock": return sm.setHideThinkingBlock(value as boolean);
-			case "shellPath": return sm.setShellPath(value as string | undefined);
+			case "shellPath":
+				sm.setShellPath(value as string | undefined);
+				session.refreshSystemPrompt();
+				return;
 			case "quietStartup": return sm.setQuietStartup(value as boolean);
 			case "shellCommandPrefix": return sm.setShellCommandPrefix(value as string | undefined);
 			case "npmCommand": return sm.setNpmCommand(value as string[] | undefined);
@@ -425,6 +447,14 @@ export class SessionBridge {
 			case "compactionReserveTokens": return;
 			case "compactionKeepRecentTokens": return;
 			case "retryEnabled": return sm.setRetryEnabled(value as boolean);
+			case "executionMode":
+				sm.setExecutionMode(value === "unattended" ? "unattended" : "approval");
+				session.refreshSystemPrompt();
+				return;
+			case "verificationGate":
+				sm.setVerificationGateEnabled(value as boolean);
+				session.refreshSystemPrompt();
+				return;
 			case "enableSkillCommands": return sm.setEnableSkillCommands(value as boolean);
 			case "showImages": return sm.setShowImages(value as boolean);
 			case "imageWidthCells": return sm.setImageWidthCells(value as number);
@@ -471,6 +501,7 @@ export class SessionBridge {
 			thinkingLevel: session.thinkingLevel,
 			isStreaming: session.isStreaming,
 			isCompacting: this._isCompacting,
+			executionMode: session.settingsManager.getExecutionMode(),
 			steeringMode: session.steeringMode,
 			followUpMode: session.followUpMode,
 			sessionFile: session.sessionManager.getSessionFile() ?? undefined,
@@ -809,7 +840,7 @@ export class SessionBridge {
 
 	private async _activateSession(session: AgentSession): Promise<void> {
 		this._session = session;
-		this._setupEventSubscription();
+		this._setupEventSubscription(session);
 		await this._bindExtensions();
 		this._emitLifecycle("ready");
 	}
@@ -912,11 +943,11 @@ export class SessionBridge {
 		}
 	}
 
-	private _setupEventSubscription(): void {
+	private _setupEventSubscription(session: AgentSession): void {
 		this._isCompacting = false;
 		this._pendingMessageCount = 0;
 
-		this._unsubscribe = this._session!.subscribe((event) => {
+		this._unsubscribe = session.subscribe((event) => {
 			const sessionEvent = event as AgentSessionEvent;
 			this._updateTrackedState(sessionEvent);
 

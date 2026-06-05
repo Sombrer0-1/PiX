@@ -83,10 +83,10 @@ function mergeAttachments(...groups: ChatMessageAttachment[][]): ChatMessageAtta
       const key = attachment.path || attachment.name;
       const existing = merged.get(key);
       merged.set(key, {
-        ...attachment,
         ...existing,
-        content: existing?.content ?? attachment.content,
-        size: existing?.size ?? attachment.size,
+        ...attachment,
+        content: attachment.content ?? existing?.content,
+        size: attachment.size ?? existing?.size,
       });
     }
   }
@@ -126,6 +126,35 @@ export const useSessionStore = defineStore("session", () => {
 
   let currentAgentBlockId: string | null = null;
   let currentWorkStatusId: string | null = null;
+  let currentThinkingBlockId: string | null = null;
+
+  function removeThinkingBlock(): void {
+    if (!currentThinkingBlockId) return;
+    const blockId = currentThinkingBlockId;
+    displayBlocks.value = displayBlocks.value.filter((block) => block.id !== blockId);
+    currentThinkingBlockId = null;
+  }
+
+  function showThinkingBlock(timestamp = Date.now()): void {
+    if (currentThinkingBlockId) return;
+    const block: DisplayBlock = {
+      id: nextBlockId(),
+      type: "thinking",
+      timestamp,
+    };
+    currentThinkingBlockId = block.id;
+    displayBlocks.value.push(block);
+  }
+
+  function appendTurnSeparator(timestamp = Date.now()): void {
+    const last = displayBlocks.value.at(-1);
+    if (!last || last.type === "turn-separator") return;
+    displayBlocks.value.push({
+      id: nextBlockId(),
+      type: "turn-separator",
+      timestamp,
+    });
+  }
 
   function appendUserOrNoteMessage(msg: AgentMessage): void {
     const display = extractMessageDisplay(msg);
@@ -142,7 +171,10 @@ export const useSessionStore = defineStore("session", () => {
     }
 
     if (display.text || display.attachments.length > 0) {
-      currentWorkStatusId = null;
+      closeCurrentWorkStatus(true);
+      if (msg.role === "user") {
+        appendTurnSeparator(messageTimestamp(msg));
+      }
       displayBlocks.value.push({
         id: nextBlockId(),
         type: "user-message",
@@ -153,19 +185,30 @@ export const useSessionStore = defineStore("session", () => {
     }
   }
 
-  function closeCurrentWorkStatus(): void {
+  function closeCurrentWorkStatus(force = false): void {
     const ws = currentWorkStatusId
       ? displayBlocks.value.find((b) => b.id === currentWorkStatusId && b.type === "work-status")
       : null;
-    if (ws && ws.type === "work-status" && ws.tools.length === 0) {
-      displayBlocks.value = displayBlocks.value.filter((block) => block.id !== ws.id);
-    } else if (ws && ws.type === "work-status" && !ws.tools.some((tool) => tool.result === null)) {
-      ws.isStreaming = false;
+    if (ws && ws.type === "work-status") {
+      const hasPending = ws.tools.some((tool) => tool.result === null);
+      if (ws.tools.length === 0) {
+        // No tools were executed — remove the empty "thinking" block entirely
+        displayBlocks.value = displayBlocks.value.filter((block) => block.id !== ws.id);
+        currentWorkStatusId = null;
+      } else if (!hasPending || force) {
+        // All tools done, or agent ended (force) — mark as finished
+        ws.isStreaming = false;
+        currentWorkStatusId = null;
+      }
+      // else: tools still pending — keep currentWorkStatusId so we can
+      // find and close this block when tools finish
+    } else {
+      currentWorkStatusId = null;
     }
-    currentWorkStatusId = null;
   }
 
   function createAgentBlock(text: string, isStreamingBlock: boolean, timestamp = Date.now()): string {
+    removeThinkingBlock();
     closeCurrentWorkStatus();
     const block: DisplayBlock = {
       id: nextBlockId(),
@@ -225,25 +268,13 @@ export const useSessionStore = defineStore("session", () => {
       case "agent_start": {
         isStreaming.value = true;
         errorMessage.value = null;
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "status",
-          status: "running",
-          timestamp: Date.now(),
-        });
-        ensureWorkStatusBlock();
         break;
       }
       case "agent_end": {
         isStreaming.value = false;
         currentAgentBlockId = null;
-        closeCurrentWorkStatus();
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "status",
-          status: "idle",
-          timestamp: Date.now(),
-        });
+        removeThinkingBlock();
+        closeCurrentWorkStatus(true);
         break;
       }
 
@@ -252,6 +283,9 @@ export const useSessionStore = defineStore("session", () => {
         if (msg.role === "user" || msg.role === "custom") {
           if (msg.role === "custom" && msg.display === false) break;
           appendUserOrNoteMessage(msg);
+          if (msg.role === "user") {
+            showThinkingBlock(messageTimestamp(msg));
+          }
         } else if (msg.role === "assistant") {
           const text = extractContentText(msg);
           // Only create agent block when there's real text — skip empty tool-call-only messages
@@ -266,6 +300,7 @@ export const useSessionStore = defineStore("session", () => {
         if (msg.role === "assistant") {
           const text = extractContentText(msg);
           if (!text) return;
+          removeThinkingBlock();
           if (!currentAgentBlockId) {
             // First text in this response — create the agent block now
             currentAgentBlockId = createAgentBlock(text, true);
@@ -291,6 +326,7 @@ export const useSessionStore = defineStore("session", () => {
 
       // Tool lifecycle — aggregate into a single work-status block
       case "tool_execution_start": {
+        removeThinkingBlock();
         ensureWorkStatusBlock().tools.push({
           toolCallId: event.toolCallId,
           toolName: event.toolName,
@@ -322,6 +358,20 @@ export const useSessionStore = defineStore("session", () => {
             ws.isStreaming = false;
           }
         }
+        break;
+      }
+      case "file_change": {
+        const ws = findWorkStatusForTool(event.toolCallId);
+        if (ws && ws.type === "work-status") {
+          const tool = ws.tools.find((t) => t.toolCallId === event.toolCallId);
+          if (tool) {
+            tool.fileChange = event.change;
+            tool.diff = { added: event.change.added, removed: event.change.removed };
+          }
+        }
+        break;
+      }
+      case "verification_gate": {
         break;
       }
 
@@ -473,6 +523,7 @@ export const useSessionStore = defineStore("session", () => {
     errorMessage.value = null;
     currentAgentBlockId = null;
     currentWorkStatusId = null;
+    currentThinkingBlockId = null;
   }
 
   function getRawEventsJson(): string {

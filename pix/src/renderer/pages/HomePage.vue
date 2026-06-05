@@ -59,6 +59,10 @@ async function openRecentProject(project: ProjectInfo): Promise<void> {
   await startFreshWorkspace(project.path);
 }
 
+async function removeRecentProject(project: ProjectInfo): Promise<void> {
+  await projectStore.removeRecentProject(project.path);
+}
+
 function formatDate(timestamp: number): string {
   const d = new Date(timestamp);
   const now = new Date();
@@ -114,7 +118,22 @@ function formatDate(timestamp: number): string {
               class="project-list-item"
             >
               <template #append>
-                <span class="project-path-mono">{{ project.path }}</span>
+                <div class="project-list-actions">
+                  <span class="project-path-mono">{{ project.path }}</span>
+                  <button
+                    class="project-delete-btn"
+                    type="button"
+                    title="从最近项目中移除"
+                    aria-label="从最近项目中移除"
+                    @click.stop="removeRecentProject(project)"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <polyline points="3 6 5 6 21 6" />
+                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    </svg>
+                  </button>
+                </div>
               </template>
             </v-list-item>
           </v-list>
@@ -209,6 +228,13 @@ function formatDate(timestamp: number): string {
   cursor: pointer;
 }
 
+.project-list-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pix-space-xs);
+  min-width: 0;
+}
+
 .project-path-mono {
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-xs);
@@ -217,6 +243,22 @@ function formatDate(timestamp: number): string {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 200px;
+}
+
+.project-delete-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--pix-radius-sm);
+  color: var(--pix-text-muted);
+  transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
+}
+
+.project-delete-btn:hover {
+  color: var(--pix-error);
+  background: var(--pix-error-bg);
 }
 
 .home-empty {

@@ -39,6 +39,8 @@ const defaultModel = ref("");
 const defaultThinkingLevel = ref<ThinkingLevel>("xhigh");
 const steeringMode = ref<"all" | "one-at-a-time">("one-at-a-time");
 const followUpMode = ref<"all" | "one-at-a-time">("one-at-a-time");
+const executionMode = ref<"approval" | "unattended">("approval");
+const verificationGate = ref(true);
 const autoCompact = ref(true);
 const quietStartup = ref(false);
 const enableInstallTelemetry = ref(true);
@@ -121,6 +123,10 @@ async function deleteKey(provider: string): Promise<void> {
 // ---- Option lists ----
 const thinkingLevels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const steeringModes = ["all", "one-at-a-time"] as const;
+const executionModeItems = [
+  { title: "审批模式", value: "approval" },
+  { title: "无监管模式", value: "unattended" },
+] as const;
 const transportOptions = ["auto", "sse", "websocket"] as const;
 const escapeActions = ["fork", "tree", "none"] as const;
 const treeFilterModes = ["default", "no-tools", "user-only", "labeled-only", "all"] as const;
@@ -144,6 +150,9 @@ onMounted(async () => {
 function applyPiSettings(s: Record<string, unknown>): void {
   steeringMode.value = (s.steeringMode as "all" | "one-at-a-time") ?? "one-at-a-time";
   followUpMode.value = (s.followUpMode as "all" | "one-at-a-time") ?? "one-at-a-time";
+  const execution = (s.execution && typeof s.execution === "object" ? s.execution : {}) as Record<string, unknown>;
+  executionMode.value = execution.mode === "unattended" ? "unattended" : "approval";
+  verificationGate.value = (execution.verificationGate ?? true) as boolean;
   autoCompact.value = (s.compactionEnabled ?? s.compaction?.enabled ?? true) as boolean;
   quietStartup.value = (s.quietStartup ?? false) as boolean;
   enableInstallTelemetry.value = (s.enableInstallTelemetry ?? true) as boolean;
@@ -188,6 +197,7 @@ async function saveSettings(): Promise<void> {
     if (rpc.isConnected.value) {
       const setters: [string, unknown][] = [
         ["steeringMode", steeringMode.value], ["followUpMode", followUpMode.value],
+        ["executionMode", executionMode.value], ["verificationGate", verificationGate.value],
         ["compactEnabled", autoCompact.value], ["quietStartup", quietStartup.value],
         ["enableInstallTelemetry", enableInstallTelemetry.value],
         ["theme", piTheme.value || undefined], ["hideThinkingBlock", hideThinkingBlock.value],
@@ -377,6 +387,8 @@ function goBack(): void { router.back(); }
             <v-select v-model="doubleEscapeAction" label="双击 Esc 操作" :items="escapeActions" hint="双击 Escape 键时的操作。" persistent-hint class="mb-4" />
             <v-select v-model="treeFilterMode" label="树过滤器模式" :items="treeFilterModes" hint="会话树视图的默认过滤器模式。" persistent-hint class="mb-4" />
             <v-text-field v-model.number="autocompleteMaxVisible" label="自动补全最大显示数" type="number" min="3" max="20" hint="自动补全建议的最大显示数量 (3-20)。" persistent-hint style="max-width:200px" class="mb-4" />
+            <v-select v-model="executionMode" label="执行模式" :items="executionModeItems" item-title="title" item-value="value" hint="审批模式会拦截高风险命令；无监管模式不做审批拦截，但仍会阻止 Windows 保留设备名文件。" persistent-hint class="mb-4" />
+            <v-switch v-model="verificationGate" label="完成前验证提醒" hint="代码或配置被修改后，提醒 Agent 在收尾前运行针对性的测试、类型检查、构建或打包。" persistent-hint class="mb-4" />
             <div class="advanced-info">
               <h3>诊断信息</h3>
               <div class="info-row"><span>集成方式</span><span>Direct (AgentSession in-process)</span></div>

@@ -8,6 +8,88 @@ export interface ShellConfig {
 	args: string[];
 }
 
+function isPosixLikeShell(shell: string): boolean {
+	const normalized = shell.replace(/\\/g, "/").toLowerCase();
+	const basename = normalized.split("/").pop() ?? normalized;
+	return /^(ba|da|k|z)?sh(?:\.exe)?$/.test(basename) || basename === "fish.exe" || basename === "fish";
+}
+
+function isShellWordContinuation(ch: string | undefined): boolean {
+	return ch !== undefined && !/[\s;&|()<>]/.test(ch);
+}
+
+/**
+ * Git Bash/MSYS on Windows treats `>nul` as a real file named "nul", which
+ * Windows APIs then cannot remove normally. Convert the common Windows null
+ * device spelling to the POSIX null device before handing commands to bash.
+ */
+export function normalizeWindowsNullDeviceRedirects(
+	command: string,
+	shell: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	if (platform !== "win32" || !isPosixLikeShell(shell)) return command;
+
+	let result = "";
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+
+		if (escaped) {
+			result += ch;
+			escaped = false;
+			continue;
+		}
+
+		if (ch === "\\" && quote !== "'") {
+			result += ch;
+			escaped = true;
+			continue;
+		}
+
+		if (quote) {
+			if (ch === quote) quote = undefined;
+			result += ch;
+			continue;
+		}
+
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			result += ch;
+			continue;
+		}
+
+		if (ch !== ">") {
+			result += ch;
+			continue;
+		}
+
+		result += ch;
+		if (command[i + 1] === ">" || command[i + 1] === "|") {
+			result += command[++i]!;
+		}
+
+		let whitespace = "";
+		while (command[i + 1] === " " || command[i + 1] === "\t") {
+			whitespace += command[++i]!;
+		}
+
+		const targetStart = i + 1;
+		const target = command.slice(targetStart, targetStart + 3);
+		if (target.toLowerCase() === "nul" && !isShellWordContinuation(command[targetStart + 3])) {
+			result += `${whitespace}/dev/null`;
+			i += 3;
+			continue;
+		}
+
+		result += whitespace;
+	}
+
+	return result;
+}
+
 /**
  * Find bash executable on PATH (cross-platform)
  */

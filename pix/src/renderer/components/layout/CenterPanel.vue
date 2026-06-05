@@ -42,6 +42,9 @@ const showModelSelector = ref(false);
 const isSending = ref(false);
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const isDraggingFiles = ref(false);
+const AUTO_SCROLL_THRESHOLD_PX = 48;
+let programmaticScrollFrame: number | null = null;
+let isProgrammaticScroll = false;
 
 interface ChatAttachment {
   path: string;
@@ -98,23 +101,45 @@ const modelButtonDisplay = computed(() => {
   return `${model.provider}/${model.id} · ${thinkingDisplay.value}`;
 });
 
+const executionMode = computed(() => rpc.sessionState.value?.executionMode ?? "approval");
+const executionModeLabel = computed(() => executionMode.value === "unattended" ? "无监管" : "审批");
+const executionModeTitle = computed(() =>
+  executionMode.value === "unattended"
+    ? "当前是无监管模式：Agent 工具调用不会请求审批。点击切换到审批模式。"
+    : "当前是审批模式：高风险工具调用会请求你审批。点击切换到无监管模式。"
+);
+const isSwitchingExecutionMode = ref(false);
+
 // Auto-scroll
 watch(
   () => sessionStore.displayBlocks,
   async () => {
     await nextTick();
-    if (contentArea.value && shouldStickToBottom.value) {
-      contentArea.value.scrollTop = contentArea.value.scrollHeight;
+    if (shouldStickToBottom.value) {
+      scrollContentToBottom();
     }
   },
   { deep: true }
 );
 
+function scrollContentToBottom(): void {
+  const el = contentArea.value;
+  if (!el) return;
+  isProgrammaticScroll = true;
+  el.scrollTop = el.scrollHeight;
+  if (programmaticScrollFrame !== null) cancelAnimationFrame(programmaticScrollFrame);
+  programmaticScrollFrame = requestAnimationFrame(() => {
+    isProgrammaticScroll = false;
+    programmaticScrollFrame = null;
+  });
+}
+
 function handleContentScroll(): void {
+  if (isProgrammaticScroll) return;
   const el = contentArea.value;
   if (!el) return;
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-  shouldStickToBottom.value = distance < 120;
+  shouldStickToBottom.value = distance <= AUTO_SCROLL_THRESHOLD_PX;
 }
 
 // Session ops
@@ -124,6 +149,20 @@ async function copyLastReply(): Promise<void> {
     if (result) await navigator.clipboard.writeText(result);
   } catch (err) {
     console.error("[CenterPanel] Copy failed:", err);
+  }
+}
+
+async function toggleExecutionMode(): Promise<void> {
+  if (isSwitchingExecutionMode.value) return;
+  isSwitchingExecutionMode.value = true;
+  const nextMode = executionMode.value === "unattended" ? "approval" : "unattended";
+  try {
+    await rpc.setPiSetting("executionMode", nextMode);
+    await rpc.refreshState();
+  } catch (err) {
+    console.error("[CenterPanel] Failed to toggle execution mode:", err);
+  } finally {
+    isSwitchingExecutionMode.value = false;
   }
 }
 
@@ -273,7 +312,7 @@ function handleDrop(e: DragEvent): void {
 async function sendMessage(): Promise<void> {
   const text = inputText.value.trim();
   if (!text && attachments.value.length === 0) return;
-  if (!canSend.value && !isStreaming.value) return;
+  if (!canSend.value) return;
 
   isSending.value = true;
   const filePaths = attachments.value.map((file) => file.path);
@@ -373,6 +412,18 @@ function autoResize(): void {
       </div>
 
       <div class="topbar-right">
+        <button
+          class="execution-mode-toggle"
+          :class="executionMode"
+          type="button"
+          :title="executionModeTitle"
+          :aria-label="executionModeTitle"
+          :disabled="isSwitchingExecutionMode"
+          @click="toggleExecutionMode"
+        >
+          <span class="mode-dot"></span>
+          {{ executionModeLabel }}
+        </button>
         <span class="conn-pill" :class="rpc.isConnected.value ? 'connected' : 'offline'">
           <span class="conn-dot"></span>
           {{ rpc.isConnected.value ? '已连接' : '离线' }}
@@ -461,21 +512,44 @@ function autoResize(): void {
           <div class="composer-right">
             <button
               v-if="isStreaming"
-              class="send-btn primary-action"
+              class="composer-action-btn primary-action"
+              type="button"
               :disabled="!canSend"
+              title="发送引导"
+              aria-label="发送引导"
               @click="sendMessage"
-            >发送引导</button>
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M22 2 11 13" />
+                <path d="m22 2-7 20-4-9-9-4Z" />
+              </svg>
+            </button>
             <button
               v-if="isStreaming"
-              class="send-btn stop-action"
+              class="composer-action-btn stop-action"
+              type="button"
+              title="停止"
+              aria-label="停止"
               @click="stopAgent"
-            >停止</button>
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+            </button>
             <button
               v-else
-              class="send-btn primary-action"
+              class="composer-action-btn primary-action"
+              type="button"
               :disabled="!canSend"
+              title="发送"
+              aria-label="发送"
               @click="sendMessage"
-            >发送</button>
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M22 2 11 13" />
+                <path d="m22 2-7 20-4-9-9-4Z" />
+              </svg>
+            </button>
           </div>
         </div>
       </div>
@@ -642,9 +716,54 @@ function autoResize(): void {
 .topbar-right {
   display: flex;
   align-items: center;
+  gap: var(--pix-space-sm);
   flex-shrink: 0;
   margin-left: auto;
   -webkit-app-region: no-drag;
+}
+
+.execution-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 10px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: 12px;
+  background: var(--pix-bg-content);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  cursor: pointer;
+  transition:
+    background var(--pix-transition-fast),
+    border-color var(--pix-transition-fast),
+    color var(--pix-transition-fast);
+}
+
+.execution-mode-toggle:hover {
+  background: var(--pix-bg-hover);
+  border-color: var(--pix-border);
+  color: var(--pix-text-primary);
+}
+
+.execution-mode-toggle:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.execution-mode-toggle .mode-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.execution-mode-toggle.approval .mode-dot {
+  background: var(--pix-warning);
+}
+
+.execution-mode-toggle.unattended .mode-dot {
+  background: var(--pix-success);
 }
 
 /* Connection pill */
@@ -888,46 +1007,50 @@ function autoResize(): void {
   transition: transform var(--pix-transition-fast);
 }
 
-/* Send / Stop button */
-.send-btn {
+/* Send / Stop icon actions */
+.composer-action-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  padding: 6px 16px;
+  width: 34px;
+  height: 34px;
   border-radius: var(--pix-radius-sm);
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-medium);
-  font-family: var(--pix-font-ui);
   cursor: pointer;
-  transition: background var(--pix-transition-fast), box-shadow var(--pix-transition-fast), opacity var(--pix-transition-fast);
+  transition:
+    background var(--pix-transition-fast),
+    box-shadow var(--pix-transition-fast),
+    opacity var(--pix-transition-fast),
+    transform var(--pix-transition-fast);
   border: none;
 }
 
-.send-btn.primary-action {
+.composer-action-btn.primary-action {
   background: var(--pix-accent);
   color: var(--pix-text-inverse);
   box-shadow: var(--pix-shadow-xs);
 }
 
-.send-btn.primary-action:hover {
+.composer-action-btn.primary-action:hover:not(:disabled) {
   background: var(--pix-accent-hover);
   box-shadow: var(--pix-shadow-sm);
+  transform: translateY(-1px);
 }
 
-.send-btn.primary-action:disabled {
+.composer-action-btn.primary-action:disabled {
   background: var(--pix-bg-hover);
   color: var(--pix-text-secondary);
   cursor: not-allowed;
   box-shadow: none;
+  opacity: 0.62;
 }
 
-.send-btn.stop-action {
+.composer-action-btn.stop-action {
   background: var(--pix-error-bg);
   color: var(--pix-error);
 }
 
-.send-btn.stop-action:hover {
+.composer-action-btn.stop-action:hover {
   background: var(--pix-error-light);
+  transform: translateY(-1px);
 }
 </style>

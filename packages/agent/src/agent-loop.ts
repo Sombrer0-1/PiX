@@ -179,14 +179,16 @@ async function runLoop(
 				firstTurn = false;
 			}
 
+			let injectedPendingThisTurn = false;
 			if (pendingMessages.length > 0) {
 				await injectPendingMessages(pendingMessages, currentContext, newMessages, emit);
 				pendingMessages = [];
+				injectedPendingThisTurn = true;
 			}
 
 			// Poll again immediately before subsequent provider requests. This catches
 			// user steering submitted after the post-tool drain but before sampling.
-			if (sampleCount > 0) {
+			if (sampleCount > 0 && !injectedPendingThisTurn) {
 				const justInTimeMessages = (await config.getSteeringMessages?.()) || [];
 				if (justInTimeMessages.length > 0) {
 					await injectPendingMessages(justInTimeMessages, currentContext, newMessages, emit);

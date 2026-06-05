@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { Type, type Static } from "typebox";
+import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "./extensions/types.ts";
 import { defineTool } from "./extensions/types.ts";
 import type { SessionManager } from "./session-manager.ts";
@@ -217,7 +217,8 @@ function escapeXml(input: string): string {
 
 export function createGoalContinuationPrompt(goal: ThreadGoal): string {
 	const budget = goal.tokenBudget === undefined ? "none" : String(goal.tokenBudget);
-	const remaining = goal.tokenBudget === undefined ? "unbounded" : String(Math.max(0, goal.tokenBudget - goal.tokensUsed));
+	const remaining =
+		goal.tokenBudget === undefined ? "unbounded" : String(Math.max(0, goal.tokenBudget - goal.tokensUsed));
 	return `<pi_internal_context source="goal">
 Active goal:
 <objective>${escapeXml(goal.objective)}</objective>
@@ -231,7 +232,8 @@ Continue working toward this active goal without waiting for new user input. Bef
 
 export function createGoalUpdatedPrompt(goal: ThreadGoal): string {
 	const budget = goal.tokenBudget === undefined ? "none" : String(goal.tokenBudget);
-	const remaining = goal.tokenBudget === undefined ? "unbounded" : String(Math.max(0, goal.tokenBudget - goal.tokensUsed));
+	const remaining =
+		goal.tokenBudget === undefined ? "unbounded" : String(Math.max(0, goal.tokenBudget - goal.tokensUsed));
 	return `<pi_internal_context source="goal">
 The active goal has been updated and supersedes any previous goal context:
 <objective>${escapeXml(goal.objective)}</objective>
@@ -299,7 +301,8 @@ export function createGoalToolDefinitions(host: GoalToolHost): ToolDefinition[] 
 		defineTool({
 			name: "create_goal",
 			label: "Create goal",
-			description: "Create a new active goal for the session. Use only when the user explicitly asks to start a goal.",
+			description:
+				"Create a new active goal for the session. Use only when the user explicitly asks to start a goal.",
 			promptSnippet: "Create a persistent session goal when explicitly requested by the user.",
 			parameters: createGoalSchema,
 			executionMode: "sequential",

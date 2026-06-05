@@ -40,6 +40,21 @@ describe("AgentSession prompt characterization", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("refreshes model-visible runtime settings in the system prompt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		expect(harness.session.systemPrompt).toContain("Execution mode: approval mode");
+		expect(harness.session.systemPrompt).toContain("Verification gate: enabled for code/configuration changes");
+
+		harness.settingsManager.setExecutionMode("unattended");
+		harness.settingsManager.setVerificationGateEnabled(false);
+		harness.session.refreshSystemPrompt();
+
+		expect(harness.session.systemPrompt).toContain("Execution mode: unattended mode");
+		expect(harness.session.systemPrompt).toContain("Verification gate: disabled");
+	});
+
 	it("handles a tool call turn and waits for the follow-up LLM response", async () => {
 		const toolRuns: string[] = [];
 		const echoTool: AgentTool = {

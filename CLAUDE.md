@@ -1,3 +1,20 @@
+# Git 提交规范
+
+## 核心原则：只提交纯净源码
+
+提交代码时必须确保：
+- **只提交源码文件**（.ts, .vue, .json, .md 等）
+- **不提交依赖包**（node_modules/）
+- **不提交构建产物**（dist/, release/, release-bugfix/, *.exe, *.blockmap 等）
+- **不提交编译中间产物**（*.tsbuildinfo, *.log 等）
+
+目标：别人 clone 仓库后执行 `npm install` → `npm run build` → 打包，即可生成相同的可执行文件。
+
+检查清单：
+1. 运行 `git status` 确认没有意外文件
+2. 使用 `git add <具体文件路径>` 暂存，绝不使用 `git add .` 或 `git add -A`
+3. 确认 .gitignore 已覆盖所有产物目录
+
 # 开发规范
 
 ## 对话风格

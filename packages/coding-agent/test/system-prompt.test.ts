@@ -1,5 +1,11 @@
 import { describe, expect, test } from "vitest";
-import { buildSystemPrompt } from "../src/core/system-prompt.ts";
+import {
+	buildSystemPrompt,
+	definePromptFragment,
+	getPromptFragmentMarkers,
+	matchesPromptFragment,
+	renderPromptFragment,
+} from "../src/core/system-prompt.ts";
 
 describe("buildSystemPrompt", () => {
 	describe("empty tools", () => {
@@ -27,6 +33,26 @@ describe("buildSystemPrompt", () => {
 	});
 
 	describe("default tools", () => {
+		test("renders typed prompt fragments with stable markers", () => {
+			const fragment = definePromptFragment({
+				tag: "sample_context",
+				role: "developer",
+				source: "runtime",
+				priority: 20,
+				body: "Use the current runtime context.",
+			});
+			const rendered = renderPromptFragment(fragment);
+
+			expect(rendered).toContain('<sample_context role="developer" source="runtime" priority="20">');
+			expect(rendered).toContain("</sample_context>");
+			expect(getPromptFragmentMarkers("sample_context")).toEqual({
+				startMarker: "<sample_context",
+				endMarker: "</sample_context>",
+			});
+			expect(matchesPromptFragment(rendered, "sample_context")).toBe(true);
+			expect(matchesPromptFragment("<other_context>text</other_context>", "sample_context")).toBe(false);
+		});
+
 		test("renders core instructions as structured prompt fragments", () => {
 			const prompt = buildSystemPrompt({
 				contextFiles: [],
@@ -34,13 +60,19 @@ describe("buildSystemPrompt", () => {
 				cwd: process.cwd(),
 			});
 
-			expect(prompt).toContain("<role_and_scope>");
-			expect(prompt).toContain("<instruction_hierarchy>");
-			expect(prompt).toContain("<task_execution>");
-			expect(prompt).toContain("<tool_use>");
-			expect(prompt).toContain("<context_boundaries>");
-			expect(prompt).toContain("<runtime_context>");
+			expect(prompt).toContain('<role_and_scope role="system" source="base"');
+			expect(prompt).toContain('<instruction_hierarchy role="system" source="base"');
+			expect(prompt).toContain('<task_execution role="developer" source="base"');
+			expect(prompt).toContain('<tool_use role="developer" source="tools"');
+			expect(prompt).toContain('<context_boundaries role="developer" source="base"');
+			expect(prompt).toContain('<environment_context role="developer" source="runtime"');
 			expect(prompt).toContain("adapt to the user's actual task");
+			expect(
+				matchesPromptFragment(
+					prompt.match(/<role_and_scope[\s\S]*?<\/role_and_scope>/)?.[0] ?? "",
+					"role_and_scope",
+				),
+			).toBe(true);
 		});
 
 		test("includes all default tools when snippets are provided", () => {
@@ -81,10 +113,8 @@ describe("buildSystemPrompt", () => {
 				cwd: process.cwd(),
 			});
 
-			expect(prompt).toContain("<project_context>");
-			expect(prompt).toContain(
-				"Treat these as task/project context rather than immutable system rules.",
-			);
+			expect(prompt).toContain('<project_context role="user" source="project"');
+			expect(prompt).toContain("listed from broadest to most specific");
 			expect(prompt).toContain('<project_instructions path="AGENTS.md">');
 		});
 	});
@@ -139,6 +169,53 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
+		});
+	});
+
+	describe("environment context", () => {
+		test("includes OS and configured POSIX shell guidance", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: "C:\\Users\\me\\project",
+				runtimeEnvironment: {
+					platform: "win32",
+					osName: "Windows",
+					timezone: "Asia/Shanghai",
+					shell: {
+						path: "C:\\Program Files\\Git\\bin\\bash.exe",
+						args: ["-c"],
+					},
+				},
+			});
+
+			expect(prompt).toContain('<environment_context role="developer" source="runtime"');
+			expect(prompt).toContain("Timezone: Asia/Shanghai");
+			expect(prompt).toContain("Current working directory: C:/Users/me/project");
+			expect(prompt).toContain("Operating system: Windows (win32)");
+			expect(prompt).toContain("Execution mode: approval mode");
+			expect(prompt).toContain("Verification gate: enabled for code/configuration changes");
+			expect(prompt).toContain("Command shell for bash tool: C:\\Program Files\\Git\\bin\\bash.exe -c");
+			expect(prompt).toContain("Shell syntax for bash tool: POSIX shell/bash syntax.");
+			expect(prompt).toContain("use /dev/null to discard output");
+			expect(prompt).toContain("do not use bare NUL/nul redirection");
+		});
+
+		test("describes unavailable shell instead of hiding it", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: "/workspace",
+				runtimeEnvironment: {
+					platform: "win32",
+					shell: {
+						error: "No bash shell found",
+					},
+				},
+			});
+
+			expect(prompt).toContain("Command shell for bash tool: unavailable (No bash shell found)");
+			expect(prompt).toContain("bash tool calls may fail");
 		});
 	});
 });

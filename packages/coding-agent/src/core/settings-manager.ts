@@ -5,6 +5,7 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import type { AgentExecutionMode } from "./tool-execution-policy.ts";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -28,6 +29,11 @@ export interface RetrySettings {
 	maxRetries?: number; // default: 3
 	baseDelayMs?: number; // default: 2000 (exponential backoff: 2s, 4s, 8s)
 	provider?: ProviderRetrySettings;
+}
+
+export interface ExecutionSettings {
+	mode?: AgentExecutionMode; // default: "approval"
+	verificationGate?: boolean; // default: true
 }
 
 export interface TerminalSettings {
@@ -86,6 +92,7 @@ export interface Settings {
 	compaction?: CompactionSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
+	execution?: ExecutionSettings;
 	hideThinkingBlock?: boolean;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
@@ -731,6 +738,32 @@ export class SettingsManager {
 			maxRetries: this.settings.retry?.maxRetries ?? 3,
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
 		};
+	}
+
+	getExecutionMode(): AgentExecutionMode {
+		return this.settings.execution?.mode === "unattended" ? "unattended" : "approval";
+	}
+
+	setExecutionMode(mode: AgentExecutionMode): void {
+		if (!this.globalSettings.execution) {
+			this.globalSettings.execution = {};
+		}
+		this.globalSettings.execution.mode = mode;
+		this.markModified("execution", "mode");
+		this.save();
+	}
+
+	getVerificationGateEnabled(): boolean {
+		return this.settings.execution?.verificationGate ?? true;
+	}
+
+	setVerificationGateEnabled(enabled: boolean): void {
+		if (!this.globalSettings.execution) {
+			this.globalSettings.execution = {};
+		}
+		this.globalSettings.execution.verificationGate = enabled;
+		this.markModified("execution", "verificationGate");
+		this.save();
 	}
 
 	getHttpIdleTimeoutMs(): number {

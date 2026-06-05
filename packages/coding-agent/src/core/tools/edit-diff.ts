@@ -267,6 +267,15 @@ export function generateUnifiedPatch(path: string, oldContent: string, newConten
 	});
 }
 
+function splitDisplayLines(content: string): string[] {
+	if (content.length === 0) return [];
+	const lines = normalizeToLF(content).split("\n");
+	if (lines[lines.length - 1] === "") {
+		lines.pop();
+	}
+	return lines;
+}
+
 /**
  * Generate a display-oriented diff string with line numbers and context.
  * Returns both the diff string and the first changed line number (in the new file).
@@ -276,12 +285,12 @@ export function generateDiffString(
 	newContent: string,
 	contextLines = 4,
 ): { diff: string; firstChangedLine: number | undefined } {
-	const parts = Diff.diffLines(oldContent, newContent);
+	const oldLines = splitDisplayLines(oldContent);
+	const newLines = splitDisplayLines(newContent);
+	const parts = Diff.diffArrays(oldLines, newLines);
 	const output: string[] = [];
 
-	const oldLines = oldContent.split("\n");
-	const newLines = newContent.split("\n");
-	const maxLineNum = Math.max(oldLines.length, newLines.length);
+	const maxLineNum = Math.max(1, oldLines.length, newLines.length);
 	const lineNumWidth = String(maxLineNum).length;
 
 	let oldLineNum = 1;
@@ -291,10 +300,7 @@ export function generateDiffString(
 
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i];
-		const raw = part.value.split("\n");
-		if (raw[raw.length - 1] === "") {
-			raw.pop();
-		}
+		const raw = part.value;
 
 		if (part.added || part.removed) {
 			// Capture the first changed line (in the new file)

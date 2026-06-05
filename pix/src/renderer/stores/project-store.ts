@@ -106,20 +106,53 @@ export const useProjectStore = defineStore("project", () => {
     await listSessions();
   }
 
+  async function removeRecentProject(path: string): Promise<void> {
+    const next = recentProjects.value.filter((project) => project.path !== path);
+    recentProjects.value = next;
+    try {
+      const settings = await api().getSettings();
+      const latest = (settings.recentProjects || []).filter((project: ProjectInfo) => project.path !== path);
+      await api().setSettings({ recentProjects: latest });
+      recentProjects.value = latest;
+    } catch (err) {
+      console.error("[project-store] Failed to remove recent project:", err);
+      await loadSettings();
+    }
+  }
+
   function setCurrentProject(project: ProjectInfo | null): void {
     currentProject.value = project;
   }
 
+  async function syncRecentProjectSessionCount(projectPath: string, sessionCount: number): Promise<void> {
+    try {
+      const settings = await api().getSettings();
+      const projects = settings.recentProjects || [];
+      const existing = projects.findIndex((project: ProjectInfo) => project.path === projectPath);
+      if (existing === -1 || projects[existing]?.sessionCount === sessionCount) {
+        if (existing !== -1) recentProjects.value = projects;
+        return;
+      }
+      const updated = [...projects];
+      updated[existing] = { ...updated[existing], sessionCount };
+      await api().setSettings({ recentProjects: updated });
+      recentProjects.value = updated;
+    } catch {
+      // Non-critical; the session list itself is still current.
+    }
+  }
+
   async function listSessions(): Promise<void> {
-    if (!currentProject.value) return;
+    const project = currentProject.value;
+    if (!project) return;
     isLoadingSessions.value = true;
     try {
-      const sessionInfos = await api().listSessions(currentProject.value.path);
+      const sessionInfos = await api().listSessions(project.path);
       if (Array.isArray(sessionInfos)) {
+        if (currentProject.value?.path !== project.path) return;
         sessions.value = sessionInfos;
-        if (currentProject.value) {
-          currentProject.value.sessionCount = sessionInfos.length;
-        }
+        currentProject.value.sessionCount = sessionInfos.length;
+        await syncRecentProjectSessionCount(project.path, sessionInfos.length);
       }
     } catch (err) {
       console.error("[project-store] Failed to list sessions:", err);
@@ -165,6 +198,7 @@ export const useProjectStore = defineStore("project", () => {
     openProject,
     setCurrentProject,
     listSessions,
+    removeRecentProject,
     setCurrentSession,
     syncCurrentSession,
     addSession,

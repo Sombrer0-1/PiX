@@ -36,11 +36,13 @@ onMounted(async () => {
 });
 
 function toggleNode(id: string): void {
-  if (expandedNodes.value.has(id)) {
-    expandedNodes.value.delete(id);
+  const next = new Set(expandedNodes.value);
+  if (next.has(id)) {
+    next.delete(id);
   } else {
-    expandedNodes.value.add(id);
+    next.add(id);
   }
+  expandedNodes.value = next;
 }
 
 async function navigateTo(targetId: string): Promise<void> {

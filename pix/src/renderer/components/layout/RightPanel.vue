@@ -47,7 +47,7 @@ const goalStatusText = computed(() => {
 const goalBudgetText = computed(() => {
   const currentGoal = goal.value;
   if (!currentGoal) return "-";
-  const budget = currentGoal.tokenBudget === undefined ? "不限" : currentGoal.tokenBudget.toLocaleString();
+  const budget = currentGoal.tokenBudget == null ? "不限" : currentGoal.tokenBudget.toLocaleString();
   return `${currentGoal.tokensUsed.toLocaleString()} / ${budget}`;
 });
 const goalTimeText = computed(() => {
@@ -216,7 +216,7 @@ watch(() => rpc.isConnected.value, (connected) => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: var(--pix-space-lg);
+  padding: calc(var(--pix-space-lg) + 8px) var(--pix-space-lg) var(--pix-space-lg);
   gap: var(--pix-space-md);
   user-select: none;
 }

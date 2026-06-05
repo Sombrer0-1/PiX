@@ -147,18 +147,17 @@ export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.ts";
+export {
+	countDiffStat,
+	type DiffStat,
+	extractFileChangeFromToolResult,
+	type FileChangeSummary,
+	type TurnDiffSummary,
+} from "./core/file-change.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
-export { convertToLlm } from "./core/messages.ts";
 export type { CreateGoalOptions, ThreadGoal, ThreadGoalStatus, UpdateGoalOptions } from "./core/goal-runtime.ts";
-export type {
-	RequestUserInputHandler,
-	RequestUserInputOption,
-	RequestUserInputQuestion,
-	RequestUserInputRequest,
-	RequestUserInputResponse,
-	UserInputAttachment,
-} from "./core/request-user-input-tool.ts";
+export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export type {
 	PackageManager,
@@ -169,6 +168,14 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
+export type {
+	RequestUserInputHandler,
+	RequestUserInputOption,
+	RequestUserInputQuestion,
+	RequestUserInputRequest,
+	RequestUserInputResponse,
+	UserInputAttachment,
+} from "./core/request-user-input-tool.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage
@@ -224,6 +231,7 @@ export {
 } from "./core/session-manager.ts";
 export {
 	type CompactionSettings,
+	type ExecutionSettings,
 	type ImageSettings,
 	type PackageSource,
 	type RetrySettings,
@@ -240,6 +248,11 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
+export {
+	type AgentExecutionMode,
+	inspectToolExecution,
+	type ToolPolicyDecision,
+} from "./core/tool-execution-policy.ts";
 // Tools
 export {
 	type BashOperations,

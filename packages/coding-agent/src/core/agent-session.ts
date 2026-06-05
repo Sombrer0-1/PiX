@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -36,7 +37,7 @@ import {
 import { theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { killTrackedDetachedChildren } from "../utils/shell.ts";
+import { getShellConfig, killTrackedDetachedChildren } from "../utils/shell.ts";
 import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
@@ -81,34 +82,48 @@ import {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import {
+	addFileChangeToTurnSummary,
+	emptyTurnDiffSummary,
+	extractFileChangeFromToolResult,
+	type FileChangeSummary,
+	type TurnDiffSummary,
+} from "./file-change.ts";
+import {
+	type CreateGoalOptions,
 	createGoalContinuationPrompt,
 	createGoalToolDefinitions,
 	createGoalUpdatedPrompt,
-	formatGoalForTool,
 	GOAL_TOOL_NAMES,
 	GoalRuntime,
-	type CreateGoalOptions,
 	type ThreadGoal,
 	type UpdateGoalOptions,
 } from "./goal-runtime.ts";
+import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import type { ModelRegistry } from "./model-registry.ts";
+import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import {
 	createRequestUserInputToolDefinitions,
 	type RequestUserInputHandler,
 	type UserInputAttachment,
 } from "./request-user-input-tool.ts";
-import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
-import type { ModelRegistry } from "./model-registry.ts";
-import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import { BUILTIN_SLASH_COMMANDS, type SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
-import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
+import { type BuildSystemPromptOptions, buildSystemPrompt, type RuntimeEnvironmentContext } from "./system-prompt.ts";
+import { inspectToolExecution } from "./tool-execution-policy.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+import {
+	createVerificationContinuationMessage,
+	createVerificationGateState,
+	looksLikeVerificationCommand,
+	shouldQueueVerificationContinuation,
+	type VerificationGateState,
+} from "./verification-gate.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -154,6 +169,18 @@ export type AgentSessionEvent =
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| { type: "goal_update"; goal: ThreadGoal | undefined }
+	| {
+			type: "file_change";
+			toolCallId: string;
+			toolName: string;
+			change: FileChangeSummary;
+			aggregate: TurnDiffSummary;
+	  }
+	| {
+			type: "verification_gate";
+			reason: "file_changes";
+			summary: TurnDiffSummary;
+	  }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -336,6 +363,12 @@ export class AgentSession {
 	private _goalAutoContinueSuspendedFor: string | undefined = undefined;
 	private _disposed = false;
 
+	// Tool policy, file-change tracking, and verification gate state
+	private _toolArgsById = new Map<string, unknown>();
+	private _turnDiffSummary: TurnDiffSummary = emptyTurnDiffSummary();
+	private _verificationGateState: VerificationGateState = createVerificationGateState(emptyTurnDiffSummary());
+	private _requestUserInput?: RequestUserInputHandler;
+
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
@@ -378,20 +411,15 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		this._requestUserInput = config.requestUserInput;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._goalRuntime = new GoalRuntime(config.sessionManager);
 		const builtInEnhancementTools =
 			config.enableBuiltInEnhancementTools === false
 				? []
-				: [
-						...createRequestUserInputToolDefinitions(config.requestUserInput),
-						...createGoalToolDefinitions(this),
-					];
-		this._customTools = [
-			...(config.customTools ?? []),
-			...builtInEnhancementTools,
-		];
+				: [...createRequestUserInputToolDefinitions(config.requestUserInput), ...createGoalToolDefinitions(this)];
+		this._customTools = [...(config.customTools ?? []), ...builtInEnhancementTools];
 		this._cwd = config.cwd;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
@@ -455,6 +483,54 @@ export class AgentSession {
 		return result.ok ? { apiKey: result.apiKey, headers: result.headers } : {};
 	}
 
+	private _approvalSummary(toolName: string, args: unknown): string {
+		if (toolName === "bash") {
+			const command = this._getCommandText(args);
+			if (command) return this._truncateApprovalText(command);
+		}
+		if (args && typeof args === "object" && !Array.isArray(args)) {
+			const record = args as Record<string, unknown>;
+			const path = record.path ?? record.file_path ?? record.file ?? record.filename;
+			if (typeof path === "string") return this._truncateApprovalText(path);
+		}
+		try {
+			return this._truncateApprovalText(JSON.stringify(args));
+		} catch {
+			return toolName;
+		}
+	}
+
+	private _truncateApprovalText(text: string | undefined, maxLength = 180): string {
+		const value = (text ?? "").replace(/\s+/g, " ").trim();
+		return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+	}
+
+	private async _requestToolApproval(toolName: string, args: unknown, reason?: string): Promise<boolean> {
+		const handler = this._requestUserInput;
+		if (!handler) return false;
+		const target = this._approvalSummary(toolName, args);
+		const reasonText = reason ? ` 原因：${reason}。` : "";
+		try {
+			const response = await handler({
+				id: randomUUID(),
+				questions: [
+					{
+						id: "approval",
+						header: "工具审批",
+						question: `${toolName} 想执行：${target}.${reasonText}是否允许本次执行？`,
+						options: [
+							{ label: "允许执行", description: "仅允许这一次工具调用继续。" },
+							{ label: "拒绝", description: "阻止这一次工具调用。" },
+						],
+					},
+				],
+			});
+			return !response.cancelled && response.answers.approval === "允许执行";
+		} catch {
+			return false;
+		}
+	}
+
 	/**
 	 * Install tool hooks once on the Agent instance.
 	 *
@@ -465,6 +541,29 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+			const policyDecision = inspectToolExecution({
+				mode: this.settingsManager.getExecutionMode(),
+				toolName: toolCall.name,
+				args,
+				cwd: this.sessionManager.getCwd(),
+			});
+			if (!policyDecision.allowed) {
+				if (policyDecision.requiresApproval) {
+					const approved = await this._requestToolApproval(toolCall.name, args, policyDecision.reason);
+					if (!approved) {
+						return {
+							block: true,
+							reason: policyDecision.reason,
+						};
+					}
+				} else {
+					return {
+						block: true,
+						reason: policyDecision.reason,
+					};
+				}
+			}
+
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
@@ -542,6 +641,7 @@ export class AgentSession {
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			this._goalAutoContinueSuspendedFor = undefined;
+			this._verificationGateState = createVerificationGateState(emptyTurnDiffSummary());
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
 				// Check steering queue first
@@ -560,6 +660,12 @@ export class AgentSession {
 			}
 		}
 
+		if (event.type === "turn_start") {
+			this._turnDiffSummary = emptyTurnDiffSummary();
+		} else if (event.type === "tool_execution_start") {
+			this._toolArgsById.set(event.toolCallId, event.args);
+		}
+
 		if (event.type === "tool_execution_end" && !event.isError && !GOAL_TOOL_NAMES.has(event.toolName)) {
 			this._markGoalProgress();
 		}
@@ -569,6 +675,10 @@ export class AgentSession {
 
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+
+		if (event.type === "tool_execution_end") {
+			this._recordToolExecutionOutcome(event);
+		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
@@ -645,6 +755,48 @@ export class AgentSession {
 		if (typeof content === "string") return content;
 		const textBlocks = content.filter((c) => c.type === "text");
 		return textBlocks.map((c) => (c as TextContent).text).join("");
+	}
+
+	private _getCommandText(args: unknown): string | undefined {
+		if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+		const command = (args as Record<string, unknown>).command;
+		return typeof command === "string" ? command : undefined;
+	}
+
+	private _recordToolExecutionOutcome(event: Extract<AgentEvent, { type: "tool_execution_end" }>): void {
+		const args = this._toolArgsById.get(event.toolCallId);
+		this._toolArgsById.delete(event.toolCallId);
+
+		const change = extractFileChangeFromToolResult({
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			args,
+			result: event.result,
+			isError: event.isError,
+		});
+		if (change) {
+			this._turnDiffSummary = addFileChangeToTurnSummary(this._turnDiffSummary, change);
+			this._verificationGateState.hasFileChanges = true;
+			this._verificationGateState.verificationAttemptedAfterLastChange = false;
+			this._verificationGateState.verificationSucceededAfterLastChange = false;
+			this._verificationGateState.summary = addFileChangeToTurnSummary(this._verificationGateState.summary, change);
+			this._emit({
+				type: "file_change",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				change,
+				aggregate: this._turnDiffSummary,
+			});
+			return;
+		}
+
+		if (event.toolName === "bash") {
+			const command = this._getCommandText(args);
+			if (command && looksLikeVerificationCommand(command)) {
+				this._verificationGateState.verificationAttemptedAfterLastChange = true;
+				this._verificationGateState.verificationSucceededAfterLastChange = !event.isError;
+			}
+		}
 	}
 
 	/** Find the last assistant message in agent state (including aborted ones) */
@@ -791,11 +943,13 @@ export class AgentSession {
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	async dispose(options: {
-		reason?: SessionShutdownEvent["reason"];
-		targetSessionFile?: string;
-		emitSessionShutdown?: boolean;
-	} = {}): Promise<void> {
+	async dispose(
+		options: {
+			reason?: SessionShutdownEvent["reason"];
+			targetSessionFile?: string;
+			emitSessionShutdown?: boolean;
+		} = {},
+	): Promise<void> {
 		if (this._disposed) return;
 		this._disposed = true;
 
@@ -911,8 +1065,15 @@ export class AgentSession {
 		}
 		this.agent.state.tools = tools;
 
-		// Rebuild base system prompt with new tool set
-		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
+		this.refreshSystemPrompt(validToolNames);
+	}
+
+	/**
+	 * Rebuild the base system prompt from current runtime settings, tools, project context, and skills.
+	 * Use this when model-visible settings such as execution mode, verification gate, or shell path change.
+	 */
+	refreshSystemPrompt(toolNames = this.getActiveToolNames()): void {
+		this._baseSystemPrompt = this._rebuildSystemPrompt(toolNames);
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
@@ -994,6 +1155,31 @@ export class AgentSession {
 		return Array.from(unique);
 	}
 
+	private _runtimeEnvironmentContext(): RuntimeEnvironmentContext {
+		const shellPath = this.settingsManager.getShellPath();
+		try {
+			const shellConfig = getShellConfig(shellPath);
+			return {
+				platform: process.platform,
+				executionMode: this.settingsManager.getExecutionMode(),
+				verificationGate: this.settingsManager.getVerificationGateEnabled(),
+				shell: {
+					path: shellConfig.shell,
+					args: shellConfig.args,
+				},
+			};
+		} catch (error) {
+			return {
+				platform: process.platform,
+				executionMode: this.settingsManager.getExecutionMode(),
+				verificationGate: this.settingsManager.getVerificationGateEnabled(),
+				shell: {
+					error: error instanceof Error ? error.message : String(error),
+				},
+			};
+		}
+	}
+
 	private _rebuildSystemPrompt(toolNames: string[]): string {
 		const validToolNames = toolNames.filter((name) => this._toolRegistry.has(name));
 		const toolSnippets: Record<string, string> = {};
@@ -1019,6 +1205,7 @@ export class AgentSession {
 
 		this._baseSystemPromptOptions = {
 			cwd: this._cwd,
+			runtimeEnvironment: this._runtimeEnvironmentContext(),
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
@@ -1076,7 +1263,33 @@ export class AgentSession {
 			return true;
 		}
 
+		if (this._prepareVerificationContinuationIfNeeded()) {
+			return true;
+		}
+
 		return this._prepareGoalContinuationIfNeeded();
+	}
+
+	private _prepareVerificationContinuationIfNeeded(): boolean {
+		const state = this._verificationGateState;
+		if (
+			!shouldQueueVerificationContinuation({
+				enabled: this.settingsManager.getVerificationGateEnabled(),
+				hasActiveGoal: this.goal?.status === "active",
+				state,
+			})
+		) {
+			return false;
+		}
+
+		state.continuationCount++;
+		this._emit({
+			type: "verification_gate",
+			reason: "file_changes",
+			summary: state.summary,
+		});
+		this.agent.followUp(createVerificationContinuationMessage(state.summary));
+		return this.agent.hasQueuedMessages();
 	}
 
 	get goal(): ThreadGoal | undefined {
@@ -1196,7 +1409,12 @@ export class AgentSession {
 			timestamp: Date.now(),
 		} satisfies CustomMessage<Record<string, unknown>>;
 		this.agent.state.messages.push(message);
-		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+		);
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
 	}
@@ -1219,18 +1437,14 @@ export class AgentSession {
 	}
 
 	private _scheduleGoalContinuation(): void {
-		try {
-			this._assertGoalContinuationReady();
-			void this.continueActiveGoalIfIdle().catch((err) => {
-				this._extensionRunner.emitError({
-					extensionPath: "<goal>",
-					event: "goal_continuation",
-					error: err instanceof Error ? err.message : String(err),
-				});
+		this._assertGoalContinuationReady();
+		void this.continueActiveGoalIfIdle().catch((err) => {
+			this._extensionRunner.emitError({
+				extensionPath: "<goal>",
+				event: "goal_continuation",
+				error: err instanceof Error ? err.message : String(err),
 			});
-		} catch (err) {
-			throw err;
-		}
+		});
 	}
 
 	/**
@@ -2433,8 +2647,7 @@ export class AgentSession {
 		};
 
 		this._resourceLoader.extendResources(extensionPaths);
-		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
-		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this.refreshSystemPrompt();
 	}
 
 	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{

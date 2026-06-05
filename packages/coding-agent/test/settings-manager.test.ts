@@ -26,6 +26,27 @@ describe("SettingsManager", () => {
 	});
 
 	describe("preserves externally added settings", () => {
+		it("should persist execution settings without dropping other global settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					theme: "dark",
+					defaultModel: "claude-sonnet",
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setExecutionMode("unattended");
+			manager.setVerificationGateEnabled(false);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.theme).toBe("dark");
+			expect(savedSettings.defaultModel).toBe("claude-sonnet");
+			expect(savedSettings.execution).toEqual({ mode: "unattended", verificationGate: false });
+		});
+
 		it("should preserve enabledModels when changing thinking level", async () => {
 			// Create initial settings file
 			const settingsPath = join(agentDir, "settings.json");

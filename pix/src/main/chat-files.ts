@@ -112,13 +112,7 @@ function basenameFromPath(filePath: string): string {
 
 function resolveReadPath(filePath: string, cwd: string): string {
 	const resolved = resolveToCwd(filePath, cwd);
-	const candidates = [
-		resolved,
-		tryMacOSScreenshotPath(resolved),
-		resolved.normalize("NFD"),
-		resolved.replace(/'/g, "\u2019"),
-		resolved.normalize("NFD").replace(/'/g, "\u2019"),
-	];
+	const candidates = buildPathCandidates(resolved);
 
 	for (const candidate of candidates) {
 		if (existsSync(candidate)) {
@@ -127,6 +121,27 @@ function resolveReadPath(filePath: string, cwd: string): string {
 	}
 
 	return resolved;
+}
+
+function buildPathCandidates(filePath: string): string[] {
+	const candidates = new Set<string>();
+	const addCandidate = (candidate: string): void => {
+		candidates.add(candidate);
+		candidates.add(candidate.normalize("NFC"));
+		candidates.add(candidate.normalize("NFD"));
+		candidates.add(candidate.normalize("NFKC"));
+		candidates.add(candidate.normalize("NFKD"));
+		candidates.add(candidate.replace(/'/g, "\u2019"));
+		candidates.add(candidate.replace(/\u2019/g, "'"));
+		candidates.add(candidate.normalize("NFD").replace(/'/g, "\u2019"));
+		candidates.add(candidate.normalize("NFD").replace(/\u2019/g, "'"));
+		candidates.add(candidate.normalize("NFKC").replace(/'/g, "\u2019"));
+		candidates.add(candidate.normalize("NFKC").replace(/\u2019/g, "'"));
+	};
+
+	addCandidate(filePath);
+	addCandidate(tryMacOSScreenshotPath(filePath));
+	return Array.from(candidates);
 }
 
 function resolveToCwd(filePath: string, cwd: string): string {

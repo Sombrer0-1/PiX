@@ -295,8 +295,8 @@ async function getAvailableThinkingLevels(): Promise<ThinkingLevel[] | null> {
 	return sendCommand<ThinkingLevel[]>({ type: "get_available_thinking_levels" });
 }
 
-async function supportsThinking(): Promise<boolean> {
-	return sendCommand<boolean>({ type: "supports_thinking" }) as Promise<boolean>;
+async function supportsThinking(): Promise<boolean | null> {
+	return sendCommand<boolean>({ type: "supports_thinking" });
 }
 
 async function setScopedModels(patterns: string[]): Promise<void> {
@@ -357,8 +357,11 @@ async function getUserMessagesForForking(): Promise<UserMessageForForking[] | nu
 	return sendCommand<UserMessageForForking[]>({ type: "get_user_messages_for_forking" });
 }
 
-async function navigateTree(targetId: string, options?: { summarize?: boolean; customInstructions?: string; label?: string }): Promise<{ cancelled: boolean } | null> {
-	return sendCommand<{ cancelled: boolean }>({ type: "navigate_tree", ...options, targetId } as RpcCommand);
+async function navigateTree(
+	targetId: string,
+	options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
+): Promise<{ cancelled: boolean } | null> {
+	return sendCommand<{ cancelled: boolean }>({ type: "navigate_tree", ...options, targetId });
 }
 
 // =========================================================================

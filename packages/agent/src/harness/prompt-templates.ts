@@ -214,9 +214,13 @@ function parseFrontmatter<T extends Record<string, unknown>>(
 }
 
 function basenameEnvPath(path: string): string {
-	const normalized = path.replace(/\/+$/, "");
+	const normalized = normalizeEnvPath(path);
 	const slashIndex = normalized.lastIndexOf("/");
 	return slashIndex === -1 ? normalized : normalized.slice(slashIndex + 1);
+}
+
+function normalizeEnvPath(path: string): string {
+	return path.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
 /** Parse an argument string using simple shell-style single and double quotes. */
