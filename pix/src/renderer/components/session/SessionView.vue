@@ -236,7 +236,6 @@ const props = defineProps<{
 
 const expandedWorkStatus = ref<Set<string>>(new Set());
 const expandedTools = ref<Set<string>>(new Set());
-const copiedKeys = ref<Set<string>>(new Set());
 
 function toolKey(blockId: string, toolCallId: string): string {
   return `${blockId}:${toolCallId}`;
@@ -259,20 +258,6 @@ function toggleTool(blockId: string, toolCallId: string): void {
 
 function isToolExpanded(blockId: string, toolCallId: string): boolean {
   return expandedTools.value.has(toolKey(blockId, toolCallId));
-}
-
-async function copyText(text: string, key: string): Promise<void> {
-  if (!text.trim()) return;
-  const copied = await writeClipboardText(text);
-  if (!copied) return;
-  const next = new Set(copiedKeys.value);
-  next.add(key);
-  copiedKeys.value = next;
-  window.setTimeout(() => {
-    const updated = new Set(copiedKeys.value);
-    updated.delete(key);
-    copiedKeys.value = updated;
-  }, 1400);
 }
 
 async function writeClipboardText(text: string): Promise<boolean> {
@@ -356,45 +341,6 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
           :class="{ streaming: block.isStreaming }"
           v-html="renderMarkdown(block.content)"
         ></div>
-        <div v-if="block.content.trim()" class="agent-actions">
-          <button
-            class="copy-response-btn"
-            type="button"
-            :title="copiedKeys.has(block.id) ? '已复制' : '复制回复'"
-            :aria-label="copiedKeys.has(block.id) ? '已复制' : '复制回复'"
-            @click.stop="copyText(block.content, block.id)"
-          >
-            <svg
-              v-if="copiedKeys.has(block.id)"
-              width="15"
-              height="15"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.4"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
-            >
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-            <svg
-              v-else
-              width="15"
-              height="15"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
-            >
-              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-            </svg>
-          </button>
-        </div>
       </div>
 
       <!-- Thinking indicator - waits for the first assistant text or tool call -->
@@ -576,36 +522,6 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 .agent-content :deep(.code-copy-btn.copied) {
   color: var(--pix-success);
   border-color: #bbf7d0;
-}
-
-.agent-actions {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: var(--pix-space-xs);
-}
-
-.copy-response-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--pix-radius-sm);
-  color: var(--pix-text-secondary);
-  border: 1px solid var(--pix-border-light);
-  background: var(--pix-bg-content);
-  transition:
-    color var(--pix-transition-fast),
-    border-color var(--pix-transition-fast),
-    background var(--pix-transition-fast),
-    transform var(--pix-transition-fast);
-}
-
-.copy-response-btn:hover {
-  color: var(--pix-text-primary);
-  border-color: var(--pix-border);
-  background: var(--pix-bg-hover);
-  transform: translateY(-1px);
 }
 
 .agent-content.streaming :deep(p:last-child::after) {

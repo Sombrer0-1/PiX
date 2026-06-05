@@ -11,7 +11,7 @@
  * │ Composer                     │
  * └──────────────────────────────┘
  */
-import { computed, ref, watch, nextTick } from "vue";
+import { computed, ref, watch, nextTick, onMounted } from "vue";
 import { useSessionStore } from "../../stores/session-store";
 import { useRpc } from "../../composables/useRpc";
 import { useProjectStore } from "../../stores/project-store";
@@ -122,6 +122,14 @@ watch(
   { deep: true }
 );
 
+// Scroll to bottom on mount when there are existing blocks (e.g. navigating back from settings)
+onMounted(async () => {
+  if (sessionStore.displayBlocks.length > 0) {
+    await nextTick();
+    scrollContentToBottom();
+  }
+});
+
 function scrollContentToBottom(): void {
   const el = contentArea.value;
   if (!el) return;
@@ -143,15 +151,6 @@ function handleContentScroll(): void {
 }
 
 // Session ops
-async function copyLastReply(): Promise<void> {
-  try {
-    const result = await rpc.sendCommand<string>({ type: "get_last_assistant_text" });
-    if (result) await navigator.clipboard.writeText(result);
-  } catch (err) {
-    console.error("[CenterPanel] Copy failed:", err);
-  }
-}
-
 async function toggleExecutionMode(): Promise<void> {
   if (isSwitchingExecutionMode.value) return;
   isSwitchingExecutionMode.value = true;
@@ -406,7 +405,6 @@ function autoResize(): void {
           <v-list density="compact">
             <v-list-item @click="exportHtml(); showExportMenu = false" title="导出 HTML" />
             <v-list-item @click="exportJsonl(); showExportMenu = false" title="导出 JSONL" />
-            <v-list-item @click="copyLastReply(); showExportMenu = false" title="复制最后回复" />
           </v-list>
         </v-menu>
       </div>
