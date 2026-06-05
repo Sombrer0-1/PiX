@@ -36,6 +36,7 @@ pi-*.html
 out.html
 packages/coding-agent/binaries/
 pix/release-bugfix/
+vuetify_guide/
 todo.md
 plans/
 .pi/hf-sessions/

@@ -1,3 +1,0 @@
-{
-  "description": "A flexible layout wrapper that allows you to scope layout-aware components like `v-main`, `v-footer`, `v-toolbar`, `v-navigation-drawer`, etc."
-}

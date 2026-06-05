@@ -1,6 +1,0 @@
-{
-  "description": "Root-level layout component resolving global theme and background color.",
-  "exposed": {
-    "theme": "The instance of the injected active theme."
-  }
-}
