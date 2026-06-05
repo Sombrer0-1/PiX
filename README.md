@@ -1,89 +1,82 @@
-<p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-</p>
-<p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
-  <br /><br />
-  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
-</p>
+# PiX
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+PiX 是一个基于 Electron 的桌面 GUI 应用，为 Pi AI 编码代理提供图形化界面。
 
----
+## 技术栈
 
-# Pi Agent Harness Mono Repo
+- **前端**: Vue 3 + Vuetify 3 + Pinia + Vue Router
+- **桌面框架**: Electron
+- **构建工具**: Vite + TypeScript
+- **AI 后端**: Pi Agent Core (支持 OpenAI、Anthropic、Google 等多模型)
 
-This is the home of the pi agent harness project including our self extensible coding agent.
+## 功能特性
 
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
-* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
-* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
+- 多会话管理，支持创建、切换、删除会话
+- 集成 Pi 编码代理，支持代码编辑、文件操作、终端命令执行
+- 可视化设置面板，配置模型、API Key、工作目录等
+- 会话历史记录和文件变更追踪
+- 支持多种 AI 模型和深度思考模式
 
-To learn more about pi:
+## 项目结构
 
-* [Visit pi.dev](https://pi.dev), the project website with demos
-* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
-
-## Share your OSS coding agent sessions
-
-If you use pi or other coding agents for open source work, please share your sessions.
-
-Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
-
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
-
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
-
-I regularly publish my own `pi-mono` work sessions here:
-
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
-
-## All Packages
-
-| Package | Description |
-|---------|-------------|
-| **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
-| **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
-| **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
-
-For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).
-
-## Development
-
-```bash
-npm install --ignore-scripts  # Install all dependencies without running lifecycle scripts
-npm run build        # Build all packages
-npm run check        # Lint, format, and type check
-./test.sh            # Run tests (skips LLM-dependent tests without API keys)
-./pi-test.sh         # Run pi from sources (can be run from any directory)
+```
+pix/
+├── src/
+│   ├── main/           # Electron 主进程
+│   │   ├── index.ts    # 应用入口
+│   │   ├── session-bridge.ts  # 会话管理桥接
+│   │   ├── settings-store.ts  # 设置持久化
+│   │   └── ipc-handlers.ts    # IPC 通信处理
+│   ├── renderer/       # Vue 渲染进程
+│   │   ├── components/ # UI 组件
+│   │   ├── pages/      # 页面视图
+│   │   ├── stores/     # Pinia 状态管理
+│   │   └── composables/# 组合式函数
+│   └── shared/         # 共享类型定义
+├── package.json
+└── tsconfig.json
 ```
 
-## Supply-chain hardening
+## 开发
 
-We treat npm dependency changes as reviewed code changes.
+```bash
+# 安装依赖
+npm install --ignore-scripts
 
-- Direct external dependencies are pinned to exact versions. Internal workspace packages remain version-ranged.
-- `.npmrc` sets `save-exact=true` and `min-release-age=2` to avoid same-day dependency releases during npm resolution.
-- `package-lock.json` is the dependency ground truth. Pre-commit blocks accidental lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1` is set.
-- `npm run check` verifies pinned direct deps, native TypeScript import compatibility, and the generated coding-agent shrinkwrap.
-- The published CLI package includes `packages/coding-agent/npm-shrinkwrap.json`, generated from the root lockfile, to pin transitive deps for npm users.
-- Release smoke tests use `npm run release:local` to build, pack, and create isolated npm and Bun installs outside the repo before tagging a release.
-- Local release installs, documented npm installs, and `pi update --self` use `--ignore-scripts` where supported.
-- CI installs with `npm ci --ignore-scripts`, and a scheduled GitHub workflow runs `npm audit --omit=dev` plus `npm audit signatures --omit=dev`.
-- Shrinkwrap generation has an explicit allowlist for dependency lifecycle scripts; new lifecycle-script deps fail checks until reviewed.
+# 开发模式（同时启动 Vite 和 Electron）
+npm run dev
 
-## License
+# 仅启动渲染进程开发服务器
+npm run dev:renderer
+
+# 构建
+npm run build
+
+# 打包为可执行文件
+npm run package
+```
+
+## 构建打包
+
+```bash
+# 构建并打包为安装程序
+npm run package
+```
+
+打包产物位于 `release/` 目录，包含：
+- Windows: `PiX Setup x.x.x.exe`
+- macOS: `PiX-x.x.x.dmg`
+- Linux: `PiX-x.x.x.AppImage`
+
+## 依赖包
+
+| 包名 | 说明 |
+|------|------|
+| `@earendil-works/pi-coding-agent` | Pi 编码代理核心 |
+| `@earendil-works/pi-agent-core` | Agent 运行时 |
+| `@earendil-works/pi-ai` | 多模型 LLM API |
+| `pi-mcp-adapter` | MCP 协议适配器 |
+
+## 许可证
 
 MIT
