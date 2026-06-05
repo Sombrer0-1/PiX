@@ -28,9 +28,11 @@ const rpc = useRpc();
 const projectStore = useProjectStore();
 
 type ViewMode = "session" | "raw" | "tree";
+type ExecutionMode = "read-only" | "approval" | "unattended";
 const viewMode = ref<ViewMode>("session");
 const showExportMenu = ref(false);
 const showForkDialog = ref(false);
+const showExecutionModeMenu = ref(false);
 const contentArea = ref<HTMLElement | null>(null);
 const shouldStickToBottom = ref(true);
 
@@ -101,12 +103,14 @@ const modelButtonDisplay = computed(() => {
   return `${model.provider}/${model.id} · ${thinkingDisplay.value}`;
 });
 
-const executionMode = computed(() => rpc.sessionState.value?.executionMode ?? "approval");
-const executionModeLabel = computed(() => executionMode.value === "unattended" ? "无监管" : "审批");
-const executionModeTitle = computed(() =>
-  executionMode.value === "unattended"
-    ? "当前是无监管模式：Agent 工具调用不会请求审批。点击切换到审批模式。"
-    : "当前是审批模式：高风险工具调用会请求你审批。点击切换到无监管模式。"
+const executionModes: Array<{ value: ExecutionMode; label: string; description: string; icon: string }> = [
+  { value: "read-only", label: "只读", description: "只能读取和搜索，禁止修改文件。", icon: "mdi-eye-outline" },
+  { value: "approval", label: "审批", description: "高风险操作需要确认。", icon: "mdi-shield-check-outline" },
+  { value: "unattended", label: "无监管", description: "工具调用不弹出审批。", icon: "mdi-lightning-bolt-outline" },
+];
+const executionMode = computed<ExecutionMode>(() => rpc.sessionState.value?.executionMode ?? "approval");
+const currentExecutionMode = computed(() =>
+  executionModes.find((mode) => mode.value === executionMode.value) ?? executionModes[1]
 );
 const isSwitchingExecutionMode = ref(false);
 
@@ -151,17 +155,21 @@ function handleContentScroll(): void {
 }
 
 // Session ops
-async function toggleExecutionMode(): Promise<void> {
+async function setExecutionMode(mode: ExecutionMode): Promise<void> {
   if (isSwitchingExecutionMode.value) return;
+  if (executionMode.value === mode) {
+    showExecutionModeMenu.value = false;
+    return;
+  }
   isSwitchingExecutionMode.value = true;
-  const nextMode = executionMode.value === "unattended" ? "approval" : "unattended";
   try {
-    await rpc.setPiSetting("executionMode", nextMode);
+    await rpc.setPiSetting("executionMode", mode);
     await rpc.refreshState();
   } catch (err) {
     console.error("[CenterPanel] Failed to toggle execution mode:", err);
   } finally {
     isSwitchingExecutionMode.value = false;
+    showExecutionModeMenu.value = false;
   }
 }
 
@@ -324,6 +332,7 @@ async function sendMessage(): Promise<void> {
   }
   try {
     if (isStreaming.value) {
+      sessionStore.appendOptimisticUserMessage(text, filePaths);
       rpc.sendCommandAsync({ type: "steer", message: text, filePaths });
     } else {
       await rpc.sendPrompt(text, filePaths);
@@ -410,18 +419,42 @@ function autoResize(): void {
       </div>
 
       <div class="topbar-right">
-        <button
-          class="execution-mode-toggle"
-          :class="executionMode"
-          type="button"
-          :title="executionModeTitle"
-          :aria-label="executionModeTitle"
-          :disabled="isSwitchingExecutionMode"
-          @click="toggleExecutionMode"
-        >
-          <span class="mode-dot"></span>
-          {{ executionModeLabel }}
-        </button>
+        <v-menu v-model="showExecutionModeMenu" location="bottom end" :close-on-content-click="false">
+          <template #activator="{ props: menuProps }">
+            <button
+              class="execution-mode-select"
+              :class="executionMode"
+              type="button"
+              :title="currentExecutionMode.description"
+              :aria-label="`执行模式：${currentExecutionMode.label}`"
+              :disabled="isSwitchingExecutionMode"
+              v-bind="menuProps"
+            >
+              <v-icon :icon="currentExecutionMode.icon" size="14" />
+              <span>{{ currentExecutionMode.label }}</span>
+              <v-icon icon="mdi-chevron-down" size="13" />
+            </button>
+          </template>
+          <div class="execution-mode-menu">
+            <button
+              v-for="mode in executionModes"
+              :key="mode.value"
+              class="execution-mode-option"
+              :class="{ active: executionMode === mode.value }"
+              type="button"
+              @click="setExecutionMode(mode.value)"
+            >
+              <span class="mode-option-icon" :class="mode.value">
+                <v-icon :icon="mode.icon" size="16" />
+              </span>
+              <span class="mode-option-text">
+                <span class="mode-option-label">{{ mode.label }}</span>
+                <span class="mode-option-desc">{{ mode.description }}</span>
+              </span>
+              <v-icon v-if="executionMode === mode.value" icon="mdi-check" size="15" />
+            </button>
+          </div>
+        </v-menu>
         <span class="conn-pill" :class="rpc.isConnected.value ? 'connected' : 'offline'">
           <span class="conn-dot"></span>
           {{ rpc.isConnected.value ? '已连接' : '离线' }}
@@ -432,8 +465,11 @@ function autoResize(): void {
     <!-- Session content -->
     <div class="session-content" ref="contentArea" @scroll="handleContentScroll">
       <div v-if="sessionStore.displayBlocks.length === 0" class="empty-state">
-        <div class="empty-icon">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <div class="empty-orbit" aria-hidden="true">
+          <span class="empty-planet"></span>
+          <span class="empty-ring"></span>
+          <span class="empty-star empty-star-a"></span>
+          <span class="empty-star empty-star-b"></span>
         </div>
         <p class="empty-title">新建会话</p>
         <p class="empty-hint">在下方输入任务开始使用 Pi。</p>
@@ -563,6 +599,9 @@ function autoResize(): void {
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0.94)),
+    var(--pix-bg-content);
 }
 
 /* ── TopBar ── */
@@ -571,13 +610,14 @@ function autoResize(): void {
   align-items: center;
   height: var(--pix-topbar-height);
   min-height: var(--pix-topbar-height);
-  padding: 0 var(--pix-space-lg);
+  padding: 0 var(--pix-space-lg) 0 var(--pix-space-xl);
   background: var(--pix-bg-topbar);
   border-bottom: 1px solid var(--pix-border-light);
   -webkit-app-region: drag;
   user-select: none;
   flex-shrink: 0;
   gap: var(--pix-space-md);
+  backdrop-filter: blur(14px);
 }
 
 .topbar-left {
@@ -592,21 +632,21 @@ function autoResize(): void {
 .topbar-brand {
   font-size: var(--pix-text-sm);
   font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-secondary);
+  color: var(--pix-text-primary);
   flex-shrink: 0;
   letter-spacing: 0.3px;
 }
 
 .topbar-sep {
   font-size: var(--pix-text-md);
-  color: var(--pix-border);
+  color: #b7bdce;
   flex-shrink: 0;
   line-height: 1;
 }
 
 .topbar-path {
   font-size: var(--pix-text-sm);
-  color: var(--pix-text-primary);
+  color: var(--pix-text-secondary);
   font-weight: var(--pix-weight-medium);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -624,7 +664,7 @@ function autoResize(): void {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 2px 10px;
+  padding: 4px 10px;
   border-radius: 12px;
   font-size: var(--pix-text-xs);
   font-weight: var(--pix-weight-medium);
@@ -671,12 +711,17 @@ function autoResize(): void {
   gap: 2px;
   flex-shrink: 0;
   -webkit-app-region: no-drag;
+  padding: 3px;
+  border: 1px solid var(--pix-border-subtle);
+  border-radius: var(--pix-radius-lg);
+  background: rgba(248, 249, 255, 0.88);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
 }
 
 /* View mode tabs */
 .view-tab {
-  padding: 4px 12px;
-  border-radius: var(--pix-radius-sm);
+  padding: 5px 12px;
+  border-radius: var(--pix-radius-md);
   font-size: var(--pix-text-sm);
   font-family: var(--pix-font-ui);
   color: var(--pix-text-secondary);
@@ -686,19 +731,20 @@ function autoResize(): void {
 }
 
 .view-tab:hover {
-  background: var(--pix-bg-hover);
+  background: #ffffff;
   color: var(--pix-text-primary);
 }
 
 .view-tab.active {
-  background: var(--pix-accent-light);
+  background: #ffffff;
   color: var(--pix-accent);
   font-weight: var(--pix-weight-medium);
+  box-shadow: var(--pix-shadow-xs);
 }
 
 .topbar-action {
-  padding: 4px 10px;
-  border-radius: var(--pix-radius-sm);
+  padding: 5px 10px;
+  border-radius: var(--pix-radius-md);
   font-size: var(--pix-text-sm);
   font-family: var(--pix-font-ui);
   color: var(--pix-text-secondary);
@@ -707,7 +753,7 @@ function autoResize(): void {
 }
 
 .topbar-action:hover {
-  background: var(--pix-bg-hover);
+  background: #ffffff;
   color: var(--pix-text-primary);
 }
 
@@ -720,14 +766,14 @@ function autoResize(): void {
   -webkit-app-region: no-drag;
 }
 
-.execution-mode-toggle {
+.execution-mode-select {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 2px 10px;
+  gap: 6px;
+  padding: 4px 10px;
   border: 1px solid var(--pix-border-light);
   border-radius: 12px;
-  background: var(--pix-bg-content);
+  background: #ffffff;
   color: var(--pix-text-secondary);
   font-size: var(--pix-text-xs);
   font-weight: var(--pix-weight-medium);
@@ -738,30 +784,105 @@ function autoResize(): void {
     color var(--pix-transition-fast);
 }
 
-.execution-mode-toggle:hover {
-  background: var(--pix-bg-hover);
+.execution-mode-select:hover {
+  background: var(--pix-accent-light);
   border-color: var(--pix-border);
   color: var(--pix-text-primary);
 }
 
-.execution-mode-toggle:disabled {
+.execution-mode-select:disabled {
   opacity: 0.65;
   cursor: wait;
 }
 
-.execution-mode-toggle .mode-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
+.execution-mode-select.read-only {
+  color: #2563eb;
+  background: #eff6ff;
+  border-color: #dbeafe;
+}
+
+.execution-mode-select.approval {
+  color: var(--pix-warning);
+  background: var(--pix-warning-bg);
+  border-color: var(--pix-warning-light);
+}
+
+.execution-mode-select.unattended {
+  color: var(--pix-success);
+  background: var(--pix-success-bg);
+  border-color: var(--pix-success-light);
+}
+
+.execution-mode-menu {
+  width: 244px;
+  padding: var(--pix-space-xs);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: var(--pix-shadow-xl);
+}
+
+.execution-mode-option {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-sm);
+  width: 100%;
+  min-height: 52px;
+  padding: var(--pix-space-sm);
+  border-radius: var(--pix-radius-lg);
+  text-align: left;
+  color: var(--pix-text-primary);
+}
+
+.execution-mode-option:hover,
+.execution-mode-option.active {
+  background: var(--pix-bg-hover);
+}
+
+.mode-option-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--pix-radius-md);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+  background: var(--pix-bg-code);
+  color: var(--pix-text-secondary);
 }
 
-.execution-mode-toggle.approval .mode-dot {
-  background: var(--pix-warning);
+.mode-option-icon.read-only {
+  background: #eff6ff;
+  color: #2563eb;
 }
 
-.execution-mode-toggle.unattended .mode-dot {
-  background: var(--pix-success);
+.mode-option-icon.approval {
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+}
+
+.mode-option-icon.unattended {
+  background: var(--pix-success-bg);
+  color: var(--pix-success);
+}
+
+.mode-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.mode-option-label {
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-semibold);
+}
+
+.mode-option-desc {
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-muted);
+  line-height: 1.35;
 }
 
 /* Connection pill */
@@ -769,7 +890,7 @@ function autoResize(): void {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 2px 10px;
+  padding: 4px 10px;
   border-radius: 12px;
   font-size: var(--pix-text-xs);
   font-weight: var(--pix-weight-medium);
@@ -799,7 +920,7 @@ function autoResize(): void {
 .session-content {
   flex: 1;
   overflow-y: auto;
-  padding: var(--pix-space-3xl) var(--pix-space-xl);
+  padding: var(--pix-space-3xl) var(--pix-space-xl) var(--pix-space-xl);
 }
 
 .empty-state {
@@ -809,23 +930,83 @@ function autoResize(): void {
   justify-content: center;
   height: 100%;
   text-align: center;
+  padding-bottom: 9vh;
 }
 
-.empty-icon {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  background: var(--pix-bg-hover);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.empty-orbit {
+  position: relative;
+  width: 92px;
+  height: 78px;
   margin-bottom: var(--pix-space-lg);
-  color: var(--pix-text-secondary);
+}
+
+.empty-planet {
+  position: absolute;
+  left: 25px;
+  top: 12px;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 32% 26%, rgba(255, 255, 255, 0.88), transparent 28%),
+    linear-gradient(145deg, #c7c0ff 0%, #7567f5 72%);
+  box-shadow: 0 18px 38px rgba(98, 84, 243, 0.23);
+}
+
+.empty-ring {
+  position: absolute;
+  left: 12px;
+  top: 22px;
+  width: 78px;
+  height: 34px;
+  border: 4px solid rgba(188, 151, 235, 0.28);
+  border-left-color: rgba(98, 84, 243, 0.72);
+  border-radius: 50%;
+  transform: rotate(-24deg);
+}
+
+.empty-star {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  color: var(--pix-accent-soft);
+}
+
+.empty-star::before,
+.empty-star::after {
+  content: "";
+  position: absolute;
+  background: currentColor;
+  border-radius: 999px;
+}
+
+.empty-star::before {
+  left: 3px;
+  top: 0;
+  width: 1px;
+  height: 7px;
+}
+
+.empty-star::after {
+  left: 0;
+  top: 3px;
+  width: 7px;
+  height: 1px;
+}
+
+.empty-star-a {
+  left: 9px;
+  top: 20px;
+}
+
+.empty-star-b {
+  right: 5px;
+  bottom: 18px;
 }
 
 .empty-title {
-  font-size: var(--pix-text-lg);
-  font-weight: var(--pix-weight-medium);
+  font-size: var(--pix-text-xl);
+  font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-primary);
   margin-bottom: var(--pix-space-xs);
 }
@@ -838,7 +1019,7 @@ function autoResize(): void {
 /* ── Composer ── */
 .center-composer {
   flex-shrink: 0;
-  padding: var(--pix-space-md) var(--pix-space-xl) var(--pix-space-lg);
+  padding: var(--pix-space-md) var(--pix-space-xl) var(--pix-space-xl);
 }
 
 .composer-inner {
@@ -846,17 +1027,17 @@ function autoResize(): void {
   display: flex;
   flex-direction: column;
   gap: var(--pix-space-sm);
-  background: var(--pix-bg-content);
+  background: rgba(255, 255, 255, 0.96);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-lg);
-  padding: var(--pix-space-sm);
-  box-shadow: var(--pix-shadow-sm);
+  border-radius: var(--pix-radius-xl);
+  padding: 12px;
+  box-shadow: var(--pix-shadow-lg);
   transition: border-color var(--pix-transition-base), box-shadow var(--pix-transition-base);
 }
 
 .composer-inner:focus-within {
   border-color: var(--pix-accent);
-  box-shadow: var(--pix-shadow-md), 0 0 0 2px var(--pix-accent-light);
+  box-shadow: var(--pix-shadow-lg), 0 0 0 3px rgba(98, 84, 243, 0.12);
 }
 
 .composer-inner.dragging-files {
@@ -877,7 +1058,7 @@ function autoResize(): void {
   gap: 5px;
   max-width: 220px;
   padding: 4px 6px;
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   background: var(--pix-bg-hover);
   color: var(--pix-text-secondary);
   font-size: var(--pix-text-xs);
@@ -923,7 +1104,7 @@ function autoResize(): void {
   color: var(--pix-text-primary);
   resize: none;
   font-family: var(--pix-font-ui);
-  min-height: 48px;
+  min-height: 46px;
 }
 
 .composer-textarea:focus {
@@ -938,7 +1119,7 @@ function autoResize(): void {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 var(--pix-space-xs);
+  padding: 0 2px;
 }
 
 .composer-left {
@@ -959,16 +1140,16 @@ function autoResize(): void {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--pix-radius-sm);
+  width: 30px;
+  height: 30px;
+  border-radius: var(--pix-radius-md);
   color: var(--pix-text-secondary);
   cursor: pointer;
   transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
 }
 
 .composer-icon-btn:hover {
-  background: var(--pix-bg-hover);
+  background: var(--pix-accent-light);
   color: var(--pix-text-primary);
 }
 
@@ -977,8 +1158,8 @@ function autoResize(): void {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 3px 10px;
-  border-radius: var(--pix-radius-sm);
+  padding: 5px 10px;
+  border-radius: var(--pix-radius-md);
   font-size: var(--pix-text-sm);
   font-family: var(--pix-font-ui);
   color: var(--pix-text-secondary);
@@ -1010,9 +1191,9 @@ function autoResize(): void {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
-  border-radius: var(--pix-radius-sm);
+  width: 38px;
+  height: 38px;
+  border-radius: var(--pix-radius-lg);
   cursor: pointer;
   transition:
     background var(--pix-transition-fast),
@@ -1023,14 +1204,13 @@ function autoResize(): void {
 }
 
 .composer-action-btn.primary-action {
-  background: var(--pix-accent);
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
   color: var(--pix-text-inverse);
-  box-shadow: var(--pix-shadow-xs);
+  box-shadow: 0 12px 24px rgba(98, 84, 243, 0.26);
 }
 
 .composer-action-btn.primary-action:hover:not(:disabled) {
-  background: var(--pix-accent-hover);
-  box-shadow: var(--pix-shadow-sm);
+  box-shadow: 0 15px 30px rgba(98, 84, 243, 0.32);
   transform: translateY(-1px);
 }
 

@@ -116,8 +116,10 @@ function toggleExpand(): void {
 .tool-block {
   margin-bottom: var(--pix-space-md);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
+  border-radius: var(--pix-radius-lg);
   overflow: hidden;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: var(--pix-shadow-xs);
 }
 
 .tool-block.error {
@@ -188,7 +190,7 @@ function toggleExpand(): void {
   font-weight: 600;
   font-family: var(--pix-font-mono);
   padding: 1px 5px;
-  border-radius: 3px;
+  border-radius: 999px;
   background: rgba(0, 150, 136, 0.12);
   color: #00897b;
   white-space: nowrap;
@@ -221,7 +223,7 @@ function toggleExpand(): void {
 .tool-body {
   padding: var(--pix-space-md);
   border-top: 1px solid var(--pix-border-light);
-  background: var(--pix-bg-content);
+  background: rgba(255, 255, 255, 0.88);
 }
 
 .tool-section {
@@ -247,7 +249,7 @@ function toggleExpand(): void {
   line-height: var(--pix-leading-tight);
   background: var(--pix-bg-code);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   padding: var(--pix-space-sm) var(--pix-space-md);
   overflow-x: auto;
   max-height: 300px;

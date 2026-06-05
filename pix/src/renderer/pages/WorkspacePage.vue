@@ -182,6 +182,9 @@ onUnmounted(() => {
 <style scoped>
 .user-input-dialog {
   padding: var(--pix-space-lg);
+  border-radius: var(--pix-radius-xl);
+  border: 1px solid var(--pix-border-light);
+  box-shadow: var(--pix-shadow-xl);
 }
 
 .user-input-title {
@@ -227,7 +230,7 @@ onUnmounted(() => {
   width: 100%;
   padding: var(--pix-space-sm) var(--pix-space-md);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-lg);
   color: var(--pix-text-primary);
   background: var(--pix-bg-content);
   text-align: left;
@@ -240,6 +243,7 @@ onUnmounted(() => {
 .question-option.active {
   border-color: var(--pix-accent);
   background: var(--pix-accent-light);
+  box-shadow: inset 3px 0 0 var(--pix-accent);
 }
 
 .option-label {
@@ -259,7 +263,7 @@ onUnmounted(() => {
   min-height: 58px;
   padding: var(--pix-space-sm) var(--pix-space-md);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-lg);
   background: var(--pix-bg-input);
   color: var(--pix-text-primary);
   font-family: var(--pix-font-ui);
@@ -270,7 +274,7 @@ onUnmounted(() => {
 .question-textarea:focus {
   outline: none;
   border-color: var(--pix-accent);
-  box-shadow: 0 0 0 2px var(--pix-accent-light);
+  box-shadow: 0 0 0 3px rgba(98, 84, 243, 0.12);
 }
 
 .user-input-actions {

@@ -12,10 +12,12 @@ const rpc = useRpc();
 const stats = computed(() => rpc.sessionStats.value);
 const contextUsage = computed(() => stats.value?.contextUsage);
 const contextPercent = computed(() => contextUsage.value?.percent ?? null);
-const contextBarWidth = computed(() => {
+const contextRingStyle = computed(() => {
   const percent = contextPercent.value;
-  if (percent === null) return "0%";
-  return `${Math.max(0, Math.min(100, percent))}%`;
+  const safePercent = percent === null ? 0 : Math.max(0, Math.min(100, percent));
+  return {
+    background: `conic-gradient(var(--token-ring-color) ${safePercent}%, #eef0f6 0)`,
+  };
 });
 const contextClass = computed(() => {
   const percent = contextPercent.value ?? 0;
@@ -51,17 +53,15 @@ function formatPercent(n: number | null): string {
   <div class="token-stats">
     <div v-if="stats" class="stats-content">
       <div v-if="stats.contextUsage" class="context-usage" :class="contextClass">
-        <div class="context-row">
-          <span class="context-label">上下文</span>
-          <span class="context-value">
-            {{ formatPercent(stats.contextUsage.percent) }}
-          </span>
+        <div class="context-ring" :style="contextRingStyle">
+          <div class="context-ring-inner">
+            <span class="context-percent">{{ formatPercent(stats.contextUsage.percent) }}</span>
+          </div>
         </div>
-        <div class="context-meter">
-          <div class="context-meter-fill" :style="{ width: contextBarWidth }"></div>
-        </div>
-        <div class="context-detail">
-          {{ formatContextTokens(stats.contextUsage.tokens) }} / {{ formatNumber(stats.contextUsage.contextWindow) }}
+        <div class="context-total">
+          <span>{{ formatContextTokens(stats.contextUsage.tokens) }}</span>
+          <span class="context-divider">/</span>
+          <span>{{ formatNumber(stats.contextUsage.contextWindow) }}</span>
         </div>
       </div>
 
@@ -101,6 +101,7 @@ function formatPercent(n: number | null): string {
 <style scoped>
 .token-stats {
   font-size: var(--pix-text-sm);
+  --token-ring-color: var(--pix-accent);
 }
 
 .stats-content {
@@ -110,66 +111,77 @@ function formatPercent(n: number | null): string {
 }
 
 .context-usage {
-  padding-bottom: var(--pix-space-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding-bottom: var(--pix-space-md);
   border-bottom: 1px solid var(--pix-border-light);
 }
 
-.context-row {
+.context-ring {
+  width: 92px;
+  height: 92px;
+  border-radius: 50%;
+  padding: 10px;
+  transition: background var(--pix-transition-base);
+}
+
+.context-ring-inner {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: var(--pix-bg-card);
+  box-shadow: inset 0 0 0 1px var(--pix-border-subtle);
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: var(--pix-space-xs);
+  justify-content: center;
 }
 
-.context-label {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-secondary);
+.context-percent {
+  color: #000000;
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-lg);
+  font-weight: var(--pix-weight-semibold);
+  line-height: 1.2;
 }
 
-.context-value {
+.context-total {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 48px;
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-sm);
   font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-}
-
-.context-meter {
-  height: 7px;
-  border-radius: 999px;
-  background: var(--pix-bg-hover);
-  overflow: hidden;
-}
-
-.context-meter-fill {
-  height: 100%;
-  border-radius: inherit;
-  background: var(--pix-success);
-  transition: width var(--pix-transition-base), background var(--pix-transition-fast);
-}
-
-.context-usage.warning .context-meter-fill {
-  background: var(--pix-warning);
-}
-
-.context-usage.danger .context-meter-fill {
-  background: var(--pix-error);
-}
-
-.context-detail {
-  margin-top: var(--pix-space-xs);
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
+  line-height: 1.2;
   color: var(--pix-text-secondary);
+}
+
+.context-divider {
+  color: var(--pix-text-muted);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.context-usage.warning {
+  --token-ring-color: var(--pix-warning);
+}
+
+.context-usage.danger {
+  --token-ring-color: var(--pix-error);
 }
 
 .stats-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 3px var(--pix-space-md);
+  gap: 7px var(--pix-space-md);
 }
 
 .stat-item {
-  padding: 3px 0;
+  padding: 2px 0;
 }
 
 .stat-item.total,
@@ -182,7 +194,7 @@ function formatPercent(n: number | null): string {
 
 .stat-label {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-secondary);
+  color: var(--pix-text-muted);
   margin-bottom: 1px;
 }
 

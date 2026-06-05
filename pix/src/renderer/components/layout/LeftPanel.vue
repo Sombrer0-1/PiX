@@ -257,6 +257,8 @@ function goSettings(): void { router.push("/settings"); }
   flex-direction: column;
   height: 100%;
   user-select: none;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(252, 252, 255, 0.9));
 }
 
 /* ── Project header ── */
@@ -272,21 +274,22 @@ function goSettings(): void { router.push("/settings"); }
 }
 
 .project-icon {
-  width: 28px;
-  height: 28px;
-  border-radius: var(--pix-radius-sm);
-  background: var(--pix-accent-light);
-  color: var(--pix-accent);
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
+  color: var(--pix-text-inverse);
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
+  font-size: var(--pix-text-lg);
+  font-weight: var(--pix-weight-bold);
+  box-shadow: 0 10px 22px rgba(98, 84, 243, 0.26);
 }
 
 .project-name {
-  font-size: var(--pix-text-md);
+  font-size: var(--pix-text-base);
   font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-primary);
   overflow: hidden;
@@ -297,10 +300,10 @@ function goSettings(): void { router.push("/settings"); }
 
 .project-path {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-secondary);
+  color: var(--pix-text-muted);
   font-family: var(--pix-font-ui);
-  margin-top: var(--pix-space-xs);
-  margin-left: calc(28px + var(--pix-space-sm));
+  margin-top: 4px;
+  margin-left: calc(38px + var(--pix-space-sm));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -318,22 +321,26 @@ function goSettings(): void { router.push("/settings"); }
   justify-content: center;
   gap: var(--pix-space-sm);
   width: 100%;
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  background: var(--pix-accent);
+  padding: 11px var(--pix-space-md);
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
   color: var(--pix-text-inverse);
   border: none;
-  border-radius: var(--pix-radius-md);
+  border-radius: var(--pix-radius-lg);
   font-size: var(--pix-text-sm);
   font-weight: var(--pix-weight-medium);
   font-family: var(--pix-font-ui);
   cursor: pointer;
-  transition: background var(--pix-transition-fast), box-shadow var(--pix-transition-fast);
-  box-shadow: var(--pix-shadow-xs);
+  transition:
+    box-shadow var(--pix-transition-fast),
+    transform var(--pix-transition-fast),
+    filter var(--pix-transition-fast);
+  box-shadow: 0 12px 24px rgba(98, 84, 243, 0.22);
 }
 
 .new-session-btn:hover {
-  background: var(--pix-accent-hover);
-  box-shadow: var(--pix-shadow-sm);
+  box-shadow: 0 15px 28px rgba(98, 84, 243, 0.28);
+  filter: saturate(1.05);
+  transform: translateY(-1px);
 }
 
 .new-session-btn:active {
@@ -378,14 +385,19 @@ function goSettings(): void { router.push("/settings"); }
 
 .search-input {
   width: 100%;
-  padding: 7px var(--pix-space-sm) 7px 30px;
+  height: 40px;
+  padding: 8px var(--pix-space-sm) 8px 32px;
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
+  border-radius: var(--pix-radius-lg);
   font-size: var(--pix-text-sm);
   font-family: var(--pix-font-ui);
   background: var(--pix-bg-input);
   color: var(--pix-text-primary);
-  transition: border-color var(--pix-transition-fast), box-shadow var(--pix-transition-fast);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  transition:
+    border-color var(--pix-transition-fast),
+    box-shadow var(--pix-transition-fast),
+    background var(--pix-transition-fast);
 }
 
 .search-input::placeholder {
@@ -395,7 +407,7 @@ function goSettings(): void { router.push("/settings"); }
 .search-input:focus {
   outline: none;
   border-color: var(--pix-accent);
-  box-shadow: 0 0 0 2px var(--pix-accent-light);
+  box-shadow: 0 0 0 3px rgba(98, 84, 243, 0.12);
 }
 
 .search-clear {
@@ -420,32 +432,36 @@ function goSettings(): void { router.push("/settings"); }
 .session-list {
   flex: 1;
   overflow-y: auto;
-  padding: 0 var(--pix-space-sm);
+  padding: 0 var(--pix-space-sm) var(--pix-space-sm);
 }
 
 .session-item {
   display: flex;
   align-items: center;
   gap: var(--pix-space-sm);
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  margin-bottom: 2px;
-  border-radius: var(--pix-radius-md);
+  padding: 9px var(--pix-space-md);
+  margin-bottom: 4px;
+  border-radius: var(--pix-radius-lg);
   cursor: pointer;
   transition: background var(--pix-transition-fast);
-  min-height: 42px;
+  min-height: 44px;
   position: relative;
+  border: 1px solid transparent;
 }
 
 .session-item:hover {
   background: var(--pix-bg-hover);
+  border-color: var(--pix-border-subtle);
 }
 
 .session-item.active {
-  background: var(--pix-accent-light);
+  background: linear-gradient(90deg, #f0eeff 0%, rgba(240, 238, 255, 0.4) 100%);
+  border-color: #e4e0ff;
+  box-shadow: inset 3px 0 0 var(--pix-accent);
 }
 
 .session-item.active:hover {
-  background: var(--pix-accent-light-hover);
+  background: linear-gradient(90deg, #ebe8ff 0%, rgba(235, 232, 255, 0.5) 100%);
 }
 
 .session-info {
@@ -474,7 +490,7 @@ function goSettings(): void { router.push("/settings"); }
 
 .session-time {
   font-size: var(--pix-text-xs);
-  color: var(--pix-text-secondary);
+  color: var(--pix-text-muted);
   font-weight: var(--pix-weight-medium);
   flex-shrink: 0;
   min-width: 44px;
@@ -538,7 +554,7 @@ function goSettings(): void { router.push("/settings"); }
 /* Empty state */
 .empty-hint {
   font-size: var(--pix-text-sm);
-  color: var(--pix-text-secondary);
+  color: var(--pix-text-muted);
   padding: var(--pix-space-2xl) var(--pix-space-lg);
   text-align: center;
 }
@@ -547,19 +563,20 @@ function goSettings(): void { router.push("/settings"); }
 .panel-footer {
   display: flex;
   justify-content: center;
-  gap: var(--pix-space-xs);
-  padding: var(--pix-space-sm) var(--pix-space-md);
+  gap: var(--pix-space-sm);
+  padding: var(--pix-space-md);
   border-top: 1px solid var(--pix-border-light);
   flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.74);
 }
 
 .footer-btn {
-  width: 32px;
-  height: 32px;
+  width: 34px;
+  height: 34px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   color: var(--pix-text-secondary);
   cursor: pointer;
   transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
@@ -568,11 +585,12 @@ function goSettings(): void { router.push("/settings"); }
 
 .footer-btn:hover {
   color: var(--pix-text-primary);
-  background: var(--pix-bg-hover);
+  background: var(--pix-accent-light);
 }
 
 .delete-dialog-card {
   padding: var(--pix-space-lg);
+  border-radius: var(--pix-radius-xl);
 }
 
 .delete-dialog-title {

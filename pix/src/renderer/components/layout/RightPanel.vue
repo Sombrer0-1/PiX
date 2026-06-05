@@ -216,9 +216,11 @@ watch(() => rpc.isConnected.value, (connected) => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: calc(var(--pix-space-lg) + 8px) var(--pix-space-lg) var(--pix-space-lg);
+  padding: 46px var(--pix-space-md) var(--pix-space-md);
   gap: var(--pix-space-md);
   user-select: none;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(251, 252, 255, 0.82));
 }
 
 /* ── Status indicator ── */
@@ -272,18 +274,27 @@ watch(() => rpc.isConnected.value, (connected) => {
 
 /* ── Info cards ── */
 .info-card {
-  background: var(--pix-bg-card);
-  border: 1px solid var(--pix-border);
-  border-radius: var(--pix-radius-md);
-  padding: var(--pix-space-md);
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  padding: var(--pix-space-lg);
+  box-shadow: var(--pix-shadow-xs);
+  transition:
+    border-color var(--pix-transition-fast),
+    box-shadow var(--pix-transition-fast);
+}
+
+.info-card:hover {
+  border-color: #dfe2f0;
+  box-shadow: var(--pix-shadow-sm);
 }
 
 .card-title {
-  font-size: var(--pix-text-xs);
+  font-size: var(--pix-text-sm);
   font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
+  color: var(--pix-text-primary);
+  text-transform: none;
+  letter-spacing: 0;
   margin-bottom: var(--pix-space-md);
 }
 
@@ -295,12 +306,12 @@ watch(() => rpc.isConnected.value, (connected) => {
 }
 
 .card-action-btn {
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--pix-radius-xs);
+  border-radius: var(--pix-radius-md);
   color: var(--pix-text-secondary);
   cursor: pointer;
   transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
@@ -308,14 +319,14 @@ watch(() => rpc.isConnected.value, (connected) => {
 
 .card-action-btn:hover {
   color: var(--pix-text-primary);
-  background: var(--pix-bg-hover);
+  background: var(--pix-accent-light);
 }
 
 /* ── Info rows ── */
 .info-rows {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
 }
 
 .info-rows.compact {
@@ -326,13 +337,13 @@ watch(() => rpc.isConnected.value, (connected) => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 5px 0;
-  min-height: 30px;
+  padding: 3px 0;
+  min-height: 28px;
 }
 
 .info-label {
   font-size: var(--pix-text-sm);
-  color: var(--pix-text-secondary);
+  color: var(--pix-text-muted);
   flex-shrink: 0;
 }
 
@@ -356,6 +367,10 @@ watch(() => rpc.isConnected.value, (connected) => {
   color: var(--pix-text-primary);
   font-size: var(--pix-text-sm);
   font-weight: var(--pix-weight-medium);
+  background: var(--pix-bg-code);
+  border: 1px solid var(--pix-border-subtle);
+  border-radius: var(--pix-radius-md);
+  padding: var(--pix-space-sm);
   line-height: var(--pix-leading-base);
   display: -webkit-box;
   -webkit-line-clamp: 3;
@@ -395,7 +410,7 @@ watch(() => rpc.isConnected.value, (connected) => {
 
 .mcp-count {
   font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-lg);
+  font-size: var(--pix-text-xl);
   font-weight: var(--pix-weight-semibold);
   color: var(--pix-success);
 }
@@ -418,15 +433,16 @@ watch(() => rpc.isConnected.value, (connected) => {
 .mcp-server-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .mcp-server-row {
   display: flex;
   align-items: center;
   gap: 7px;
-  min-height: 22px;
+  min-height: 24px;
   font-size: var(--pix-text-xs);
+  padding: 2px 0;
 }
 
 .mcp-server-dot {
@@ -469,7 +485,8 @@ watch(() => rpc.isConnected.value, (connected) => {
 
 /* ── Error card ── */
 .error-card {
-  border-color: #f1d7d7;
+  border-color: var(--pix-error-light);
+  background: var(--pix-error-bg);
 }
 
 .error-title {

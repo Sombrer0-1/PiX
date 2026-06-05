@@ -102,10 +102,10 @@ function getSourceLabel(source: string): string {
   left: 0;
   right: 0;
   margin-bottom: var(--pix-space-sm);
-  background: var(--pix-bg-elevated);
+  background: rgba(255, 255, 255, 0.97);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
-  box-shadow: var(--pix-shadow-lg);
+  border-radius: var(--pix-radius-xl);
+  box-shadow: var(--pix-shadow-xl);
   max-height: 240px;
   display: flex;
   flex-direction: column;
@@ -124,7 +124,7 @@ function getSourceLabel(source: string): string {
   gap: var(--pix-space-sm);
   width: 100%;
   padding: var(--pix-space-sm) var(--pix-space-md);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-lg);
   text-align: left;
   font-size: var(--pix-text-sm);
 }
@@ -136,6 +136,7 @@ function getSourceLabel(source: string): string {
 
 .palette-selected {
   background: var(--pix-accent-light);
+  box-shadow: inset 3px 0 0 var(--pix-accent);
 }
 
 .palette-name {

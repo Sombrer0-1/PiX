@@ -27,7 +27,8 @@ defineProps<{
   padding: var(--pix-space-md);
   background: var(--pix-error-bg);
   border: 1px solid var(--pix-error-light);
-  border-radius: var(--pix-radius-md);
+  border-radius: var(--pix-radius-lg);
+  box-shadow: var(--pix-shadow-xs);
 }
 
 .error-header {
@@ -39,7 +40,15 @@ defineProps<{
 
 .error-icon {
   color: var(--pix-error);
-  font-size: var(--pix-text-base);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #ffffff;
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-bold);
 }
 
 .error-label {

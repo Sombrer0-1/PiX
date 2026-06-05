@@ -81,7 +81,7 @@ function kindLabel(kind: ChatMessageAttachment["kind"]): string {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  margin-bottom: var(--pix-space-xl);
+  margin-bottom: var(--pix-space-lg);
   animation: message-in 0.18s ease-out;
 }
 
@@ -109,15 +109,16 @@ function kindLabel(kind: ChatMessageAttachment["kind"]): string {
 
 .message-content {
   max-width: min(78%, 760px);
-  font-size: var(--pix-text-sm);
+  font-size: var(--pix-text-base);
   line-height: var(--pix-leading-relaxed);
-  color: var(--pix-text-primary);
+  color: #000000;
   white-space: pre-wrap;
   word-break: break-word;
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  background: #f8fafc;
-  border-radius: var(--pix-radius-md);
-  border: 1px solid var(--pix-border);
+  padding: 10px 14px;
+  background: linear-gradient(180deg, #fbfbff 0%, #f7f8ff 100%);
+  border-radius: var(--pix-radius-lg);
+  border: 1px solid var(--pix-border-light);
+  box-shadow: var(--pix-shadow-xs);
 }
 
 .message-attachments {
@@ -136,7 +137,7 @@ function kindLabel(kind: ChatMessageAttachment["kind"]): string {
   max-width: 280px;
   padding: 5px 8px;
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   background: var(--pix-bg-content);
   color: var(--pix-text-secondary);
   font-size: var(--pix-text-xs);
@@ -169,6 +170,7 @@ function kindLabel(kind: ChatMessageAttachment["kind"]): string {
 
 .attachment-dialog {
   padding: var(--pix-space-lg);
+  border-radius: var(--pix-radius-xl);
 }
 
 .attachment-dialog-title {
@@ -190,7 +192,7 @@ function kindLabel(kind: ChatMessageAttachment["kind"]): string {
   overflow: auto;
   padding: var(--pix-space-md);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   background: var(--pix-bg-code);
   color: var(--pix-text-primary);
   font-size: var(--pix-text-xs);

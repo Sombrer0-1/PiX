@@ -30,7 +30,7 @@ export interface RuntimeEnvironmentContext {
 	platform?: NodeJS.Platform | string;
 	osName?: string;
 	timezone?: string;
-	executionMode?: "approval" | "unattended";
+	executionMode?: "approval" | "unattended" | "read-only";
 	verificationGate?: boolean;
 	shell?: {
 		path?: string;
@@ -150,11 +150,21 @@ function renderEnvironmentContext(date: string, cwd: string, environment?: Runti
 		`Operating system: ${osName} (${platform})`,
 	];
 	const executionMode = environment?.executionMode ?? "approval";
+	const executionModeLabel =
+		executionMode === "read-only"
+			? "read-only mode"
+			: executionMode === "approval"
+				? "approval mode"
+				: "unattended mode";
+	const executionPolicy =
+		executionMode === "read-only"
+			? "Execution policy: read-only mode. You may inspect files and search the project, but you must not modify files, write code, run shell commands, install packages, delete files, or change project state."
+			: executionMode === "approval"
+				? "Execution policy: high-risk destructive commands and file edits outside the project may be blocked before execution. Prefer narrow, reversible commands and ask the user before destructive work."
+				: "Execution policy: commands run without approval prompts. Be especially careful with destructive operations and verify paths before changing or deleting files.";
 	lines.push(
-		`Execution mode: ${executionMode === "approval" ? "approval mode" : "unattended mode"}`,
-		executionMode === "approval"
-			? "Execution policy: high-risk destructive commands and file edits outside the project may be blocked before execution. Prefer narrow, reversible commands and ask the user before destructive work."
-			: "Execution policy: commands run without approval prompts. Be especially careful with destructive operations and verify paths before changing or deleting files.",
+		`Execution mode: ${executionModeLabel}`,
+		executionPolicy,
 	);
 	lines.push(
 		`Verification gate: ${environment?.verificationGate === false ? "disabled" : "enabled for code/configuration changes"}`,

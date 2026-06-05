@@ -741,7 +741,8 @@ export class SettingsManager {
 	}
 
 	getExecutionMode(): AgentExecutionMode {
-		return this.settings.execution?.mode === "unattended" ? "unattended" : "approval";
+		const mode = this.settings.execution?.mode;
+		return mode === "unattended" || mode === "read-only" ? mode : "approval";
 	}
 
 	setExecutionMode(mode: AgentExecutionMode): void {

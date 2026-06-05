@@ -34,28 +34,36 @@
   display: flex;
   height: 100%;
   overflow: hidden;
+  gap: 8px;
+  padding: 10px 12px 10px 10px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(247, 248, 252, 0.94)),
+    var(--pix-bg-app);
 }
 
 .layout-left {
   width: var(--pix-left-width);
   min-width: var(--pix-left-width);
   background: var(--pix-bg-left);
-  border-right: 1px solid var(--pix-border-light);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
   overflow-y: auto;
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
+  box-shadow: var(--pix-shadow-sm);
 }
 
 .layout-center {
   flex: 1;
   min-width: 0;
   background: var(--pix-bg-content);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  /* Subtle inner shadow for depth separation from side panels */
-  box-shadow: 1px 0 0 rgba(0, 0, 0, 0.02), -1px 0 0 rgba(0, 0, 0, 0.02);
+  box-shadow: var(--pix-shadow-sm);
   position: relative;
   z-index: 1;
 }
@@ -64,10 +72,12 @@
   width: var(--pix-right-width);
   min-width: var(--pix-right-width);
   background: var(--pix-bg-right);
-  border-left: 1px solid var(--pix-border-light);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
   overflow-y: auto;
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
+  box-shadow: var(--pix-shadow-sm);
 }
 </style>

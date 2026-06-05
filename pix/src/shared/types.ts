@@ -82,7 +82,7 @@ export interface RpcSessionState {
   thinkingLevel: ThinkingLevel;
   isStreaming: boolean;
   isCompacting: boolean;
-  executionMode: "approval" | "unattended";
+  executionMode: "approval" | "unattended" | "read-only";
   steeringMode: "all" | "one-at-a-time";
   followUpMode: "all" | "one-at-a-time";
   sessionFile?: string;
@@ -146,6 +146,7 @@ export interface ModelInfo {
   id: string;
   contextWindow?: number;
   reasoning?: boolean;
+  thinkingLevels?: ThinkingLevel[];
 }
 
 // ============================================================================

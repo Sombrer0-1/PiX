@@ -8264,7 +8264,7 @@ export const MODELS = {
 				cacheRead: 0.05,
 				cacheWrite: 0.625,
 			},
-			contextWindow: 262144,
+			contextWindow: 1000000,
 			maxTokens: 65536,
 		} satisfies Model<"openai-completions">,
 		"qwen3.7-max": {
@@ -8298,7 +8298,7 @@ export const MODELS = {
 				cacheRead: 0.04,
 				cacheWrite: 0.5,
 			},
-			contextWindow: 262144,
+			contextWindow: 1000000,
 			maxTokens: 65536,
 		} satisfies Model<"anthropic-messages">,
 	},
@@ -11454,7 +11454,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 131072,
-			maxTokens: 20000,
+			maxTokens: 16384,
 		} satisfies Model<"openai-completions">,
 		"qwen/qwen3-30b-a3b-instruct-2507": {
 			id: "qwen/qwen3-30b-a3b-instruct-2507",

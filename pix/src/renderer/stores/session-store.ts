@@ -35,6 +35,14 @@ function attachmentName(path: string): string {
   return path.split(/[/\\]/).pop() || path;
 }
 
+function attachmentFromPath(path: string): ChatMessageAttachment {
+  return {
+    path,
+    name: attachmentName(path),
+    kind: "file",
+  };
+}
+
 function normalizeAttachment(value: unknown): ChatMessageAttachment | null {
   if (!isRecord(value) || typeof value.path !== "string") return null;
   const kind = value.kind === "image" || value.kind === "file" || value.kind === "text" ? value.kind : "file";
@@ -93,6 +101,11 @@ function mergeAttachments(...groups: ChatMessageAttachment[][]): ChatMessageAtta
   return Array.from(merged.values());
 }
 
+function fingerprintUserMessage(text: string, attachments: ChatMessageAttachment[]): string {
+  const paths = attachments.map((attachment) => attachment.path).sort();
+  return JSON.stringify({ text: text.trim(), paths });
+}
+
 function extractMessageDisplay(message: AgentMessage): MessageDisplay {
   if (message.role === "custom" && message.customType === "pi.ui_note" && isRecord(message.details)) {
     return {
@@ -127,6 +140,7 @@ export const useSessionStore = defineStore("session", () => {
   let currentAgentBlockId: string | null = null;
   let currentWorkStatusId: string | null = null;
   let currentThinkingBlockId: string | null = null;
+  let optimisticUserMessages: Array<{ blockId: string; fingerprint: string }> = [];
 
   function removeThinkingBlock(): void {
     if (!currentThinkingBlockId) return;
@@ -173,6 +187,12 @@ export const useSessionStore = defineStore("session", () => {
     if (display.text || display.attachments.length > 0) {
       closeCurrentWorkStatus(true);
       if (msg.role === "user") {
+        const fingerprint = fingerprintUserMessage(display.text, display.attachments);
+        const optimistic = optimisticUserMessages.find((item) => item.fingerprint === fingerprint);
+        if (optimistic) {
+          displayBlocks.value = displayBlocks.value.filter((block) => block.id !== optimistic.blockId);
+          optimisticUserMessages = optimisticUserMessages.filter((item) => item.blockId !== optimistic.blockId);
+        }
         appendTurnSeparator(messageTimestamp(msg));
       }
       displayBlocks.value.push({
@@ -183,6 +203,27 @@ export const useSessionStore = defineStore("session", () => {
         timestamp: messageTimestamp(msg),
       });
     }
+  }
+
+  function appendOptimisticUserMessage(text: string, filePaths: string[] = []): void {
+    const attachments = filePaths.map(attachmentFromPath);
+    if (!text.trim() && attachments.length === 0) return;
+
+    const timestamp = Date.now();
+    closeCurrentWorkStatus(true);
+    appendTurnSeparator(timestamp);
+    const block: DisplayBlock = {
+      id: nextBlockId(),
+      type: "user-message",
+      text: text.trim(),
+      attachments,
+      timestamp,
+    };
+    displayBlocks.value.push(block);
+    optimisticUserMessages.push({
+      blockId: block.id,
+      fingerprint: fingerprintUserMessage(text, attachments),
+    });
   }
 
   function closeCurrentWorkStatus(force = false): void {
@@ -524,6 +565,7 @@ export const useSessionStore = defineStore("session", () => {
     currentAgentBlockId = null;
     currentWorkStatusId = null;
     currentThinkingBlockId = null;
+    optimisticUserMessages = [];
   }
 
   function getRawEventsJson(): string {
@@ -537,6 +579,7 @@ export const useSessionStore = defineStore("session", () => {
     errorMessage,
     addEvent,
     addEvents,
+    appendOptimisticUserMessage,
     loadMessages,
     clearSession,
     getRawEventsJson,

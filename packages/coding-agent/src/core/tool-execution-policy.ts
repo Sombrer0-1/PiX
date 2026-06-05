@@ -1,7 +1,7 @@
 import { basename, resolve } from "node:path";
 import { getPathFromToolArgs, isPathInsideCwd } from "./file-change.ts";
 
-export type AgentExecutionMode = "approval" | "unattended";
+export type AgentExecutionMode = "approval" | "unattended" | "read-only";
 
 export interface ToolPolicyDecision {
 	allowed: boolean;
@@ -49,12 +49,23 @@ function riskyCommandReason(command: string): string | undefined {
 	return undefined;
 }
 
+function isReadOnlyTool(toolName: string): boolean {
+	return ["read", "grep", "find", "ls"].includes(toolName);
+}
+
 export function inspectToolExecution(options: {
 	mode: AgentExecutionMode;
 	toolName: string;
 	args: unknown;
 	cwd: string;
 }): ToolPolicyDecision {
+	if (options.mode === "read-only" && !isReadOnlyTool(options.toolName)) {
+		return {
+			allowed: false,
+			reason: `Read-only mode only allows read, grep, find, and ls tools. Blocked "${options.toolName}".`,
+		};
+	}
+
 	const path = getPathFromToolArgs(options.args);
 	if ((options.toolName === "write" || options.toolName === "edit") && path) {
 		if (isWindowsReservedDevicePath(path)) {

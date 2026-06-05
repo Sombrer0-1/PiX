@@ -440,7 +440,8 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 .session-view {
   max-width: var(--pix-content-max-width);
   margin: 0 auto;
-  font-size: var(--pix-text-sm);
+  font-size: var(--pix-text-base);
+  color: #000000;
 }
 
 .turn-separator {
@@ -452,14 +453,15 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 
 /* ── Agent message block ── */
 .agent-block {
-  margin-bottom: var(--pix-space-xl);
+  margin-bottom: var(--pix-space-lg);
   animation: block-in 0.18s ease-out;
 }
 
 .agent-content {
-  font-size: var(--pix-text-sm);
+  font-size: var(--pix-text-base);
   line-height: var(--pix-leading-relaxed);
-  color: var(--pix-text-primary);
+  color: #000000;
+  max-width: 100%;
 }
 
 .agent-content :deep(p) { margin-bottom: var(--pix-space-sm); }
@@ -489,9 +491,9 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   margin: 0;
   padding: var(--pix-space-lg);
   padding-top: 38px;
-  background: #f8fafc;
-  border-color: var(--pix-border);
-  color: #172033;
+  background: #f7f8fc;
+  border-color: var(--pix-border-light);
+  color: #000000;
   font-size: var(--pix-text-sm);
   line-height: 1.65;
 }
@@ -509,7 +511,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   justify-content: center;
   width: 28px;
   height: 28px;
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   background: #ffffff;
   border: 1px solid var(--pix-border);
   color: var(--pix-text-secondary);
@@ -517,7 +519,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 }
 .agent-content :deep(.code-copy-btn:hover) {
   color: var(--pix-text-primary);
-  background: var(--pix-bg-hover);
+  background: var(--pix-accent-light);
 }
 .agent-content :deep(.code-copy-btn.copied) {
   color: var(--pix-success);
@@ -544,11 +546,11 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  margin: 0 0 var(--pix-space-xl);
-  padding: 5px 10px;
+  margin: 0 0 var(--pix-space-lg);
+  padding: 6px 11px;
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
-  background: var(--pix-bg-content);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94);
   color: var(--pix-accent);
   font-size: var(--pix-text-xs);
   font-weight: var(--pix-weight-medium);
@@ -569,11 +571,11 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   width: fit-content;
   max-width: 100%;
   margin-bottom: var(--pix-space-md);
-  border: 1px solid var(--pix-border);
-  border-radius: var(--pix-radius-sm);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-lg);
   overflow: hidden;
-  background: var(--pix-bg-content);
-  box-shadow: none;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: var(--pix-shadow-xs);
   animation: block-in 0.16s ease-out;
   transition:
     border-color var(--pix-transition-fast),
@@ -583,6 +585,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 
 .work-status-block.expanded {
   width: min(760px, 100%);
+  box-shadow: var(--pix-shadow-sm);
 }
 
 .work-status-block + .agent-block {
@@ -598,11 +601,11 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   align-items: center;
   gap: 8px;
   width: 100%;
-  min-height: 30px;
-  padding: 5px 10px;
+  min-height: 32px;
+  padding: 6px 11px;
   text-align: left;
   font-size: var(--pix-text-xs);
-  background: var(--pix-bg-content);
+  background: rgba(255, 255, 255, 0.96);
   cursor: pointer;
   border: none;
   color: var(--pix-text-primary);
@@ -686,12 +689,12 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 .ws-body {
   border-top: 1px solid var(--pix-border-light);
   padding: var(--pix-space-sm);
-  background: var(--pix-bg-content);
+  background: #fbfcff;
 }
 
 .ws-tool-item {
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   overflow: hidden;
   margin-bottom: var(--pix-space-xs);
   background: var(--pix-bg-content);
@@ -712,7 +715,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   align-items: center;
   gap: var(--pix-space-sm);
   width: 100%;
-  min-height: 32px;
+  min-height: 34px;
   padding: 6px 10px;
   text-align: left;
   color: var(--pix-text-primary);
@@ -760,7 +763,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 .ws-tool-details {
   padding: 0 10px 10px;
   border-top: 1px solid var(--pix-border-light);
-  background: var(--pix-bg-content);
+  background: rgba(255, 255, 255, 0.86);
 }
 
 .ws-tool-section {
@@ -784,7 +787,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   line-height: var(--pix-leading-tight);
   background: var(--pix-bg-code);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   padding: var(--pix-space-sm) var(--pix-space-md);
   overflow-x: auto;
   max-height: 200px;

@@ -23,6 +23,11 @@ defineProps<{
 .raw-viewer {
   max-width: var(--pix-content-max-width);
   margin: 0 auto;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  box-shadow: var(--pix-shadow-xs);
+  padding: var(--pix-space-lg);
 }
 
 .raw-header {
@@ -31,7 +36,7 @@ defineProps<{
   gap: var(--pix-space-sm);
   margin-bottom: var(--pix-space-md);
   padding-bottom: var(--pix-space-sm);
-  border-bottom: 1px solid var(--pix-border);
+  border-bottom: 1px solid var(--pix-border-light);
 }
 
 .raw-label {
@@ -51,7 +56,7 @@ defineProps<{
   line-height: var(--pix-leading-tight);
   background: var(--pix-bg-code);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
+  border-radius: var(--pix-radius-lg);
   padding: var(--pix-space-md);
   overflow-x: auto;
   white-space: pre-wrap;

@@ -56,6 +56,39 @@ body {
   --v-sheet-border-radius: 8px;
 }
 
+.v-application {
+  background: transparent !important;
+}
+
+.v-card,
+.v-list,
+.v-menu .v-overlay__content {
+  color: var(--pix-text-primary);
+}
+
+.v-btn {
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.v-field {
+  box-shadow: none;
+}
+
+.v-field__outline {
+  --v-field-border-opacity: 1;
+  color: var(--pix-border-light) !important;
+}
+
+.v-field.v-field--focused .v-field__outline {
+  color: var(--pix-accent) !important;
+}
+
+.v-label,
+.v-messages {
+  color: var(--pix-text-muted) !important;
+}
+
 /* ── Scrollbar styling ── */
 ::-webkit-scrollbar {
   width: 5px;
@@ -105,8 +138,8 @@ pre {
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-sm);
   background: var(--pix-bg-code);
-  border: 1px solid var(--pix-border);
-  border-radius: var(--pix-radius-sm);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-md);
   padding: var(--pix-space-md);
   overflow-x: auto;
   line-height: 1.65;
@@ -199,7 +232,7 @@ textarea::placeholder {
   display: inline-block;
   width: 12px;
   height: 12px;
-  border: 2px solid var(--pix-border-light);
+  border: 2px solid #d9dcf8;
   border-top-color: var(--pix-accent);
   border-radius: 50%;
   animation: pix-spin 0.6s linear infinite;

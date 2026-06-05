@@ -7,10 +7,12 @@
  */
 import { ref, computed, nextTick } from "vue";
 import { useRpc } from "../../composables/useRpc";
+import { useSessionStore } from "../../stores/session-store";
 import CommandPalette from "../input/CommandPalette.vue";
 import ModelSelector from "../input/ModelSelector.vue";
 
 const rpc = useRpc();
+const sessionStore = useSessionStore();
 
 const inputText = ref("");
 const searchQuery = ref("");
@@ -75,6 +77,7 @@ async function sendMessage(): Promise<void> {
   try {
     if (isStreaming.value) {
       // Queue as steering message while agent is running
+      sessionStore.appendOptimisticUserMessage(text);
       rpc.sendCommandAsync({ type: "steer", message: text });
     } else {
       await rpc.sendPrompt(text);

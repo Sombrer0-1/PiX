@@ -19,13 +19,11 @@ const authStore = useAuthStore();
 const rpc = useRpc();
 
 // ---- Navigation ----
-type SettingsSection = "general" | "display" | "model" | "terminal" | "shell" | "resources" | "mcp" | "auth" | "advanced";
+type SettingsSection = "general" | "model" | "shell" | "resources" | "mcp" | "auth" | "advanced";
 const activeSection = ref<SettingsSection>("general");
 const sections: { key: SettingsSection; label: string; icon: string }[] = [
   { key: "general", label: "常规", icon: "mdi-cog-outline" },
-  { key: "display", label: "显示", icon: "mdi-monitor" },
   { key: "model", label: "模型", icon: "mdi-cube-outline" },
-  { key: "terminal", label: "终端", icon: "mdi-console" },
   { key: "shell", label: "Shell", icon: "mdi-bash" },
   { key: "resources", label: "资源", icon: "mdi-package-variant" },
   { key: "mcp", label: "MCP", icon: "mdi-puzzle-outline" },
@@ -39,28 +37,17 @@ const defaultModel = ref("");
 const defaultThinkingLevel = ref<ThinkingLevel>("xhigh");
 const steeringMode = ref<"all" | "one-at-a-time">("one-at-a-time");
 const followUpMode = ref<"all" | "one-at-a-time">("one-at-a-time");
-const executionMode = ref<"approval" | "unattended">("approval");
+const executionMode = ref<"read-only" | "approval" | "unattended">("approval");
 const verificationGate = ref(true);
 const autoCompact = ref(true);
 const quietStartup = ref(false);
-const enableInstallTelemetry = ref(true);
-
-const piTheme = ref("");
-const hideThinkingBlock = ref(false);
-const collapseChangelog = ref(false);
-const showHardwareCursor = ref(false);
-const editorPaddingX = ref(0);
 
 const enabledModels = ref("");
 const transport = ref("auto");
 const retryEnabled = ref(true);
 
-const showImages = ref(true);
-const imageWidthCells = ref(60);
 const imageAutoResize = ref(true);
 const blockImages = ref(false);
-const clearOnShrink = ref(false);
-const showTerminalProgress = ref(false);
 
 const shellPath = ref("");
 const shellCommandPrefix = ref("");
@@ -73,9 +60,6 @@ const promptTemplatePaths = ref("");
 const themePaths = ref("");
 const enableSkillCommands = ref(true);
 
-const sessionDir = ref("");
-const doubleEscapeAction = ref<"fork" | "tree" | "none">("tree");
-const treeFilterMode = ref<"default" | "no-tools" | "user-only" | "labeled-only" | "all">("default");
 const autocompleteMaxVisible = ref(5);
 
 const saving = ref(false);
@@ -124,12 +108,11 @@ async function deleteKey(provider: string): Promise<void> {
 const thinkingLevels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const steeringModes = ["all", "one-at-a-time"] as const;
 const executionModeItems = [
-  { title: "审批模式", value: "approval" },
-  { title: "无监管模式", value: "unattended" },
+  { title: "只读模式", value: "read-only", icon: "mdi-eye-outline", subtitle: "只允许读取和搜索，禁止修改文件。" },
+  { title: "审批模式", value: "approval", icon: "mdi-shield-check-outline", subtitle: "高风险操作需要确认。" },
+  { title: "无监管模式", value: "unattended", icon: "mdi-lightning-bolt-outline", subtitle: "工具调用不弹出审批。" },
 ] as const;
 const transportOptions = ["auto", "sse", "websocket"] as const;
-const escapeActions = ["fork", "tree", "none"] as const;
-const treeFilterModes = ["default", "no-tools", "user-only", "labeled-only", "all"] as const;
 
 // ---- Load ----
 onMounted(async () => {
@@ -151,25 +134,15 @@ function applyPiSettings(s: Record<string, unknown>): void {
   steeringMode.value = (s.steeringMode as "all" | "one-at-a-time") ?? "one-at-a-time";
   followUpMode.value = (s.followUpMode as "all" | "one-at-a-time") ?? "one-at-a-time";
   const execution = (s.execution && typeof s.execution === "object" ? s.execution : {}) as Record<string, unknown>;
-  executionMode.value = execution.mode === "unattended" ? "unattended" : "approval";
+  executionMode.value = execution.mode === "read-only" || execution.mode === "unattended" ? execution.mode : "approval";
   verificationGate.value = (execution.verificationGate ?? true) as boolean;
   autoCompact.value = (s.compactionEnabled ?? s.compaction?.enabled ?? true) as boolean;
   quietStartup.value = (s.quietStartup ?? false) as boolean;
-  enableInstallTelemetry.value = (s.enableInstallTelemetry ?? true) as boolean;
-  piTheme.value = (s.theme ?? "") as string;
-  hideThinkingBlock.value = (s.hideThinkingBlock ?? false) as boolean;
-  collapseChangelog.value = (s.collapseChangelog ?? false) as boolean;
-  showHardwareCursor.value = (s.showHardwareCursor ?? false) as boolean;
-  editorPaddingX.value = (s.editorPaddingX ?? 0) as number;
   if (s.enabledModels && Array.isArray(s.enabledModels)) enabledModels.value = s.enabledModels.join(", ");
   transport.value = (s.transport ?? "auto") as string;
   retryEnabled.value = (s.retry?.enabled ?? true) as boolean;
-  showImages.value = (s.terminal?.showImages ?? true) as boolean;
-  imageWidthCells.value = (s.terminal?.imageWidthCells ?? 60) as number;
   imageAutoResize.value = (s.images?.autoResize ?? true) as boolean;
   blockImages.value = (s.images?.blockImages ?? false) as boolean;
-  clearOnShrink.value = (s.terminal?.clearOnShrink ?? false) as boolean;
-  showTerminalProgress.value = (s.terminal?.showTerminalProgress ?? false) as boolean;
   shellPath.value = (s.shellPath ?? "") as string;
   shellCommandPrefix.value = (s.shellCommandPrefix ?? "") as string;
   if (s.npmCommand && Array.isArray(s.npmCommand)) npmCommand.value = s.npmCommand.join(" ");
@@ -179,9 +152,6 @@ function applyPiSettings(s: Record<string, unknown>): void {
   if (s.promptTemplatePaths && Array.isArray(s.promptTemplatePaths)) promptTemplatePaths.value = s.promptTemplatePaths.join(", ");
   if (s.themePaths && Array.isArray(s.themePaths)) themePaths.value = s.themePaths.join(", ");
   enableSkillCommands.value = (s.enableSkillCommands ?? true) as boolean;
-  sessionDir.value = (s.sessionDir ?? "") as string;
-  doubleEscapeAction.value = (s.doubleEscapeAction ?? "tree") as "fork" | "tree" | "none";
-  treeFilterMode.value = (s.treeFilterMode ?? "default") as "default" | "no-tools" | "user-only" | "labeled-only" | "all";
   autocompleteMaxVisible.value = (s.autocompleteMaxVisible ?? 5) as number;
 }
 
@@ -199,15 +169,9 @@ async function saveSettings(): Promise<void> {
         ["steeringMode", steeringMode.value], ["followUpMode", followUpMode.value],
         ["executionMode", executionMode.value], ["verificationGate", verificationGate.value],
         ["compactEnabled", autoCompact.value], ["quietStartup", quietStartup.value],
-        ["enableInstallTelemetry", enableInstallTelemetry.value],
-        ["theme", piTheme.value || undefined], ["hideThinkingBlock", hideThinkingBlock.value],
-        ["collapseChangelog", collapseChangelog.value], ["showHardwareCursor", showHardwareCursor.value],
-        ["editorPaddingX", editorPaddingX.value],
         ["enabledModels", enabledModels.value ? enabledModels.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
         ["transport", transport.value], ["retryEnabled", retryEnabled.value],
-        ["showImages", showImages.value], ["imageWidthCells", imageWidthCells.value],
         ["autoResizeImages", imageAutoResize.value], ["blockImages", blockImages.value],
-        ["clearOnShrink", clearOnShrink.value], ["showTerminalProgress", showTerminalProgress.value],
         ["shellPath", shellPath.value || undefined], ["shellCommandPrefix", shellCommandPrefix.value || undefined],
         ["npmCommand", npmCommand.value ? npmCommand.value.split(/\s+/).filter(Boolean) : undefined],
         ["httpIdleTimeoutMs", httpIdleTimeoutMs.value || undefined],
@@ -216,8 +180,7 @@ async function saveSettings(): Promise<void> {
         ["promptTemplatePaths", promptTemplatePaths.value ? promptTemplatePaths.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
         ["themePaths", themePaths.value ? themePaths.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
         ["enableSkillCommands", enableSkillCommands.value],
-        ["sessionDir", sessionDir.value || undefined], ["doubleEscapeAction", doubleEscapeAction.value],
-        ["treeFilterMode", treeFilterMode.value], ["autocompleteMaxVisible", autocompleteMaxVisible.value],
+        ["autocompleteMaxVisible", autocompleteMaxVisible.value],
       ];
       for (const [key, value] of setters) {
         if (value !== undefined) await rpc.setPiSetting(key, value);
@@ -269,22 +232,20 @@ function goBack(): void { router.back(); }
             <v-select v-model="defaultThinkingLevel" label="默认思考级别" :items="thinkingLevels" class="mb-4" />
             <v-select v-model="steeringMode" label="操控模式" :items="steeringModes" hint="流式输出期间操控消息的排队方式。" persistent-hint class="mb-4" />
             <v-select v-model="followUpMode" label="跟进模式" :items="steeringModes" hint="流式输出期间跟进消息的发送方式。" persistent-hint class="mb-4" />
+            <v-select v-model="executionMode" label="执行模式" :items="executionModeItems" item-title="title" item-value="value" hint="只读模式禁止修改；审批模式拦截高风险操作；无监管模式不弹出审批。" persistent-hint class="mb-4">
+              <template #item="{ props, item }">
+                <v-list-item v-bind="props" :prepend-icon="item.raw.icon" :subtitle="item.raw.subtitle" />
+              </template>
+              <template #selection="{ item }">
+                <div class="execution-selection">
+                  <v-icon size="18" :icon="item.raw.icon" />
+                  <span>{{ item.raw.title }}</span>
+                </div>
+              </template>
+            </v-select>
+            <v-switch v-model="verificationGate" label="完成前验证提醒" hint="代码或配置被修改后，提醒 Agent 在收尾前运行针对性的测试、类型检查、构建或打包。" persistent-hint class="mb-4" />
             <v-switch v-model="autoCompact" label="自动压缩" hint="达到阈值时自动压缩上下文。" persistent-hint class="mb-4" />
             <v-switch v-model="quietStartup" label="静默启动" hint="隐藏启动消息。" persistent-hint class="mb-4" />
-            <v-switch v-model="enableInstallTelemetry" label="安装统计" hint="发送匿名安装归因数据。" persistent-hint class="mb-4" />
-          </div>
-        </div>
-
-        <!-- ============ 显示 ============ -->
-        <div v-show="activeSection === 'display'" class="section-panel">
-          <h2 class="section-title">显示</h2>
-          <p class="section-desc">终端与编辑器视觉偏好。</p>
-          <div class="form-fields">
-            <v-text-field v-model="piTheme" label="Pi 终端主题" placeholder="default" hint="Pi TUI 主题名称（仅影响 CLI/TUI 模式）。" persistent-hint class="mb-4" />
-            <v-switch v-model="hideThinkingBlock" label="隐藏思考块" hint="折叠 agent 思考区域。" persistent-hint class="mb-4" />
-            <v-switch v-model="collapseChangelog" label="折叠更新日志" hint="启动时折叠更新日志。" persistent-hint class="mb-4" />
-            <v-switch v-model="showHardwareCursor" label="显示硬件光标" hint="使用终端硬件光标。" persistent-hint class="mb-4" />
-            <v-text-field v-model.number="editorPaddingX" label="编辑器水平内边距" type="number" min="0" max="3" hint="编辑器单元格的水平内边距 (0-3)。" persistent-hint style="max-width:200px" class="mb-4" />
           </div>
         </div>
 
@@ -296,20 +257,8 @@ function goBack(): void { router.back(); }
             <v-text-field v-model="enabledModels" label="启用的模型（glob 模式）" placeholder="anthropic/*, openai/gpt-5*" hint="逗号分隔的 glob 模式。留空则启用所有模型。" persistent-hint class="mb-4" />
             <v-select v-model="transport" label="传输方式" :items="transportOptions" hint="API 请求的 HTTP 传输方式。" persistent-hint class="mb-4" />
             <v-switch v-model="retryEnabled" label="自动重试" hint="自动重试失败的 API 请求。" persistent-hint class="mb-4" />
-          </div>
-        </div>
-
-        <!-- ============ 终端 ============ -->
-        <div v-show="activeSection === 'terminal'" class="section-panel">
-          <h2 class="section-title">终端</h2>
-          <p class="section-desc">图片显示与终端行为。</p>
-          <div class="form-fields">
-            <v-switch v-model="showImages" label="显示图片" hint="在终端中显示内联图片（TUI 模式）。" persistent-hint class="mb-4" />
-            <v-text-field v-model.number="imageWidthCells" label="图片宽度（单元格）" type="number" min="10" max="200" hint="终端中图片显示的宽度（单元格数）。" persistent-hint style="max-width:200px" class="mb-4" />
             <v-switch v-model="imageAutoResize" label="自动调整图片大小" hint="发送给模型前自动调整大图片尺寸。" persistent-hint class="mb-4" />
             <v-switch v-model="blockImages" label="阻止图片" hint="完全阻止将图片发送给模型。" persistent-hint class="mb-4" />
-            <v-switch v-model="clearOnShrink" label="缩小时清屏" hint="终端缩小到阈值以下时清屏。" persistent-hint class="mb-4" />
-            <v-switch v-model="showTerminalProgress" label="显示终端进度" hint="在终端中显示进度指示器。" persistent-hint class="mb-4" />
           </div>
         </div>
 
@@ -381,14 +330,9 @@ function goBack(): void { router.back(); }
         <!-- ============ 高级 ============ -->
         <div v-show="activeSection === 'advanced'" class="section-panel">
           <h2 class="section-title">高级</h2>
-          <p class="section-desc">会话存储、导航与 UI 行为。</p>
+          <p class="section-desc">少量调试与底层行为设置。</p>
           <div class="form-fields">
-            <v-text-field v-model="sessionDir" label="会话目录" placeholder="~/.pi/agent/sessions/" hint="自定义会话存储目录。" persistent-hint class="mb-4" />
-            <v-select v-model="doubleEscapeAction" label="双击 Esc 操作" :items="escapeActions" hint="双击 Escape 键时的操作。" persistent-hint class="mb-4" />
-            <v-select v-model="treeFilterMode" label="树过滤器模式" :items="treeFilterModes" hint="会话树视图的默认过滤器模式。" persistent-hint class="mb-4" />
             <v-text-field v-model.number="autocompleteMaxVisible" label="自动补全最大显示数" type="number" min="3" max="20" hint="自动补全建议的最大显示数量 (3-20)。" persistent-hint style="max-width:200px" class="mb-4" />
-            <v-select v-model="executionMode" label="执行模式" :items="executionModeItems" item-title="title" item-value="value" hint="审批模式会拦截高风险命令；无监管模式不做审批拦截，但仍会阻止 Windows 保留设备名文件。" persistent-hint class="mb-4" />
-            <v-switch v-model="verificationGate" label="完成前验证提醒" hint="代码或配置被修改后，提醒 Agent 在收尾前运行针对性的测试、类型检查、构建或打包。" persistent-hint class="mb-4" />
             <div class="advanced-info">
               <h3>诊断信息</h3>
               <div class="info-row"><span>集成方式</span><span>Direct (AgentSession in-process)</span></div>
@@ -415,7 +359,9 @@ function goBack(): void { router.back(); }
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: var(--pix-bg-app);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(247, 248, 252, 0.96)),
+    var(--pix-bg-app);
 }
 
 .drag-bar {
@@ -433,17 +379,21 @@ function goBack(): void { router.back(); }
   flex: 1;
   display: flex;
   overflow: hidden;
+  gap: var(--pix-space-lg);
+  padding: 0 var(--pix-space-lg) var(--pix-space-lg);
 }
 
 /* Sidebar */
 .settings-sidebar {
   width: 220px;
   min-width: 220px;
-  border-right: 1px solid var(--pix-border-light);
-  background: var(--pix-bg-left);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  background: rgba(255, 255, 255, 0.9);
   display: flex;
   flex-direction: column;
   padding: var(--pix-space-sm);
+  box-shadow: var(--pix-shadow-sm);
 }
 
 .sidebar-header {
@@ -451,21 +401,31 @@ function goBack(): void { router.back(); }
 }
 
 .sidebar-item {
-  border-radius: 8px;
-  margin-bottom: 2px;
+  border-radius: var(--pix-radius-lg);
+  margin-bottom: 4px;
+}
+
+.settings-sidebar :deep(.v-list-item--active) {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
 }
 
 /* Content */
 .settings-content {
   flex: 1;
   overflow-y: auto;
-  padding: var(--pix-space-2xl);
+  padding: 0;
   display: flex;
   flex-direction: column;
 }
 
 .section-panel {
-  max-width: 640px;
+  width: min(760px, 100%);
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  box-shadow: var(--pix-shadow-sm);
+  padding: var(--pix-space-2xl);
 }
 
 .section-title {
@@ -477,12 +437,18 @@ function goBack(): void { router.back(); }
 .section-desc {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-secondary);
-  margin-bottom: var(--pix-space-2xl);
+  margin-bottom: var(--pix-space-xl);
 }
 
 .form-fields {
   display: flex;
   flex-direction: column;
+}
+
+.execution-selection {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .mb-3 { margin-bottom: 12px; }
@@ -504,8 +470,10 @@ function goBack(): void { router.back(); }
 
 .advanced-info {
   margin-top: var(--pix-space-xl);
-  padding-top: var(--pix-space-lg);
-  border-top: 1px solid var(--pix-border-light);
+  padding: var(--pix-space-lg);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-lg);
+  background: var(--pix-bg-code);
 }
 
 .advanced-info h3 {
@@ -536,6 +504,9 @@ function goBack(): void { router.back(); }
   text-align: center;
   color: var(--pix-text-secondary);
   font-size: var(--pix-text-sm);
+  border: 1px dashed var(--pix-border);
+  border-radius: var(--pix-radius-lg);
+  background: var(--pix-bg-code);
 }
 
 .auth-list {
@@ -545,6 +516,8 @@ function goBack(): void { router.back(); }
 
 .auth-card {
   padding: var(--pix-space-sm);
+  border-radius: var(--pix-radius-lg) !important;
+  background: var(--pix-bg-card);
 }
 
 .auth-provider-row {
@@ -605,10 +578,18 @@ function goBack(): void { router.back(); }
 
 .settings-actions {
   margin-top: var(--pix-space-2xl);
-  padding-top: var(--pix-space-lg);
-  border-top: 1px solid var(--pix-border-light);
+  width: min(760px, 100%);
+  padding: var(--pix-space-md) 0 0;
   display: flex;
   justify-content: flex-end;
+}
+
+.settings-content :deep(.v-field) {
+  border-radius: var(--pix-radius-lg);
+}
+
+.settings-content :deep(.v-input) {
+  color: var(--pix-text-primary);
 }
 
 .ml-2 { margin-left: var(--pix-space-sm); }

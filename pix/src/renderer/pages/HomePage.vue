@@ -78,36 +78,38 @@ function formatDate(timestamp: number): string {
     <div class="drag-bar"></div>
     <div class="home-container-wrapper">
       <div class="home-container">
-      <header class="home-header">
-        <h1 class="home-title">PiX</h1>
-        <p class="home-subtitle">AI 编程工作区</p>
-      </header>
+        <header class="home-header">
+          <div class="home-logo">Pi</div>
+          <div class="home-heading">
+            <h1 class="home-title">PiX</h1>
+            <p class="home-subtitle">AI 编程工作区</p>
+          </div>
+        </header>
 
-      <div class="pi-status-row">
-        <v-chip
-          size="small"
-          :color="piDetection?.found ? 'success' : undefined"
-          variant="tonal"
-        >
-          {{ piDetection?.found ? 'Pi 就绪' : 'Pi 未检测到' }}
-        </v-chip>
-      </div>
+        <div class="home-card">
+          <div class="pi-status-row">
+            <span class="pi-status-dot" :class="{ ready: piDetection?.found }"></span>
+            <span>{{ piDetection?.found ? 'Pi 就绪' : 'Pi 未检测到' }}</span>
+          </div>
 
-      <div class="home-actions">
-        <v-btn
-          variant="outlined"
-          color="primary"
-          size="large"
-          block
-          @click="openProject"
-        >
-          打开项目...
-        </v-btn>
-      </div>
+          <div class="home-actions">
+            <v-btn
+              class="open-project-btn"
+              variant="flat"
+              color="primary"
+              size="large"
+              block
+              prepend-icon="mdi-folder-open-outline"
+              @click="openProject"
+            >
+              打开项目文件夹
+            </v-btn>
+          </div>
+        </div>
 
-      <section v-if="recentProjects.length > 0" class="home-section">
-        <h2 class="section-title">最近</h2>
-        <v-card variant="flat" border>
+        <section v-if="recentProjects.length > 0" class="home-section">
+          <h2 class="section-title">最近项目</h2>
+          <v-card class="recent-card" variant="flat">
           <v-list density="default" bg-color="transparent">
             <v-list-item
               v-for="project in recentProjects"
@@ -137,17 +139,17 @@ function formatDate(timestamp: number): string {
               </template>
             </v-list-item>
           </v-list>
-        </v-card>
-      </section>
+          </v-card>
+        </section>
 
-      <section v-else class="home-section home-empty">
-        <p class="empty-text">暂无最近项目。打开项目目录以开始。</p>
-      </section>
+        <section v-else class="home-section home-empty">
+          <p class="empty-text">暂无最近项目。打开项目目录以开始。</p>
+        </section>
 
-      <footer class="home-footer">
-        <router-link to="/settings" class="footer-link">Settings</router-link>
-      </footer>
-    </div>
+        <footer class="home-footer">
+          <router-link to="/settings" class="footer-link">设置</router-link>
+        </footer>
+      </div>
     </div>
   </div>
 </template>
@@ -157,7 +159,9 @@ function formatDate(timestamp: number): string {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: var(--pix-bg-app);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(247, 248, 252, 0.96)),
+    var(--pix-bg-app);
 }
 
 .drag-bar {
@@ -173,42 +177,108 @@ function formatDate(timestamp: number): string {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: var(--pix-space-xl);
 }
 
 .home-container {
   width: 100%;
-  max-width: 520px;
-  padding: var(--pix-space-2xl);
+  max-width: 640px;
+  padding: var(--pix-space-xl);
 }
 
 .home-header {
-  text-align: center;
-  margin-bottom: var(--pix-space-xl);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--pix-space-md);
+  margin-bottom: var(--pix-space-lg);
+}
+
+.home-logo {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
+  color: var(--pix-text-inverse);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--pix-text-xl);
+  font-weight: var(--pix-weight-bold);
+  box-shadow: 0 16px 34px rgba(98, 84, 243, 0.28);
+}
+
+.home-heading {
+  min-width: 0;
 }
 
 .home-title {
-  font-size: 32px;
-  font-weight: 600;
+  font-size: 34px;
+  font-weight: 700;
   color: var(--pix-text-primary);
-  letter-spacing: -0.3px;
+  letter-spacing: 0;
+  line-height: 1.1;
 }
 
 .home-subtitle {
   margin-top: var(--pix-space-xs);
   color: var(--pix-text-muted);
-  font-size: var(--pix-text-md);
+  font-size: var(--pix-text-base);
+}
+
+.home-card,
+.recent-card {
+  background: rgba(255, 255, 255, 0.94) !important;
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  box-shadow: var(--pix-shadow-md);
+}
+
+.home-card {
+  padding: var(--pix-space-lg);
+  margin-bottom: var(--pix-space-xl);
 }
 
 .pi-status-row {
-  display: flex;
-  justify-content: center;
-  margin-bottom: var(--pix-space-xl);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  margin-bottom: var(--pix-space-md);
+}
+
+.pi-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--pix-text-muted);
+}
+
+.pi-status-dot.ready {
+  background: var(--pix-success);
 }
 
 .home-actions {
   display: flex;
   justify-content: center;
-  margin-bottom: var(--pix-space-2xl);
+}
+
+.open-project-btn {
+  min-height: 44px;
+  border-radius: var(--pix-radius-lg) !important;
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%) !important;
+  box-shadow: 0 14px 28px rgba(98, 84, 243, 0.24) !important;
+  font-weight: var(--pix-weight-semibold);
+}
+
+.open-project-btn:hover {
+  box-shadow: 0 17px 34px rgba(98, 84, 243, 0.3) !important;
 }
 
 .home-section {
@@ -222,10 +292,23 @@ function formatDate(timestamp: number): string {
   text-transform: uppercase;
   letter-spacing: 0.3px;
   margin-bottom: var(--pix-space-sm);
+  padding-left: 2px;
+}
+
+.recent-card {
+  overflow: hidden;
 }
 
 .project-list-item {
   cursor: pointer;
+  border-radius: var(--pix-radius-md);
+  margin: 4px 6px;
+  min-height: 58px;
+  transition: background var(--pix-transition-fast);
+}
+
+.project-list-item:hover {
+  background: var(--pix-bg-hover);
 }
 
 .project-list-actions {
@@ -242,7 +325,7 @@ function formatDate(timestamp: number): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 200px;
+  max-width: 250px;
 }
 
 .project-delete-btn {
@@ -251,7 +334,7 @@ function formatDate(timestamp: number): string {
   justify-content: center;
   width: 28px;
   height: 28px;
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-md);
   color: var(--pix-text-muted);
   transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
 }
@@ -263,7 +346,10 @@ function formatDate(timestamp: number): string {
 
 .home-empty {
   text-align: center;
-  padding: var(--pix-space-xl) 0;
+  padding: var(--pix-space-xl);
+  border: 1px dashed var(--pix-border);
+  border-radius: var(--pix-radius-xl);
+  background: rgba(255, 255, 255, 0.7);
 }
 
 .empty-text {
@@ -273,7 +359,7 @@ function formatDate(timestamp: number): string {
 
 .home-footer {
   text-align: center;
-  margin-top: var(--pix-space-2xl);
+  margin-top: var(--pix-space-xl);
 }
 
 .footer-link {

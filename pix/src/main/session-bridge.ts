@@ -2,7 +2,7 @@ import { existsSync, statSync } from "fs";
 import { join } from "path";
 import { shell } from "electron";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type ImageContent, type Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type CreateAgentSessionResult,
@@ -368,6 +368,7 @@ export class SessionBridge {
 			id: m.model.id,
 			contextWindow: m.model.contextWindow,
 			reasoning: m.model.reasoning,
+			thinkingLevels: getSupportedThinkingLevels(m.model) as ThinkingLevel[],
 		}));
 	}
 
@@ -448,7 +449,9 @@ export class SessionBridge {
 			case "compactionKeepRecentTokens": return;
 			case "retryEnabled": return sm.setRetryEnabled(value as boolean);
 			case "executionMode":
-				sm.setExecutionMode(value === "unattended" ? "unattended" : "approval");
+				sm.setExecutionMode(
+					value === "unattended" || value === "read-only" ? value : "approval",
+				);
 				session.refreshSystemPrompt();
 				return;
 			case "verificationGate":
@@ -538,6 +541,7 @@ export class SessionBridge {
 				id: model.id,
 				contextWindow: model.contextWindow,
 				reasoning: model.reasoning,
+				thinkingLevels: getSupportedThinkingLevels(model) as ThinkingLevel[],
 			}));
 	}
 

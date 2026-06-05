@@ -81,7 +81,8 @@ function truncate(text: string, maxLen: number): string {
 .fork-dialog-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.3);
+  background: rgba(18, 24, 47, 0.28);
+  backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -89,10 +90,10 @@ function truncate(text: string, maxLen: number): string {
 }
 
 .fork-dialog {
-  background: var(--pix-bg-content);
-  border: 1px solid var(--pix-border);
-  border-radius: var(--pix-radius-lg);
-  box-shadow: var(--pix-shadow-md);
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  box-shadow: var(--pix-shadow-xl);
   width: 520px;
   max-height: 560px;
   display: flex;
@@ -116,10 +117,14 @@ function truncate(text: string, maxLen: number): string {
   font-size: var(--pix-text-xl);
   color: var(--pix-text-muted);
   line-height: 1;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--pix-radius-md);
 }
 
 .dialog-close:hover {
   color: var(--pix-text-primary);
+  background: var(--pix-bg-hover);
 }
 
 .dialog-desc {
@@ -137,7 +142,7 @@ function truncate(text: string, maxLen: number): string {
   width: 100%;
   padding: var(--pix-space-sm) var(--pix-space-md);
   border: 1px solid var(--pix-border);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-lg);
   font-size: var(--pix-text-sm);
   background: var(--pix-bg-input);
   color: var(--pix-text-primary);
@@ -145,7 +150,8 @@ function truncate(text: string, maxLen: number): string {
 
 .form-input:focus {
   outline: none;
-  border-color: var(--pix-border-focus);
+  border-color: var(--pix-accent);
+  box-shadow: 0 0 0 3px rgba(98, 84, 243, 0.12);
 }
 
 .dialog-list {
@@ -167,7 +173,7 @@ function truncate(text: string, maxLen: number): string {
   width: 100%;
   padding: var(--pix-space-md);
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-sm);
+  border-radius: var(--pix-radius-lg);
   text-align: left;
   margin-bottom: var(--pix-space-xs);
   font-size: var(--pix-text-sm);
@@ -176,7 +182,7 @@ function truncate(text: string, maxLen: number): string {
 
 .fork-item:hover {
   background: var(--pix-bg-hover);
-  border-color: var(--pix-border);
+  border-color: var(--pix-accent-light-hover);
 }
 
 .fork-text {

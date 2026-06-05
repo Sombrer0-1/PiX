@@ -201,6 +201,8 @@ export { TreeItem };
 .tree-view {
   height: 100%;
   overflow-y: auto;
+  max-width: var(--pix-content-max-width);
+  margin: 0 auto;
 }
 
 .tree-loading,
@@ -213,6 +215,10 @@ export { TreeItem };
 
 .tree-content {
   padding: var(--pix-space-md);
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-xl);
+  box-shadow: var(--pix-shadow-xs);
 }
 
 .tree-item {
@@ -222,11 +228,12 @@ export { TreeItem };
 .tree-row {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  border-radius: var(--pix-radius-sm);
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: var(--pix-radius-lg);
   cursor: pointer;
   font-size: var(--pix-text-sm);
+  transition: background var(--pix-transition-fast);
 }
 
 .tree-row:hover {
@@ -234,23 +241,36 @@ export { TreeItem };
 }
 
 .tree-toggle {
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 10px;
   color: var(--pix-text-muted);
   flex-shrink: 0;
+  border-radius: var(--pix-radius-sm);
+}
+
+.tree-toggle:hover {
+  background: var(--pix-bg-active);
+  color: var(--pix-accent);
 }
 
 .tree-toggle-placeholder {
-  width: 16px;
+  width: 20px;
   flex-shrink: 0;
 }
 
 .tree-icon {
   flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-code);
   font-size: 12px;
 }
 
