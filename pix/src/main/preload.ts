@@ -68,6 +68,19 @@ export interface PixApi {
   mcpGetConfig: () => Promise<McpConfigInfo>;
   mcpListResources: (serverName?: string) => Promise<McpResourceInfo[]>;
   mcpReadResource: (serverName: string | undefined, uri: string) => Promise<McpResourceContent>;
+
+  // Auto update
+  checkForUpdates: () => Promise<{
+    success: boolean;
+    hasUpdate?: boolean;
+    currentVersion?: string;
+    latestVersion?: string;
+    releaseNotes?: string;
+    releaseDate?: string;
+    error?: string;
+  }>;
+  downloadUpdate: () => Promise<{ success: boolean; error?: string }>;
+  installUpdate: () => void;
 }
 
 const api: PixApi = {
@@ -147,6 +160,11 @@ const api: PixApi = {
   mcpListResources: (serverName?: string) => ipcRenderer.invoke("mcp-list-resources", serverName),
   mcpReadResource: (serverName: string | undefined, uri: string) =>
     ipcRenderer.invoke("mcp-read-resource", serverName, uri),
+
+  // Auto update
+  checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
+  downloadUpdate: () => ipcRenderer.invoke("download-update"),
+  installUpdate: () => ipcRenderer.invoke("install-update"),
 };
 
 contextBridge.exposeInMainWorld("pixApi", api);

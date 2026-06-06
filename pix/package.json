@@ -18,11 +18,12 @@
     "@earendil-works/pi-agent-core": "file:../packages/agent",
     "@earendil-works/pi-ai": "file:../packages/ai",
     "@earendil-works/pi-coding-agent": "file:../packages/coding-agent",
-    "pi-mcp-adapter": "file:../packages/mcp-adapter",
     "@mdi/font": "^7.4.47",
     "electron-store": "^8.1.0",
+    "electron-updater": "^6.8.9",
     "highlight.js": "^11.9.0",
     "marked": "^12.0.0",
+    "pi-mcp-adapter": "file:../packages/mcp-adapter",
     "pinia": "^2.1.0",
     "vue": "^3.4.0",
     "vue-router": "^4.3.0",
@@ -41,6 +42,11 @@
   "build": {
     "appId": "com.pix.app",
     "productName": "PiX",
+    "publish": [{
+      "provider": "github",
+      "owner": "Sombrer0-1",
+      "repo": "PiX"
+    }],
     "directories": {
       "output": "release"
     },

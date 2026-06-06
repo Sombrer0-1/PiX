@@ -11,6 +11,7 @@ import { existsSync, rmSync } from "fs";
 import { isAbsolute, join, relative, resolve } from "path";
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { autoUpdater } from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
@@ -333,6 +334,42 @@ export function registerIpcHandlers(
 
   ipcMain.handle("mcp-read-resource", async (_event, serverName: string | undefined, uri: string) => {
     return sessionBridge.mcpReadResource(serverName, uri);
+  });
+
+  // =========================================================================
+  // Auto Update
+  // =========================================================================
+
+  ipcMain.handle("check-for-updates", async () => {
+    try {
+      const result = await autoUpdater.checkForUpdates();
+      if (!result) {
+        return { success: true, hasUpdate: false, currentVersion: autoUpdater.currentVersion.version };
+      }
+      return {
+        success: true,
+        hasUpdate: true,
+        currentVersion: autoUpdater.currentVersion.version,
+        latestVersion: result.updateInfo.version,
+        releaseNotes: result.updateInfo.releaseNotes,
+        releaseDate: result.updateInfo.releaseDate,
+      };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcMain.handle("download-update", async () => {
+    try {
+      await autoUpdater.downloadUpdate();
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcMain.handle("install-update", () => {
+    autoUpdater.quitAndInstall();
   });
   // =========================================================================
   // Window Controls (frameless window)

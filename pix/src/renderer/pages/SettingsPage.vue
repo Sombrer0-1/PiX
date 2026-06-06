@@ -69,6 +69,17 @@ const autocompleteMaxVisible = ref(5);
 const saving = ref(false);
 const saved = ref(false);
 
+// ---- Update state ----
+const checkingUpdate = ref(false);
+const downloading = ref(false);
+const updateInfo = ref<{
+  hasUpdate: boolean;
+  currentVersion: string;
+  latestVersion?: string;
+  releaseNotes?: string;
+} | null>(null);
+const updateError = ref<string | null>(null);
+
 // ---- Auth editing state ----
 const editingProvider = ref<string | null>(null);
 const editingKeys = ref<Record<string, string>>({});
@@ -262,6 +273,46 @@ async function saveSettings(): Promise<void> {
 }
 
 function goBack(): void { router.back(); }
+
+async function checkForUpdates(): Promise<void> {
+  checkingUpdate.value = true;
+  updateError.value = null;
+  updateInfo.value = null;
+  try {
+    const result = await window.pixApi.checkForUpdates();
+    if (result.success) {
+      updateInfo.value = {
+        hasUpdate: result.hasUpdate ?? false,
+        currentVersion: result.currentVersion ?? "",
+        latestVersion: result.latestVersion,
+        releaseNotes: result.releaseNotes,
+      };
+    } else {
+      updateError.value = result.error ?? "检查更新失败";
+    }
+  } catch (err) {
+    updateError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
+
+async function downloadAndInstall(): Promise<void> {
+  downloading.value = true;
+  updateError.value = null;
+  try {
+    const result = await window.pixApi.downloadUpdate();
+    if (result.success) {
+      window.pixApi.installUpdate();
+    } else {
+      updateError.value = result.error ?? "下载更新失败";
+    }
+  } catch (err) {
+    updateError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    downloading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -433,6 +484,51 @@ function goBack(): void { router.back(); }
           <p class="section-desc">少量调试与底层行为设置。</p>
           <div class="form-fields">
             <v-text-field v-model.number="autocompleteMaxVisible" label="自动补全最大显示数" type="number" min="3" max="20" hint="自动补全建议的最大显示数量 (3-20)。" persistent-hint style="max-width:200px" class="mb-4" />
+
+            <v-divider class="my-4" />
+            <div class="update-section">
+              <div class="setting-subheader">
+                <v-icon size="20" icon="mdi-update" />
+                <div>
+                  <div class="setting-subtitle">应用更新</div>
+                  <div class="setting-caption">检查并安装最新版本。</div>
+                </div>
+              </div>
+              <div class="update-actions">
+                <v-btn
+                  variant="outlined"
+                  :loading="checkingUpdate"
+                  :disabled="downloading"
+                  @click="checkForUpdates"
+                >
+                  检查更新
+                </v-btn>
+                <v-btn
+                  v-if="updateInfo?.hasUpdate"
+                  color="primary"
+                  variant="tonal"
+                  :loading="downloading"
+                  :disabled="checkingUpdate"
+                  @click="downloadAndInstall"
+                >
+                  下载并安装
+                </v-btn>
+              </div>
+              <div v-if="updateInfo && !updateInfo.hasUpdate" class="update-status success">
+                <v-icon size="small" icon="mdi-check-circle" />
+                <span>当前已是最新版本 ({{ updateInfo.currentVersion }})</span>
+              </div>
+              <div v-if="updateInfo?.hasUpdate" class="update-status info">
+                <v-icon size="small" icon="mdi-information" />
+                <span>发现新版本 {{ updateInfo.latestVersion }} (当前: {{ updateInfo.currentVersion }})</span>
+              </div>
+              <div v-if="updateError" class="update-status error">
+                <v-icon size="small" icon="mdi-alert-circle" />
+                <span>{{ updateError }}</span>
+              </div>
+            </div>
+
+            <v-divider class="my-4" />
             <div class="advanced-info">
               <h3>诊断信息</h3>
               <div class="info-row"><span>集成方式</span><span>Direct (AgentSession in-process)</span></div>
@@ -694,6 +790,42 @@ function goBack(): void { router.back(); }
   border-top: 1px solid var(--pix-border-light);
   display: flex;
   flex-direction: column;
+}
+
+.update-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-sm);
+}
+
+.update-actions {
+  display: flex;
+  gap: var(--pix-space-md);
+  align-items: center;
+}
+
+.update-status {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-sm);
+  font-size: var(--pix-text-sm);
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  border-radius: var(--pix-radius-md);
+}
+
+.update-status.success {
+  color: rgb(var(--v-theme-success));
+  background: rgba(var(--v-theme-success), 0.1);
+}
+
+.update-status.info {
+  color: rgb(var(--v-theme-info));
+  background: rgba(var(--v-theme-info), 0.1);
+}
+
+.update-status.error {
+  color: rgb(var(--v-theme-error));
+  background: rgba(var(--v-theme-error), 0.1);
 }
 
 .auth-btn-group {
