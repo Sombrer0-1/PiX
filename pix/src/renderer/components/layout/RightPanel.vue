@@ -81,8 +81,7 @@ async function refreshMcp(): Promise<void> {
 }
 
 function goToMcpSettings(): void {
-  router.push("/settings");
-  // settings page defaults to "general", we trigger via store or just navigate
+  router.push({ path: "/settings", query: { section: "mcp" } });
 }
 
 function mcpStatusText(status: McpServerInfo["status"]): string {

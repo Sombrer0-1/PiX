@@ -69,16 +69,23 @@ function handleKeydown(e: KeyboardEvent): void {
   }
 }
 
+function sendErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function sendMessage(): Promise<void> {
   const text = inputText.value.trim();
   if (!text || (!canSend.value && !isStreaming.value)) return;
 
   isSending.value = true;
+  let optimisticBlockId: string | null = null;
   try {
     if (isStreaming.value) {
       // Queue as steering message while agent is running
-      sessionStore.appendOptimisticUserMessage(text);
-      rpc.sendCommandAsync({ type: "steer", message: text });
+      optimisticBlockId = sessionStore.appendOptimisticUserMessage(text);
+      void rpc.sendCommandAsync({ type: "steer", message: text }).catch((error) => {
+        sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
+      });
     } else {
       await rpc.sendPrompt(text);
     }
@@ -86,6 +93,13 @@ async function sendMessage(): Promise<void> {
     if (textareaRef.value) {
       textareaRef.value.value = "";
       textareaRef.value.style.height = "auto";
+    }
+  } catch (error) {
+    sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
+    inputText.value = text;
+    if (textareaRef.value) {
+      textareaRef.value.value = text;
+      void nextTick(autoResize);
     }
   } finally {
     isSending.value = false;

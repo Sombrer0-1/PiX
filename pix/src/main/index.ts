@@ -7,7 +7,7 @@
 
 import { BrowserWindow, Menu, app, shell } from "electron";
 import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { registerIpcHandlers, setupEventForwarding } from "./ipc-handlers.js";
 import { SessionBridge } from "./session-bridge.js";
 import { SettingsStore } from "./settings-store.js";
@@ -21,6 +21,38 @@ let mainWindow: BrowserWindow | null = null;
 let activeWin: BrowserWindow | null = null;
 let sessionBridge: SessionBridge | null = null;
 let settingsStore: SettingsStore;
+
+function isSafeExternalUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:";
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedAppNavigation(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "file:") {
+      return url === pathToFileURL(join(__dirname, "..", "..", "renderer", "index.html")).href;
+    }
+
+    const devServer = process.env.VITE_DEV_SERVER_URL || "http://localhost:5173";
+    if (process.env.NODE_ENV === "development" || process.env.VITE_DEV_SERVER_URL) {
+      return parsed.origin === new URL(devServer).origin;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function openExternalIfSafe(url: string): void {
+  if (isSafeExternalUrl(url)) {
+    void shell.openExternal(url);
+  }
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -46,8 +78,14 @@ function createWindow(): void {
 
   // Open external links in default browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    openExternalIfSafe(url);
     return { action: "deny" };
+  });
+
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (isAllowedAppNavigation(url)) return;
+    event.preventDefault();
+    openExternalIfSafe(url);
   });
 
   // Load app

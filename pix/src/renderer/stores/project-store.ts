@@ -23,7 +23,7 @@ function api(): PixApi {
       startPi: async () => ({ success: false }),
       stopPi: async () => ({ success: false }),
       sendCommand: async () => ({ success: false }),
-      sendCommandAsync: () => {},
+      sendCommandAsync: async () => ({ success: false }),
       getSettings: async () => ({ theme: "light", recentProjects: [] }),
       setSettings: async () => ({ success: false }),
       detectPi: async () => ({ found: true, path: "direct", note: "Direct integration" }),

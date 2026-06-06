@@ -140,10 +140,12 @@ const takeHerEyesConfigured = computed(() =>
   !!settingsStore.settings.takeHerEyes?.modelId
 );
 const currentModelSupportsImages = computed(() => currentModelInfo.value?.input?.includes("image") ?? false);
+const imagesBlocked = computed(() => rpc.sessionState.value?.blockImages ?? false);
 const eyeIndicatorVisible = computed(() => takeHerEyesEnabled.value);
-const eyeIndicatorActive = computed(() => takeHerEyesConfigured.value && !currentModelSupportsImages.value);
+const eyeIndicatorActive = computed(() => takeHerEyesConfigured.value && !currentModelSupportsImages.value && !imagesBlocked.value);
 const eyeIndicatorTitle = computed(() => {
   if (!takeHerEyesConfigured.value) return "眼睛已启用，但还没有选择视觉模型";
+  if (imagesBlocked.value) return "眼睛已启用，但已开启阻止图片，不会调用视觉模型";
   if (currentModelSupportsImages.value) return "眼睛已启用，但当前主模型支持图片，已自动停用";
   return "眼睛已启用：当前主模型不能看图，上传图片时会自动调用视觉模型";
 });
@@ -361,26 +363,43 @@ function handleDrop(e: DragEvent): void {
   addAttachmentPaths(paths);
 }
 
+function sendErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function sendMessage(): Promise<void> {
   const text = inputText.value.trim();
   if (!text && attachments.value.length === 0) return;
   if (!canSend.value) return;
 
   isSending.value = true;
+  const originalText = text;
+  const originalAttachments = [...attachments.value];
   const filePaths = attachments.value.map((file) => file.path);
-  // Clear input immediately — don't wait for response
+  // Clear input immediately while the request is being sent.
   inputText.value = "";
   attachments.value = [];
   if (textareaRef.value) {
     textareaRef.value.value = "";
     textareaRef.value.style.height = "auto";
   }
+  let optimisticBlockId: string | null = null;
   try {
-    sessionStore.appendOptimisticUserMessage(text, filePaths);
+    optimisticBlockId = sessionStore.appendOptimisticUserMessage(text, filePaths);
     if (isStreaming.value) {
-      rpc.sendCommandAsync({ type: "steer", message: text, filePaths });
+      void rpc.sendCommandAsync({ type: "steer", message: text, filePaths }).catch((error) => {
+        sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
+      });
     } else {
       await rpc.sendPrompt(text, filePaths);
+    }
+  } catch (error) {
+    sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
+    inputText.value = originalText;
+    attachments.value = originalAttachments;
+    if (textareaRef.value) {
+      textareaRef.value.value = originalText;
+      void nextTick(autoResize);
     }
   } finally {
     isSending.value = false;

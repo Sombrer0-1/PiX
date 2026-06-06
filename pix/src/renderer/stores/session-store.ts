@@ -140,7 +140,8 @@ export const useSessionStore = defineStore("session", () => {
   let currentAgentBlockId: string | null = null;
   let currentWorkStatusId: string | null = null;
   let currentThinkingBlockId: string | null = null;
-  let currentVisionStatusId: string | null = null;
+  let legacyVisionStatusId: string | null = null;
+  let visionStatusIds = new Map<string, string>();
   let optimisticUserMessages: Array<{ blockId: string; fingerprint: string; separatorId: string | null }> = [];
 
   function removeThinkingBlock(): void {
@@ -214,9 +215,9 @@ export const useSessionStore = defineStore("session", () => {
     }
   }
 
-  function appendOptimisticUserMessage(text: string, filePaths: string[] = []): void {
+  function appendOptimisticUserMessage(text: string, filePaths: string[] = []): string | null {
     const attachments = filePaths.map(attachmentFromPath);
-    if (!text.trim() && attachments.length === 0) return;
+    if (!text.trim() && attachments.length === 0) return null;
 
     const timestamp = Date.now();
     closeCurrentWorkStatus(true);
@@ -234,6 +235,26 @@ export const useSessionStore = defineStore("session", () => {
       fingerprint: fingerprintUserMessage(text, attachments),
       separatorId,
     });
+    return block.id;
+  }
+
+  function failOptimisticUserMessage(blockId: string | null, message: string): void {
+    if (!blockId) return;
+    const optimistic = optimisticUserMessages.find((item) => item.blockId === blockId);
+    if (!optimistic) return;
+
+    const removeIds = new Set([optimistic.blockId]);
+    if (optimistic.separatorId) removeIds.add(optimistic.separatorId);
+    displayBlocks.value = displayBlocks.value.filter((block) => !removeIds.has(block.id));
+    optimisticUserMessages = optimisticUserMessages.filter((item) => item.blockId !== blockId);
+
+    displayBlocks.value.push({
+      id: nextBlockId(),
+      type: "error",
+      message,
+      source: "send",
+      timestamp: Date.now(),
+    });
   }
 
   function showVisionStatus(event: Extract<AgentSessionEvent, { type: "eye_model_start" }>): void {
@@ -246,18 +267,27 @@ export const useSessionStore = defineStore("session", () => {
       status: "running",
       timestamp: Date.now(),
     };
-    currentVisionStatusId = block.id;
+    if (event.id) {
+      visionStatusIds.set(event.id, block.id);
+    } else {
+      legacyVisionStatusId = block.id;
+    }
     displayBlocks.value.push(block);
   }
 
   function finishVisionStatus(event: Extract<AgentSessionEvent, { type: "eye_model_end" }>): void {
-    const block = currentVisionStatusId
-      ? displayBlocks.value.find((item) => item.id === currentVisionStatusId && item.type === "vision-status")
+    const blockId = event.id ? visionStatusIds.get(event.id) : legacyVisionStatusId;
+    const block = blockId
+      ? displayBlocks.value.find((item) => item.id === blockId && item.type === "vision-status")
       : null;
     if (block && block.type === "vision-status") {
       block.status = event.success ? "success" : "error";
       block.timestamp = Date.now();
-      currentVisionStatusId = null;
+      if (event.id) {
+        visionStatusIds.delete(event.id);
+      } else {
+        legacyVisionStatusId = null;
+      }
       return;
     }
     displayBlocks.value.push({
@@ -620,7 +650,8 @@ export const useSessionStore = defineStore("session", () => {
     currentAgentBlockId = null;
     currentWorkStatusId = null;
     currentThinkingBlockId = null;
-    currentVisionStatusId = null;
+    legacyVisionStatusId = null;
+    visionStatusIds = new Map();
     optimisticUserMessages = [];
   }
 
@@ -636,6 +667,7 @@ export const useSessionStore = defineStore("session", () => {
     addEvent,
     addEvents,
     appendOptimisticUserMessage,
+    failOptimisticUserMessage,
     loadMessages,
     clearSession,
     getRawEventsJson,

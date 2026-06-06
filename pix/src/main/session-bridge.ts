@@ -74,6 +74,12 @@ type UserInputRequestListener = (request: RequestUserInputRequest) => void;
 type WithSessionCallback = NonNullable<
 	NonNullable<Parameters<ExtensionCommandContextActions["newSession"]>[0]>["withSession"]
 >;
+type PiSettingEntry = { key: string; value: unknown };
+type PiSettingApplyResult = {
+	reloadRuntime?: boolean;
+	refreshSystemPrompt?: boolean;
+	reapplyModelScope?: boolean;
+};
 
 const TAKE_HER_EYES_TIMEOUT_MS = 45_000;
 const TAKE_HER_EYES_MAX_TOKENS = 2048;
@@ -93,8 +99,13 @@ interface AuxiliaryUsageTotals {
 }
 
 function globPatternToRegExp(pattern: string): RegExp {
-	const escaped = pattern.trim().replace(/[\\^$+?.()|[\]{}]/g, "\\$&").replace(/\*/g, ".*");
-	return new RegExp(`^${escaped}$`, "i");
+	let source = "";
+	for (const char of pattern.trim()) {
+		if (char === "*") source += ".*";
+		else if (char === "?") source += ".";
+		else source += char.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
+	}
+	return new RegExp(`^${source}$`, "i");
 }
 
 function createEmptyAuxiliaryUsage(): AuxiliaryUsageTotals {
@@ -443,7 +454,9 @@ export class SessionBridge {
 			throw new Error("Auth storage not initialized. Start a session first.");
 		}
 		this._authStorage.set(provider, { type: "api_key", key });
-		this._getSession().modelRegistry.refresh();
+		const session = this._getSession();
+		session.modelRegistry.refresh();
+		this._applyEnabledModelScope(session);
 	}
 
 	removeAuth(provider: string): void {
@@ -451,7 +464,9 @@ export class SessionBridge {
 			throw new Error("Auth storage not initialized. Start a session first.");
 		}
 		this._authStorage.remove(provider);
-		this._getSession().modelRegistry.refresh();
+		const session = this._getSession();
+		session.modelRegistry.refresh();
+		this._applyEnabledModelScope(session);
 	}
 
 	// =========================================================================
@@ -463,63 +478,93 @@ export class SessionBridge {
 		return sm.getGlobalSettings() as unknown as Record<string, unknown>;
 	}
 
-	setPiSetting(key: string, value: unknown): void {
+	async setPiSetting(key: string, value: unknown): Promise<void> {
+		await this.setPiSettings([{ key, value }]);
+	}
+
+	async setPiSettings(entries: PiSettingEntry[]): Promise<void> {
+		const session = this._getSession();
+		let reloadRuntime = false;
+		let refreshSystemPrompt = false;
+		let reapplyModelScope = false;
+
+		for (const entry of entries) {
+			const result = this._applyPiSetting(entry.key, entry.value);
+			reloadRuntime ||= result.reloadRuntime === true;
+			refreshSystemPrompt ||= result.refreshSystemPrompt === true;
+			reapplyModelScope ||= result.reapplyModelScope === true;
+		}
+
+		if (reloadRuntime) {
+			await session.reload();
+			reapplyModelScope = true;
+		} else if (refreshSystemPrompt) {
+			session.refreshSystemPrompt();
+		}
+
+		if (reapplyModelScope) {
+			this._applyEnabledModelScope(session);
+		}
+	}
+
+	private _applyPiSetting(key: string, value: unknown): PiSettingApplyResult {
 		const sm = this._getSession().settingsManager;
 		const session = this._getSession();
 
 		switch (key) {
-			case "defaultProvider": return sm.setDefaultProvider(value as string);
-			case "defaultModel": return sm.setDefaultModel(value as string);
-			case "defaultThinkingLevel": return sm.setDefaultThinkingLevel(value as ThinkingLevel);
-			case "transport": return sm.setTransport(value as "auto" | "sse" | "websocket");
-			case "steeringMode": session.setSteeringMode(value as "all" | "one-at-a-time"); return;
-			case "followUpMode": session.setFollowUpMode(value as "all" | "one-at-a-time"); return;
-			case "theme": return sm.setTheme(value as string);
-			case "hideThinkingBlock": return sm.setHideThinkingBlock(value as boolean);
+			case "defaultProvider": sm.setDefaultProvider(value as string); return {};
+			case "defaultModel": sm.setDefaultModel(value as string); return {};
+			case "defaultThinkingLevel": sm.setDefaultThinkingLevel(value as ThinkingLevel); return {};
+			case "transport": sm.setTransport(value as "auto" | "sse" | "websocket"); return {};
+			case "steeringMode": session.setSteeringMode(value as "all" | "one-at-a-time"); return {};
+			case "followUpMode": session.setFollowUpMode(value as "all" | "one-at-a-time"); return {};
+			case "theme": sm.setTheme(value as string); return {};
+			case "hideThinkingBlock": sm.setHideThinkingBlock(value as boolean); return {};
 			case "shellPath":
 				sm.setShellPath(value as string | undefined);
-				session.refreshSystemPrompt();
-				return;
-			case "quietStartup": return sm.setQuietStartup(value as boolean);
-			case "shellCommandPrefix": return sm.setShellCommandPrefix(value as string | undefined);
-			case "npmCommand": return sm.setNpmCommand(value as string[] | undefined);
-			case "collapseChangelog": return sm.setCollapseChangelog(value as boolean);
-			case "enableInstallTelemetry": return sm.setEnableInstallTelemetry(value as boolean);
-			case "compactEnabled": return sm.setCompactionEnabled(value as boolean);
-			case "compactionReserveTokens": return;
-			case "compactionKeepRecentTokens": return;
-			case "retryEnabled": return sm.setRetryEnabled(value as boolean);
+				return { reloadRuntime: true };
+			case "quietStartup": sm.setQuietStartup(value as boolean); return {};
+			case "shellCommandPrefix": sm.setShellCommandPrefix(value as string | undefined); return { reloadRuntime: true };
+			case "npmCommand": sm.setNpmCommand(value as string[] | undefined); return { reloadRuntime: true };
+			case "collapseChangelog": sm.setCollapseChangelog(value as boolean); return {};
+			case "enableInstallTelemetry": sm.setEnableInstallTelemetry(value as boolean); return {};
+			case "compactEnabled": sm.setCompactionEnabled(value as boolean); return {};
+			case "compactionReserveTokens": return {};
+			case "compactionKeepRecentTokens": return {};
+			case "retryEnabled": sm.setRetryEnabled(value as boolean); return {};
 			case "executionMode":
 				sm.setExecutionMode(
 					value === "unattended" || value === "read-only" ? value : "approval",
 				);
-				session.refreshSystemPrompt();
-				return;
+				return { refreshSystemPrompt: true };
 			case "verificationGate":
 				sm.setVerificationGateEnabled(value as boolean);
-				session.refreshSystemPrompt();
-				return;
-			case "enableSkillCommands": return sm.setEnableSkillCommands(value as boolean);
-			case "showImages": return sm.setShowImages(value as boolean);
-			case "imageWidthCells": return sm.setImageWidthCells(value as number);
-			case "autoResizeImages": return sm.setImageAutoResize(value as boolean);
-			case "blockImages": return sm.setBlockImages(value as boolean);
-			case "clearOnShrink": return sm.setClearOnShrink(value as boolean);
-			case "showTerminalProgress": return sm.setShowTerminalProgress(value as boolean);
-			case "sessionDir": return;
-			case "httpIdleTimeoutMs": return sm.setHttpIdleTimeoutMs(value as number);
-			case "enabledModels": return sm.setEnabledModels(value as string[] | undefined);
-			case "extensionPaths": return sm.setExtensionPaths(value as string[]);
-			case "skillPaths": return sm.setSkillPaths(value as string[]);
-			case "promptTemplatePaths": return sm.setPromptTemplatePaths(value as string[]);
-			case "themePaths": return sm.setThemePaths(value as string[]);
-			case "packages": return sm.setPackages(value as Array<{ source: string; extensions?: string[]; skills?: string[]; prompts?: string[]; themes?: string[] }>);
-			case "doubleEscapeAction": return sm.setDoubleEscapeAction(value as "fork" | "tree" | "none");
-			case "treeFilterMode": return sm.setTreeFilterMode(value as "default" | "no-tools" | "user-only" | "labeled-only" | "all");
-			case "showHardwareCursor": return sm.setShowHardwareCursor(value as boolean);
-			case "editorPaddingX": return sm.setEditorPaddingX(value as number);
-			case "autocompleteMaxVisible": return sm.setAutocompleteMaxVisible(value as number);
-			case "warnings": return sm.setWarnings(value as { anthropicExtraUsage?: boolean });
+				return { refreshSystemPrompt: true };
+			case "enableSkillCommands": sm.setEnableSkillCommands(value as boolean); return { reloadRuntime: true };
+			case "showImages": sm.setShowImages(value as boolean); return {};
+			case "imageWidthCells": sm.setImageWidthCells(value as number); return {};
+			case "autoResizeImages": sm.setImageAutoResize(value as boolean); return { reloadRuntime: true };
+			case "blockImages": sm.setBlockImages(value as boolean); return {};
+			case "clearOnShrink": sm.setClearOnShrink(value as boolean); return {};
+			case "showTerminalProgress": sm.setShowTerminalProgress(value as boolean); return {};
+			case "sessionDir": return {};
+			case "httpIdleTimeoutMs": sm.setHttpIdleTimeoutMs(value as number); return {};
+			case "enabledModels":
+				sm.setEnabledModels(value as string[] | undefined);
+				return { reapplyModelScope: true };
+			case "extensionPaths": sm.setExtensionPaths(Array.isArray(value) ? value as string[] : []); return { reloadRuntime: true };
+			case "skillPaths": sm.setSkillPaths(Array.isArray(value) ? value as string[] : []); return { reloadRuntime: true };
+			case "promptTemplatePaths": sm.setPromptTemplatePaths(Array.isArray(value) ? value as string[] : []); return { reloadRuntime: true };
+			case "themePaths": sm.setThemePaths(Array.isArray(value) ? value as string[] : []); return { reloadRuntime: true };
+			case "packages":
+				sm.setPackages(value as Array<{ source: string; extensions?: string[]; skills?: string[]; prompts?: string[]; themes?: string[] }>);
+				return { reloadRuntime: true };
+			case "doubleEscapeAction": sm.setDoubleEscapeAction(value as "fork" | "tree" | "none"); return {};
+			case "treeFilterMode": sm.setTreeFilterMode(value as "default" | "no-tools" | "user-only" | "labeled-only" | "all"); return {};
+			case "showHardwareCursor": sm.setShowHardwareCursor(value as boolean); return {};
+			case "editorPaddingX": sm.setEditorPaddingX(value as number); return {};
+			case "autocompleteMaxVisible": sm.setAutocompleteMaxVisible(value as number); return {};
+			case "warnings": sm.setWarnings(value as { anthropicExtraUsage?: boolean }); return {};
 			default:
 				throw new Error(`Unknown setting key: ${key}`);
 		}
@@ -554,6 +599,7 @@ export class SessionBridge {
 			autoCompactionEnabled: session.settingsManager.getCompactionEnabled(),
 			messageCount: session.messages.length,
 			pendingMessageCount: this._pendingMessageCount,
+			blockImages: session.settingsManager.getBlockImages(),
 			goal: session.goal,
 		};
 	}
@@ -584,9 +630,12 @@ export class SessionBridge {
 	}
 
 	getAvailableModels(): ModelInfo[] {
-		return this._getSession()
-			.modelRegistry.getAvailable()
-			.map((model: Model<Api>) => ({
+		const session = this._getSession();
+		const scopedModels = session.scopedModels;
+		const models = scopedModels.length > 0
+			? scopedModels.map((scoped) => scoped.model)
+			: session.modelRegistry.getAvailable();
+		return models.map((model: Model<Api>) => ({
 				provider: model.provider,
 				id: model.id,
 				contextWindow: model.contextWindow,
@@ -858,6 +907,15 @@ export class SessionBridge {
 		if (processed.text) parts.push(processed.text);
 		if (text) parts.push(text);
 
+		if (session.settingsManager.getBlockImages()) {
+			return {
+				text: parts.join(""),
+				images: undefined,
+				displayText: text,
+				attachments: processed.attachments,
+			};
+		}
+
 		const visualContext = await this._tryTakeHerEyes(text, processed.images, processed.attachments);
 		if (visualContext) {
 			parts.push(visualContext);
@@ -897,11 +955,13 @@ export class SessionBridge {
 		if (!eyeModel || !eyeModel.input.includes("image")) return null;
 		if (!session.modelRegistry.hasConfiguredAuth(eyeModel)) return null;
 
+		const operationId = `eye_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 		let emittedStart = false;
 		const emitEnd = (success: boolean, errorMessage?: string): void => {
 			if (!emittedStart) return;
 			this._emitSessionEvent({
 				type: "eye_model_end",
+				id: operationId,
 				provider: eyeModel.provider,
 				modelId: eyeModel.id,
 				imageCount: images.length,
@@ -920,6 +980,7 @@ export class SessionBridge {
 
 			this._emitSessionEvent({
 				type: "eye_model_start",
+				id: operationId,
 				provider: eyeModel.provider,
 				modelId: eyeModel.id,
 				imageCount: images.length,
@@ -1021,6 +1082,76 @@ export class SessionBridge {
 		this._auxiliaryUsage.cost += usage.cost.total;
 	}
 
+	private _applyEnabledModelScope(session: AgentSession): void {
+		const patterns = session.settingsManager.getEnabledModels()?.map((pattern) => pattern.trim()).filter(Boolean);
+		if (!patterns || patterns.length === 0) {
+			session.setScopedModels([]);
+			return;
+		}
+		session.setScopedModels(this._resolveScopedModels(session, patterns));
+	}
+
+	private _resolveScopedModels(
+		session: AgentSession,
+		patterns: string[],
+	): Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> {
+		const availableModels = session.modelRegistry.getAvailable();
+		const scopedModels: Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> = [];
+		const seen = new Set<string>();
+
+		for (const rawPattern of patterns) {
+			const { pattern, thinkingLevel } = this._parseScopedModelPattern(rawPattern);
+			if (!pattern) continue;
+
+			const hasGlob = pattern.includes("*") || pattern.includes("?");
+			const regex = hasGlob ? globPatternToRegExp(pattern) : undefined;
+			const patternLower = pattern.toLowerCase();
+
+			for (const model of availableModels) {
+				const fullId = `${model.provider}/${model.id}`;
+				const matches = regex
+					? regex.test(fullId) || regex.test(model.id)
+					: fullId.toLowerCase() === patternLower || model.id.toLowerCase() === patternLower;
+				if (!matches) continue;
+
+				const key = `${model.provider}/${model.id}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				const supportedThinking = getSupportedThinkingLevels(model) as ThinkingLevel[];
+				scopedModels.push({
+					model,
+					thinkingLevel: thinkingLevel && supportedThinking.includes(thinkingLevel) ? thinkingLevel : undefined,
+				});
+			}
+		}
+
+		return scopedModels;
+	}
+
+	private _parseScopedModelPattern(rawPattern: string): { pattern: string; thinkingLevel?: ThinkingLevel } {
+		const trimmed = rawPattern.trim();
+		const colonIndex = trimmed.lastIndexOf(":");
+		if (colonIndex === -1) return { pattern: trimmed };
+
+		const suffix = trimmed.slice(colonIndex + 1);
+		if (this._isThinkingLevel(suffix)) {
+			return {
+				pattern: trimmed.slice(0, colonIndex),
+				thinkingLevel: suffix,
+			};
+		}
+		return { pattern: trimmed };
+	}
+
+	private _isThinkingLevel(value: string): value is ThinkingLevel {
+		return value === "off" ||
+			value === "minimal" ||
+			value === "low" ||
+			value === "medium" ||
+			value === "high" ||
+			value === "xhigh";
+	}
+
 	private async _createSession(
 		cwd: string,
 		sessionManager: SessionManager,
@@ -1037,7 +1168,7 @@ export class SessionBridge {
 		});
 		await resourceLoader.reload();
 
-		return createAgentSession({
+		const result = await createAgentSession({
 			cwd,
 			sessionManager,
 			settingsManager,
@@ -1046,6 +1177,8 @@ export class SessionBridge {
 			sessionStartEvent,
 			requestUserInput: (request, signal) => this._requestUserInput(request, signal),
 		});
+		this._applyEnabledModelScope(result.session);
+		return result;
 	}
 
 	private async _activateSession(session: AgentSession): Promise<void> {

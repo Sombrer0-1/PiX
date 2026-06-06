@@ -14,6 +14,15 @@ import { marked } from "marked";
 marked.setOptions({ breaks: true, gfm: true });
 const markdownRenderer = new marked.Renderer();
 markdownRenderer.html = (html: string) => escapeHtml(html);
+markdownRenderer.link = (href: string, title: string | null | undefined, text: string): string => {
+  const safeText = text;
+  const safeHref = sanitizeHref(href);
+  if (!safeHref) {
+    return `<a href="#" rel="noopener noreferrer" data-unsafe-link="true">${safeText}</a>`;
+  }
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  return `<a href="${escapeHtml(safeHref)}"${titleAttr} target="_blank" rel="noopener noreferrer">${safeText}</a>`;
+};
 
 function escapeHtml(text: string): string {
   return text
@@ -22,6 +31,18 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function sanitizeHref(href: string): string | null {
+  const trimmed = href.trim();
+  if (!trimmed) return null;
+  if (/^[./#?]/.test(trimmed)) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    return ["http:", "https:", "mailto:"].includes(url.protocol) ? trimmed : null;
+  } catch {
+    return null;
+  }
 }
 
 function renderMarkdown(text: string): string {

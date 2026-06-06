@@ -31,7 +31,7 @@ export interface PixApi {
 
   // RPC commands
   sendCommand: <T = unknown>(command: RpcCommand) => Promise<{ success: boolean; data?: T; error?: string }>;
-  sendCommandAsync: (command: RpcCommand) => void;
+  sendCommandAsync: (command: RpcCommand) => Promise<{ success: boolean; error?: string }>;
 
   // Settings
   getSettings: () => Promise<GuiSettings>;
@@ -85,7 +85,8 @@ const api: PixApi = {
 
   sendCommand: <T = unknown>(command: RpcCommand) =>
     ipcRenderer.invoke("rpc-command", command) as Promise<{ success: boolean; data?: T; error?: string }>,
-  sendCommandAsync: (command: RpcCommand) => ipcRenderer.invoke("rpc-command-async", command),
+  sendCommandAsync: (command: RpcCommand) =>
+    ipcRenderer.invoke("rpc-command-async", command) as Promise<{ success: boolean; error?: string }>,
 
   getSettings: () => ipcRenderer.invoke("get-settings"),
   setSettings: (settings: Partial<GuiSettings>) => ipcRenderer.invoke("set-settings", settings),

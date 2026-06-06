@@ -181,8 +181,25 @@ async function sendCommand<T = unknown>(command: RpcCommand): Promise<T | null> 
 	return result.data ?? null;
 }
 
-function sendCommandAsync(command: RpcCommand): void {
-	api().sendCommandAsync(command);
+async function sendCommandOrThrow<T = unknown>(command: RpcCommand): Promise<T | null> {
+	const result = await api().sendCommand<T>(command);
+	if (!result.success) {
+		const message = result.error || `Command ${command.type} failed`;
+		console.error(`[useRpc] Command ${command.type} failed:`, message);
+		lastError.value = message;
+		throw new Error(message);
+	}
+	return result.data ?? null;
+}
+
+async function sendCommandAsync(command: RpcCommand): Promise<void> {
+	const result = await api().sendCommandAsync(command);
+	if (!result.success) {
+		const message = result.error || `Command ${command.type} failed`;
+		console.error(`[useRpc] Async command ${command.type} failed:`, message);
+		lastError.value = message;
+		throw new Error(message);
+	}
 }
 
 async function startPi(projectDir: string): Promise<boolean> {
@@ -234,7 +251,7 @@ async function stopPi(): Promise<void> {
 }
 
 async function sendPrompt(message: string, filePaths?: string[]): Promise<void> {
-	await sendCommand({ type: "prompt", message, filePaths });
+	await sendCommandOrThrow({ type: "prompt", message, filePaths });
 }
 
 async function abort(): Promise<void> {
@@ -334,7 +351,11 @@ async function getPiSettings(): Promise<Record<string, unknown> | null> {
 }
 
 async function setPiSetting(key: string, value: unknown): Promise<void> {
-	await sendCommand({ type: "set_pi_setting", key, value });
+	await sendCommandOrThrow({ type: "set_pi_setting", key, value });
+}
+
+async function setPiSettings(entries: Array<{ key: string; value: unknown }>): Promise<void> {
+	await sendCommandOrThrow({ type: "set_pi_settings", entries });
 }
 
 // =========================================================================
@@ -449,6 +470,7 @@ export function useRpc() {
 		// Full pi settings
 		getPiSettings,
 		setPiSetting,
+		setPiSettings,
 		// Session tree / fork / clone
 		forkSession,
 		cloneSession,

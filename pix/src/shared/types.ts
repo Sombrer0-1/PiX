@@ -66,6 +66,7 @@ export type RpcCommand =
   // Settings (full pi settings from SettingsManager)
   | { id?: string; type: "get_pi_settings" }
   | { id?: string; type: "set_pi_setting"; key: string; value: unknown }
+  | { id?: string; type: "set_pi_settings"; entries: Array<{ key: string; value: unknown }> }
   // Resources
   | { id?: string; type: "reload_resources" }
   | { id?: string; type: "get_themes" }
@@ -91,6 +92,7 @@ export interface RpcSessionState {
   autoCompactionEnabled: boolean;
   messageCount: number;
   pendingMessageCount: number;
+  blockImages?: boolean;
   goal?: ThreadGoal;
 }
 
@@ -178,8 +180,8 @@ export type AgentSessionEvent =
   | { type: "compaction_end"; reason: "manual" | "threshold" | "overflow"; result?: unknown; aborted: boolean; willRetry: boolean; errorMessage?: string }
   | { type: "session_info_changed"; name: string | undefined }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
-  | { type: "eye_model_start"; provider: string; modelId: string; imageCount: number }
-  | { type: "eye_model_end"; provider: string; modelId: string; imageCount: number; success: boolean; errorMessage?: string }
+  | { type: "eye_model_start"; id?: string; provider: string; modelId: string; imageCount: number }
+  | { type: "eye_model_end"; id?: string; provider: string; modelId: string; imageCount: number; success: boolean; errorMessage?: string }
   | { type: "goal_update"; goal: ThreadGoal | undefined }
   | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
   | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
@@ -404,7 +406,7 @@ export interface PiSettings {
   steeringMode?: "all" | "one-at-a-time";
   followUpMode?: "all" | "one-at-a-time";
   execution?: {
-    mode?: "approval" | "unattended";
+    mode?: "approval" | "unattended" | "read-only";
     verificationGate?: boolean;
   };
   theme?: string;

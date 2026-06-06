@@ -250,12 +250,15 @@ export function registerIpcHandlers(
   ipcMain.handle("rpc-command-async", async (_event, command: unknown) => {
     if (!isRpcCommand(command)) {
       console.error("[ipc] Invalid async command:", command);
-      return;
+      return { success: false, error: `Invalid command: ${JSON.stringify(command)}` };
     }
-    // Fire and forget
-    executeCommand(sessionBridge, command).catch((err) => {
+    try {
+      await executeCommand(sessionBridge, command);
+      return { success: true };
+    } catch (err) {
       console.error("[ipc] Async command error:", err);
-    });
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
   });
 
   // =========================================================================
@@ -513,7 +516,10 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
     case "get_pi_settings":
       return bridge.getPiSettings();
     case "set_pi_setting":
-      bridge.setPiSetting(cmd.key, cmd.value);
+      await bridge.setPiSetting(cmd.key, cmd.value);
+      return null;
+    case "set_pi_settings":
+      await bridge.setPiSettings(cmd.entries);
       return null;
 
     // Resources

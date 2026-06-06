@@ -5,8 +5,8 @@
  * Sidebar + content layout. Left nav selects the section,
  * right panel shows the form fields for that section.
  */
-import { computed, ref, onMounted } from "vue";
-import { useRouter } from "vue-router";
+import { computed, ref, onMounted, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { useSettingsStore } from "../stores/settings-store";
 import { useAuthStore } from "../stores/auth-store";
 import { useRpc } from "../composables/useRpc";
@@ -14,6 +14,7 @@ import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 import McpSettings from "../components/settings/McpSettings.vue";
 
 const router = useRouter();
+const route = useRoute();
 const settingsStore = useSettingsStore();
 const authStore = useAuthStore();
 const rpc = useRpc();
@@ -30,6 +31,7 @@ const sections: { key: SettingsSection; label: string; icon: string }[] = [
   { key: "auth", label: "认证", icon: "mdi-shield-key" },
   { key: "advanced", label: "高级", icon: "mdi-tune" },
 ];
+const sectionKeys = new Set<SettingsSection>(sections.map((section) => section.key));
 
 // ---- Form state ----
 const defaultProvider = ref("");
@@ -118,7 +120,7 @@ const transportOptions = ["auto", "sse", "websocket"] as const;
 
 const visionModelItems = computed(() =>
   rpc.availableModels.value
-    .filter((model: ModelInfo) => model.input?.includes("image"))
+    .filter((model: ModelInfo) => model.input?.includes("image") && authStore.authStatus[model.provider]?.configured)
     .map((model: ModelInfo) => ({
       title: `${model.provider}/${model.id}`,
       value: modelKey(model),
@@ -147,8 +149,16 @@ function formatContextWindow(contextWindow: number): string {
   return String(contextWindow);
 }
 
+function syncSectionFromRoute(): void {
+  const section = route.query.section;
+  if (typeof section === "string" && sectionKeys.has(section as SettingsSection)) {
+    activeSection.value = section as SettingsSection;
+  }
+}
+
 // ---- Load ----
 onMounted(async () => {
+  syncSectionFromRoute();
   await settingsStore.load();
   defaultProvider.value = settingsStore.settings.defaultProvider || "";
   defaultModel.value = settingsStore.settings.defaultModel || "";
@@ -168,6 +178,8 @@ onMounted(async () => {
     try { await authStore.refreshStatus(); } catch { /* unavailable */ }
   }
 });
+
+watch(() => route.query.section, syncSectionFromRoute);
 
 function applyPiSettings(s: Record<string, unknown>): void {
   steeringMode.value = (s.steeringMode as "all" | "one-at-a-time") ?? "one-at-a-time";
@@ -194,6 +206,20 @@ function applyPiSettings(s: Record<string, unknown>): void {
   autocompleteMaxVisible.value = (s.autocompleteMaxVisible ?? 5) as number;
 }
 
+function commaList(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function optionalCommaList(value: string): string[] | undefined {
+  const items = commaList(value);
+  return items.length > 0 ? items : undefined;
+}
+
+function optionalSpaceList(value: string): string[] | undefined {
+  const items = value.split(/\s+/).map((item) => item.trim()).filter(Boolean);
+  return items.length > 0 ? items : undefined;
+}
+
 async function saveSettings(): Promise<void> {
   saving.value = true;
   saved.value = false;
@@ -214,24 +240,21 @@ async function saveSettings(): Promise<void> {
         ["steeringMode", steeringMode.value], ["followUpMode", followUpMode.value],
         ["executionMode", executionMode.value], ["verificationGate", verificationGate.value],
         ["compactEnabled", autoCompact.value], ["quietStartup", quietStartup.value],
-        ["enabledModels", enabledModels.value ? enabledModels.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
+        ["enabledModels", optionalCommaList(enabledModels.value)],
         ["transport", transport.value], ["retryEnabled", retryEnabled.value],
         ["autoResizeImages", imageAutoResize.value], ["blockImages", blockImages.value],
         ["shellPath", shellPath.value || undefined], ["shellCommandPrefix", shellCommandPrefix.value || undefined],
-        ["npmCommand", npmCommand.value ? npmCommand.value.split(/\s+/).filter(Boolean) : undefined],
-        ["httpIdleTimeoutMs", httpIdleTimeoutMs.value || undefined],
-        ["extensionPaths", extensionPaths.value ? extensionPaths.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
-        ["skillPaths", skillPaths.value ? skillPaths.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
-        ["promptTemplatePaths", promptTemplatePaths.value ? promptTemplatePaths.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
-        ["themePaths", themePaths.value ? themePaths.value.split(",").map(s => s.trim()).filter(Boolean) : undefined],
+        ["npmCommand", optionalSpaceList(npmCommand.value)],
+        ["httpIdleTimeoutMs", httpIdleTimeoutMs.value || 0],
+        ["extensionPaths", commaList(extensionPaths.value)],
+        ["skillPaths", commaList(skillPaths.value)],
+        ["promptTemplatePaths", commaList(promptTemplatePaths.value)],
+        ["themePaths", commaList(themePaths.value)],
         ["enableSkillCommands", enableSkillCommands.value],
         ["autocompleteMaxVisible", autocompleteMaxVisible.value],
       ];
-      for (const [key, value] of setters) {
-        if (value !== undefined) await rpc.setPiSetting(key, value);
-      }
-      await rpc.setSteeringMode(steeringMode.value);
-      await rpc.setFollowUpMode(followUpMode.value);
+      await rpc.setPiSettings(setters.map(([key, value]) => ({ key, value })));
+      await Promise.all([rpc.refreshState(), rpc.refreshModels(), rpc.refreshCommands()]);
     }
     saved.value = true;
     setTimeout(() => (saved.value = false), 2000);

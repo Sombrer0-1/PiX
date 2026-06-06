@@ -21,6 +21,7 @@ const pinnedIds = ref<Set<string>>(new Set());
 const deletingSession = ref<string | null>(null);
 const showDeleteDialog = ref(false);
 const confirmDeleteSession = ref<SessionInfo | null>(null);
+const deleteError = ref<string | null>(null);
 
 const projectPath = computed(() => projectStore.currentProject?.path || "");
 const deleteSessionTitle = computed(() => deriveSessionTitle(confirmDeleteSession.value));
@@ -80,6 +81,7 @@ function togglePin(sessionId: string): void {
 
 function requestDelete(session: SessionInfo): void {
   confirmDeleteSession.value = session;
+  deleteError.value = null;
   showDeleteDialog.value = true;
 }
 
@@ -87,9 +89,14 @@ async function executeDelete(): Promise<void> {
   const session = confirmDeleteSession.value;
   if (!session) return;
   deletingSession.value = session.id;
+  deleteError.value = null;
   const wasCurrentSession = projectStore.currentSession?.id === session.id;
   try {
     const result = await window.pixApi.deleteSession(session.path);
+    if (!result.success) {
+      deleteError.value = result.error || "Delete session failed";
+      return;
+    }
     if (result.success) {
       await projectStore.listSessions();
       if (wasCurrentSession) {
@@ -119,10 +126,13 @@ async function executeDelete(): Promise<void> {
     }
   } catch (err) {
     console.error("[LeftPanel] 删除会话失败:", err);
+    deleteError.value = err instanceof Error ? err.message : String(err);
   } finally {
     deletingSession.value = null;
-    confirmDeleteSession.value = null;
-    showDeleteDialog.value = false;
+    if (!deleteError.value) {
+      confirmDeleteSession.value = null;
+      showDeleteDialog.value = false;
+    }
   }
 }
 
@@ -241,6 +251,7 @@ function goSettings(): void { router.push("/settings"); }
           <strong class="delete-session-name">「{{ deleteSessionTitle }}」</strong>
           <span>吗？此操作不可撤销。</span>
         </div>
+        <div v-if="deleteError" class="delete-dialog-error">{{ deleteError }}</div>
         <v-card-actions class="delete-dialog-actions">
           <v-spacer />
           <v-btn variant="text" @click="showDeleteDialog = false">取消</v-btn>
@@ -611,6 +622,18 @@ function goSettings(): void { router.push("/settings"); }
 .delete-session-name {
   color: var(--pix-text-primary);
   font-weight: var(--pix-weight-semibold);
+}
+
+.delete-dialog-error {
+  margin-top: var(--pix-space-md);
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  border: 1px solid var(--pix-error-light);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-error-bg);
+  color: var(--pix-error);
+  font-size: var(--pix-text-xs);
+  line-height: var(--pix-leading-base);
+  word-break: break-word;
 }
 
 .delete-dialog-actions {
