@@ -5,12 +5,12 @@
  * Sidebar + content layout. Left nav selects the section,
  * right panel shows the form fields for that section.
  */
-import { ref, onMounted } from "vue";
+import { computed, ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { useSettingsStore } from "../stores/settings-store";
 import { useAuthStore } from "../stores/auth-store";
 import { useRpc } from "../composables/useRpc";
-import type { ThinkingLevel } from "@/types/rpc";
+import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 import McpSettings from "../components/settings/McpSettings.vue";
 
 const router = useRouter();
@@ -48,6 +48,8 @@ const retryEnabled = ref(true);
 
 const imageAutoResize = ref(true);
 const blockImages = ref(false);
+const takeHerEyesEnabled = ref(false);
+const takeHerEyesModel = ref("");
 
 const shellPath = ref("");
 const shellCommandPrefix = ref("");
@@ -114,18 +116,55 @@ const executionModeItems = [
 ] as const;
 const transportOptions = ["auto", "sse", "websocket"] as const;
 
+const visionModelItems = computed(() =>
+  rpc.availableModels.value
+    .filter((model: ModelInfo) => model.input?.includes("image"))
+    .map((model: ModelInfo) => ({
+      title: `${model.provider}/${model.id}`,
+      value: modelKey(model),
+      props: {
+        subtitle: model.contextWindow ? `${formatContextWindow(model.contextWindow)} context` : undefined,
+      },
+    }))
+);
+
+function modelKey(model: { provider: string; id: string }): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function parseModelKey(key: string): { provider: string; modelId: string } | undefined {
+  const slash = key.indexOf("/");
+  if (slash <= 0 || slash >= key.length - 1) return undefined;
+  return {
+    provider: key.slice(0, slash),
+    modelId: key.slice(slash + 1),
+  };
+}
+
+function formatContextWindow(contextWindow: number): string {
+  if (contextWindow >= 1_000_000) return `${(contextWindow / 1_000_000).toFixed(1)}M`;
+  if (contextWindow >= 1000) return `${Math.round(contextWindow / 1000)}K`;
+  return String(contextWindow);
+}
+
 // ---- Load ----
 onMounted(async () => {
   await settingsStore.load();
   defaultProvider.value = settingsStore.settings.defaultProvider || "";
   defaultModel.value = settingsStore.settings.defaultModel || "";
   defaultThinkingLevel.value = settingsStore.settings.defaultThinkingLevel || "xhigh";
+  takeHerEyesEnabled.value = settingsStore.settings.takeHerEyes?.enabled ?? false;
+  takeHerEyesModel.value =
+    settingsStore.settings.takeHerEyes?.provider && settingsStore.settings.takeHerEyes?.modelId
+      ? `${settingsStore.settings.takeHerEyes.provider}/${settingsStore.settings.takeHerEyes.modelId}`
+      : "";
 
   if (rpc.isConnected.value) {
     try {
       const s = await rpc.getPiSettings();
       if (s) applyPiSettings(s);
     } catch { /* use defaults */ }
+    try { await rpc.refreshModels(); } catch { /* unavailable */ }
     try { await authStore.refreshStatus(); } catch { /* unavailable */ }
   }
 });
@@ -159,10 +198,16 @@ async function saveSettings(): Promise<void> {
   saving.value = true;
   saved.value = false;
   try {
+    const selectedEyeModel = parseModelKey(takeHerEyesModel.value);
     await settingsStore.save({
       defaultModel: defaultModel.value || undefined,
       defaultProvider: defaultProvider.value || undefined,
       defaultThinkingLevel: defaultThinkingLevel.value,
+      takeHerEyes: {
+        enabled: takeHerEyesEnabled.value,
+        provider: selectedEyeModel?.provider,
+        modelId: selectedEyeModel?.modelId,
+      },
     });
     if (rpc.isConnected.value) {
       const setters: [string, unknown][] = [
@@ -259,6 +304,38 @@ function goBack(): void { router.back(); }
             <v-switch v-model="retryEnabled" label="自动重试" hint="自动重试失败的 API 请求。" persistent-hint class="mb-4" />
             <v-switch v-model="imageAutoResize" label="自动调整图片大小" hint="发送给模型前自动调整大图片尺寸。" persistent-hint class="mb-4" />
             <v-switch v-model="blockImages" label="阻止图片" hint="完全阻止将图片发送给模型。" persistent-hint class="mb-4" />
+            <v-divider class="my-4" />
+            <div class="eye-model-config">
+              <div class="setting-subheader">
+                <v-icon size="20" icon="mdi-eye-outline" />
+                <div>
+                  <div class="setting-subtitle">眼睛模型</div>
+                  <div class="setting-caption">当主模型不能看图时，自动用视觉模型生成图片上下文。</div>
+                </div>
+              </div>
+              <v-switch
+                v-model="takeHerEyesEnabled"
+                label="启用 takeHerEyes"
+                hint="主模型支持图片或已开启阻止图片时不会调用眼睛模型。"
+                persistent-hint
+                class="mb-4"
+              />
+              <v-select
+                v-model="takeHerEyesModel"
+                label="选择眼睛模型"
+                :items="visionModelItems"
+                item-title="title"
+                item-value="value"
+                no-data-text="没有可用的视觉模型"
+                :disabled="!takeHerEyesEnabled || blockImages"
+                hint="这里只显示已配置且支持图片输入的聊天模型。"
+                persistent-hint
+                class="mb-4"
+              />
+              <div v-if="blockImages && takeHerEyesEnabled" class="inline-hint">
+                已开启“阻止图片”，takeHerEyes 会保持关闭效果，不会把图片发送给任何模型。
+              </div>
+            </div>
           </div>
         </div>
 
@@ -449,6 +526,32 @@ function goBack(): void { router.back(); }
   display: inline-flex;
   align-items: center;
   gap: 8px;
+}
+
+.eye-model-config {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-xs);
+}
+
+.setting-subheader {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: var(--pix-space-sm);
+  color: var(--pix-text-primary);
+}
+
+.setting-subtitle {
+  font-size: var(--pix-text-md);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.setting-caption {
+  margin-top: 2px;
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-secondary);
 }
 
 .mb-3 { margin-bottom: 12px; }

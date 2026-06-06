@@ -14,6 +14,7 @@ const defaultSettings: GuiSettings = {
   defaultProvider: undefined,
   defaultModel: undefined,
   defaultThinkingLevel: "xhigh",
+  takeHerEyes: { enabled: false },
 };
 
 export class SettingsStore {
@@ -68,6 +69,13 @@ export class SettingsStore {
         this.store.delete("defaultThinkingLevel");
       } else {
         this.store.set("defaultThinkingLevel", settings.defaultThinkingLevel);
+      }
+    }
+    if (Object.hasOwn(settings, "takeHerEyes")) {
+      if (settings.takeHerEyes === undefined) {
+        this.store.delete("takeHerEyes");
+      } else {
+        this.store.set("takeHerEyes", settings.takeHerEyes);
       }
     }
   }

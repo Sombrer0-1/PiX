@@ -21,11 +21,14 @@ import SessionTreeView from "../session/SessionTreeView.vue";
 import ForkDialog from "../session/ForkDialog.vue";
 import CommandPalette from "../input/CommandPalette.vue";
 import ModelSelector from "../input/ModelSelector.vue";
+import ThinkingSelector from "../input/ThinkingSelector.vue";
 import { deriveSessionTitle } from "@/utils/session-title";
+import { useSettingsStore } from "../../stores/settings-store";
 
 const sessionStore = useSessionStore();
 const rpc = useRpc();
 const projectStore = useProjectStore();
+const settingsStore = useSettingsStore();
 
 type ViewMode = "session" | "raw" | "tree";
 type ExecutionMode = "read-only" | "approval" | "unattended";
@@ -41,6 +44,7 @@ const inputText = ref("");
 const searchQuery = ref("");
 const showCommandPalette = ref(false);
 const showModelSelector = ref(false);
+const showThinkingSelector = ref(false);
 const isSending = ref(false);
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const isDraggingFiles = ref(false);
@@ -101,6 +105,47 @@ const modelButtonDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
   if (!model) return "未选择模型";
   return `${model.provider}/${model.id} · ${thinkingDisplay.value}`;
+});
+
+const currentModelInfo = computed(() => {
+  const model = rpc.sessionState.value?.model;
+  if (!model) return null;
+  return rpc.availableModels.value.find((item) => item.provider === model.provider && item.id === model.id) ?? null;
+});
+
+const modelOnlyDisplay = computed(() => {
+  const model = rpc.sessionState.value?.model;
+  return model ? `${model.provider}/${model.id}` : "未选择模型";
+});
+
+const cleanThinkingDisplay = computed(() => {
+  const labels: Record<string, string> = {
+    off: "关闭",
+    minimal: "轻量",
+    low: "低",
+    medium: "标准",
+    high: "深入",
+    xhigh: "极深",
+  };
+  const level = rpc.sessionState.value?.thinkingLevel || "medium";
+  return labels[level] || level;
+});
+const thinkingButtonDisplay = computed(() => `思考 ${cleanThinkingDisplay.value}`);
+const thinkingButtonDisabled = computed(() => !rpc.sessionState.value?.model);
+
+const takeHerEyesEnabled = computed(() => settingsStore.settings.takeHerEyes?.enabled ?? false);
+const takeHerEyesConfigured = computed(() =>
+  takeHerEyesEnabled.value &&
+  !!settingsStore.settings.takeHerEyes?.provider &&
+  !!settingsStore.settings.takeHerEyes?.modelId
+);
+const currentModelSupportsImages = computed(() => currentModelInfo.value?.input?.includes("image") ?? false);
+const eyeIndicatorVisible = computed(() => takeHerEyesEnabled.value);
+const eyeIndicatorActive = computed(() => takeHerEyesConfigured.value && !currentModelSupportsImages.value);
+const eyeIndicatorTitle = computed(() => {
+  if (!takeHerEyesConfigured.value) return "眼睛已启用，但还没有选择视觉模型";
+  if (currentModelSupportsImages.value) return "眼睛已启用，但当前主模型支持图片，已自动停用";
+  return "眼睛已启用：当前主模型不能看图，上传图片时会自动调用视觉模型";
 });
 
 const executionModes: Array<{ value: ExecutionMode; label: string; description: string; icon: string }> = [
@@ -331,8 +376,8 @@ async function sendMessage(): Promise<void> {
     textareaRef.value.style.height = "auto";
   }
   try {
+    sessionStore.appendOptimisticUserMessage(text, filePaths);
     if (isStreaming.value) {
-      sessionStore.appendOptimisticUserMessage(text, filePaths);
       rpc.sendCommandAsync({ type: "steer", message: text, filePaths });
     } else {
       await rpc.sendPrompt(text, filePaths);
@@ -533,15 +578,38 @@ function autoResize(): void {
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
-            <button
-              class="model-btn"
-              :title="modelButtonDisplay"
-              @click="showModelSelector = !showModelSelector"
+            <span class="selector-anchor">
+              <button
+                class="model-btn"
+                :title="modelOnlyDisplay"
+                @click="showModelSelector = !showModelSelector; showThinkingSelector = false"
+              >
+                <span>{{ modelOnlyDisplay }}</span>
+                <span class="model-btn-chevron">&#9660;</span>
+              </button>
+              <ModelSelector v-if="showModelSelector" @close="showModelSelector = false" />
+            </span>
+            <span class="selector-anchor">
+              <button
+                class="thinking-btn"
+                :title="thinkingButtonDisplay"
+                :disabled="thinkingButtonDisabled"
+                @click="showThinkingSelector = !showThinkingSelector; showModelSelector = false"
+              >
+                <v-icon icon="mdi-brain" size="14" />
+                <span>{{ thinkingButtonDisplay }}</span>
+                <span class="model-btn-chevron">&#9660;</span>
+              </button>
+              <ThinkingSelector v-if="showThinkingSelector" @close="showThinkingSelector = false" />
+            </span>
+            <span
+              v-if="eyeIndicatorVisible"
+              class="eye-indicator"
+              :class="{ active: eyeIndicatorActive, inactive: !eyeIndicatorActive }"
+              :title="eyeIndicatorTitle"
             >
-              <span>{{ modelButtonDisplay }}</span>
-              <span class="model-btn-chevron">&#9660;</span>
-            </button>
-            <ModelSelector v-if="showModelSelector" @close="showModelSelector = false" />
+              <v-icon :icon="eyeIndicatorActive ? 'mdi-eye-outline' : 'mdi-eye-off-outline'" size="14" />
+            </span>
           </div>
           <div class="composer-right">
             <button
@@ -1153,8 +1221,16 @@ function autoResize(): void {
   color: var(--pix-text-primary);
 }
 
+.selector-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
 /* Model button in composer */
-.model-btn {
+.model-btn,
+.thinking-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -1169,13 +1245,26 @@ function autoResize(): void {
   max-width: min(420px, 48vw);
 }
 
-.model-btn span:first-child {
+.thinking-btn {
+  max-width: 180px;
+  color: var(--pix-accent);
+  background: var(--pix-accent-light);
+}
+
+.thinking-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.model-btn span:first-child,
+.thinking-btn span:first-of-type {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
 }
 
-.model-btn:hover {
+.model-btn:hover,
+.thinking-btn:hover:not(:disabled) {
   background: var(--pix-bg-hover);
   color: var(--pix-text-primary);
 }
@@ -1184,6 +1273,29 @@ function autoResize(): void {
   font-size: 10px;
   color: var(--pix-text-secondary);
   transition: transform var(--pix-transition-fast);
+}
+
+.eye-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-md);
+  background: #ffffff;
+  color: var(--pix-text-muted);
+}
+
+.eye-indicator.active {
+  color: #2563eb;
+  background: #eff6ff;
+  border-color: #dbeafe;
+}
+
+.eye-indicator.inactive {
+  color: var(--pix-text-muted);
+  background: var(--pix-bg-hover);
 }
 
 /* Send / Stop icon actions */

@@ -2,7 +2,15 @@ import { existsSync, statSync } from "fs";
 import { join } from "path";
 import { shell } from "electron";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getSupportedThinkingLevels, type Api, type ImageContent, type Model } from "@earendil-works/pi-ai";
+import {
+	completeSimple,
+	getSupportedThinkingLevels,
+	type Api,
+	type Context,
+	type ImageContent,
+	type Model,
+	type TextContent,
+} from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type CreateAgentSessionResult,
@@ -67,9 +75,36 @@ type WithSessionCallback = NonNullable<
 	NonNullable<Parameters<ExtensionCommandContextActions["newSession"]>[0]>["withSession"]
 >;
 
+const TAKE_HER_EYES_TIMEOUT_MS = 45_000;
+const TAKE_HER_EYES_MAX_TOKENS = 2048;
+const TAKE_HER_EYES_SYSTEM_PROMPT = [
+	"You are takeHerEyes, a precise vision assistant for Pix.",
+	"Describe the attached image(s) so a text-only model can answer the user's request.",
+	"Focus on visible text, UI layout, code, error messages, charts, tables, spatial relationships, and any uncertainty.",
+	"Do not invent hidden details. Prefer the user's language when it is clear.",
+].join(" ");
+
+interface AuxiliaryUsageTotals {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
 function globPatternToRegExp(pattern: string): RegExp {
 	const escaped = pattern.trim().replace(/[\\^$+?.()|[\]{}]/g, "\\$&").replace(/\*/g, ".*");
 	return new RegExp(`^${escaped}$`, "i");
+}
+
+function createEmptyAuxiliaryUsage(): AuxiliaryUsageTotals {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		cost: 0,
+	};
 }
 
 export class SessionBridge {
@@ -80,6 +115,7 @@ export class SessionBridge {
 	private _cwd = "";
 	private _guiSettings: GuiSettings | undefined;
 	private _unsubscribe: (() => void) | null = null;
+	private _auxiliaryUsage = createEmptyAuxiliaryUsage();
 
 	private _eventListeners: Array<(event: AgentSessionEvent) => void> = [];
 	private _userInputRequestListeners: UserInputRequestListener[] = [];
@@ -127,6 +163,10 @@ export class SessionBridge {
 		if (hadSession) {
 			this._emitLifecycle("exit", { code: 0, signal: null, stderr: "" });
 		}
+	}
+
+	updateGuiSettings(settings: GuiSettings): void {
+		this._guiSettings = settings;
 	}
 
 	async prompt(text: string, filePaths?: string[]): Promise<void> {
@@ -369,6 +409,7 @@ export class SessionBridge {
 			contextWindow: m.model.contextWindow,
 			reasoning: m.model.reasoning,
 			thinkingLevels: getSupportedThinkingLevels(m.model) as ThinkingLevel[],
+			input: m.model.input,
 		}));
 	}
 
@@ -519,6 +560,12 @@ export class SessionBridge {
 
 	getSessionStats(): SessionStats {
 		const stats = this._getSession().getSessionStats();
+		const tokens = {
+			input: stats.tokens.input + this._auxiliaryUsage.input,
+			output: stats.tokens.output + this._auxiliaryUsage.output,
+			cacheRead: stats.tokens.cacheRead + this._auxiliaryUsage.cacheRead,
+			cacheWrite: stats.tokens.cacheWrite + this._auxiliaryUsage.cacheWrite,
+		};
 		return {
 			sessionFile: stats.sessionFile,
 			sessionId: stats.sessionId,
@@ -527,8 +574,11 @@ export class SessionBridge {
 			toolCalls: stats.toolCalls,
 			toolResults: stats.toolResults,
 			totalMessages: stats.totalMessages,
-			tokens: stats.tokens,
-			cost: stats.cost,
+			tokens: {
+				...tokens,
+				total: tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite,
+			},
+			cost: stats.cost + this._auxiliaryUsage.cost,
 			contextUsage: stats.contextUsage,
 		};
 	}
@@ -542,6 +592,7 @@ export class SessionBridge {
 				contextWindow: model.contextWindow,
 				reasoning: model.reasoning,
 				thinkingLevels: getSupportedThinkingLevels(model) as ThinkingLevel[],
+				input: model.input,
 			}));
 	}
 
@@ -807,12 +858,167 @@ export class SessionBridge {
 		if (processed.text) parts.push(processed.text);
 		if (text) parts.push(text);
 
+		const visualContext = await this._tryTakeHerEyes(text, processed.images, processed.attachments);
+		if (visualContext) {
+			parts.push(visualContext);
+			return {
+				text: parts.join(""),
+				images: undefined,
+				displayText: text,
+				attachments: processed.attachments,
+			};
+		}
+
 		return {
 			text: parts.join(""),
 			images: processed.images.length > 0 ? processed.images : undefined,
 			displayText: text,
 			attachments: processed.attachments,
 		};
+	}
+
+	private async _tryTakeHerEyes(
+		userText: string,
+		images: ImageContent[],
+		attachments: ChatMessageAttachment[],
+	): Promise<string | null> {
+		if (images.length === 0) return null;
+
+		const session = this._getSession();
+		if (session.settingsManager.getBlockImages()) return null;
+		const mainModel = session.model;
+		if (!mainModel) return null;
+		if (mainModel.input.includes("image")) return null;
+
+		const config = this._guiSettings?.takeHerEyes;
+		if (!config?.enabled || !config.provider || !config.modelId) return null;
+
+		const eyeModel = session.modelRegistry.find(config.provider, config.modelId);
+		if (!eyeModel || !eyeModel.input.includes("image")) return null;
+		if (!session.modelRegistry.hasConfiguredAuth(eyeModel)) return null;
+
+		let emittedStart = false;
+		const emitEnd = (success: boolean, errorMessage?: string): void => {
+			if (!emittedStart) return;
+			this._emitSessionEvent({
+				type: "eye_model_end",
+				provider: eyeModel.provider,
+				modelId: eyeModel.id,
+				imageCount: images.length,
+				success,
+				errorMessage,
+			});
+			emittedStart = false;
+		};
+
+		try {
+			const auth = await session.modelRegistry.getApiKeyAndHeaders(eyeModel);
+			if (!auth.ok) {
+				console.warn(`[takeHerEyes] Auth unavailable for ${eyeModel.provider}/${eyeModel.id}: ${auth.error}`);
+				return null;
+			}
+
+			this._emitSessionEvent({
+				type: "eye_model_start",
+				provider: eyeModel.provider,
+				modelId: eyeModel.id,
+				imageCount: images.length,
+			});
+			emittedStart = true;
+
+			const response = await completeSimple(eyeModel, this._createEyeContext(userText, images, attachments), {
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				maxTokens: TAKE_HER_EYES_MAX_TOKENS,
+				timeoutMs: TAKE_HER_EYES_TIMEOUT_MS,
+				maxRetries: 0,
+			});
+			this._recordAuxiliaryUsage(response.usage);
+
+			if (response.stopReason === "error") {
+				const errorMessage = response.errorMessage ?? "unknown error";
+				console.warn(`[takeHerEyes] Vision model failed: ${errorMessage}`);
+				emitEnd(false, errorMessage);
+				return null;
+			}
+
+			const description = response.content
+				.filter((block): block is TextContent => block.type === "text")
+				.map((block) => block.text.trim())
+				.filter(Boolean)
+				.join("\n")
+				.trim();
+
+			if (!description) {
+				emitEnd(false, "Vision model returned no text.");
+				return null;
+			}
+			emitEnd(true);
+			return this._formatVisualContext(description, eyeModel, images.length);
+		} catch (error) {
+			emitEnd(false, error instanceof Error ? error.message : String(error));
+			console.warn("[takeHerEyes] Vision preprocessing failed:", error);
+			return null;
+		}
+	}
+
+	private _createEyeContext(
+		userText: string,
+		images: ImageContent[],
+		attachments: ChatMessageAttachment[],
+	): Context {
+		const imageNames = attachments
+			.filter((attachment) => attachment.kind === "image")
+			.map((attachment, index) => `Image ${index + 1}: ${attachment.name} (${attachment.path})`);
+		const prompt = [
+			userText
+				? `User request:\n${userText}`
+				: "User request:\nDescribe the attached image(s) accurately.",
+			imageNames.length > 0 ? `Attached image order:\n${imageNames.join("\n")}` : "",
+			"Return a concise but complete visual context for another model. Label details by image number when multiple images are attached.",
+		].filter(Boolean).join("\n\n");
+
+		const content: Array<TextContent | ImageContent> = [
+			{ type: "text", text: prompt },
+			...images,
+		];
+
+		return {
+			systemPrompt: TAKE_HER_EYES_SYSTEM_PROMPT,
+			messages: [
+				{
+					role: "user",
+					content,
+					timestamp: Date.now(),
+				},
+			],
+		};
+	}
+
+	private _formatVisualContext(description: string, eyeModel: Model<Api>, imageCount: number): string {
+		return [
+			"",
+			`<visual_context generated_by="takeHerEyes" model="${eyeModel.provider}/${eyeModel.id}" image_count="${imageCount}">`,
+			"The user attached image(s), but the current main model cannot view images directly.",
+			"A separate vision model produced the following description. Use it as visual evidence and preserve uncertainty.",
+			description,
+			"</visual_context>",
+			"",
+		].join("\n");
+	}
+
+	private _recordAuxiliaryUsage(usage: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		cost: { total: number };
+	}): void {
+		this._auxiliaryUsage.input += usage.input;
+		this._auxiliaryUsage.output += usage.output;
+		this._auxiliaryUsage.cacheRead += usage.cacheRead;
+		this._auxiliaryUsage.cacheWrite += usage.cacheWrite;
+		this._auxiliaryUsage.cost += usage.cost.total;
 	}
 
 	private async _createSession(
@@ -844,6 +1050,7 @@ export class SessionBridge {
 
 	private async _activateSession(session: AgentSession): Promise<void> {
 		this._session = session;
+		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
 		this._setupEventSubscription(session);
 		await this._bindExtensions();
 		this._emitLifecycle("ready");
@@ -953,16 +1160,20 @@ export class SessionBridge {
 
 		this._unsubscribe = session.subscribe((event) => {
 			const sessionEvent = event as AgentSessionEvent;
-			this._updateTrackedState(sessionEvent);
-
-			for (const listener of this._eventListeners) {
-				try {
-					listener(sessionEvent);
-				} catch (err) {
-					console.error("[SessionBridge] Event listener error:", err);
-				}
-			}
+			this._emitSessionEvent(sessionEvent);
 		});
+	}
+
+	private _emitSessionEvent(event: AgentSessionEvent): void {
+		this._updateTrackedState(event);
+
+		for (const listener of this._eventListeners) {
+			try {
+				listener(event);
+			} catch (err) {
+				console.error("[SessionBridge] Event listener error:", err);
+			}
+		}
 	}
 
 	private _updateTrackedState(event: AgentSessionEvent): void {

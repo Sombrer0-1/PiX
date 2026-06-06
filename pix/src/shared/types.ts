@@ -147,6 +147,13 @@ export interface ModelInfo {
   contextWindow?: number;
   reasoning?: boolean;
   thinkingLevels?: ThinkingLevel[];
+  input?: ("text" | "image")[];
+}
+
+export interface TakeHerEyesSettings {
+  enabled: boolean;
+  provider?: string;
+  modelId?: string;
 }
 
 // ============================================================================
@@ -171,6 +178,8 @@ export type AgentSessionEvent =
   | { type: "compaction_end"; reason: "manual" | "threshold" | "overflow"; result?: unknown; aborted: boolean; willRetry: boolean; errorMessage?: string }
   | { type: "session_info_changed"; name: string | undefined }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
+  | { type: "eye_model_start"; provider: string; modelId: string; imageCount: number }
+  | { type: "eye_model_end"; provider: string; modelId: string; imageCount: number; success: boolean; errorMessage?: string }
   | { type: "goal_update"; goal: ThreadGoal | undefined }
   | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
   | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
@@ -226,6 +235,7 @@ export type DisplayBlock =
   | { id: string; type: "user-message"; text: string; attachments?: ChatMessageAttachment[]; timestamp: number }
   | { id: string; type: "agent-message"; content: string; isStreaming: boolean; timestamp: number }
   | { id: string; type: "thinking"; timestamp: number }
+  | { id: string; type: "vision-status"; provider: string; modelId: string; imageCount: number; status: "running" | "success" | "error"; timestamp: number }
   | { id: string; type: "work-status"; tools: ToolWorkItem[]; isStreaming: boolean; timestamp: number }
   | { id: string; type: "turn-separator"; timestamp: number }
   | { id: string; type: "error"; message: string; source?: string; timestamp: number }
@@ -268,6 +278,7 @@ export interface GuiSettings {
   defaultProvider?: string;
   defaultModel?: string;
   defaultThinkingLevel?: ThinkingLevel;
+  takeHerEyes?: TakeHerEyesSettings;
 }
 
 // ============================================================================

@@ -28,6 +28,7 @@ const SETTING_KEYS = new Set([
   "defaultProvider",
   "defaultModel",
   "defaultThinkingLevel",
+  "takeHerEyes",
 ]);
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -45,6 +46,21 @@ function isProjectInfo(value: unknown): value is ProjectInfo {
     typeof project.lastOpened === "number" &&
     typeof project.sessionCount === "number"
   );
+}
+
+function sanitizeTakeHerEyes(value: unknown): GuiSettings["takeHerEyes"] | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const result: GuiSettings["takeHerEyes"] = {
+    enabled: raw.enabled === true,
+  };
+  if (typeof raw.provider === "string" && raw.provider.trim()) {
+    result.provider = raw.provider;
+  }
+  if (typeof raw.modelId === "string" && raw.modelId.trim()) {
+    result.modelId = raw.modelId;
+  }
+  return result;
 }
 
 function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSettings> {
@@ -84,6 +100,15 @@ function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSetting
     const value = settings.defaultThinkingLevel;
     if (value === undefined || isThinkingLevel(value)) {
       sanitized.defaultThinkingLevel = value;
+    }
+  }
+  if (Object.hasOwn(settings, "takeHerEyes")) {
+    const value = settings.takeHerEyes;
+    if (value === undefined) {
+      sanitized.takeHerEyes = undefined;
+    } else {
+      const cleaned = sanitizeTakeHerEyes(value);
+      if (cleaned) sanitized.takeHerEyes = cleaned;
     }
   }
 
@@ -266,6 +291,7 @@ export function registerIpcHandlers(
 
   ipcMain.handle("set-settings", (_event, settings: Record<string, unknown>) => {
     settingsStore.setMany(sanitizeSettings(settings));
+    sessionBridge.updateGuiSettings(settingsStore.getAll());
     return { success: true };
   });
 

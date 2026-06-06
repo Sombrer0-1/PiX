@@ -135,7 +135,7 @@ function setupEventListeners(): void {
 				return;
 			}
 
-			if (event.type === "message_end" || event.type === "tool_execution_end") {
+			if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "eye_model_end") {
 				void refreshSessionStats();
 				return;
 			}

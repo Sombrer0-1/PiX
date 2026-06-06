@@ -140,7 +140,8 @@ export const useSessionStore = defineStore("session", () => {
   let currentAgentBlockId: string | null = null;
   let currentWorkStatusId: string | null = null;
   let currentThinkingBlockId: string | null = null;
-  let optimisticUserMessages: Array<{ blockId: string; fingerprint: string }> = [];
+  let currentVisionStatusId: string | null = null;
+  let optimisticUserMessages: Array<{ blockId: string; fingerprint: string; separatorId: string | null }> = [];
 
   function removeThinkingBlock(): void {
     if (!currentThinkingBlockId) return;
@@ -160,14 +161,16 @@ export const useSessionStore = defineStore("session", () => {
     displayBlocks.value.push(block);
   }
 
-  function appendTurnSeparator(timestamp = Date.now()): void {
+  function appendTurnSeparator(timestamp = Date.now()): string | null {
     const last = displayBlocks.value.at(-1);
-    if (!last || last.type === "turn-separator") return;
+    if (!last || last.type === "turn-separator") return null;
+    const id = nextBlockId();
     displayBlocks.value.push({
-      id: nextBlockId(),
+      id,
       type: "turn-separator",
       timestamp,
     });
+    return id;
   }
 
   function appendUserOrNoteMessage(msg: AgentMessage): void {
@@ -190,8 +193,14 @@ export const useSessionStore = defineStore("session", () => {
         const fingerprint = fingerprintUserMessage(display.text, display.attachments);
         const optimistic = optimisticUserMessages.find((item) => item.fingerprint === fingerprint);
         if (optimistic) {
-          displayBlocks.value = displayBlocks.value.filter((block) => block.id !== optimistic.blockId);
+          const optimisticBlock = displayBlocks.value.find((block) => block.id === optimistic.blockId);
+          if (optimisticBlock && optimisticBlock.type === "user-message") {
+            optimisticBlock.text = display.text;
+            optimisticBlock.attachments = display.attachments;
+            optimisticBlock.timestamp = messageTimestamp(msg);
+          }
           optimisticUserMessages = optimisticUserMessages.filter((item) => item.blockId !== optimistic.blockId);
+          return;
         }
         appendTurnSeparator(messageTimestamp(msg));
       }
@@ -211,7 +220,7 @@ export const useSessionStore = defineStore("session", () => {
 
     const timestamp = Date.now();
     closeCurrentWorkStatus(true);
-    appendTurnSeparator(timestamp);
+    const separatorId = appendTurnSeparator(timestamp);
     const block: DisplayBlock = {
       id: nextBlockId(),
       type: "user-message",
@@ -223,6 +232,42 @@ export const useSessionStore = defineStore("session", () => {
     optimisticUserMessages.push({
       blockId: block.id,
       fingerprint: fingerprintUserMessage(text, attachments),
+      separatorId,
+    });
+  }
+
+  function showVisionStatus(event: Extract<AgentSessionEvent, { type: "eye_model_start" }>): void {
+    const block: DisplayBlock = {
+      id: nextBlockId(),
+      type: "vision-status",
+      provider: event.provider,
+      modelId: event.modelId,
+      imageCount: event.imageCount,
+      status: "running",
+      timestamp: Date.now(),
+    };
+    currentVisionStatusId = block.id;
+    displayBlocks.value.push(block);
+  }
+
+  function finishVisionStatus(event: Extract<AgentSessionEvent, { type: "eye_model_end" }>): void {
+    const block = currentVisionStatusId
+      ? displayBlocks.value.find((item) => item.id === currentVisionStatusId && item.type === "vision-status")
+      : null;
+    if (block && block.type === "vision-status") {
+      block.status = event.success ? "success" : "error";
+      block.timestamp = Date.now();
+      currentVisionStatusId = null;
+      return;
+    }
+    displayBlocks.value.push({
+      id: nextBlockId(),
+      type: "vision-status",
+      provider: event.provider,
+      modelId: event.modelId,
+      imageCount: event.imageCount,
+      status: event.success ? "success" : "error",
+      timestamp: Date.now(),
     });
   }
 
@@ -366,6 +411,16 @@ export const useSessionStore = defineStore("session", () => {
       }
 
       // Tool lifecycle — aggregate into a single work-status block
+      case "eye_model_start": {
+        showVisionStatus(event);
+        break;
+      }
+
+      case "eye_model_end": {
+        finishVisionStatus(event);
+        break;
+      }
+
       case "tool_execution_start": {
         removeThinkingBlock();
         ensureWorkStatusBlock().tools.push({
@@ -565,6 +620,7 @@ export const useSessionStore = defineStore("session", () => {
     currentAgentBlockId = null;
     currentWorkStatusId = null;
     currentThinkingBlockId = null;
+    currentVisionStatusId = null;
     optimisticUserMessages = [];
   }
 

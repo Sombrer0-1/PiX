@@ -352,6 +352,27 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         <span>AI 正在思考...</span>
       </div>
 
+      <!-- Vision preprocessing indicator -->
+      <div
+        v-else-if="block.type === 'vision-status'"
+        class="vision-status-block"
+        :class="block.status"
+      >
+        <span class="vision-status-icon" aria-hidden="true">
+          <span v-if="block.status === 'running'" class="thinking-spinner"></span>
+          <span v-else class="vision-dot"></span>
+        </span>
+        <span v-if="block.status === 'running'">
+          眼睛模型正在看图 · {{ block.imageCount }} 张
+        </span>
+        <span v-else-if="block.status === 'success'">
+          眼睛模型已看图 · {{ block.imageCount }} 张
+        </span>
+        <span v-else>
+          眼睛模型看图失败，已按原流程继续
+        </span>
+      </div>
+
       <!-- Work Status - aggregated tool executions -->
       <div
         v-else-if="block.type === 'work-status'"
@@ -567,6 +588,54 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 }
 
 /* ── Work Status Block ── */
+.vision-status-block {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 0 var(--pix-space-md);
+  padding: 6px 11px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  animation: block-in 0.16s ease-out;
+}
+
+.vision-status-block.running {
+  color: var(--pix-accent);
+  border-color: rgba(98, 84, 243, 0.22);
+}
+
+.vision-status-block.success {
+  color: var(--pix-success);
+  border-color: var(--pix-success-light);
+}
+
+.vision-status-block.error {
+  color: var(--pix-error);
+  border-color: var(--pix-error-light);
+}
+
+.vision-status-icon {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.vision-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 .work-status-block {
   width: fit-content;
   max-width: 100%;
