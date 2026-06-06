@@ -11,11 +11,13 @@ import { existsSync, rmSync } from "fs";
 import { isAbsolute, join, relative, resolve } from "path";
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { autoUpdater } from "electron-updater";
+import electronUpdater from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
 import type { GuiSettings, ProjectInfo, RpcCommand, ThinkingLevel } from "../shared/types.js";
+
+const { autoUpdater } = electronUpdater;
 
 let handlersRegistered = false;
 let eventForwardingSetup = false;
