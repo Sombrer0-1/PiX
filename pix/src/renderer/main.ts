@@ -45,7 +45,7 @@ const vuetify = createVuetify({
       density: "comfortable",
     },
     VCard: {
-      variant: "outlined",
+      variant: "elevated",
     },
     VTabs: {
       color: "primary",
