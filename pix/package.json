@@ -65,6 +65,7 @@
       "perMachine": false,
       "runAfterFinish": true
     },
+    "artifactName": "${productName}-Setup-${version}.${ext}",
     "win": {
       "target": "nsis"
     },
