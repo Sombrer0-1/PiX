@@ -67,8 +67,21 @@ export {
 	type WriteToolInput,
 	type WriteToolOptions,
 } from "./write.ts";
+export {
+	createRunBackgroundToolDefinition,
+	type RunBackgroundInput,
+} from "./run-background.ts";
+export {
+	createReadOutputToolDefinition,
+	type ReadOutputInput,
+} from "./read-output.ts";
+export {
+	createStopProcessToolDefinition,
+	type StopProcessInput,
+} from "./stop-process.ts";
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { BackgroundTaskRegistry } from "../background-task-registry.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { type BashToolOptions, createBashTool, createBashToolDefinition } from "./bash.ts";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
@@ -77,6 +90,9 @@ import { createGrepTool, createGrepToolDefinition, type GrepToolOptions } from "
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.ts";
 import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.ts";
 import { createWriteTool, createWriteToolDefinition, type WriteToolOptions } from "./write.ts";
+import { createRunBackgroundToolDefinition, type RunBackgroundInput } from "./run-background.ts";
+import { createReadOutputToolDefinition, type ReadOutputInput } from "./read-output.ts";
+import { createStopProcessToolDefinition, type StopProcessInput } from "./stop-process.ts";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
@@ -193,4 +209,15 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		find: createFindTool(cwd, options?.find),
 		ls: createLsTool(cwd, options?.ls),
 	};
+}
+
+export function createBackgroundToolDefinitions(
+	cwd: string,
+	registry: BackgroundTaskRegistry,
+): ToolDef[] {
+	return [
+		createRunBackgroundToolDefinition(cwd, registry),
+		createReadOutputToolDefinition(registry),
+		createStopProcessToolDefinition(registry),
+	];
 }

@@ -63,6 +63,10 @@ export interface PixApi {
   windowIsMaximized: () => Promise<boolean>;
   onWindowMaximizeChange: (callback: (maximized: boolean) => void) => () => void;
 
+  // Background tasks
+  getBackgroundTasks: () => Promise<Array<{ taskId: string; command: string; pid?: number; startedAt: number; status: string }>>;
+  stopBackgroundTask: (taskId: string) => Promise<{ found: boolean }>;
+
   // Session management
   deleteSession: (sessionPath: string) => Promise<{ success: boolean; error?: string }>;
 
@@ -157,6 +161,12 @@ const api: PixApi = {
 
   deleteSession: (sessionPath: string) =>
     ipcRenderer.invoke("delete-session", sessionPath) as Promise<{ success: boolean; error?: string }>,
+
+  getBackgroundTasks: () =>
+    ipcRenderer.invoke("get-background-tasks") as Promise<Array<{ taskId: string; command: string; pid?: number; startedAt: number; status: string }>>,
+
+  stopBackgroundTask: (taskId: string) =>
+    ipcRenderer.invoke("stop-background-task", taskId) as Promise<{ found: boolean }>,
 
   // MCP queries
   mcpGetServers: () => ipcRenderer.invoke("mcp-get-servers"),

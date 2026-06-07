@@ -466,6 +466,7 @@ export function useRpc() {
 		isRunning: computed(() => piStatus.value === "running"),
 		isStreaming: computed(() => sessionState.value?.isStreaming ?? false),
 		isConnected: computed(() => piStatus.value === "running"),
+		getBackgroundTasks: async () => api().getBackgroundTasks(),
 		startPi,
 		attachToRunningSession,
 		stopPi,

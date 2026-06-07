@@ -110,12 +110,13 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.t
 import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
+import { BackgroundTaskRegistry } from "./background-task-registry.ts";
 import { BUILTIN_SLASH_COMMANDS, type SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt, type RuntimeEnvironmentContext } from "./system-prompt.ts";
 import { inspectToolExecution } from "./tool-execution-policy.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
-import { createAllToolDefinitions } from "./tools/index.ts";
+import { createAllToolDefinitions, createBackgroundToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import {
 	createVerificationContinuationMessage,
@@ -362,6 +363,7 @@ export class AgentSession {
 	private _goalProgressSinceContinuation = false;
 	private _goalAutoContinueSuspendedFor: string | undefined = undefined;
 	private _disposed = false;
+	private _backgroundTaskRegistry: BackgroundTaskRegistry;
 
 	// Tool policy, file-change tracking, and verification gate state
 	private _toolArgsById = new Map<string, unknown>();
@@ -415,10 +417,15 @@ export class AgentSession {
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._goalRuntime = new GoalRuntime(config.sessionManager);
+		this._backgroundTaskRegistry = new BackgroundTaskRegistry();
 		const builtInEnhancementTools =
 			config.enableBuiltInEnhancementTools === false
 				? []
-				: [...createRequestUserInputToolDefinitions(config.requestUserInput), ...createGoalToolDefinitions(this)];
+				: [
+						...createRequestUserInputToolDefinitions(config.requestUserInput),
+						...createGoalToolDefinitions(this),
+						...createBackgroundToolDefinitions(config.cwd, this._backgroundTaskRegistry),
+					];
 		this._customTools = [...(config.customTools ?? []), ...builtInEnhancementTools];
 		this._cwd = config.cwd;
 		this._modelRegistry = config.modelRegistry;
@@ -975,6 +982,7 @@ export class AgentSession {
 			this.abortBranchSummary();
 			this.abortBash();
 			this.agent.abort();
+			this._backgroundTaskRegistry.stopAll();
 			killTrackedDetachedChildren();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
@@ -1114,6 +1122,11 @@ export class AgentSession {
 	/** Current session display name, if set */
 	get sessionName(): string | undefined {
 		return this.sessionManager.getSessionName();
+	}
+
+	/** Background task registry for managing long-running processes */
+	get backgroundTaskRegistry(): BackgroundTaskRegistry {
+		return this._backgroundTaskRegistry;
 	}
 
 	/** Scoped models for cycling (from --models flag) */

@@ -2,7 +2,7 @@
 /**
  * RightPanel - Session inspector
  */
-import { computed, ref, onMounted, watch } from "vue";
+import { computed, ref, onMounted, onUnmounted, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { useProjectStore } from "../../stores/project-store";
@@ -82,6 +82,55 @@ const goalTimeText = computed(() => {
 const router = useRouter();
 const mcpServers = ref<McpServerInfo[]>([]);
 const mcpConnected = computed(() => mcpServers.value.filter((s) => s.status === "connected").length);
+
+// ---- Background tasks ----
+interface BackgroundTask {
+  taskId: string;
+  command: string;
+  pid?: number;
+  startedAt: number;
+  status: string;
+}
+const backgroundTasks = ref<BackgroundTask[]>([]);
+let bgTaskTimer: ReturnType<typeof setInterval> | undefined;
+
+async function refreshBackgroundTasks(): Promise<void> {
+  try {
+    backgroundTasks.value = await rpc.getBackgroundTasks();
+  } catch { /* session not ready */ }
+}
+
+function startBgPoll(): void {
+  if (bgTaskTimer) return;
+  bgTaskTimer = setInterval(refreshBackgroundTasks, 3000);
+}
+
+function stopBgPoll(): void {
+  if (bgTaskTimer) {
+    clearInterval(bgTaskTimer);
+    bgTaskTimer = undefined;
+  }
+}
+
+function formatBgDuration(ms: number): string {
+  const seconds = Math.floor((Date.now() - ms) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+function truncateBgCommand(cmd: string, maxLen = 50): string {
+  return cmd.length > maxLen ? cmd.slice(0, maxLen - 3) + "..." : cmd;
+}
+
+async function stopBackgroundTask(taskId: string): Promise<void> {
+  try {
+    await window.pixApi.stopBackgroundTask(taskId);
+    await refreshBackgroundTasks();
+  } catch (err) {
+    console.error("[RightPanel] Stop background task failed:", err);
+  }
+}
 const mcpFailed = computed(() => mcpServers.value.filter((s) => s.status === "failed").length);
 const mcpTotal = computed(() => mcpServers.value.length);
 const connectedMcpServers = computed(() => mcpServers.value.filter((s) => s.status === "connected"));
@@ -108,9 +157,23 @@ function mcpStatusText(status: McpServerInfo["status"]): string {
   return status;
 }
 
-onMounted(refreshMcp);
+onMounted(() => {
+  refreshMcp();
+  refreshBackgroundTasks();
+  startBgPoll();
+});
+onUnmounted(() => {
+  stopBgPoll();
+});
 watch(() => rpc.isConnected.value, (connected) => {
-  if (connected) refreshMcp();
+  if (connected) {
+    refreshMcp();
+    refreshBackgroundTasks();
+    startBgPoll();
+  } else {
+    stopBgPoll();
+    backgroundTasks.value = [];
+  }
 });
 </script>
 
@@ -228,6 +291,44 @@ watch(() => rpc.isConnected.value, (connected) => {
           <span class="mcp-server-dot"></span>
           <span class="mcp-server-name">{{ server.name }}</span>
           <span class="mcp-server-meta">{{ mcpStatusText(server.status) }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Background tasks card -->
+    <div v-if="backgroundTasks.length > 0" class="info-card">
+      <div class="card-title-row">
+        <span class="card-title">后台任务</span>
+        <button
+          class="card-action-btn"
+          @click="refreshBackgroundTasks"
+          title="刷新"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+      </div>
+      <div class="bg-task-list">
+        <div
+          v-for="task in backgroundTasks"
+          :key="task.taskId"
+          class="bg-task-row"
+          :class="task.status"
+        >
+          <div class="bg-task-top">
+            <span class="bg-task-dot" :class="task.status"></span>
+            <span class="bg-task-cmd" :title="task.command">{{ truncateBgCommand(task.command) }}</span>
+            <span class="bg-task-time">{{ formatBgDuration(task.startedAt) }}</span>
+          </div>
+          <div class="bg-task-bottom">
+            <span class="bg-task-id">{{ task.taskId }}</span>
+            <button
+              class="bg-task-stop-btn"
+              @click="stopBackgroundTask(task.taskId)"
+              title="停止任务"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -552,5 +653,105 @@ watch(() => rpc.isConnected.value, (connected) => {
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ── Background tasks ── */
+.bg-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-xs);
+}
+
+.bg-task-row {
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-md);
+  padding: var(--pix-space-sm);
+}
+
+.bg-task-row.running {
+  border-color: var(--pix-accent-light);
+  background: rgba(98, 84, 243, 0.04);
+}
+
+.bg-task-row.stopped {
+  opacity: 0.6;
+}
+
+.bg-task-row.error {
+  border-color: var(--pix-error-light);
+  background: rgba(220, 38, 38, 0.04);
+}
+
+.bg-task-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bg-task-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.bg-task-dot.running {
+  background: var(--pix-success);
+  animation: status-pulse 1.5s ease-in-out infinite;
+}
+
+.bg-task-dot.stopped {
+  background: var(--pix-text-muted);
+}
+
+.bg-task-dot.error {
+  background: var(--pix-error);
+}
+
+.bg-task-cmd {
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.bg-task-time {
+  font-size: 11px;
+  color: var(--pix-text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.bg-task-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+.bg-task-id {
+  font-size: 10px;
+  font-family: var(--pix-font-mono);
+  color: var(--pix-text-muted);
+}
+
+.bg-task-stop-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--pix-radius-sm);
+  color: var(--pix-error);
+  background: var(--pix-error-bg);
+}
+
+.bg-task-stop-btn:hover {
+  background: var(--pix-error-light);
 }
 </style>

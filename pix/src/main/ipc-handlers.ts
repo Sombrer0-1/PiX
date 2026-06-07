@@ -317,6 +317,14 @@ export function registerIpcHandlers(
     return sessionBridge.isRunning();
   });
 
+  ipcMain.handle("get-background-tasks", () => {
+    return sessionBridge.getBackgroundTasks();
+  });
+
+  ipcMain.handle("stop-background-task", (_event, taskId: string) => {
+    return sessionBridge.stopBackgroundTask(taskId);
+  });
+
 
   // =========================================================================
   // MCP Queries

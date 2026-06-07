@@ -605,6 +605,21 @@ export class SessionBridge {
 		};
 	}
 
+	getBackgroundTasks(): Array<{ taskId: string; command: string; pid?: number; startedAt: number; status: string }> {
+		return this._getSession().backgroundTaskRegistry.getRunning().map((t) => ({
+			taskId: t.taskId,
+			command: t.command,
+			pid: t.pid,
+			startedAt: t.startedAt,
+			status: t.status,
+		}));
+	}
+
+	stopBackgroundTask(taskId: string): { found: boolean } {
+		const result = this._getSession().backgroundTaskRegistry.stop(taskId);
+		return { found: result.found };
+	}
+
 	getSessionStats(): SessionStats {
 		const stats = this._getSession().getSessionStats();
 		const tokens = {
