@@ -227,6 +227,8 @@ Active goal:
 <remaining_tokens>${remaining}</remaining_tokens>
 
 Continue working toward this active goal without waiting for new user input. Before doing more work, audit the current conversation and repository state. Call update_goal with status "complete" only when the objective is actually achieved. Call update_goal with status "blocked" only after the same blocking condition has repeated for at least three consecutive goal turns and you cannot make meaningful progress. Respect the token budget when one is set.
+
+Keep the user oriented while continuing the goal: before each small batch of tool calls, write a brief visible note about what you are checking or changing, then summarize what the batch showed before moving on. Do not run long silent sequences of tool calls.
 </pi_internal_context>`;
 }
 
