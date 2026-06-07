@@ -24,7 +24,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (default: 120). Increase for long-running builds or data processing. Set to 0 to disable." })),
 });
 
 export type BashToolInput = Static<typeof bashSchema>;
@@ -93,12 +93,13 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 			};
 
 			try {
-				// Set timeout if provided.
-				if (timeout !== undefined && timeout > 0) {
+				// Default timeout is 120s. Use 0 to disable.
+				const effectiveTimeout = timeout ?? 120;
+				if (effectiveTimeout > 0) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
 						if (child.pid) killProcessTree(child.pid);
-					}, timeout * 1000);
+					}, effectiveTimeout * 1000);
 				}
 				// Stream stdout and stderr.
 				child.stdout?.on("data", onData);
@@ -278,7 +279,7 @@ export function createBashToolDefinition(
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Default timeout is 120s; increase for long-running builds or set to 0 to disable. When a timeout fires the output collected so far is returned.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(
@@ -389,7 +390,7 @@ export function createBashToolDefinition(
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
 						const timeoutSecs = err.message.split(":")[1];
-						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+						return { content: [{ type: "text", text: appendStatus(text, `Command timed out after ${timeoutSecs} seconds`) }], details: undefined };
 					}
 					throw err;
 				}
