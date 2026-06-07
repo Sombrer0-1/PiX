@@ -25,6 +25,9 @@ export interface PixApi {
   selectChatFiles: () => Promise<string[]>;
   getPathForFile: (file: File) => string;
 
+  // External links
+  openExternal: (url: string) => void;
+
   // Pi lifecycle
   startPi: (projectDir: string) => Promise<{ success: boolean; error?: string }>;
   stopPi: () => Promise<{ success: boolean }>;
@@ -92,6 +95,7 @@ const api: PixApi = {
   selectSessionFile: () => ipcRenderer.invoke("select-session-file"),
   selectChatFiles: () => ipcRenderer.invoke("select-chat-files"),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
+  openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
 
   startPi: (projectDir: string) => ipcRenderer.invoke("start-pi", projectDir),
   stopPi: () => ipcRenderer.invoke("stop-pi"),

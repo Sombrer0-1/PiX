@@ -373,6 +373,23 @@ export function registerIpcHandlers(
   ipcMain.handle("install-update", () => {
     autoUpdater.quitAndInstall();
   });
+
+  // =========================================================================
+  // External Links
+  // =========================================================================
+
+  ipcMain.handle("open-external", async (_event, url: string) => {
+    try {
+      const { shell } = await import("electron");
+      const parsed = new URL(url);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:") {
+        await shell.openExternal(url);
+      }
+    } catch (err) {
+      console.error("[ipc] Failed to open external URL:", url, err);
+    }
+  });
+
   // =========================================================================
   // Window Controls (frameless window)
   // =========================================================================

@@ -5,3 +5,14 @@ declare module '*.vue' {
   const component: DefineComponent<Record<string, unknown>, Record<string, unknown>, unknown>
   export default component
 }
+
+interface PixApi {
+  openExternal: (url: string) => void;
+  [key: string]: unknown;
+}
+
+declare global {
+  interface Window {
+    pixApi: PixApi;
+  }
+}

@@ -21,7 +21,7 @@ markdownRenderer.link = (href: string, title: string | null | undefined, text: s
     return `<a href="#" rel="noopener noreferrer" data-unsafe-link="true">${safeText}</a>`;
   }
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
-  return `<a href="${escapeHtml(safeHref)}"${titleAttr} target="_blank" rel="noopener noreferrer">${safeText}</a>`;
+  return `<a href="${escapeHtml(safeHref)}"${titleAttr} data-external-link="true" rel="noopener noreferrer">${safeText}</a>`;
 };
 
 function escapeHtml(text: string): string {
@@ -311,6 +311,27 @@ async function writeClipboardText(text: string): Promise<boolean> {
 
 async function handleSessionClick(event: MouseEvent): Promise<void> {
   const target = event.target as HTMLElement | null;
+
+  // Handle external links - open in default browser
+  const link = target?.closest<HTMLAnchorElement>("a[data-external-link='true']");
+  if (link) {
+    event.preventDefault();
+    event.stopPropagation();
+    const href = link.getAttribute("href");
+    if (href && href !== "#") {
+      window.pixApi.openExternal(href);
+    }
+    return;
+  }
+
+  // Handle unsafe links
+  const unsafeLink = target?.closest<HTMLAnchorElement>("a[data-unsafe-link='true']");
+  if (unsafeLink) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+
   const button = target?.closest<HTMLButtonElement>("[data-copy-code='true']");
   if (!button) return;
 
