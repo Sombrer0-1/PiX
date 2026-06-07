@@ -353,14 +353,16 @@ export function registerIpcHandlers(
   ipcMain.handle("check-for-updates", async () => {
     try {
       const result = await autoUpdater.checkForUpdates();
+      const currentVersion = autoUpdater.currentVersion.version;
       if (!result) {
-        return { success: true, hasUpdate: false, currentVersion: autoUpdater.currentVersion.version };
+        return { success: true, hasUpdate: false, currentVersion };
       }
+      const latestVersion = result.updateInfo.version;
       return {
         success: true,
-        hasUpdate: true,
-        currentVersion: autoUpdater.currentVersion.version,
-        latestVersion: result.updateInfo.version,
+        hasUpdate: latestVersion !== currentVersion,
+        currentVersion,
+        latestVersion,
         releaseNotes: result.updateInfo.releaseNotes,
         releaseDate: result.updateInfo.releaseDate,
       };
