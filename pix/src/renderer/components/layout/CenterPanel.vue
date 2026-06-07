@@ -474,13 +474,10 @@ async function sendMessage(): Promise<void> {
   let optimisticBlockId: string | null = null;
   try {
     optimisticBlockId = sessionStore.appendOptimisticUserMessage(text, allFilePaths);
-    if (isStreaming.value) {
-      void rpc.sendCommandAsync({ type: "steer", message: text, filePaths: allFilePaths, images: allImages }).catch((error) => {
-        sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
-      });
-    } else {
-      await rpc.sendPrompt(text, allFilePaths, allImages);
-    }
+    const commandType = isStreaming.value ? "steer" : "prompt";
+    void rpc.sendCommandAsync({ type: commandType, message: text, filePaths: allFilePaths, images: allImages }).catch((error) => {
+      sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
+    });
   } catch (error) {
     sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
     inputText.value = originalText;

@@ -80,15 +80,11 @@ async function sendMessage(): Promise<void> {
   isSending.value = true;
   let optimisticBlockId: string | null = null;
   try {
-    if (isStreaming.value) {
-      // Queue as steering message while agent is running
-      optimisticBlockId = sessionStore.appendOptimisticUserMessage(text);
-      void rpc.sendCommandAsync({ type: "steer", message: text }).catch((error) => {
-        sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
-      });
-    } else {
-      await rpc.sendPrompt(text);
-    }
+    const commandType = isStreaming.value ? "steer" : "prompt";
+    optimisticBlockId = sessionStore.appendOptimisticUserMessage(text);
+    void rpc.sendCommandAsync({ type: commandType, message: text }).catch((error) => {
+      sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
+    });
     inputText.value = "";
     if (textareaRef.value) {
       textareaRef.value.value = "";
