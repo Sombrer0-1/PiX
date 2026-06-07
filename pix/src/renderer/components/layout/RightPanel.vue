@@ -13,6 +13,24 @@ import type { McpServerInfo } from "../../../shared/types";
 const rpc = useRpc();
 const projectStore = useProjectStore();
 
+// Compaction state
+const isCompacting = computed(() => rpc.sessionState.value?.isCompacting ?? false);
+const isStreaming = computed(() => rpc.isStreaming.value);
+const canCompact = computed(() =>
+  rpc.isConnected.value &&
+  !isStreaming.value &&
+  !isCompacting.value
+);
+
+async function handleCompact(): Promise<void> {
+  if (!canCompact.value) return;
+  try {
+    await rpc.compact();
+  } catch (err) {
+    console.error("[RightPanel] Compaction failed:", err);
+  }
+}
+
 const modelDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
   if (!model) return "未设置";
@@ -147,7 +165,19 @@ watch(() => rpc.isConnected.value, (connected) => {
 
     <!-- Token stats card -->
     <div class="info-card">
-      <div class="card-title">Token 用量</div>
+      <div class="card-title-row">
+        <span class="card-title">Token 用量</span>
+        <button
+          class="card-action-btn compact-btn"
+          :class="{ compacting: isCompacting }"
+          :disabled="!canCompact"
+          :title="isCompacting ? '正在压缩...' : !rpc.isConnected.value ? '未连接会话' : isStreaming ? '运行中，请等待完成' : '压缩上下文'"
+          @click="handleCompact"
+        >
+          <svg v-if="isCompacting" class="spin-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+          <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M8 8l4-4 4 4"/><path d="M8 16l4 4 4-4"/><rect x="4" y="10" width="16" height="4" rx="1"/></svg>
+        </button>
+      </div>
       <TokenStats />
     </div>
 
@@ -319,6 +349,28 @@ watch(() => rpc.isConnected.value, (connected) => {
 .card-action-btn:hover {
   color: var(--pix-text-primary);
   background: var(--pix-accent-light);
+}
+
+.card-action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.card-action-btn:disabled:hover {
+  background: transparent;
+}
+
+.compact-btn.compacting {
+  color: var(--pix-warning);
+}
+
+.spin-icon {
+  animation: pix-spin 0.8s linear infinite;
+}
+
+@keyframes pix-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 /* ── Info rows ── */

@@ -167,6 +167,22 @@ function setupEventListeners(): void {
 					pendingMessageCount: event.steering.length + event.followUp.length,
 				};
 			}
+
+			if (event.type === "compaction_start") {
+				if (sessionState.value) {
+					sessionState.value = { ...sessionState.value, isCompacting: true };
+				}
+				return;
+			}
+
+			if (event.type === "compaction_end") {
+				if (sessionState.value) {
+					sessionState.value = { ...sessionState.value, isCompacting: false };
+				}
+				void refreshSessionStats();
+				void refreshState();
+				return;
+			}
 		}),
 	);
 }
@@ -407,6 +423,16 @@ async function setSteeringMode(mode: "all" | "one-at-a-time"): Promise<void> {
 	await sendCommand({ type: "set_steering_mode", mode });
 }
 
+// =========================================================================
+// Compaction
+// =========================================================================
+
+async function compact(customInstructions?: string): Promise<void> {
+	await sendCommandOrThrow({ type: "compact", customInstructions });
+	await refreshSessionStats();
+	await refreshState();
+}
+
 async function setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
 	await sendCommand({ type: "set_follow_up_mode", mode });
 }
@@ -483,6 +509,8 @@ export function useRpc() {
 		// Session config
 		setSteeringMode,
 		setFollowUpMode,
+		// Compaction
+		compact,
 		// Resources
 		reloadResources,
 		getThemes,
