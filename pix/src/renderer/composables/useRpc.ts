@@ -266,8 +266,8 @@ async function stopPi(): Promise<void> {
 	sessionStats.value = null;
 }
 
-async function sendPrompt(message: string, filePaths?: string[]): Promise<void> {
-	await sendCommandOrThrow({ type: "prompt", message, filePaths });
+async function sendPrompt(message: string, filePaths?: string[], images?: Array<{ mimeType: string; base64: string }>): Promise<void> {
+	await sendCommandOrThrow({ type: "prompt", message, filePaths, images });
 }
 
 async function abort(): Promise<void> {

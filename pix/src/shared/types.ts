@@ -7,11 +7,16 @@
 // RPC Command Types (commands sent to pi via stdin)
 // ============================================================================
 
+export interface ClipboardImage {
+  mimeType: string;
+  base64: string;
+}
+
 export type RpcCommand =
   // Prompting
-  | { id?: string; type: "prompt"; message: string; filePaths?: string[] }
-  | { id?: string; type: "steer"; message: string; filePaths?: string[] }
-  | { id?: string; type: "follow_up"; message: string; filePaths?: string[] }
+  | { id?: string; type: "prompt"; message: string; filePaths?: string[]; images?: ClipboardImage[] }
+  | { id?: string; type: "steer"; message: string; filePaths?: string[]; images?: ClipboardImage[] }
+  | { id?: string; type: "follow_up"; message: string; filePaths?: string[]; images?: ClipboardImage[] }
   | { id?: string; type: "abort" }
   | { id?: string; type: "respond_user_input"; response: RequestUserInputResponse }
   | { id?: string; type: "new_session"; parentSession?: string }

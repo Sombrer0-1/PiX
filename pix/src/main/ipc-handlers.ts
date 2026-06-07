@@ -457,13 +457,13 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
   switch (cmd.type) {
     // Prompting
     case "prompt":
-      await bridge.prompt(cmd.message, cmd.filePaths);
+      await bridge.prompt(cmd.message, cmd.filePaths, cmd.images);
       return null;
     case "steer":
-      await bridge.steer(cmd.message, cmd.filePaths);
+      await bridge.steer(cmd.message, cmd.filePaths, cmd.images);
       return null;
     case "follow_up":
-      await bridge.followUp(cmd.message, cmd.filePaths);
+      await bridge.followUp(cmd.message, cmd.filePaths, cmd.images);
       return null;
     case "abort":
       await bridge.abort();

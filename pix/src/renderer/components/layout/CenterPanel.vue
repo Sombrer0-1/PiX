@@ -55,6 +55,8 @@ let isProgrammaticScroll = false;
 interface ChatAttachment {
   path: string;
   name: string;
+  base64?: string;
+  mimeType?: string;
 }
 
 const attachments = ref<ChatAttachment[]>([]);
@@ -327,6 +329,46 @@ async function pickFiles(): Promise<void> {
   }
 }
 
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Remove data:image/xxx;base64, prefix
+      const base64 = result.split(",")[1] || "";
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addImageFiles(files: File[]): Promise<void> {
+  const existing = new Set(attachments.value.map((file) => file.path));
+  const next = [...attachments.value];
+
+  for (const file of files) {
+    if (!file.type.startsWith("image/")) continue;
+    const key = `clipboard-${file.name}-${file.size}-${file.lastModified}`;
+    if (existing.has(key)) continue;
+
+    try {
+      const base64 = await fileToBase64(file);
+      next.push({
+        path: key,
+        name: file.name || `image.${file.type.split("/")[1] || "png"}`,
+        base64,
+        mimeType: file.type,
+      });
+      existing.add(key);
+    } catch (err) {
+      console.error("[CenterPanel] Failed to convert image to base64:", err);
+    }
+  }
+
+  attachments.value = next;
+}
+
 function hasDraggedFiles(e: DragEvent): boolean {
   return Array.from(e.dataTransfer?.types ?? []).includes("Files");
 }
@@ -357,10 +399,40 @@ function handleDrop(e: DragEvent): void {
   isDraggingFiles.value = false;
 
   const files = Array.from(e.dataTransfer?.files ?? []);
-  const paths = files
-    .map((file) => window.pixApi.getPathForFile(file))
-    .filter((path) => path.length > 0);
-  addAttachmentPaths(paths);
+  const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+  const nonImageFiles = files.filter((file) => !file.type.startsWith("image/"));
+
+  // Handle non-image files via file paths
+  if (nonImageFiles.length > 0) {
+    const paths = nonImageFiles
+      .map((file) => window.pixApi.getPathForFile(file))
+      .filter((path) => path.length > 0);
+    addAttachmentPaths(paths);
+  }
+
+  // Handle image files via base64
+  if (imageFiles.length > 0) {
+    void addImageFiles(imageFiles);
+  }
+}
+
+function handlePaste(e: ClipboardEvent): void {
+  const items = Array.from(e.clipboardData?.items ?? []);
+  const imageItems = items.filter((item) => item.type.startsWith("image/"));
+
+  if (imageItems.length === 0) return;
+
+  e.preventDefault();
+
+  const files: File[] = [];
+  for (const item of imageItems) {
+    const file = item.getAsFile();
+    if (file) files.push(file);
+  }
+
+  if (files.length > 0) {
+    void addImageFiles(files);
+  }
 }
 
 function sendErrorMessage(error: unknown): string {
@@ -375,7 +447,19 @@ async function sendMessage(): Promise<void> {
   isSending.value = true;
   const originalText = text;
   const originalAttachments = [...attachments.value];
-  const filePaths = attachments.value.map((file) => file.path);
+
+  // Separate file paths and clipboard images
+  const filePaths: string[] = [];
+  const clipboardImages: Array<{ mimeType: string; base64: string }> = [];
+
+  for (const attachment of attachments.value) {
+    if (attachment.base64 && attachment.mimeType) {
+      clipboardImages.push({ mimeType: attachment.mimeType, base64: attachment.base64 });
+    } else {
+      filePaths.push(attachment.path);
+    }
+  }
+
   // Clear input immediately while the request is being sent.
   inputText.value = "";
   attachments.value = [];
@@ -383,15 +467,19 @@ async function sendMessage(): Promise<void> {
     textareaRef.value.value = "";
     textareaRef.value.style.height = "auto";
   }
+
+  const allFilePaths = filePaths.length > 0 ? filePaths : undefined;
+  const allImages = clipboardImages.length > 0 ? clipboardImages : undefined;
+
   let optimisticBlockId: string | null = null;
   try {
-    optimisticBlockId = sessionStore.appendOptimisticUserMessage(text, filePaths);
+    optimisticBlockId = sessionStore.appendOptimisticUserMessage(text, allFilePaths);
     if (isStreaming.value) {
-      void rpc.sendCommandAsync({ type: "steer", message: text, filePaths }).catch((error) => {
+      void rpc.sendCommandAsync({ type: "steer", message: text, filePaths: allFilePaths, images: allImages }).catch((error) => {
         sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
       });
     } else {
-      await rpc.sendPrompt(text, filePaths);
+      await rpc.sendPrompt(text, allFilePaths, allImages);
     }
   } catch (error) {
     sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
@@ -584,6 +672,7 @@ function autoResize(): void {
           :placeholder="isStreaming ? 'AI 正在运行... 输入以操控' : '输入任务或按 / 使用命令...'"
           @input="handleInput"
           @keydown="handleKeydown"
+          @paste="handlePaste"
           rows="2"
           spellcheck="true"
         ></textarea>

@@ -30,6 +30,7 @@ import {
 import { McpAdapter } from "pi-mcp-adapter";
 import type {
 	AgentSessionEvent,
+	ClipboardImage,
 	GuiSettings,
 	McpConfigInfo,
 	McpResourceContent,
@@ -180,8 +181,8 @@ export class SessionBridge {
 		this._guiSettings = settings;
 	}
 
-	async prompt(text: string, filePaths?: string[]): Promise<void> {
-		const prepared = await this._preparePromptInput(text, filePaths);
+	async prompt(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().prompt(prepared.text, {
 			images: prepared.images,
 			displayText: prepared.displayText,
@@ -189,8 +190,8 @@ export class SessionBridge {
 		});
 	}
 
-	async steer(text: string, filePaths?: string[]): Promise<void> {
-		const prepared = await this._preparePromptInput(text, filePaths);
+	async steer(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().steer(prepared.text, {
 			images: prepared.images,
 			displayText: prepared.displayText,
@@ -198,8 +199,8 @@ export class SessionBridge {
 		});
 	}
 
-	async followUp(text: string, filePaths?: string[]): Promise<void> {
-		const prepared = await this._preparePromptInput(text, filePaths);
+	async followUp(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().followUp(prepared.text, {
 			images: prepared.images,
 			displayText: prepared.displayText,
@@ -889,22 +890,45 @@ export class SessionBridge {
 	private async _preparePromptInput(
 		text: string,
 		filePaths?: readonly string[],
+		clipboardImages?: ClipboardImage[],
 	): Promise<{
 		text: string;
 		images?: ImageContent[];
 		displayText?: string;
 		attachments?: ChatMessageAttachment[];
 	}> {
-		if (!filePaths || filePaths.length === 0) {
-			return { text };
+		const session = this._getSession();
+		const allImages: ImageContent[] = [];
+		const allAttachments: ChatMessageAttachment[] = [];
+		const parts: string[] = [];
+
+		// Process file paths
+		if (filePaths && filePaths.length > 0) {
+			const processed = await processChatFiles(filePaths, this._cwd, {
+				autoResizeImages: session.settingsManager.getImageAutoResize(),
+			});
+			if (processed.text) parts.push(processed.text);
+			allImages.push(...processed.images);
+			allAttachments.push(...processed.attachments);
 		}
 
-		const session = this._getSession();
-		const processed = await processChatFiles(filePaths, this._cwd, {
-			autoResizeImages: session.settingsManager.getImageAutoResize(),
-		});
-		const parts: string[] = [];
-		if (processed.text) parts.push(processed.text);
+		// Process clipboard images
+		if (clipboardImages && clipboardImages.length > 0) {
+			for (let i = 0; i < clipboardImages.length; i++) {
+				const img = clipboardImages[i];
+				allImages.push({
+					type: "image",
+					mimeType: img.mimeType,
+					data: img.base64,
+				});
+				allAttachments.push({
+					path: `clipboard-image-${i + 1}`,
+					name: `clipboard-image-${i + 1}.${img.mimeType.split("/")[1] || "png"}`,
+					kind: "image",
+				});
+			}
+		}
+
 		if (text) parts.push(text);
 
 		if (session.settingsManager.getBlockImages()) {
@@ -912,26 +936,26 @@ export class SessionBridge {
 				text: parts.join(""),
 				images: undefined,
 				displayText: text,
-				attachments: processed.attachments,
+				attachments: allAttachments,
 			};
 		}
 
-		const visualContext = await this._tryTakeHerEyes(text, processed.images, processed.attachments);
+		const visualContext = await this._tryTakeHerEyes(text, allImages, allAttachments);
 		if (visualContext) {
 			parts.push(visualContext);
 			return {
 				text: parts.join(""),
 				images: undefined,
 				displayText: text,
-				attachments: processed.attachments,
+				attachments: allAttachments,
 			};
 		}
 
 		return {
 			text: parts.join(""),
-			images: processed.images.length > 0 ? processed.images : undefined,
+			images: allImages.length > 0 ? allImages : undefined,
 			displayText: text,
-			attachments: processed.attachments,
+			attachments: allAttachments,
 		};
 	}
 
