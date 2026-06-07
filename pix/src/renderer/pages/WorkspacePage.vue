@@ -28,20 +28,37 @@ let unsubscribeEvent: (() => void) | null = null;
 let unsubscribeUserInput: (() => void) | null = null;
 const pendingUserInput = ref<RequestUserInputRequest | null>(null);
 const userInputAnswers = ref<Record<string, string>>({});
+const currentQuestionIndex = ref(0);
+const currentAnswer = ref("");
 
-const hasMissingUserInputAnswer = computed(() => {
-  const request = pendingUserInput.value;
-  if (!request) return true;
-  return request.questions.some((question) => !userInputAnswers.value[question.id]?.trim());
+const currentQuestion = computed(() => {
+  const req = pendingUserInput.value;
+  if (!req || currentQuestionIndex.value >= req.questions.length) return null;
+  return req.questions[currentQuestionIndex.value];
+});
+
+const totalQuestions = computed(() => pendingUserInput.value?.questions.length ?? 0);
+
+const answeredSummary = computed(() => {
+  const req = pendingUserInput.value;
+  if (!req) return [];
+  return req.questions.map((q, i) => ({
+    field: q.header,
+    value: userInputAnswers.value[q.id] || "",
+    checked: !!userInputAnswers.value[q.id]?.trim(),
+    index: i,
+  }));
 });
 
 function openUserInputRequest(request: RequestUserInputRequest): void {
   pendingUserInput.value = request;
+  currentQuestionIndex.value = 0;
   const next: Record<string, string> = {};
   for (const question of request.questions) {
-    next[question.id] = question.options?.[0]?.label ?? "";
+    next[question.id] = "";
   }
   userInputAnswers.value = next;
+  currentAnswer.value = "";
 }
 
 async function respondUserInput(cancelled = false): Promise<void> {
@@ -54,7 +71,37 @@ async function respondUserInput(cancelled = false): Promise<void> {
   };
   pendingUserInput.value = null;
   userInputAnswers.value = {};
+  currentQuestionIndex.value = 0;
+  currentAnswer.value = "";
   await rpc.sendCommand({ type: "respond_user_input", response });
+}
+
+function advanceToNextQuestion(): void {
+  const question = currentQuestion.value;
+  if (!question) return;
+  userInputAnswers.value[question.id] = currentAnswer.value.trim();
+  currentAnswer.value = "";
+  if (currentQuestionIndex.value < totalQuestions.value - 1) {
+    currentQuestionIndex.value++;
+    const nextQ = pendingUserInput.value!.questions[currentQuestionIndex.value];
+    currentAnswer.value = userInputAnswers.value[nextQ.id] || "";
+  } else {
+    void respondUserInput(false);
+  }
+}
+
+function jumpToQuestion(index: number): void {
+  const curQ = currentQuestion.value;
+  if (curQ) {
+    userInputAnswers.value[curQ.id] = currentAnswer.value.trim();
+  }
+  currentQuestionIndex.value = index;
+  const targetQ = pendingUserInput.value!.questions[index];
+  currentAnswer.value = userInputAnswers.value[targetQ.id] || "";
+}
+
+function cancelClarification(): void {
+  void respondUserInput(true);
 }
 
 async function syncWorkspaceState(options: { loadMessagesIfEmpty?: boolean } = {}): Promise<void> {
@@ -130,154 +177,25 @@ onUnmounted(() => {
       <LeftPanel />
     </template>
     <template #center>
-      <CenterPanel />
+      <CenterPanel
+        :pending-user-input="pendingUserInput"
+        :current-question-index="currentQuestionIndex"
+        :current-answer="currentAnswer"
+        :current-question="currentQuestion"
+        :total-questions="totalQuestions"
+        :answered-summary="answeredSummary"
+        @update:current-answer="currentAnswer = $event"
+        @advance-question="advanceToNextQuestion"
+        @jump-to-question="jumpToQuestion"
+        @cancel-clarification="cancelClarification"
+      />
     </template>
     <template #right>
       <RightPanel />
     </template>
   </AppLayout>
-
-  <v-dialog :model-value="!!pendingUserInput" persistent max-width="640">
-    <v-card v-if="pendingUserInput" class="user-input-dialog">
-      <div class="user-input-title">需要你的输入</div>
-      <div class="user-input-questions">
-        <div
-          v-for="question in pendingUserInput.questions"
-          :key="question.id"
-          class="user-input-question"
-        >
-          <div class="question-header">{{ question.header }}</div>
-          <div class="question-text">{{ question.question }}</div>
-          <div v-if="question.options?.length" class="question-options">
-            <button
-              v-for="option in question.options"
-              :key="option.label"
-              class="question-option"
-              :class="{ active: userInputAnswers[question.id] === option.label }"
-              @click="userInputAnswers[question.id] = option.label"
-            >
-              <span class="option-label">{{ option.label }}</span>
-              <span v-if="option.description" class="option-description">{{ option.description }}</span>
-            </button>
-          </div>
-          <textarea
-            v-model="userInputAnswers[question.id]"
-            class="question-textarea"
-            rows="2"
-            :placeholder="question.options?.length ? '其他回答...' : '输入回答...'"
-          ></textarea>
-        </div>
-      </div>
-      <v-card-actions class="user-input-actions">
-        <v-spacer />
-        <v-btn variant="text" @click="respondUserInput(true)">取消</v-btn>
-        <v-btn color="primary" variant="flat" :disabled="hasMissingUserInputAnswer" @click="respondUserInput(false)">
-          发送
-        </v-btn>
-      </v-card-actions>
-    </v-card>
-  </v-dialog>
 </template>
 
+
 <style scoped>
-.user-input-dialog {
-  padding: var(--pix-space-lg);
-  border-radius: var(--pix-radius-xl);
-  border: 1px solid var(--pix-border-light);
-  box-shadow: var(--pix-shadow-xl);
-}
-
-.user-input-title {
-  font-size: var(--pix-text-lg);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  margin-bottom: var(--pix-space-md);
-}
-
-.user-input-questions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--pix-space-lg);
-}
-
-.question-header {
-  color: var(--pix-accent);
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-semibold);
-  text-transform: uppercase;
-  letter-spacing: 0;
-  margin-bottom: var(--pix-space-xs);
-}
-
-.question-text {
-  color: var(--pix-text-primary);
-  font-size: var(--pix-text-sm);
-  line-height: var(--pix-leading-base);
-  margin-bottom: var(--pix-space-sm);
-}
-
-.question-options {
-  display: grid;
-  gap: var(--pix-space-xs);
-  margin-bottom: var(--pix-space-sm);
-}
-
-.question-option {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  width: 100%;
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-lg);
-  color: var(--pix-text-primary);
-  background: var(--pix-bg-content);
-  text-align: left;
-}
-
-.question-option:hover {
-  background: var(--pix-bg-hover);
-}
-
-.question-option.active {
-  border-color: var(--pix-accent);
-  background: var(--pix-accent-light);
-  box-shadow: inset 3px 0 0 var(--pix-accent);
-}
-
-.option-label {
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-medium);
-}
-
-.option-description {
-  color: var(--pix-text-secondary);
-  font-size: var(--pix-text-xs);
-  line-height: var(--pix-leading-base);
-}
-
-.question-textarea {
-  width: 100%;
-  resize: vertical;
-  min-height: 58px;
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-lg);
-  background: var(--pix-bg-input);
-  color: var(--pix-text-primary);
-  font-family: var(--pix-font-ui);
-  font-size: var(--pix-text-sm);
-  line-height: var(--pix-leading-base);
-}
-
-.question-textarea:focus {
-  outline: none;
-  border-color: var(--pix-accent);
-  box-shadow: 0 0 0 3px rgba(98, 84, 243, 0.12);
-}
-
-.user-input-actions {
-  padding: var(--pix-space-lg) 0 0;
-}
 </style>

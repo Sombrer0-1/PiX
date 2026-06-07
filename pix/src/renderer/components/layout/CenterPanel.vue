@@ -22,13 +22,33 @@ import ForkDialog from "../session/ForkDialog.vue";
 import CommandPalette from "../input/CommandPalette.vue";
 import ModelSelector from "../input/ModelSelector.vue";
 import ThinkingSelector from "../input/ThinkingSelector.vue";
+import ClarificationCard from "../input/ClarificationCard.vue";
+import ClarificationChip from "../input/ClarificationChip.vue";
 import { deriveSessionTitle } from "@/utils/session-title";
 import { useSettingsStore } from "../../stores/settings-store";
+import type { RequestUserInputRequest, RequestUserInputQuestion } from "@/types/rpc";
 
 const sessionStore = useSessionStore();
 const rpc = useRpc();
 const projectStore = useProjectStore();
 const settingsStore = useSettingsStore();
+
+// Clarification props — driven by WorkspacePage's request_user_input handling
+const props = defineProps<{
+  pendingUserInput: RequestUserInputRequest | null;
+  currentQuestionIndex: number;
+  currentAnswer: string;
+  currentQuestion: RequestUserInputQuestion | null;
+  totalQuestions: number;
+  answeredSummary: Array<{ field: string; value: string; checked: boolean; index: number }>;
+}>();
+
+const emit = defineEmits<{
+  "update:currentAnswer": [value: string];
+  advanceQuestion: [];
+  jumpToQuestion: [index: number];
+  cancelClarification: [];
+}>();
 
 type ViewMode = "session" | "raw" | "tree";
 type ExecutionMode = "read-only" | "approval" | "unattended";
@@ -517,6 +537,19 @@ function autoResize(): void {
     textareaRef.value.style.height = Math.min(textareaRef.value.scrollHeight, 200) + "px";
   }
 }
+
+// New-session onboarding
+const onboardingHints = [
+  { icon: "🔨", label: "功能开发", prompt: "帮我开发一个新功能" },
+  { icon: "🐛", label: "调试排查", prompt: "帮我排查一个问题或 bug" },
+  { icon: "📖", label: "学习指导", prompt: "教我理解一段代码或技术概念" },
+  { icon: "🔍", label: "代码审查", prompt: "帮我审查代码质量和安全性" },
+];
+
+function sendQuickStart(prompt: string): void {
+  inputText.value = prompt;
+  void sendMessage();
+}
 </script>
 
 <template>
@@ -646,6 +679,49 @@ function autoResize(): void {
           @close="showCommandPalette = false"
         />
 
+        <!-- Clarification section: summary chips + current question card -->
+        <div v-if="pendingUserInput" class="clarification-section">
+          <div v-if="answeredSummary.some(s => s.checked)" class="clarification-chips">
+            <ClarificationChip
+              v-for="item in answeredSummary.filter(s => s.checked)"
+              :key="item.field"
+              :field="item.field"
+              :value="item.value"
+              @edit="emit('jumpToQuestion', item.index)"
+            />
+          </div>
+          <ClarificationCard
+            v-if="currentQuestion"
+            :question="currentQuestion"
+            :question-index="currentQuestionIndex + 1"
+            :total-questions="totalQuestions"
+            :answer="currentAnswer"
+            @update:answer="emit('update:currentAnswer', $event)"
+            @next="emit('advanceQuestion')"
+            @cancel="emit('cancelClarification')"
+          />
+        </div>
+
+        <!-- New-session onboarding hints -->
+        <div
+          v-if="!pendingUserInput && sessionStore.displayBlocks.length === 0 && !isStreaming"
+          class="onboarding-hints"
+        >
+          <span class="onboarding-label">开始新任务？告诉我你想做什么：</span>
+          <div class="onboarding-chips">
+            <button
+              v-for="hint in onboardingHints"
+              :key="hint.label"
+              type="button"
+              class="onboarding-chip"
+              @click="sendQuickStart(hint.prompt)"
+            >
+              <span class="hint-icon">{{ hint.icon }}</span>
+              <span>{{ hint.label }}</span>
+            </button>
+          </div>
+        </div>
+
         <div v-if="attachments.length > 0" class="attachment-list">
           <span
             v-for="file in attachments"
@@ -664,6 +740,7 @@ function autoResize(): void {
         </div>
 
         <textarea
+          v-if="!pendingUserInput"
           ref="textareaRef"
           class="composer-textarea"
           :placeholder="isStreaming ? 'AI 正在运行... 输入以操控' : '输入任务或按 / 使用命令...'"
@@ -674,7 +751,7 @@ function autoResize(): void {
           spellcheck="true"
         ></textarea>
 
-        <div class="composer-controls">
+        <div v-if="!pendingUserInput" class="composer-controls">
           <div class="composer-left">
             <button
               class="composer-icon-btn"
@@ -1264,6 +1341,78 @@ function autoResize(): void {
 .attachment-remove:hover {
   background: var(--pix-bg-active);
   color: var(--pix-text-primary);
+}
+
+/* ── Clarification section (above textarea) ── */
+.clarification-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-sm);
+  padding: 0 var(--pix-space-xs);
+}
+
+.clarification-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pix-space-xs);
+  padding-bottom: 2px;
+}
+
+/* ── New-session onboarding ── */
+.onboarding-hints {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-sm);
+  padding: 0 var(--pix-space-xs);
+  animation: card-enter 220ms ease-out;
+}
+
+@keyframes card-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.onboarding-label {
+  font-size: var(--pix-text-sm);
+  color: var(--pix-text-secondary);
+  font-weight: var(--pix-weight-medium);
+}
+
+.onboarding-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pix-space-xs);
+}
+
+.onboarding-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 14px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: 20px;
+  background: var(--pix-bg-content);
+  color: var(--pix-text-primary);
+  font-family: var(--pix-font-ui);
+  font-size: var(--pix-text-sm);
+  cursor: pointer;
+  transition:
+    background var(--pix-transition-fast),
+    border-color var(--pix-transition-fast),
+    box-shadow var(--pix-transition-fast),
+    transform var(--pix-transition-fast);
+}
+
+.onboarding-chip:hover {
+  background: var(--pix-accent-light);
+  border-color: var(--pix-accent-soft);
+  box-shadow: 0 2px 8px rgba(98, 84, 243, 0.12);
+  transform: translateY(-1px);
+}
+
+.hint-icon {
+  font-size: var(--pix-text-base);
+  line-height: 1;
 }
 
 .composer-textarea {
