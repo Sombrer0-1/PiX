@@ -156,6 +156,8 @@ export class SessionBridge {
 		this._cwd = projectDir;
 		this._guiSettings = guiSettings;
 
+		process.env.PI_CACHE_DEBUG_DIR = join(projectDir, "log");
+
 		const agentDir = getAgentDir();
 		this._authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 
@@ -237,7 +239,9 @@ export class SessionBridge {
 
 		this._sessionManager = SessionManager.open(sessionPath, undefined, this._cwd);
 		this._cwd = this._sessionManager.getCwd();
+		process.env.PI_CACHE_DEBUG_DIR = join(this._cwd, "log");
 		const result = await this._createSession(this._cwd, this._sessionManager, {
+
 			type: "session_start",
 			reason: "resume",
 			previousSessionFile,

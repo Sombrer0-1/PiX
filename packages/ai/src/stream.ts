@@ -5,6 +5,7 @@ import { getEnvApiKey } from "./env-api-keys.ts";
 import type {
 	Api,
 	AssistantMessage,
+	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
 	Model,
@@ -12,6 +13,8 @@ import type {
 	SimpleStreamOptions,
 	StreamOptions,
 } from "./types.ts";
+import { logRequest, logResponse } from "./utils/cache-debug.ts";
+import { AssistantMessageEventStream as AssistantMessageEventStreamImpl } from "./utils/event-stream.ts";
 
 export { getEnvApiKey } from "./env-api-keys.ts";
 
@@ -60,8 +63,44 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	const requestId = logRequest({
+		model: {
+			id: model.id,
+			name: model.name,
+			api: model.api as string,
+			provider: model.provider as string,
+			reasoning: model.reasoning,
+			baseUrl: model.baseUrl,
+		},
+		systemText: context.systemPrompt ?? "",
+		messages: context.messages as unknown[],
+		tools: (context.tools as unknown[]) ?? [],
+		// Pass through what we have at this level; providers can log more detail later.
+		promptCacheKey: options?.sessionId,
+		promptCacheRetention: options?.cacheRetention,
+		store: false,
+	});
+
 	const provider = resolveApiProvider(model.api);
-	return provider.streamSimple(model, context, withEnvApiKey(model, options));
+	const original = provider.streamSimple(model, context, withEnvApiKey(model, options));
+
+	const wrapped = new AssistantMessageEventStreamImpl();
+	(async () => {
+		try {
+			for await (const event of original as AsyncIterable<AssistantMessageEvent>) {
+				wrapped.push(event);
+				if (event.type === "done") {
+					logResponse(event.message.usage, requestId);
+				} else if (event.type === "error") {
+					logResponse(event.error.usage, requestId);
+				}
+			}
+		} catch (err) {
+			wrapped.end();
+			throw err;
+		}
+	})();
+	return wrapped;
 }
 
 export async function completeSimple<TApi extends Api>(
