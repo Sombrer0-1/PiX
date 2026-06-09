@@ -11,7 +11,7 @@ export const MODELS = {
 			api: "bedrock-converse-stream",
 			provider: "amazon-bedrock",
 			baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-			reasoning: false,
+			reasoning: true,
 			input: ["text", "image"],
 			cost: {
 				input: 0.33,
@@ -1131,7 +1131,7 @@ export const MODELS = {
 			api: "bedrock-converse-stream",
 			provider: "amazon-bedrock",
 			baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-			reasoning: false,
+			reasoning: true,
 			input: ["text"],
 			cost: {
 				input: 0.15,
@@ -1148,7 +1148,7 @@ export const MODELS = {
 			api: "bedrock-converse-stream",
 			provider: "amazon-bedrock",
 			baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-			reasoning: false,
+			reasoning: true,
 			input: ["text"],
 			cost: {
 				input: 0.15,
@@ -1165,7 +1165,7 @@ export const MODELS = {
 			api: "bedrock-converse-stream",
 			provider: "amazon-bedrock",
 			baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-			reasoning: false,
+			reasoning: true,
 			input: ["text"],
 			cost: {
 				input: 0.07,
@@ -1182,7 +1182,7 @@ export const MODELS = {
 			api: "bedrock-converse-stream",
 			provider: "amazon-bedrock",
 			baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-			reasoning: false,
+			reasoning: true,
 			input: ["text"],
 			cost: {
 				input: 0.07,
@@ -10034,6 +10034,23 @@ export const MODELS = {
 			contextWindow: 262144,
 			maxTokens: 4096,
 		} satisfies Model<"openai-completions">,
+		"nex-agi/nex-n2-pro:free": {
+			id: "nex-agi/nex-n2-pro:free",
+			name: "Nex AGI: Nex-N2-Pro (free)",
+			api: "openai-completions",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 262144,
+			maxTokens: 262144,
+		} satisfies Model<"openai-completions">,
 		"nvidia/llama-3.3-nemotron-super-49b-v1.5": {
 			id: "nvidia/llama-3.3-nemotron-super-49b-v1.5",
 			name: "NVIDIA: Llama 3.3 Nemotron Super 49B V1.5",
@@ -13052,8 +13069,8 @@ export const MODELS = {
 			reasoning: true,
 			input: ["text"],
 			cost: {
-				input: 0.08,
-				output: 0.29,
+				input: 0.12,
+				output: 0.5,
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
@@ -15917,7 +15934,7 @@ export const MODELS = {
 				cacheRead: 0.2,
 				cacheWrite: 0,
 			},
-			contextWindow: 2000000,
+			contextWindow: 1000000,
 			maxTokens: 30000,
 		} satisfies Model<"openai-completions">,
 		"grok-4.20-0309-reasoning": {
@@ -15934,7 +15951,7 @@ export const MODELS = {
 				cacheRead: 0.2,
 				cacheWrite: 0,
 			},
-			contextWindow: 2000000,
+			contextWindow: 1000000,
 			maxTokens: 30000,
 		} satisfies Model<"openai-completions">,
 		"grok-4.3": {
