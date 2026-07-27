@@ -6,12 +6,17 @@ import { computed, ref, onMounted, onUnmounted, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { useProjectStore } from "../../stores/project-store";
+import { useTeamStore } from "../../stores/team-store";
 import TokenStats from "../status/TokenStats.vue";
+import WorkerDetailCard from "../team/WorkerDetailCard.vue";
+import FileChangeSummary from "../team/FileChangeSummary.vue";
+import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
 import { deriveSessionTitle } from "@/utils/session-title";
 import type { McpServerInfo } from "../../../shared/types";
 
 const rpc = useRpc();
 const projectStore = useProjectStore();
+const teamStore = useTeamStore();
 
 // Compaction state
 const isCompacting = computed(() => rpc.sessionState.value?.isCompacting ?? false);
@@ -179,7 +184,43 @@ watch(() => rpc.isConnected.value, (connected) => {
 
 <template>
   <div class="right-panel">
-    <!-- Session info card -->
+    <!-- ====================================================================== -->
+    <!-- Team Mode: Worker Detail + File Changes -->
+    <!-- ====================================================================== -->
+    <!-- Protocol requests (worker permission approvals) must be visible in
+         every mode: a request raised while the user is outside team mode
+         would otherwise silently time out and fail the worker's task. -->
+    <TeamProtocolPanel />
+
+    <template v-if="teamStore.teamMode">
+      <WorkerDetailCard v-if="teamStore.focusedAgentId" />
+      <FileChangeSummary />
+
+      <!-- Session info (compact: remove session name and project in team mode) -->
+      <div class="info-card">
+        <div class="card-title">会话信息</div>
+        <div class="info-rows">
+          <div class="info-row">
+            <span class="info-label">模型</span>
+            <span class="info-value" :title="modelDisplay">{{ modelDisplay }}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">思考</span>
+            <span class="info-value">{{ thinkingLevel }}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">消息数</span>
+            <span class="info-value">{{ messageCount }}</span>
+          </div>
+        </div>
+      </div>
+
+    </template>
+
+    <!-- ====================================================================== -->
+    <!-- Normal Mode: Full session info -->
+    <!-- ====================================================================== -->
+    <template v-else>
     <div class="info-card">
       <div class="card-title">会话信息</div>
       <div class="info-rows">
@@ -205,9 +246,10 @@ watch(() => rpc.isConnected.value, (connected) => {
         </div>
       </div>
     </div>
+    </template>
 
-    <!-- Goal card -->
-    <div v-if="goal" class="info-card">
+    <!-- Goal card (normal mode only) -->
+    <div v-if="goal && !teamStore.teamMode" class="info-card">
       <div class="card-title">目标</div>
       <div class="goal-objective" :title="goal.objective">{{ goal.objective }}</div>
       <div class="info-rows compact">
@@ -754,4 +796,5 @@ watch(() => rpc.isConnected.value, (connected) => {
 .bg-task-stop-btn:hover {
   background: var(--pix-error-light);
 }
+
 </style>

@@ -15,6 +15,9 @@ import type {
   RequestUserInputRequest,
   RpcCommand,
   SessionInfo,
+  TeamCommand,
+  TeamEvent,
+  TeamState,
 } from "../shared/types.js";
 
 export interface PixApi {
@@ -88,13 +91,14 @@ export interface PixApi {
   }>;
   downloadUpdate: () => Promise<{ success: boolean; error?: string }>;
   installUpdate: () => void;
+
+  // Team commands
+  sendTeamCommand: <T = unknown>(command: TeamCommand) => Promise<{ success: boolean; data?: T; error?: string; code?: string }>;
+  onTeamEvent: (callback: (event: TeamEvent) => void) => () => void;
 }
 
 const api: PixApi = {
-  selectProject: () => {
-    console.log("[preload] selectProject() called, invoking IPC select-project");
-    return ipcRenderer.invoke("select-project");
-  },
+  selectProject: () => ipcRenderer.invoke("select-project"),
   selectPiPath: () => ipcRenderer.invoke("select-pi-path"),
   selectSessionFile: () => ipcRenderer.invoke("select-session-file"),
   selectChatFiles: () => ipcRenderer.invoke("select-chat-files"),
@@ -179,6 +183,15 @@ const api: PixApi = {
   checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
   downloadUpdate: () => ipcRenderer.invoke("download-update"),
   installUpdate: () => ipcRenderer.invoke("install-update"),
+
+  // Team commands
+  sendTeamCommand: <T = unknown>(command: TeamCommand) =>
+    ipcRenderer.invoke("team-command", command) as Promise<{ success: boolean; data?: T; error?: string; code?: string }>,
+  onTeamEvent: (callback: (event: TeamEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: TeamEvent) => callback(data);
+    ipcRenderer.on("team-event", handler);
+    return () => ipcRenderer.removeListener("team-event", handler);
+  },
 };
 
 contextBridge.exposeInMainWorld("pixApi", api);

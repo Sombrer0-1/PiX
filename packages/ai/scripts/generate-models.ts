@@ -15,6 +15,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageRoot = join(__dirname, "..");
 
+function formatCostValue(value: number): string {
+	const rounded = Number(value.toFixed(12));
+	return String(Object.is(rounded, -0) ? 0 : rounded);
+}
+
 interface ModelsDevModel {
 	id: string;
 	name: string;
@@ -1983,10 +1988,10 @@ export const MODELS = {
 			}
 			output += `\t\t\tinput: [${model.input.map(i => `"${i}"`).join(", ")}],\n`;
 			output += `\t\t\tcost: {\n`;
-			output += `\t\t\t\tinput: ${model.cost.input},\n`;
-			output += `\t\t\t\toutput: ${model.cost.output},\n`;
-			output += `\t\t\t\tcacheRead: ${model.cost.cacheRead},\n`;
-			output += `\t\t\t\tcacheWrite: ${model.cost.cacheWrite},\n`;
+			output += `\t\t\t\tinput: ${formatCostValue(model.cost.input)},\n`;
+			output += `\t\t\t\toutput: ${formatCostValue(model.cost.output)},\n`;
+			output += `\t\t\t\tcacheRead: ${formatCostValue(model.cost.cacheRead)},\n`;
+			output += `\t\t\t\tcacheWrite: ${formatCostValue(model.cost.cacheWrite)},\n`;
 			output += `\t\t\t},\n`;
 			output += `\t\t\tcontextWindow: ${model.contextWindow},\n`;
 			output += `\t\t\tmaxTokens: ${model.maxTokens},\n`;

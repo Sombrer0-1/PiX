@@ -68,6 +68,41 @@ function extractContentText(message: AgentMessage): string {
   return "";
 }
 
+/**
+ * Turn a steered <teammate-message> (worker report injected into the Leader
+ * session) into a compact human-readable note, or null if the text is not a
+ * teammate message.
+ */
+function parseTeammateMessageNote(text: string): string | null {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith("<teammate-message")) return null;
+  const match = trimmed.match(
+    /^<teammate-message\s+from="([^"]*)"(?:\s+role="([^"]*)")?[^>]*>\r?\n?([\s\S]*?)\r?\n?<\/teammate-message>\s*$/,
+  );
+  if (!match) return null;
+  const from = match[1] || "teammate";
+  const role = match[2];
+  const body = (match[3] ?? "").trim();
+  const label = role && role !== from ? `${from} (${role})` : from;
+  return `Teammate report from ${label}:\n${body}`;
+}
+
+/**
+ * Produce a one-line summary of an internal <orchestrator-event> prompt so the
+ * user sees WHY the leader is suddenly responding, without exposing the full
+ * internal coordination payload.
+ */
+function summarizeOrchestratorEvent(text: string): string {
+  const events = [...text.matchAll(/^EVENT: (\S+)/gm)].map((m) => m[1]);
+  if (events.length === 0) return "Team coordination event";
+  const workers = [...new Set([...text.matchAll(/^Worker: ([^\n(]+)/gm)].map((m) => m[1].trim()))];
+  const tasks = [...new Set([...text.matchAll(/^Task: "([^"]+)"/gm)].map((m) => m[1]))];
+  const parts = [`Team event: ${[...new Set(events)].join(", ")}`];
+  if (workers.length > 0) parts.push(`worker: ${workers.join(", ")}`);
+  if (tasks.length > 0) parts.push(`task: ${tasks.slice(0, 2).join("; ")}`);
+  return parts.join(" · ");
+}
+
 function parseEmbeddedFileBlocks(text: string): { text: string; attachments: ChatMessageAttachment[] } {
   const attachments: ChatMessageAttachment[] = [];
   const stripped = text.replace(/<file name="([^"]*)">\r?\n?([\s\S]*?)\r?\n?<\/file>\r?\n?/g, (_match, path, content) => {
@@ -174,7 +209,35 @@ export const useSessionStore = defineStore("session", () => {
     return id;
   }
 
-  function appendUserOrNoteMessage(msg: AgentMessage): void {
+  function appendUserOrNoteMessage(msg: AgentMessage): boolean {
+    if (msg.role === "user") {
+      const rawText = extractContentText(msg).trimStart();
+      // Internal orchestration turn: show a compact note (so the leader's
+      // upcoming response has visible context) instead of the raw payload,
+      // plus the thinking indicator since a leader turn is starting.
+      if (rawText.startsWith("<orchestrator-event>")) {
+        displayBlocks.value.push({
+          id: nextBlockId(),
+          type: "note",
+          text: summarizeOrchestratorEvent(rawText),
+          timestamp: messageTimestamp(msg),
+        });
+        showThinkingBlock(messageTimestamp(msg));
+        return false;
+      }
+      // Steered worker report: render as a styled note, not a fake "user" bubble.
+      const teammateNote = parseTeammateMessageNote(rawText);
+      if (teammateNote) {
+        displayBlocks.value.push({
+          id: nextBlockId(),
+          type: "note",
+          text: teammateNote,
+          timestamp: messageTimestamp(msg),
+        });
+        return false;
+      }
+    }
+
     const display = extractMessageDisplay(msg);
     if (msg.role === "custom" && display.noteKind && display.noteKind !== "user_command") {
       if (display.text) {
@@ -185,7 +248,7 @@ export const useSessionStore = defineStore("session", () => {
           timestamp: messageTimestamp(msg),
         });
       }
-      return;
+      return true;
     }
 
     if (display.text || display.attachments.length > 0) {
@@ -201,7 +264,7 @@ export const useSessionStore = defineStore("session", () => {
             optimisticBlock.timestamp = messageTimestamp(msg);
           }
           optimisticUserMessages = optimisticUserMessages.filter((item) => item.blockId !== optimistic.blockId);
-          return;
+          return true;
         }
         appendTurnSeparator(messageTimestamp(msg));
       }
@@ -212,7 +275,9 @@ export const useSessionStore = defineStore("session", () => {
         attachments: display.attachments,
         timestamp: messageTimestamp(msg),
       });
+      return true;
     }
+    return false;
   }
 
   function appendOptimisticUserMessage(text: string, filePaths: string[] = []): string | null {
@@ -398,8 +463,8 @@ export const useSessionStore = defineStore("session", () => {
         const msg = event.message;
         if (msg.role === "user" || msg.role === "custom") {
           if (msg.role === "custom" && msg.display === false) break;
-          appendUserOrNoteMessage(msg);
-          if (msg.role === "user") {
+          const appended = appendUserOrNoteMessage(msg);
+          if (msg.role === "user" && appended) {
             showThinkingBlock(messageTimestamp(msg));
           }
         } else if (msg.role === "assistant") {

@@ -435,3 +435,353 @@ export interface PiSettings {
   codeBlockIndent?: string;
   [key: string]: unknown;
 }
+
+// ============================================================================
+// Team Types (Agent Teams / Swarm)
+// ============================================================================
+
+/** Lifecycle status of a team. */
+export type TeamLifecycleStatus = "inactive" | "active" | "stopping";
+
+/** Predefined worker agent roles. */
+export type TeammateRole = "planner" | "coder" | "reviewer" | "tester" | "researcher";
+
+/** Runtime status of a single teammate agent. */
+export type TeammateStatus = "dormant" | "standby" | "idle" | "running" | "error" | "shutdown";
+
+/** How a teammate participates in a team. */
+export type TeamMemberMode = "core" | "on_demand";
+
+/** When a teammate should be activated. */
+export type TeamActivationPolicy = "always" | "when_needed" | "manual";
+
+/** Identity and runtime state of a teammate, sent to renderer. */
+export interface TeammateInfo {
+  /** Unique agent ID: "{agentName}::{teamName}" */
+  agentId: string;
+  /** Short display name (e.g. "planner", "coder", "reviewer") */
+  name: string;
+  /** Predefined role */
+  role: TeammateRole;
+  /** Whether this role is a default participant or an on-demand capability. */
+  mode?: TeamMemberMode;
+  /** Activation policy for this teammate. */
+  activationPolicy?: TeamActivationPolicy;
+  /** Current runtime status */
+  status: TeammateStatus;
+  /** Model used by this teammate (inherits leader model if undefined) */
+  model?: string;
+  /** UI color assigned at creation so same-role teammates stay distinguishable. */
+  color?: string;
+  /** Extra specialization instructions appended to this teammate's identity prompt. */
+  specialization?: string;
+  /** Timestamp when this teammate was created */
+  createdAt: number;
+  /** Last status change timestamp */
+  statusChangedAt: number;
+  /** Last time the worker was actively executing (started a turn or completed a turn) */
+  lastActiveAt?: number;
+  /** Current activity description (derived from latest session events) */
+  currentActivity?: string;
+  /** Error message if status is "error" */
+  error?: string;
+}
+
+/** Full team state snapshot, sent to renderer on query and on changes. */
+export interface TeamState {
+  /** Team name */
+  name: string;
+  /** Lifecycle status */
+  status: TeamLifecycleStatus;
+  /** Leader agent ID (always "team-lead::{teamName}") */
+  leadAgentId: string;
+  /** Map of teammate agentId -> info */
+  teammates: Record<string, TeammateInfo>;
+  /** Timestamp when team was created */
+  createdAt: number;
+}
+
+/** Persisted team history replayed to the renderer when a team is restored. */
+export interface TeamHistory {
+  /** Per-worker chat timelines, keyed by agentId. */
+  workerMessages: Record<string, TeammateChatMessage[]>;
+  /** Pending team bus messages (best-effort; consumed messages are not retained). */
+  teamMessages: TeamMessage[];
+  /** Full task list. */
+  tasks: TeamTask[];
+}
+
+/** A single chat message in a worker's message timeline. */
+export interface TeammateChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: number;
+  /** Agent ID of the actual sender (only set for incoming "user" messages). Used for correct persistence attribution. */
+  senderAgentId?: string;
+}
+
+/** Priority level for messages on the team bus. Lower number = higher priority. */
+export type MessageKind =
+  | "shutdown"
+  | "shutdown_response"
+  | "permission_request"
+  | "permission_response"
+  | "plan_approval"
+  | "leader_message"
+  | "peer_message"
+  | "broadcast"
+  | "task_message"
+  | "worker_summary"
+  | "question"
+  | "answer"
+  | "proposal"
+  | "objection"
+  | "decision"
+  | "handoff"
+  | "review_request"
+  | "fix_request"
+  | "task_result"
+  | "blocked";
+
+// ============================================================================
+// Team Task Type System
+// ============================================================================
+
+/** Semantic type of a team task, used for role-based auto-assignment. */
+export type TeamTaskType = "research" | "plan" | "implement" | "fix" | "review" | "test" | "summarize" | "audit";
+
+// ============================================================================
+// Team Protocol Types (Phase 4)
+// ============================================================================
+
+/** Per-worker shutdown negotiation state. */
+export type ShutdownState = "pending" | "confirmed" | "rejected";
+
+/** A pending shutdown request for a specific worker. */
+export interface ShutdownRequest {
+  agentId: string;
+  state: ShutdownState;
+  reason?: string;
+  requestedAt: number;
+  respondedAt?: number;
+}
+
+/** A permission request from a worker agent. */
+export interface PermissionRequest {
+  id: string;
+  teamName: string;
+  agentId: string;
+  tool: string;
+  args: Record<string, unknown>;
+  status: "pending" | "approved" | "rejected";
+  reason?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A plan approval request from a worker agent. */
+export interface PlanApproval {
+  id: string;
+  teamName: string;
+  agentId: string;
+  plan: string;
+  files: string[];
+  status: "pending" | "approved" | "rejected";
+  feedback?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Role-based permission policy for worker tools. */
+export type RolePermissionPolicy = {
+  allowedTools: string[];
+  deniedTools: string[];
+};
+
+// ============================================================================
+// Team Roster Types
+// ============================================================================
+
+/** Configuration for a single worker slot. */
+export interface WorkerConfig {
+  role: TeammateRole;
+  model?: string;
+  customName?: string;
+  mode?: TeamMemberMode;
+  activationPolicy?: TeamActivationPolicy;
+  /** Extra specialization instructions for this teammate's identity prompt. */
+  specialization?: string;
+}
+
+// ============================================================================
+// Team Task Types
+// ============================================================================
+
+/** Lifecycle status of a team task. */
+export type TeamTaskStatus = "pending" | "assigned" | "in_progress" | "blocked" | "completed" | "failed" | "cancelled";
+
+/** Structured completion evidence attached to a task result. */
+export interface TeamTaskEvidence {
+  /** One or two sentence outcome summary. */
+  summary: string;
+  /** Files or important paths changed by this task. */
+  changedFiles: string[];
+  /** Scope items the worker believes are complete. */
+  completedScope: string[];
+  /** Scope items explicitly not completed or still uncertain. */
+  missingScope: string[];
+  /** Verification performed, including commands, tests, or manual checks. */
+  verification: string[];
+  /** Known risks, assumptions, or fragile areas. */
+  risks: string[];
+  /** Suggested follow-up work. */
+  followUps: string[];
+  /** Worker confidence in the completion claim. */
+  confidence?: "low" | "medium" | "high";
+}
+
+/** Context bundle injected when a worker starts a task. */
+export interface TeamTaskContextPack {
+  taskId: string;
+  generatedAt: number;
+  objective: string;
+  assignedScope: string;
+  dependencyEvidence: Array<{
+    taskId: string;
+    subject: string;
+    result?: string;
+    evidence?: TeamTaskEvidence;
+  }>;
+  parentEvidence?: {
+    taskId: string;
+    subject: string;
+    result?: string;
+    evidence?: TeamTaskEvidence;
+  };
+  relevantRisks: string[];
+  touchedFiles: string[];
+  openQuestions: string[];
+  /** Role-specific coordination hints generated by the team runtime. */
+  coordinationHints?: string[];
+}
+
+/** Stable task handoff packet produced when a worker completes a task. */
+export interface TeamTaskHandoffPacket {
+  taskId: string;
+  createdAt: number;
+  workerAgentId?: string;
+  summary: string;
+  evidence: TeamTaskEvidence;
+  contextPack?: TeamTaskContextPack;
+}
+
+/** Explicit reliability gate state for task orchestration. */
+export interface TeamTaskGateState {
+  gate: "implementation" | "review" | "fix" | "verification" | "summary" | "none";
+  status: "waiting" | "active" | "passed" | "issues" | "blocked";
+  parentTaskId?: string;
+  reason?: string;
+  updatedAt: number;
+}
+
+/** Potential file ownership conflict between concurrent team tasks. */
+export interface TeamTaskFileConflict {
+  withTaskId: string;
+  withSubject: string;
+  files: string[];
+  severity: "info" | "warning";
+  reason: string;
+}
+
+/** A shared task in the team task list. */
+export interface TeamTask {
+  /** Unique task identifier (UUID). */
+  id: string;
+  /** Team this task belongs to. */
+  teamName: string;
+  /** Short title / subject. */
+  subject: string;
+  /** Detailed description of what needs to be done. */
+  description: string;
+  /** Semantic task type for role-based auto-assignment. */
+  taskType?: TeamTaskType;
+  /** Current lifecycle status. */
+  status: TeamTaskStatus;
+  /** Agent ID of the worker who claimed this task (undefined if unclaimed). */
+  ownerAgentId?: string;
+  /** IDs of tasks that must be completed before this one can be claimed. */
+  blockedBy: string[];
+  /** IDs of tasks that are blocked by this one. */
+  blocks: string[];
+  /** Result summary provided by the worker upon completion. */
+  result?: string;
+  /** Structured evidence ledger captured with the completion result. */
+  evidence?: TeamTaskEvidence;
+  /** Model-visible context pack used when this task was claimed. */
+  contextPack?: TeamTaskContextPack;
+  /** Stable handoff packet produced at completion. */
+  handoff?: TeamTaskHandoffPacket;
+  /** Explicit reliability gate state for orchestration. */
+  gateState?: TeamTaskGateState;
+  /** Potential file conflicts with concurrent tasks. */
+  fileConflicts?: TeamTaskFileConflict[];
+  /** Timestamp when the task was created. */
+  createdAt: number;
+  /** Timestamp of the last status change. */
+  updatedAt: number;
+  /** Optional metadata (e.g. priority, tags). */
+  metadata?: Record<string, unknown>;
+}
+
+/** A rich message flowing through the team message bus. */
+export interface TeamMessage {
+  id: string;
+  teamName: string;
+  fromAgentId: string;
+  toAgentId: string;        // specific agentId or "*" for broadcast
+  text: string;
+  timestamp: number;
+  read: boolean;
+  delivered: boolean;
+  summary: string;          // short description for UI timeline
+  kind: MessageKind;
+  fromRole: TeammateRole | "leader";
+}
+
+/** Events pushed from main to renderer for team state changes. */
+export type TeamEvent =
+  | { type: "team_created"; team: TeamState }
+  | { type: "team_deleted"; teamName: string }
+  | { type: "team_state_changed"; team: TeamState }
+  | { type: "teammate_status_changed"; teamName: string; agentId: string; status: TeammateStatus; error?: string; timestamp?: number }
+  | { type: "teammate_event"; teamName: string; agentId: string; event: AgentSessionEvent }
+  | { type: "teammate_message"; teamName: string; agentId: string; message: TeammateChatMessage }
+  | { type: "team_message"; teamName: string; message: TeamMessage }
+  | { type: "task_created"; teamName: string; task: TeamTask }
+  | { type: "task_updated"; teamName: string; task: TeamTask }
+  | { type: "task_deleted"; teamName: string; taskId: string }
+  | { type: "protocol_permission_request"; teamName: string; request: PermissionRequest }
+  | { type: "protocol_permission_response"; teamName: string; requestId: string; approved: boolean; reason?: string }
+  | { type: "protocol_plan_approval"; teamName: string; approval: PlanApproval }
+  | { type: "protocol_plan_response"; teamName: string; approvalId: string; approved: boolean; feedback?: string }
+  | { type: "protocol_shutdown_request"; teamName: string; agentId: string }
+  | { type: "protocol_shutdown_response"; teamName: string; agentId: string; confirmed: boolean; reason?: string }
+  | { type: "worker_summary"; teamName: string; fromAgentId: string; summary: string; taskId?: string };
+
+/** Commands sent from renderer to main for team operations. */
+export type TeamCommand =
+  | { type: "create_team"; teamName?: string }
+  | { type: "get_team_state" }
+  | { type: "get_team_history" }
+  | { type: "stop_team" }
+  | { type: "send_message"; agentId: string; message: string }
+  | { type: "abort_worker"; agentId: string }
+  | { type: "activate_member"; agentId: string }
+  | { type: "pause_member"; agentId: string }
+  | { type: "create_task"; subject: string; description: string; assignTo?: string; blockedBy?: string[]; taskType?: TeamTaskType }
+  | { type: "delete_task"; taskId: string }
+  | { type: "request_shutdown"; agentId?: string }
+  | { type: "respond_permission"; requestId: string; approved: boolean; reason?: string }
+  | { type: "respond_plan_approval"; approvalId: string; approved: boolean; feedback?: string }
+  | { type: "restart_worker"; agentId: string };

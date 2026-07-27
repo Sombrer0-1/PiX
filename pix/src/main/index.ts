@@ -8,9 +8,10 @@
 import { BrowserWindow, Menu, app, shell } from "electron";
 import { dirname, join } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
-import { registerIpcHandlers, setupEventForwarding } from "./ipc-handlers.js";
+import { registerIpcHandlers, setupEventForwarding, teardownEventForwarding } from "./ipc-handlers.js";
 import { SessionBridge } from "./session-bridge.js";
 import { SettingsStore } from "./settings-store.js";
+import { TeamManager } from "./team-manager.js";
 
 // ESM doesn't have __dirname; derive it from import.meta.url.
 const __filename = fileURLToPath(import.meta.url);
@@ -21,6 +22,7 @@ let mainWindow: BrowserWindow | null = null;
 let activeWin: BrowserWindow | null = null;
 let sessionBridge: SessionBridge | null = null;
 let settingsStore: SettingsStore;
+let teamManager: TeamManager;
 
 function isSafeExternalUrl(url: string): boolean {
   try {
@@ -103,6 +105,15 @@ function createWindow(): void {
 }
 
 async function cleanup(): Promise<void> {
+  teardownEventForwarding();
+
+  if (teamManager) {
+    try {
+      await teamManager.dispose();
+    } catch (err) {
+      console.error("[main] Error during team manager cleanup:", err);
+    }
+  }
   if (sessionBridge) {
     try {
       await sessionBridge.dispose();
@@ -116,11 +127,8 @@ app.whenReady().then(() => {
   // Remove default Electron menu bar (File, Edit, View, Window, Help)
   Menu.setApplicationMenu(null);
 
-  console.log("[main] app.whenReady() callback executing");
-
   try {
     settingsStore = new SettingsStore();
-    console.log("[main] SettingsStore created");
   } catch (err) {
     console.error("[main] SettingsStore FAILED:", err);
     throw err;
@@ -128,21 +136,29 @@ app.whenReady().then(() => {
 
   try {
     sessionBridge = new SessionBridge();
-    console.log("[main] SessionBridge created");
   } catch (err) {
     console.error("[main] SessionBridge FAILED:", err);
     throw err;
   }
 
+  try {
+    teamManager = new TeamManager();
+  } catch (err) {
+    console.error("[main] TeamManager FAILED:", err);
+    throw err;
+  }
+
+  // Wire TeamManager → SessionBridge so Leader tools are registered on the main session
+  if (sessionBridge && teamManager) {
+    sessionBridge.setTeamManager(teamManager);
+  }
+
   createWindow();
   activeWin = mainWindow;
-  console.log("[main] Window created, activeWin:", !!activeWin);
 
   if (activeWin) {
-    console.log("[main] registering IPC handlers...");
-    registerIpcHandlers(activeWin, sessionBridge, settingsStore);
-    setupEventForwarding(() => activeWin, sessionBridge);
-    console.log("[main] IPC handlers registered");
+    registerIpcHandlers(activeWin, sessionBridge, settingsStore, teamManager);
+    setupEventForwarding(() => activeWin, sessionBridge, teamManager);
   }
 
   app.on("activate", () => {
@@ -151,7 +167,7 @@ app.whenReady().then(() => {
       activeWin = mainWindow;
       if (activeWin && sessionBridge) {
         // Re-register IPC handlers for the new window (handler guard prevents duplicates)
-        registerIpcHandlers(activeWin, sessionBridge, settingsStore);
+        registerIpcHandlers(activeWin, sessionBridge, settingsStore, teamManager);
         // Event forwarding is already set up with a getter; updating activeWin is enough.
       }
     }

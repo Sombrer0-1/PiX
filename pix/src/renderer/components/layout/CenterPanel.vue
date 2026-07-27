@@ -2,14 +2,7 @@
 /**
  * CenterPanel - Main workspace column
  *
- * ┌──────────────────────────────┐
- * │ TopBar (breadcrumb, status,  │
- * │   connection, session ops)   │
- * ├──────────────────────────────┤
- * │ Session content (scrollable) │
- * ├──────────────────────────────┤
- * │ Composer                     │
- * └──────────────────────────────┘
+ * Owns the main session layout and team-mode split view.
  */
 import { computed, ref, watch, nextTick, onMounted } from "vue";
 import { useSessionStore } from "../../stores/session-store";
@@ -26,14 +19,18 @@ import ClarificationCard from "../input/ClarificationCard.vue";
 import ClarificationChip from "../input/ClarificationChip.vue";
 import { deriveSessionTitle } from "@/utils/session-title";
 import { useSettingsStore } from "../../stores/settings-store";
+import { useTeamStore } from "../../stores/team-store";
+import TeamDashboard from "../team/TeamDashboard.vue";
+import WorkerStatusBar from "../team/WorkerStatusBar.vue";
 import type { RequestUserInputRequest, RequestUserInputQuestion } from "@/types/rpc";
 
 const sessionStore = useSessionStore();
 const rpc = useRpc();
 const projectStore = useProjectStore();
 const settingsStore = useSettingsStore();
+const teamStore = useTeamStore();
 
-// Clarification props — driven by WorkspacePage's request_user_input handling
+// Clarification props are driven by WorkspacePage request_user_input handling.
 const props = defineProps<{
   pendingUserInput: RequestUserInputRequest | null;
   currentQuestionIndex: number;
@@ -93,11 +90,20 @@ const canSend = computed(() =>
   !isSending.value
 );
 const isStreaming = computed(() => rpc.isStreaming.value);
+const canUseTeamMode = computed(() => Boolean(projectStore.currentProject && rpc.isConnected.value));
+
+const composerPlaceholder = computed(() => {
+  if (rpc.isStreaming.value) return "AI is running... type to steer";
+  if (teamStore.teamMode && teamStore.isTeamActive) {
+    return "Message the team leader — it will plan and delegate to the team...";
+  }
+  return "Type a task or press / for commands...";
+});
 
 const statusText = computed(() => {
-  if (rpc.isStreaming.value) return "运行中";
-  if (rpc.sessionState.value?.isCompacting) return "压缩中";
-  return "空闲";
+  if (rpc.isStreaming.value) return "Running";
+  if (rpc.sessionState.value?.isCompacting) return "Compacting";
+  return "Idle";
 });
 
 const statusClass = computed(() => {
@@ -108,25 +114,25 @@ const statusClass = computed(() => {
 
 const modelDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  return model ? `${model.provider}/${model.id}` : "未选择模型";
+  return model ? `${model.provider}/${model.id}` : "No model";
 });
 
 const thinkingDisplay = computed(() => {
   const labels: Record<string, string> = {
-    off: "关闭",
-    minimal: "极简",
-    low: "低",
-    medium: "中",
-    high: "高",
-    xhigh: "极高",
+    off: "Off",
+    minimal: "Minimal",
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    xhigh: "XHigh",
   };
-  return labels[rpc.sessionState.value?.thinkingLevel || "medium"] || rpc.sessionState.value?.thinkingLevel || "中";
+  return labels[rpc.sessionState.value?.thinkingLevel || "medium"] || rpc.sessionState.value?.thinkingLevel || "Medium";
 });
 
 const modelButtonDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  if (!model) return "未选择模型";
-  return `${model.provider}/${model.id} · ${thinkingDisplay.value}`;
+  if (!model) return "No model";
+  return `${model.provider}/${model.id} / ${thinkingDisplay.value}`;
 });
 
 const currentModelInfo = computed(() => {
@@ -137,22 +143,22 @@ const currentModelInfo = computed(() => {
 
 const modelOnlyDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  return model ? `${model.provider}/${model.id}` : "未选择模型";
+  return model ? `${model.provider}/${model.id}` : "No model";
 });
 
 const cleanThinkingDisplay = computed(() => {
   const labels: Record<string, string> = {
-    off: "关闭",
-    minimal: "轻量",
-    low: "低",
-    medium: "标准",
-    high: "深入",
-    xhigh: "极深",
+    off: "Off",
+    minimal: "Minimal",
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    xhigh: "XHigh",
   };
   const level = rpc.sessionState.value?.thinkingLevel || "medium";
   return labels[level] || level;
 });
-const thinkingButtonDisplay = computed(() => `思考 ${cleanThinkingDisplay.value}`);
+const thinkingButtonDisplay = computed(() => `Thinking ${cleanThinkingDisplay.value}`);
 const thinkingButtonDisabled = computed(() => !rpc.sessionState.value?.model);
 
 const takeHerEyesEnabled = computed(() => settingsStore.settings.takeHerEyes?.enabled ?? false);
@@ -166,16 +172,16 @@ const imagesBlocked = computed(() => rpc.sessionState.value?.blockImages ?? fals
 const eyeIndicatorVisible = computed(() => takeHerEyesEnabled.value);
 const eyeIndicatorActive = computed(() => takeHerEyesConfigured.value && !currentModelSupportsImages.value && !imagesBlocked.value);
 const eyeIndicatorTitle = computed(() => {
-  if (!takeHerEyesConfigured.value) return "眼睛已启用，但还没有选择视觉模型";
-  if (imagesBlocked.value) return "眼睛已启用，但已开启阻止图片，不会调用视觉模型";
-  if (currentModelSupportsImages.value) return "眼睛已启用，但当前主模型支持图片，已自动停用";
-  return "眼睛已启用：当前主模型不能看图，上传图片时会自动调用视觉模型";
+  if (!takeHerEyesConfigured.value) return "Vision bridge is not configured.";
+  if (imagesBlocked.value) return "Images are blocked for this session.";
+  if (currentModelSupportsImages.value) return "Current model supports images directly.";
+  return "Vision bridge is active.";
 });
 
 const executionModes: Array<{ value: ExecutionMode; label: string; description: string; icon: string }> = [
-  { value: "read-only", label: "只读", description: "只能读取和搜索，禁止修改文件。", icon: "mdi-eye-outline" },
-  { value: "approval", label: "审批", description: "高风险操作需要确认。", icon: "mdi-shield-check-outline" },
-  { value: "unattended", label: "无监管", description: "工具调用不弹出审批。", icon: "mdi-lightning-bolt-outline" },
+  { value: "read-only", label: "Read only", description: "Read and inspect only.", icon: "mdi-eye-outline" },
+  { value: "approval", label: "Approval", description: "Ask before risky changes.", icon: "mdi-shield-check-outline" },
+  { value: "unattended", label: "Unattended", description: "Run tools without approval prompts.", icon: "mdi-lightning-bolt-outline" },
 ];
 const executionMode = computed<ExecutionMode>(() => rpc.sessionState.value?.executionMode ?? "approval");
 const currentExecutionMode = computed(() =>
@@ -194,6 +200,12 @@ watch(
   },
   { deep: true }
 );
+
+watch(canUseTeamMode, (available) => {
+  if (!available && teamStore.teamMode) {
+    teamStore.toggleTeamMode();
+  }
+});
 
 // Scroll to bottom on mount when there are existing blocks (e.g. navigating back from settings)
 onMounted(async () => {
@@ -540,16 +552,17 @@ function autoResize(): void {
 
 // New-session onboarding
 const onboardingHints = [
-  { icon: "🔨", label: "功能开发", prompt: "帮我开发一个新功能" },
-  { icon: "🐛", label: "调试排查", prompt: "帮我排查一个问题或 bug" },
-  { icon: "📖", label: "学习指导", prompt: "教我理解一段代码或技术概念" },
-  { icon: "🔍", label: "代码审查", prompt: "帮我审查代码质量和安全性" },
+  { icon: "mdi-code-braces", label: "Build a feature", prompt: "Implement a focused feature and verify it with tests." },
+  { icon: "mdi-bug-outline", label: "Fix a bug", prompt: "Find the cause of this bug, fix it, and explain the change." },
+  { icon: "mdi-file-tree-outline", label: "Explore the project", prompt: "Read the project structure and summarize the main architecture." },
+  { icon: "mdi-test-tube", label: "Add tests", prompt: "Add or improve tests for the current change." },
 ];
 
 function sendQuickStart(prompt: string): void {
   inputText.value = prompt;
   void sendMessage();
 }
+
 </script>
 
 <template>
@@ -577,25 +590,36 @@ function sendQuickStart(prompt: string): void {
           class="view-tab"
           :class="{ active: viewMode === 'session' }"
           @click="viewMode = 'session'"
-        >会话</button>
+        >Session</button>
         <button
           class="view-tab"
           :class="{ active: viewMode === 'tree' }"
           @click="viewMode = 'tree'"
-        >树</button>
+        >Tree</button>
         <button
           class="view-tab"
           :class="{ active: viewMode === 'raw' }"
           @click="viewMode = 'raw'"
-        >原始</button>
-        <button class="topbar-action" @click="showForkDialog = true">分支</button>
+        >Raw</button>
+        <button
+          v-if="canUseTeamMode"
+          class="view-tab view-tab--team"
+          :class="{ active: teamStore.teamMode }"
+          @click="teamStore.toggleTeamMode()"
+        >
+          Team
+          <span v-if="teamStore.pendingProtocolCount > 0" class="team-tab-badge">
+            {{ teamStore.pendingProtocolCount }}
+          </span>
+        </button>
+        <button class="topbar-action" @click="showForkDialog = true">Branch</button>
         <v-menu v-model="showExportMenu" :close-on-content-click="true" location="bottom end">
           <template #activator="{ props: menuProps }">
-            <button class="topbar-action" v-bind="menuProps">导出</button>
+            <button class="topbar-action" v-bind="menuProps">Export</button>
           </template>
           <v-list density="compact">
-            <v-list-item @click="exportHtml(); showExportMenu = false" title="导出 HTML" />
-            <v-list-item @click="exportJsonl(); showExportMenu = false" title="导出 JSONL" />
+            <v-list-item @click="exportHtml(); showExportMenu = false" title="Export HTML" />
+            <v-list-item @click="exportJsonl(); showExportMenu = false" title="Export JSONL" />
           </v-list>
         </v-menu>
       </div>
@@ -608,7 +632,7 @@ function sendQuickStart(prompt: string): void {
               :class="executionMode"
               type="button"
               :title="currentExecutionMode.description"
-              :aria-label="`执行模式：${currentExecutionMode.label}`"
+              :aria-label="`Execution mode: ${currentExecutionMode.label}`"
               :disabled="isSwitchingExecutionMode"
               v-bind="menuProps"
             >
@@ -639,12 +663,31 @@ function sendQuickStart(prompt: string): void {
         </v-menu>
         <span class="conn-pill" :class="rpc.isConnected.value ? 'connected' : 'offline'">
           <span class="conn-dot"></span>
-          {{ rpc.isConnected.value ? '已连接' : '离线' }}
+          {{ rpc.isConnected.value ? 'Connected' : 'Offline' }}
         </span>
       </div>
     </div>
 
-    <!-- Session content -->
+    <!-- Team mode keeps Leader conversation and team workbench visible side by side. -->
+    <template v-if="teamStore.teamMode">
+      <!-- Sticky team command bar -->
+      <WorkerStatusBar />
+
+      <!-- Leader conversation + team workbench -->
+      <div class="team-middle">
+        <div class="team-conversation" ref="contentArea" @scroll="handleContentScroll">
+          <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks" />
+          <SessionTreeView v-else-if="viewMode === 'tree'" />
+          <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
+        </div>
+        <div class="team-console-sidebar">
+          <TeamDashboard />
+        </div>
+      </div>
+    </template>
+
+    <!-- Session content (normal mode) -->
+    <template v-else>
     <div class="session-content" ref="contentArea" @scroll="handleContentScroll">
       <div v-if="sessionStore.displayBlocks.length === 0" class="empty-state">
         <div class="empty-orbit" aria-hidden="true">
@@ -653,16 +696,17 @@ function sendQuickStart(prompt: string): void {
           <span class="empty-star empty-star-a"></span>
           <span class="empty-star empty-star-b"></span>
         </div>
-        <p class="empty-title">新建会话</p>
-        <p class="empty-hint">在下方输入任务开始使用 Pi。</p>
+        <p class="empty-title">New session</p>
+        <p class="empty-hint">Describe a task below to start using Pi.</p>
       </div>
 
       <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks" />
       <SessionTreeView v-else-if="viewMode === 'tree'" />
       <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
     </div>
+    </template>
 
-    <!-- Composer -->
+    <!-- Composer remains visible; in team mode it sends to the Leader. -->
     <div class="center-composer">
       <div
         class="composer-inner"
@@ -707,7 +751,7 @@ function sendQuickStart(prompt: string): void {
           v-if="!pendingUserInput && sessionStore.displayBlocks.length === 0 && !isStreaming"
           class="onboarding-hints"
         >
-          <span class="onboarding-label">开始新任务？告诉我你想做什么：</span>
+          <span class="onboarding-label">Start with a common task:</span>
           <div class="onboarding-chips">
             <button
               v-for="hint in onboardingHints"
@@ -733,7 +777,7 @@ function sendQuickStart(prompt: string): void {
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
             </span>
             <span class="attachment-name">{{ file.name }}</span>
-            <button class="attachment-remove" @click="removeAttachment(file.path)" title="移除文件">
+            <button class="attachment-remove" @click="removeAttachment(file.path)" title="Remove attachment">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
             </button>
           </span>
@@ -743,7 +787,7 @@ function sendQuickStart(prompt: string): void {
           v-if="!pendingUserInput"
           ref="textareaRef"
           class="composer-textarea"
-          :placeholder="isStreaming ? 'AI 正在运行... 输入以操控' : '输入任务或按 / 使用命令...'"
+          :placeholder="composerPlaceholder"
           @input="handleInput"
           @keydown="handleKeydown"
           @paste="handlePaste"
@@ -756,7 +800,7 @@ function sendQuickStart(prompt: string): void {
             <button
               class="composer-icon-btn"
               @click="pickFiles"
-              title="添加文件"
+              title="Attach files"
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
@@ -799,8 +843,8 @@ function sendQuickStart(prompt: string): void {
               class="composer-action-btn primary-action"
               type="button"
               :disabled="!canSend"
-              title="发送引导"
-              aria-label="发送引导"
+              title="Send steer message"
+              aria-label="Send steer message"
               @click="sendMessage"
             >
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -812,8 +856,8 @@ function sendQuickStart(prompt: string): void {
               v-if="isStreaming"
               class="composer-action-btn stop-action"
               type="button"
-              title="停止"
-              aria-label="停止"
+              title="Stop"
+              aria-label="Stop"
               @click="stopAgent"
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -825,8 +869,8 @@ function sendQuickStart(prompt: string): void {
               class="composer-action-btn primary-action"
               type="button"
               :disabled="!canSend"
-              title="发送"
-              aria-label="发送"
+              title="Send"
+              aria-label="Send"
               @click="sendMessage"
             >
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -854,7 +898,7 @@ function sendQuickStart(prompt: string): void {
     var(--pix-bg-content);
 }
 
-/* ── TopBar ── */
+/* Topbar */
 .center-topbar {
   display: flex;
   align-items: center;
@@ -990,6 +1034,34 @@ function sendQuickStart(prompt: string): void {
   color: var(--pix-accent);
   font-weight: var(--pix-weight-medium);
   box-shadow: var(--pix-shadow-xs);
+}
+
+.view-tab--team {
+  margin-left: 4px;
+  border-left: 1px solid var(--pix-border-subtle);
+  padding-left: 12px;
+}
+
+.view-tab--team.active {
+  color: var(--pix-accent);
+  background: var(--pix-accent-light);
+}
+
+.team-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--pix-error);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: var(--pix-weight-semibold);
+  line-height: 1;
+  vertical-align: 1px;
 }
 
 .topbar-action {
@@ -1166,7 +1238,33 @@ function sendQuickStart(prompt: string): void {
   background: var(--pix-text-secondary);
 }
 
-/* ── Session content ── */
+/* Team mode layout */
+.team-middle {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.team-conversation {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: var(--pix-space-3xl) var(--pix-space-xl) var(--pix-space-xl);
+}
+
+.team-console-sidebar {
+  width: clamp(420px, 34vw, 560px);
+  flex-shrink: 0;
+  border-left: 1px solid var(--pix-border-subtle);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--pix-bg-content);
+}
+
+/* Session content */
 .session-content {
   flex: 1;
   overflow-y: auto;
@@ -1266,7 +1364,7 @@ function sendQuickStart(prompt: string): void {
   color: var(--pix-text-secondary);
 }
 
-/* ── Composer ── */
+/* Composer */
 .center-composer {
   flex-shrink: 0;
   padding: var(--pix-space-md) var(--pix-space-xl) var(--pix-space-xl);
@@ -1343,7 +1441,7 @@ function sendQuickStart(prompt: string): void {
   color: var(--pix-text-primary);
 }
 
-/* ── Clarification section (above textarea) ── */
+/* Clarification section */
 .clarification-section {
   display: flex;
   flex-direction: column;
@@ -1358,7 +1456,7 @@ function sendQuickStart(prompt: string): void {
   padding-bottom: 2px;
 }
 
-/* ── New-session onboarding ── */
+/* New-session onboarding */
 .onboarding-hints {
   display: flex;
   flex-direction: column;
@@ -1457,7 +1555,7 @@ function sendQuickStart(prompt: string): void {
   align-items: center;
 }
 
-/* Icon action in composer */
+/* Composer */
 .composer-icon-btn {
   display: inline-flex;
   align-items: center;
@@ -1482,7 +1580,7 @@ function sendQuickStart(prompt: string): void {
   min-width: 0;
 }
 
-/* Model button in composer */
+/* Composer */
 .model-btn,
 .thinking-btn {
   display: inline-flex;

@@ -28,6 +28,7 @@ import {
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
+import type { TeamManager } from "./team-manager.js";
 import type {
 	AgentSessionEvent,
 	ClipboardImage,
@@ -126,6 +127,7 @@ export class SessionBridge {
 	private _mcpAdapter: McpAdapter | null = null;
 	private _cwd = "";
 	private _guiSettings: GuiSettings | undefined;
+	private _teamManager: TeamManager | null = null;
 	private _unsubscribe: (() => void) | null = null;
 	private _auxiliaryUsage = createEmptyAuxiliaryUsage();
 
@@ -148,6 +150,11 @@ export class SessionBridge {
 
 	private _isCompacting = false;
 	private _pendingMessageCount = 0;
+
+	/** Store a reference to the TeamManager for Leader tool registration. */
+	setTeamManager(teamManager: TeamManager): void {
+		this._teamManager = teamManager;
+	}
 
 	async start(projectDir: string, guiSettings?: GuiSettings): Promise<void> {
 		this._assertProjectDirectory(projectDir);
@@ -175,6 +182,16 @@ export class SessionBridge {
 		if (hadSession) {
 			this._emitLifecycle("exit", { code: 0, signal: null, stderr: "" });
 		}
+	}
+
+	/** Get the current working directory (empty if no session started). */
+	getCwd(): string {
+		return this._cwd;
+	}
+
+	/** Get the auth storage instance (null if no session started). */
+	getAuthStorage(): AuthStorage | null {
+		return this._authStorage;
 	}
 
 	updateGuiSettings(settings: GuiSettings): void {
@@ -209,6 +226,7 @@ export class SessionBridge {
 	}
 
 	async abort(): Promise<void> {
+		this._teamManager?.abortActiveTurns();
 		await this._getSession().abort();
 	}
 
@@ -1203,7 +1221,10 @@ export class SessionBridge {
 			cwd,
 			agentDir: getAgentDir(),
 			settingsManager,
-			extensionFactories: [(pi) => { mcpAdapter.register(pi); }],
+			extensionFactories: [
+				(pi) => { mcpAdapter.register(pi); },
+				(pi) => { this._teamManager?.registerLeaderTools(pi); },
+			],
 		});
 		await resourceLoader.reload();
 
@@ -1225,6 +1246,10 @@ export class SessionBridge {
 		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
 		this._setupEventSubscription(session);
 		await this._bindExtensions();
+		// Wire the Leader session to TeamManager so worker summaries can be injected
+		if (this._teamManager) {
+			this._teamManager.setLeaderSession(session);
+		}
 		this._emitLifecycle("ready");
 	}
 
@@ -1236,6 +1261,7 @@ export class SessionBridge {
 		const mcpAdapter = this._mcpAdapter;
 		this._unsubscribe?.();
 		this._unsubscribe = null;
+		this._teamManager?.setLeaderSession(null);
 		this._session = null;
 		this._sessionManager = null;
 		this._isCompacting = false;

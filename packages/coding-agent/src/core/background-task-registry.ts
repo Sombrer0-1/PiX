@@ -62,9 +62,16 @@ export class BackgroundTaskRegistry {
 
 		this._tasks.set(taskId, task);
 
+		const appendOutput = (data: Buffer) => {
+			if (task.status !== "running") {
+				return;
+			}
+			task.output.append(data);
+		};
+
 		// Pipe output to accumulator
-		child.stdout?.on("data", (data: Buffer) => task.output.append(data));
-		child.stderr?.on("data", (data: Buffer) => task.output.append(data));
+		child.stdout?.on("data", appendOutput);
+		child.stderr?.on("data", appendOutput);
 
 		// Handle abort signal
 		const onAbort = () => {

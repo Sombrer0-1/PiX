@@ -12,5 +12,5 @@
     "rootDir": "src"
   },
   "include": ["src/main/**/*.ts", "src/shared/**/*.ts"],
-  "exclude": ["src/main/preload.ts"]
+  "exclude": ["src/main/preload.ts", "src/main/__tests__"]
 }

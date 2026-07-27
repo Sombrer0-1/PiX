@@ -95,6 +95,21 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0.08333333333333334
 	}
 		} satisfies ImagesModel<"openrouter-images">,
+		"google/gemini-3-pro-image": {
+			id: "google/gemini-3-pro-image",
+			name: "Google: Nano Banana Pro (Gemini 3 Pro Image)",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["image","text"],
+			output: ["image","text"],
+			cost: 	{
+	  "input": 2,
+	  "output": 12,
+	  "cacheRead": 0.19999999999999998,
+	  "cacheWrite": 0.375
+	}
+		} satisfies ImagesModel<"openrouter-images">,
 		"google/gemini-3-pro-image-preview": {
 			id: "google/gemini-3-pro-image-preview",
 			name: "Google: Nano Banana Pro (Gemini 3 Pro Image Preview)",
@@ -108,6 +123,21 @@ export const IMAGE_MODELS = {
 	  "output": 12,
 	  "cacheRead": 0.19999999999999998,
 	  "cacheWrite": 0.375
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"google/gemini-3.1-flash-image": {
+			id: "google/gemini-3.1-flash-image",
+			name: "Google: Nano Banana 2 (Gemini 3.1 Flash Image)",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["image","text"],
+			output: ["image","text"],
+			cost: 	{
+	  "input": 0.5,
+	  "output": 3,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
 		"google/gemini-3.1-flash-image-preview": {
@@ -125,9 +155,84 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
+		"google/gemini-3.1-flash-lite-image": {
+			id: "google/gemini-3.1-flash-lite-image",
+			name: "Google: Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["image","text"],
+			output: ["image","text"],
+			cost: 	{
+	  "input": 0.25,
+	  "output": 1.5,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"krea/krea-2-large": {
+			id: "krea/krea-2-large",
+			name: "Krea: Krea 2 Large",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"krea/krea-2-medium": {
+			id: "krea/krea-2-medium",
+			name: "Krea: Krea 2 Medium",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"krea/krea-2-medium-turbo": {
+			id: "krea/krea-2-medium-turbo",
+			name: "Krea: Krea 2 Medium Turbo",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
 		"microsoft/mai-image-2.5": {
 			id: "microsoft/mai-image-2.5",
 			name: "Microsoft: MAI-Image-2.5",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 5,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"microsoft/mai-image-2.5-pro": {
+			id: "microsoft/mai-image-2.5-pro",
+			name: "Microsoft: MAI-Image-2.5 Pro",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
@@ -185,9 +290,69 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
+		"openai/gpt-image-1": {
+			id: "openai/gpt-image-1",
+			name: "OpenAI: GPT Image 1",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 10,
+	  "output": 10,
+	  "cacheRead": 1.25,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"openai/gpt-image-1-mini": {
+			id: "openai/gpt-image-1-mini",
+			name: "OpenAI: GPT Image 1 Mini",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 2.5,
+	  "output": 2.5,
+	  "cacheRead": 0.25,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"openai/gpt-image-2": {
+			id: "openai/gpt-image-2",
+			name: "OpenAI: GPT Image 2",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 8,
+	  "output": 8,
+	  "cacheRead": 2,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
 		"openrouter/auto": {
 			id: "openrouter/auto",
 			name: "Auto Router",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["text","image"],
+			cost: 	{
+	  "input": -1000000,
+	  "output": -1000000,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"openrouter/auto-beta": {
+			id: "openrouter/auto-beta",
+			name: "Auto Router (Beta)",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
@@ -380,36 +545,6 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
-		"sourceful/riverflow-v2-fast-preview": {
-			id: "sourceful/riverflow-v2-fast-preview",
-			name: "Sourceful: Riverflow V2 Fast Preview",
-			api: "openrouter-images",
-			provider: "openrouter",
-			baseUrl: "https://openrouter.ai/api/v1",
-			input: ["text","image"],
-			output: ["image"],
-			cost: 	{
-	  "input": 0,
-	  "output": 0,
-	  "cacheRead": 0,
-	  "cacheWrite": 0
-	}
-		} satisfies ImagesModel<"openrouter-images">,
-		"sourceful/riverflow-v2-max-preview": {
-			id: "sourceful/riverflow-v2-max-preview",
-			name: "Sourceful: Riverflow V2 Max Preview",
-			api: "openrouter-images",
-			provider: "openrouter",
-			baseUrl: "https://openrouter.ai/api/v1",
-			input: ["text","image"],
-			output: ["image"],
-			cost: 	{
-	  "input": 0,
-	  "output": 0,
-	  "cacheRead": 0,
-	  "cacheWrite": 0
-	}
-		} satisfies ImagesModel<"openrouter-images">,
 		"sourceful/riverflow-v2-pro": {
 			id: "sourceful/riverflow-v2-pro",
 			name: "Sourceful: Riverflow V2 Pro",
@@ -425,9 +560,9 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
-		"sourceful/riverflow-v2-standard-preview": {
-			id: "sourceful/riverflow-v2-standard-preview",
-			name: "Sourceful: Riverflow V2 Standard Preview",
+		"sourceful/riverflow-v2.5-fast": {
+			id: "sourceful/riverflow-v2.5-fast",
+			name: "Sourceful: Riverflow V2.5 Fast",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
@@ -440,24 +575,9 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
-		"sourceful/riverflow-v2.5-fast:free": {
-			id: "sourceful/riverflow-v2.5-fast:free",
-			name: "Sourceful: Riverflow V2.5 Fast (free)",
-			api: "openrouter-images",
-			provider: "openrouter",
-			baseUrl: "https://openrouter.ai/api/v1",
-			input: ["text","image"],
-			output: ["image"],
-			cost: 	{
-	  "input": 0,
-	  "output": 0,
-	  "cacheRead": 0,
-	  "cacheWrite": 0
-	}
-		} satisfies ImagesModel<"openrouter-images">,
-		"sourceful/riverflow-v2.5-pro:free": {
-			id: "sourceful/riverflow-v2.5-pro:free",
-			name: "Sourceful: Riverflow V2.5 Pro (free)",
+		"sourceful/riverflow-v2.5-pro": {
+			id: "sourceful/riverflow-v2.5-pro",
+			name: "Sourceful: Riverflow V2.5 Pro",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",

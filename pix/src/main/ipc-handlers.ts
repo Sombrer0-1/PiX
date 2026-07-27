@@ -15,12 +15,14 @@ import electronUpdater from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
-import type { GuiSettings, ProjectInfo, RpcCommand, ThinkingLevel } from "../shared/types.js";
+import type { GuiSettings, ProjectInfo, RpcCommand, TeamCommand, ThinkingLevel } from "../shared/types.js";
+import type { TeamManager } from "./team-manager.js";
 
 const { autoUpdater } = electronUpdater;
 
 let handlersRegistered = false;
 let eventForwardingSetup = false;
+let eventForwardingUnsubscribes: Array<() => void> = [];
 let currentWindow: BrowserWindow | null = null;
 let detachWindowStateListeners: (() => void) | null = null;
 
@@ -163,17 +165,16 @@ function isPathInsideDirectory(candidatePath: string, directoryPath: string): bo
 export function registerIpcHandlers(
   win: BrowserWindow,
   sessionBridge: SessionBridge,
-  settingsStore: SettingsStore
+  settingsStore: SettingsStore,
+  teamManager?: TeamManager
 ): void {
   setCurrentWindow(win);
 
   // Prevent duplicate registration (e.g. macOS activate)
   if (handlersRegistered) {
-    console.log("[ipc-handlers] Already registered, skipping");
     return;
   }
   handlersRegistered = true;
-  console.log("[ipc-handlers] registerIpcHandlers() start");
 
   // =========================================================================
   // File Dialogs
@@ -183,14 +184,10 @@ export function registerIpcHandlers(
   // handler works after macOS window close/reopen (where the original `win`
   // captured at registration time may be destroyed).
   ipcMain.handle("select-project", async (event) => {
-    console.log("[ipc-handlers] select-project handler invoked");
     const callerWin = BrowserWindow.fromWebContents(event.sender);
-    console.log("[ipc-handlers] callerWin from webContents:", !!callerWin);
     if (!callerWin) {
-      console.log("[ipc-handlers] NO callerWin, returning null");
       return null;
     }
-    console.log("[ipc-handlers] calling selectProjectDirectory");
     return selectProjectDirectory(callerWin);
   });
 
@@ -219,6 +216,33 @@ export function registerIpcHandlers(
   ipcMain.handle("start-pi", async (_event, projectDir: string) => {
     try {
       await sessionBridge.start(projectDir, settingsStore.getAll());
+      // Initialize TeamManager with the same cwd and auth storage so it can launch workers
+      if (teamManager) {
+        const authStorage = sessionBridge.getAuthStorage();
+        if (!authStorage) {
+          const initErr = new Error("TeamManager initialization failed: auth storage unavailable");
+          console.error("[ipc] TeamManager init failed, rolling back session:", initErr);
+          try {
+            await sessionBridge.dispose();
+          } catch (disposeErr) {
+            console.error("[ipc] Session dispose during rollback also failed:", disposeErr);
+          }
+          throw initErr;
+        }
+        try {
+          await teamManager.initialize(projectDir, authStorage);
+        } catch (initErr) {
+          // Roll back: dispose the session since team init failed.
+          // Without this, the session is orphaned during startup.
+          console.error("[ipc] TeamManager init failed, rolling back session:", initErr);
+          try {
+            await sessionBridge.dispose();
+          } catch (disposeErr) {
+            console.error("[ipc] Session dispose during rollback also failed:", disposeErr);
+          }
+          throw initErr;
+        }
+      }
       return { success: true };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -226,6 +250,18 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle("stop-pi", async () => {
+    // Stop the team first (if active) before disposing the session
+    if (teamManager) {
+      try {
+        if (teamManager.hasActiveTeam()) {
+          // Preserve the snapshot so the team can be restored when the project
+          // is reopened. Only an explicit "stop_team" command disbands it.
+          await teamManager.stopTeam({ deleteSnapshot: false });
+        }
+      } catch (err) {
+        console.error("[ipc] Error stopping team during session dispose:", err);
+      }
+    }
     try {
       await sessionBridge.dispose();
     } catch (err) {
@@ -261,6 +297,25 @@ export function registerIpcHandlers(
     } catch (err) {
       console.error("[ipc] Async command error:", err);
       return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  // =========================================================================
+  // Team Commands
+  // =========================================================================
+
+  ipcMain.handle("team-command", async (_event, command: unknown) => {
+    if (!teamManager) {
+      return { success: false, code: "team_manager_unavailable", error: "TeamManager not available" };
+    }
+    if (!isTeamCommand(command)) {
+      return { success: false, code: "invalid_team_command", error: `Invalid team command: ${JSON.stringify(command)}` };
+    }
+    try {
+      const result = await executeTeamCommand(teamManager, command);
+      return { success: true, data: result };
+    } catch (err: unknown) {
+      return { success: false, code: "team_command_failed", error: err instanceof Error ? err.message : String(err) };
     }
   });
 
@@ -615,47 +670,165 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
  */
 export function setupEventForwarding(
   getWin: () => BrowserWindow | null,
-  sessionBridge: SessionBridge
+  sessionBridge: SessionBridge,
+  teamManager?: TeamManager
 ): void {
   if (eventForwardingSetup) return;
   eventForwardingSetup = true;
 
+  // Forward team events
+  if (teamManager) {
+    eventForwardingUnsubscribes.push(teamManager.onEvent((event) => {
+      const win = getWin();
+      if (win && !win.isDestroyed()) {
+        win.webContents.send("team-event", event);
+      }
+    }));
+  }
+
   // Forward agent session events
-  sessionBridge.onEvent((event) => {
+  eventForwardingUnsubscribes.push(sessionBridge.onEvent((event) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-event", event);
     }
-  });
+  }));
 
-  sessionBridge.onUserInputRequest((request) => {
+  eventForwardingUnsubscribes.push(sessionBridge.onUserInputRequest((request) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("user-input-request", request);
     }
-  });
+  }));
 
   // Lifecycle: ready
-  sessionBridge.onLifecycle("ready", () => {
+  eventForwardingUnsubscribes.push(sessionBridge.onLifecycle("ready", () => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-ready");
     }
-  });
+  }));
 
   // Lifecycle: exit
-  sessionBridge.onLifecycle("exit", (data) => {
+  eventForwardingUnsubscribes.push(sessionBridge.onLifecycle("exit", (data) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-exit", data);
     }
-  });
+  }));
 
   // Lifecycle: error
-  sessionBridge.onLifecycle("error", (err) => {
+  eventForwardingUnsubscribes.push(sessionBridge.onLifecycle("error", (err) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-error", { message: err.message ?? String(err) });
     }
-  });
+  }));
+}
+
+export function teardownEventForwarding(): void {
+  for (const unsubscribe of eventForwardingUnsubscribes.splice(0)) {
+    try {
+      unsubscribe();
+    } catch (err) {
+      console.error("[ipc] Error tearing down event forwarding:", err);
+    }
+  }
+  eventForwardingSetup = false;
+}
+
+// ===========================================================================
+// Team Command Dispatch
+// ===========================================================================
+
+const VALID_TEAM_COMMAND_TYPES = new Set([
+  "create_team",
+  "get_team_state",
+  "get_team_history",
+  "stop_team",
+  "send_message",
+  "abort_worker",
+  "activate_member",
+  "pause_member",
+  "create_task",
+  "delete_task",
+  "request_shutdown",
+  "respond_permission",
+  "respond_plan_approval",
+  "restart_worker",
+]);
+
+function isTeamCommand(cmd: unknown): cmd is TeamCommand {
+  if (typeof cmd !== "object" || cmd === null || !("type" in cmd)) return false;
+  const type = (cmd as Record<string, unknown>).type;
+  if (typeof type !== "string" || !VALID_TEAM_COMMAND_TYPES.has(type)) return false;
+
+  // Validate required sub-fields per command type
+  const c = cmd as Record<string, unknown>;
+  switch (type) {
+    case "send_message":
+      return typeof c.agentId === "string" && typeof c.message === "string";
+    case "abort_worker":
+    case "activate_member":
+    case "pause_member":
+      return typeof c.agentId === "string";
+    case "create_task":
+      return typeof c.subject === "string" && typeof c.description === "string";
+    case "delete_task":
+      return typeof c.taskId === "string";
+    case "request_shutdown":
+      return true; // agentId is optional (all workers if omitted)
+    case "respond_permission":
+      return typeof c.requestId === "string" && typeof c.approved === "boolean";
+    case "respond_plan_approval":
+      return typeof c.approvalId === "string" && typeof c.approved === "boolean";
+    case "restart_worker":
+      return typeof c.agentId === "string";
+    default:
+      return true;
+  }
+}
+
+async function executeTeamCommand(teamManager: TeamManager, cmd: TeamCommand): Promise<unknown> {
+  switch (cmd.type) {
+    case "create_team":
+      return teamManager.createTeam(cmd.teamName);
+    case "get_team_state":
+      return teamManager.getTeamState();
+    case "get_team_history":
+      return teamManager.getTeamHistory();
+    case "stop_team":
+      await teamManager.stopTeam();
+      return null;
+    case "send_message":
+      await teamManager.sendMessageToWorker(cmd.agentId, cmd.message);
+      return null;
+    case "abort_worker":
+      teamManager.abortWorker(cmd.agentId);
+      return null;
+    case "activate_member":
+      await teamManager.activateMember(cmd.agentId);
+      return null;
+    case "pause_member":
+      await teamManager.pauseMember(cmd.agentId);
+      return null;
+    case "create_task":
+      return teamManager.createTask(cmd.subject, cmd.description, cmd.assignTo, cmd.blockedBy, cmd.taskType);
+    case "delete_task":
+      teamManager.deleteTask(cmd.taskId);
+      return null;
+    case "request_shutdown":
+      return teamManager.requestShutdown(cmd.agentId);
+    case "respond_permission":
+      teamManager.respondPermission(cmd.requestId, cmd.approved, cmd.reason);
+      return null;
+    case "respond_plan_approval":
+      teamManager.respondPlanApproval(cmd.approvalId, cmd.approved, cmd.feedback);
+      return null;
+    case "restart_worker":
+      await teamManager.restartWorker(cmd.agentId);
+      return null;
+    default:
+      throw new Error(`Unknown team command type: ${(cmd as { type: string }).type}`);
+  }
 }

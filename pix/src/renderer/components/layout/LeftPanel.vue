@@ -1,12 +1,13 @@
 <script setup lang="ts">
 /**
- * LeftPanel - 会话导航侧栏
+ * LeftPanel - project and session navigation.
  */
 import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { useProjectStore } from "../../stores/project-store";
 import { useSessionStore } from "../../stores/session-store";
+import { useTeamStore } from "../../stores/team-store";
 import { deriveSessionTitle, formatSessionTime } from "@/utils/session-title";
 import type { AgentMessage } from "@/types/rpc";
 import type { SessionInfo } from "@/types/session";
@@ -15,6 +16,7 @@ const router = useRouter();
 const rpc = useRpc();
 const projectStore = useProjectStore();
 const sessionStore = useSessionStore();
+const teamStore = useTeamStore();
 
 const searchQuery = ref("");
 const pinnedIds = ref<Set<string>>(new Set());
@@ -25,51 +27,76 @@ const deleteError = ref<string | null>(null);
 
 const projectPath = computed(() => projectStore.currentProject?.path || "");
 const deleteSessionTitle = computed(() => deriveSessionTitle(confirmDeleteSession.value));
+const currentSessionId = computed(() => projectStore.currentSession?.id ?? rpc.sessionState.value?.sessionId ?? "");
 
 const filteredSessions = computed(() => {
-  let sessions = [...projectStore.sessions];
+  const sessions = [...projectStore.sessions];
   sessions.sort((a, b) => {
     const aPinned = pinnedIds.value.has(a.id);
     const bPinned = pinnedIds.value.has(b.id);
     if (aPinned && !bPinned) return -1;
     if (!aPinned && bPinned) return 1;
-    return 0;
+    return b.modified - a.modified;
   });
-  if (!searchQuery.value) return sessions;
-  const query = searchQuery.value.toLowerCase();
-  return sessions.filter((s) => {
-    const title = deriveSessionTitle(s);
-    return title.toLowerCase().includes(query) ||
-      s.firstMessage.toLowerCase().includes(query) ||
-      s.path.toLowerCase().includes(query);
+
+  const query = searchQuery.value.trim().toLowerCase();
+  if (!query) return sessions;
+
+  return sessions.filter((session) => {
+    const title = deriveSessionTitle(session).toLowerCase();
+    return title.includes(query) ||
+      session.firstMessage.toLowerCase().includes(query) ||
+      session.path.toLowerCase().includes(query);
   });
 });
 
+function isCurrentTeamSession(session: SessionInfo): boolean {
+  return teamStore.isTeamActive && currentSessionId.value === session.id;
+}
+
+async function refreshCurrentSession(): Promise<void> {
+  await projectStore.listSessions();
+  projectStore.syncCurrentSession(
+    rpc.sessionState.value?.sessionFile,
+    rpc.sessionState.value?.sessionId,
+  );
+}
+
 async function newSession(): Promise<void> {
   const result = await rpc.newSession();
-  if (result && !result.cancelled) {
-    sessionStore.clearSession();
-    await projectStore.listSessions();
-    projectStore.syncCurrentSession(
-      rpc.sessionState.value?.sessionFile,
-      rpc.sessionState.value?.sessionId
-    );
+  if (!result || result.cancelled) return;
+  teamStore.teamMode = false;
+  sessionStore.clearSession();
+  await refreshCurrentSession();
+}
+
+async function newTeamSession(): Promise<void> {
+  // Only one team can exist per project: disband the previous one first so the
+  // new session starts with a fresh team instead of a "team already active" error.
+  if (teamStore.isTeamActive) {
+    const stopped = await teamStore.stopTeam();
+    if (!stopped) return;
   }
+  const result = await rpc.newSession();
+  if (!result || result.cancelled) return;
+  sessionStore.clearSession();
+  await refreshCurrentSession();
+  teamStore.teamMode = true;
+  await teamStore.createTeam();
 }
 
 async function handleSelectSession(session: SessionInfo): Promise<void> {
   const result = await rpc.switchSession(session.path);
   if (!result || result.cancelled) return;
+
   projectStore.setCurrentSession(session);
   const messages = await rpc.getMessages();
   if (messages) {
     sessionStore.loadMessages(messages as AgentMessage[]);
   }
-  await projectStore.listSessions();
-  projectStore.syncCurrentSession(
-    rpc.sessionState.value?.sessionFile,
-    rpc.sessionState.value?.sessionId
-  );
+  await refreshCurrentSession();
+  await teamStore.fetchTeamState();
+  await teamStore.fetchTeamHistory();
 }
 
 function togglePin(sessionId: string): void {
@@ -88,44 +115,38 @@ function requestDelete(session: SessionInfo): void {
 async function executeDelete(): Promise<void> {
   const session = confirmDeleteSession.value;
   if (!session) return;
+
   deletingSession.value = session.id;
   deleteError.value = null;
-  const wasCurrentSession = projectStore.currentSession?.id === session.id;
+  const wasCurrentSession = currentSessionId.value === session.id;
+
   try {
     const result = await window.pixApi.deleteSession(session.path);
     if (!result.success) {
       deleteError.value = result.error || "Delete session failed";
       return;
     }
-    if (result.success) {
-      await projectStore.listSessions();
-      if (wasCurrentSession) {
-        const replacement = projectStore.sessions[0] ?? null;
-        if (replacement) {
-          await handleSelectSession(replacement);
-        } else {
-          const newResult = await rpc.newSession();
-          if (newResult && !newResult.cancelled) {
-            sessionStore.clearSession();
-            await projectStore.listSessions();
-            projectStore.syncCurrentSession(
-              rpc.sessionState.value?.sessionFile,
-              rpc.sessionState.value?.sessionId
-            );
-          } else {
-            projectStore.setCurrentSession(null);
-            sessionStore.clearSession();
-          }
-        }
+
+    await projectStore.listSessions();
+    if (wasCurrentSession) {
+      const replacement = projectStore.sessions[0] ?? null;
+      if (replacement) {
+        await handleSelectSession(replacement);
       } else {
-        projectStore.syncCurrentSession(
-          rpc.sessionState.value?.sessionFile,
-          rpc.sessionState.value?.sessionId
-        );
+        const newResult = await rpc.newSession();
+        if (newResult && !newResult.cancelled) {
+          sessionStore.clearSession();
+          await refreshCurrentSession();
+        } else {
+          projectStore.setCurrentSession(null);
+          sessionStore.clearSession();
+        }
       }
+    } else {
+      await refreshCurrentSession();
     }
   } catch (err) {
-    console.error("[LeftPanel] 删除会话失败:", err);
+    console.error("[LeftPanel] Delete session failed:", err);
     deleteError.value = err instanceof Error ? err.message : String(err);
   } finally {
     deletingSession.value = null;
@@ -136,26 +157,24 @@ async function executeDelete(): Promise<void> {
   }
 }
 
-function goHome(): void { router.push("/"); }
-function goSettings(): void { router.push("/settings"); }
+function goHome(): void { void router.push("/"); }
+function goSettings(): void { void router.push("/settings"); }
 </script>
 
 <template>
   <div class="left-panel">
-    <!-- Project header -->
     <div class="panel-header">
       <div class="project-name-row">
         <div class="project-icon">
           {{ (projectStore.currentProject?.name || "P")[0] }}
         </div>
         <div class="project-name" :title="projectStore.currentProject?.name">
-          {{ projectStore.currentProject?.name || "未打开项目" }}
+          {{ projectStore.currentProject?.name || "No project" }}
         </div>
       </div>
       <div class="project-path" :title="projectPath">{{ projectPath }}</div>
     </div>
 
-    <!-- New session button -->
     <div class="panel-actions">
       <button
         class="new-session-btn"
@@ -163,11 +182,18 @@ function goSettings(): void { router.push("/settings"); }
         @click="newSession"
       >
         <span class="btn-icon">+</span>
-        <span>新建会话</span>
+        <span>New Session</span>
+      </button>
+      <button
+        class="new-team-session-btn"
+        :disabled="!rpc.isConnected.value"
+        @click="newTeamSession"
+      >
+        <v-icon icon="mdi-account-group-outline" size="15" />
+        <span>New Team Session</span>
       </button>
     </div>
 
-    <!-- Search -->
     <div class="panel-search">
       <div class="search-wrapper">
         <span class="search-icon">
@@ -177,85 +203,88 @@ function goSettings(): void { router.push("/settings"); }
           v-model="searchQuery"
           type="text"
           class="search-input"
-          placeholder="搜索会话..."
+          placeholder="Search sessions..."
           spellcheck="false"
         />
         <button
           v-if="searchQuery"
           class="search-clear"
+          title="Clear search"
           @click="searchQuery = ''"
-          title="清除"
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
     </div>
 
-    <!-- Session list -->
     <div class="session-list">
       <div
         v-for="session in filteredSessions"
         :key="session.id"
         class="session-item"
-        :class="{ active: projectStore.currentSession?.id === session.id }"
+        :class="{
+          active: currentSessionId === session.id,
+          'team-session': isCurrentTeamSession(session),
+        }"
         @click="handleSelectSession(session)"
       >
-        <span v-if="pinnedIds.has(session.id)" class="pin-marker" title="已置顶">
+        <span v-if="pinnedIds.has(session.id)" class="pin-marker" title="Pinned">
           <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M16,12V4H17V2H7V4H8V12L6,14V16H11.2V22H12.8V16H18V14L16,12Z"/></svg>
+        </span>
+        <span v-if="isCurrentTeamSession(session)" class="team-marker" title="Active team session">
+          <v-icon icon="mdi-account-group-outline" size="12" />
         </span>
         <div class="session-info">
           <span class="session-name" :title="deriveSessionTitle(session)">
             {{ deriveSessionTitle(session) }}
           </span>
+          <span v-if="isCurrentTeamSession(session)" class="session-kind">Team</span>
         </div>
         <span class="session-time">{{ formatSessionTime(session.modified) }}</span>
         <span class="hover-actions">
           <button
             class="hover-btn"
             :class="{ 'pin-active': pinnedIds.has(session.id) }"
+            :title="pinnedIds.has(session.id) ? 'Unpin' : 'Pin'"
             @click.stop="togglePin(session.id)"
-            :title="pinnedIds.has(session.id) ? '取消置顶' : '置顶'"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
           </button>
           <button
             class="hover-btn danger"
+            title="Delete session"
             @click.stop="requestDelete(session)"
-            title="删除会话"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
           </button>
         </span>
       </div>
       <div v-if="filteredSessions.length === 0" class="empty-hint">
-        {{ searchQuery ? '无匹配结果' : '暂无会话' }}
+        {{ searchQuery ? "No matching sessions" : "No sessions yet" }}
       </div>
     </div>
 
-    <!-- Footer -->
     <div class="panel-footer">
-      <button class="footer-btn" @click="goSettings" title="设置">
+      <button class="footer-btn" title="Settings" @click="goSettings">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </button>
-      <button class="footer-btn" @click="goHome" title="主页">
+      <button class="footer-btn" title="Home" @click="goHome">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
       </button>
     </div>
 
-    <!-- Delete confirmation dialog -->
     <v-dialog v-model="showDeleteDialog" max-width="400">
       <v-card class="delete-dialog-card">
-        <div class="delete-dialog-title">确认删除</div>
+        <div class="delete-dialog-title">Delete Session</div>
         <div class="delete-dialog-text">
-          <span>确定要删除会话</span>
-          <strong class="delete-session-name">「{{ deleteSessionTitle }}」</strong>
-          <span>吗？此操作不可撤销。</span>
+          Delete <strong class="delete-session-name">{{ deleteSessionTitle }}</strong>?
+          This cannot be undone.
         </div>
         <div v-if="deleteError" class="delete-dialog-error">{{ deleteError }}</div>
         <v-card-actions class="delete-dialog-actions">
           <v-spacer />
-          <v-btn variant="text" @click="showDeleteDialog = false">取消</v-btn>
-          <v-btn color="error" variant="tonal" :loading="!!deletingSession" @click="executeDelete">删除</v-btn>
+          <v-btn variant="text" @click="showDeleteDialog = false">Cancel</v-btn>
+          <v-btn color="error" variant="tonal" :loading="!!deletingSession" @click="executeDelete">Delete</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -268,11 +297,9 @@ function goSettings(): void { router.push("/settings"); }
   flex-direction: column;
   height: 100%;
   user-select: none;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(252, 252, 255, 0.9));
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(252, 252, 255, 0.9));
 }
 
-/* ── Project header ── */
 .panel-header {
   padding: var(--pix-space-lg) var(--pix-space-lg) var(--pix-space-md);
   flex-shrink: 0;
@@ -312,7 +339,6 @@ function goSettings(): void { router.push("/settings"); }
 .project-path {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-muted);
-  font-family: var(--pix-font-ui);
   margin-top: 4px;
   margin-left: calc(38px + var(--pix-space-sm));
   overflow: hidden;
@@ -320,47 +346,50 @@ function goSettings(): void { router.push("/settings"); }
   white-space: nowrap;
 }
 
-/* ── New session button ── */
 .panel-actions {
+  display: grid;
+  gap: var(--pix-space-xs);
   padding: 0 var(--pix-space-lg) var(--pix-space-md);
   flex-shrink: 0;
 }
 
-.new-session-btn {
+.new-session-btn,
+.new-team-session-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: var(--pix-space-sm);
   width: 100%;
-  padding: 11px var(--pix-space-md);
-  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
-  color: var(--pix-text-inverse);
-  border: none;
+  min-height: 40px;
   border-radius: var(--pix-radius-lg);
   font-size: var(--pix-text-sm);
   font-weight: var(--pix-weight-medium);
   font-family: var(--pix-font-ui);
   cursor: pointer;
-  transition:
-    box-shadow var(--pix-transition-fast),
-    transform var(--pix-transition-fast),
-    filter var(--pix-transition-fast);
+  transition: box-shadow var(--pix-transition-fast), transform var(--pix-transition-fast), filter var(--pix-transition-fast);
+}
+
+.new-session-btn {
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
+  color: var(--pix-text-inverse);
   box-shadow: 0 12px 24px rgba(98, 84, 243, 0.22);
 }
 
-.new-session-btn:hover {
-  box-shadow: 0 15px 28px rgba(98, 84, 243, 0.28);
+.new-team-session-btn {
+  border: 1px solid var(--pix-border-light);
+  background: #fff;
+  color: var(--pix-accent);
+}
+
+.new-session-btn:hover,
+.new-team-session-btn:hover {
+  box-shadow: 0 12px 24px rgba(98, 84, 243, 0.18);
   filter: saturate(1.05);
   transform: translateY(-1px);
 }
 
-.new-session-btn:active {
-  background: var(--pix-accent-hover);
-  box-shadow: var(--pix-shadow-none);
-  transform: translateY(1px);
-}
-
-.new-session-btn:disabled {
+.new-session-btn:disabled,
+.new-team-session-btn:disabled {
   background: var(--pix-border);
   color: var(--pix-text-secondary);
   cursor: not-allowed;
@@ -368,12 +397,11 @@ function goSettings(): void { router.push("/settings"); }
   transform: none;
 }
 
-.new-session-btn .btn-icon {
+.btn-icon {
   font-size: var(--pix-text-lg);
   line-height: 1;
 }
 
-/* ── Search ── */
 .panel-search {
   padding: 0 var(--pix-space-lg) var(--pix-space-md);
   flex-shrink: 0;
@@ -389,7 +417,6 @@ function goSettings(): void { router.push("/settings"); }
   position: absolute;
   left: 10px;
   color: var(--pix-text-secondary);
-  font-size: var(--pix-text-base);
   pointer-events: none;
   line-height: 0;
 }
@@ -397,7 +424,7 @@ function goSettings(): void { router.push("/settings"); }
 .search-input {
   width: 100%;
   height: 40px;
-  padding: 8px var(--pix-space-sm) 8px 32px;
+  padding: 8px 30px 8px 32px;
   border: 1px solid var(--pix-border-light);
   border-radius: var(--pix-radius-lg);
   font-size: var(--pix-text-sm);
@@ -405,10 +432,6 @@ function goSettings(): void { router.push("/settings"); }
   background: var(--pix-bg-input);
   color: var(--pix-text-primary);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
-  transition:
-    border-color var(--pix-transition-fast),
-    box-shadow var(--pix-transition-fast),
-    background var(--pix-transition-fast);
 }
 
 .search-input::placeholder {
@@ -423,7 +446,7 @@ function goSettings(): void { router.push("/settings"); }
 
 .search-clear {
   position: absolute;
-  right: 4px;
+  right: 5px;
   padding: 4px;
   color: var(--pix-text-secondary);
   cursor: pointer;
@@ -431,7 +454,6 @@ function goSettings(): void { router.push("/settings"); }
   align-items: center;
   line-height: 0;
   border-radius: var(--pix-radius-xs);
-  transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
 }
 
 .search-clear:hover {
@@ -439,7 +461,6 @@ function goSettings(): void { router.push("/settings"); }
   background: var(--pix-bg-hover);
 }
 
-/* ── Session list ── */
 .session-list {
   flex: 1;
   overflow-y: auto;
@@ -450,14 +471,13 @@ function goSettings(): void { router.push("/settings"); }
   display: flex;
   align-items: center;
   gap: var(--pix-space-sm);
+  min-height: 44px;
   padding: 9px var(--pix-space-md);
   margin-bottom: 4px;
+  border: 1px solid transparent;
   border-radius: var(--pix-radius-lg);
   cursor: pointer;
-  transition: background var(--pix-transition-fast);
-  min-height: 44px;
   position: relative;
-  border: 1px solid transparent;
 }
 
 .session-item:hover {
@@ -471,8 +491,8 @@ function goSettings(): void { router.push("/settings"); }
   box-shadow: inset 3px 0 0 var(--pix-accent);
 }
 
-.session-item.active:hover {
-  background: linear-gradient(90deg, #ebe8ff 0%, rgba(235, 232, 255, 0.5) 100%);
+.session-item.team-session {
+  border-color: rgba(22, 163, 74, 0.24);
 }
 
 .session-info {
@@ -480,12 +500,11 @@ function goSettings(): void { router.push("/settings"); }
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: var(--pix-space-sm);
+  gap: var(--pix-space-xs);
 }
 
 .session-name {
   font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-normal);
   color: var(--pix-text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -499,6 +518,16 @@ function goSettings(): void { router.push("/settings"); }
   color: var(--pix-accent);
 }
 
+.session-kind {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--pix-success-bg);
+  color: var(--pix-success);
+  font-size: 10px;
+  font-weight: var(--pix-weight-semibold);
+  flex-shrink: 0;
+}
+
 .session-time {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-muted);
@@ -508,18 +537,18 @@ function goSettings(): void { router.push("/settings"); }
   text-align: center;
 }
 
-.session-item.active .session-time {
+.pin-marker,
+.team-marker {
+  display: inline-flex;
+  align-items: center;
   color: var(--pix-accent);
-}
-
-.pin-marker {
-  color: var(--pix-accent);
-  font-size: var(--pix-text-xs);
   flex-shrink: 0;
-  line-height: 0;
 }
 
-/* Hover actions */
+.team-marker {
+  color: var(--pix-success);
+}
+
 .hover-actions {
   display: none;
   align-items: center;
@@ -544,8 +573,6 @@ function goSettings(): void { router.push("/settings"); }
   border-radius: var(--pix-radius-xs);
   color: var(--pix-text-secondary);
   cursor: pointer;
-  transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
-  font-size: var(--pix-text-sm);
 }
 
 .hover-btn:hover {
@@ -562,7 +589,6 @@ function goSettings(): void { router.push("/settings"); }
   background: var(--pix-error-bg);
 }
 
-/* Empty state */
 .empty-hint {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-muted);
@@ -570,7 +596,6 @@ function goSettings(): void { router.push("/settings"); }
   text-align: center;
 }
 
-/* ── Footer ── */
 .panel-footer {
   display: flex;
   justify-content: center;
@@ -590,8 +615,6 @@ function goSettings(): void { router.push("/settings"); }
   border-radius: var(--pix-radius-md);
   color: var(--pix-text-secondary);
   cursor: pointer;
-  transition: color var(--pix-transition-fast), background var(--pix-transition-fast);
-  font-size: var(--pix-text-lg);
 }
 
 .footer-btn:hover {

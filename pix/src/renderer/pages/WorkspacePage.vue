@@ -13,6 +13,7 @@ import { useSessionStore } from "../stores/session-store";
 import { useRpc } from "../composables/useRpc";
 import { useProjectStore } from "../stores/project-store";
 import { useAuthStore } from "../stores/auth-store";
+import { useTeamStore } from "../stores/team-store";
 import AppLayout from "../components/layout/AppLayout.vue";
 import LeftPanel from "../components/layout/LeftPanel.vue";
 import CenterPanel from "../components/layout/CenterPanel.vue";
@@ -23,9 +24,11 @@ const router = useRouter();
 const sessionStore = useSessionStore();
 const projectStore = useProjectStore();
 const authStore = useAuthStore();
+const teamStore = useTeamStore();
 const rpc = useRpc();
 let unsubscribeEvent: (() => void) | null = null;
 let unsubscribeUserInput: (() => void) | null = null;
+let unsubscribeTeamEvent: (() => void) | null = null;
 const pendingUserInput = ref<RequestUserInputRequest | null>(null);
 const userInputAnswers = ref<Record<string, string>>({});
 const currentQuestionIndex = ref(0);
@@ -154,6 +157,11 @@ onMounted(async () => {
     }
     openUserInputRequest(request);
   });
+
+  // Subscribe to team events and fetch current state (handles macOS window reopen)
+  unsubscribeTeamEvent = teamStore.subscribeToEvents();
+  void teamStore.fetchTeamState();
+  void teamStore.fetchTeamHistory();
 });
 
 onUnmounted(() => {
@@ -164,6 +172,10 @@ onUnmounted(() => {
   if (unsubscribeUserInput) {
     unsubscribeUserInput();
     unsubscribeUserInput = null;
+  }
+  if (unsubscribeTeamEvent) {
+    unsubscribeTeamEvent();
+    unsubscribeTeamEvent = null;
   }
   if (pendingUserInput.value) {
     void respondUserInput(true);
