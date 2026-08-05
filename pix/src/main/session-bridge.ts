@@ -1,5 +1,6 @@
+import { createHash } from "crypto";
 import { existsSync, statSync } from "fs";
-import { join } from "path";
+import { isAbsolute, join, relative, resolve } from "path";
 import { shell } from "electron";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
@@ -48,6 +49,7 @@ import type {
 	ThemeInfo,
 	ResourceStatus,
 	ChatMessageAttachment,
+	SessionInfo,
 } from "../shared/types.js";
 import { processChatFiles } from "./chat-files.js";
 
@@ -82,6 +84,13 @@ type PiSettingApplyResult = {
 	refreshSystemPrompt?: boolean;
 	reapplyModelScope?: boolean;
 };
+
+export type SessionBridgeRole = "single" | "team-leader";
+
+export interface SessionBridgeOptions {
+	role?: SessionBridgeRole;
+	teamManager?: TeamManager;
+}
 
 const TAKE_HER_EYES_TIMEOUT_MS = 45_000;
 const TAKE_HER_EYES_MAX_TOKENS = 2048;
@@ -121,6 +130,7 @@ function createEmptyAuxiliaryUsage(): AuxiliaryUsageTotals {
 }
 
 export class SessionBridge {
+	private readonly _role: SessionBridgeRole;
 	private _session: AgentSession | null = null;
 	private _sessionManager: SessionManager | null = null;
 	private _authStorage: AuthStorage | null = null;
@@ -151,9 +161,9 @@ export class SessionBridge {
 	private _isCompacting = false;
 	private _pendingMessageCount = 0;
 
-	/** Store a reference to the TeamManager for Leader tool registration. */
-	setTeamManager(teamManager: TeamManager): void {
-		this._teamManager = teamManager;
+	constructor(options: SessionBridgeOptions = {}) {
+		this._role = options.role ?? "single";
+		this._teamManager = this._role === "team-leader" ? options.teamManager ?? null : null;
 	}
 
 	async start(projectDir: string, guiSettings?: GuiSettings): Promise<void> {
@@ -167,7 +177,7 @@ export class SessionBridge {
 		this._authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 
 		const settingsManager = this._createSettingsManager(projectDir);
-		const sessionDir = settingsManager.getSessionDir();
+		const sessionDir = this._getSessionDir(projectDir, settingsManager.getSessionDir());
 		this._sessionManager = SessionManager.continueRecent(projectDir, sessionDir);
 
 		const result = await this._createSession(projectDir, this._sessionManager, {
@@ -194,11 +204,32 @@ export class SessionBridge {
 		return this._authStorage;
 	}
 
+	/** List persisted sessions in this bridge's session namespace. */
+	async listSessions(projectDir: string): Promise<SessionInfo[]> {
+		this._assertProjectDirectory(projectDir);
+		const settingsManager = this._createSettingsManager(projectDir);
+		const sessionDir = this._getSessionDir(projectDir, settingsManager.getSessionDir());
+		const sessions = await SessionManager.list(projectDir, sessionDir);
+		return sessions.map((session) => ({
+			path: session.path,
+			id: session.id,
+			cwd: session.cwd || projectDir,
+			name: session.name,
+			created: session.created.toISOString(),
+			modified: session.modified.toISOString(),
+			messageCount: session.messageCount,
+			firstMessage: session.firstMessage,
+		}));
+	}
+
 	updateGuiSettings(settings: GuiSettings): void {
 		this._guiSettings = settings;
 	}
 
 	async prompt(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		if (this._role === "team-leader") {
+			this._teamManager?.resumeRuntime("leader_prompt");
+		}
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().prompt(prepared.text, {
 			images: prepared.images,
@@ -208,6 +239,9 @@ export class SessionBridge {
 	}
 
 	async steer(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		if (this._role === "team-leader") {
+			this._teamManager?.resumeRuntime("leader_steer");
+		}
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().steer(prepared.text, {
 			images: prepared.images,
@@ -217,6 +251,9 @@ export class SessionBridge {
 	}
 
 	async followUp(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		if (this._role === "team-leader") {
+			this._teamManager?.resumeRuntime("leader_follow_up");
+		}
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().followUp(prepared.text, {
 			images: prepared.images,
@@ -226,8 +263,22 @@ export class SessionBridge {
 	}
 
 	async abort(): Promise<void> {
-		this._teamManager?.abortActiveTurns();
-		await this._getSession().abort();
+		const session = this._getSession();
+		if (this._role === "team-leader") {
+			await this._teamManager?.abortActiveTurns();
+			// Team abort is a runtime boundary: queued Leader steering/follow-up
+			// messages belong to the invalidated epoch and must not run on resume.
+			session.clearQueue();
+		}
+		await session.abort();
+	}
+
+	/** Manually retry the last failed turn (user-initiated, bypasses auto-retry setting). */
+	async retry(): Promise<void> {
+		if (this._role === "team-leader") {
+			this._teamManager?.resumeRuntime("leader_retry");
+		}
+		await this._getSession().retryLastTurn();
 	}
 
 	async newSession(parentSession?: string): Promise<CommandResult> {
@@ -250,10 +301,15 @@ export class SessionBridge {
 	}
 
 	async switchSession(sessionPath: string): Promise<CommandResult> {
+		const currentSessionManager = this._sessionManager;
+		if (!currentSessionManager) {
+			throw new Error("No active session.");
+		}
+		this._assertSessionPathInNamespace(sessionPath, currentSessionManager.getSessionDir());
 		const previousSessionFile = this._session?.sessionFile;
 		await this._closeCurrentSession("resume", sessionPath);
 
-		this._sessionManager = SessionManager.open(sessionPath, undefined, this._cwd);
+		this._sessionManager = SessionManager.open(sessionPath, currentSessionManager.getSessionDir(), this._cwd);
 		this._cwd = this._sessionManager.getCwd();
 		const result = await this._createSession(this._cwd, this._sessionManager, {
 			type: "session_start",
@@ -1207,6 +1263,21 @@ export class SessionBridge {
 			value === "medium" ||
 			value === "high" ||
 			value === "xhigh";
+	}
+
+	private _getSessionDir(cwd: string, defaultSessionDir: string | undefined): string | undefined {
+		if (this._role === "single") return defaultSessionDir;
+		const cwdHash = createHash("sha1").update(cwd).digest("hex");
+		return join(getAgentDir(), "team-leader-sessions", cwdHash);
+	}
+
+	private _assertSessionPathInNamespace(sessionPath: string, sessionDir: string): void {
+		const candidatePath = resolve(sessionPath);
+		const namespacePath = resolve(sessionDir);
+		const relativePath = relative(namespacePath, candidatePath);
+		if (relativePath === "" || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+			throw new Error("Session path is outside the active session namespace.");
+		}
 	}
 
 	private async _createSession(

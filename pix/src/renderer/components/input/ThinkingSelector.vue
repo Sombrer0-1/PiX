@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, watch } from "vue";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 
 const emit = defineEmits<{
   close: [];
 }>();
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
 
 const ALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 

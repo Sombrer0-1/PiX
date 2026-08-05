@@ -9,7 +9,7 @@ import { computed, ref, onMounted, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useSettingsStore } from "../stores/settings-store";
 import { useAuthStore } from "../stores/auth-store";
-import { useRpc } from "../composables/useRpc";
+import { useWorkspaceRpc } from "../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 import McpSettings from "../components/settings/McpSettings.vue";
 
@@ -17,7 +17,7 @@ const router = useRouter();
 const route = useRoute();
 const settingsStore = useSettingsStore();
 const authStore = useAuthStore();
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
 
 // ---- Navigation ----
 type SettingsSection = "general" | "model" | "shell" | "resources" | "mcp" | "auth" | "advanced";
@@ -120,14 +120,28 @@ async function deleteKey(provider: string): Promise<void> {
 }
 
 // ---- Option lists ----
-const thinkingLevels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-const steeringModes = ["all", "one-at-a-time"] as const;
+const thinkingLevelItems: Array<{ title: string; value: ThinkingLevel }> = [
+  { title: "关闭", value: "off" },
+  { title: "轻量", value: "minimal" },
+  { title: "低", value: "low" },
+  { title: "标准", value: "medium" },
+  { title: "深入", value: "high" },
+  { title: "极深", value: "xhigh" },
+];
+const steeringModeItems = [
+  { title: "全部排队", value: "all" },
+  { title: "逐条处理", value: "one-at-a-time" },
+] as const;
 const executionModeItems = [
   { title: "只读模式", value: "read-only", icon: "mdi-eye-outline", subtitle: "只允许读取和搜索，禁止修改文件。" },
   { title: "审批模式", value: "approval", icon: "mdi-shield-check-outline", subtitle: "高风险操作需要确认。" },
   { title: "无监管模式", value: "unattended", icon: "mdi-lightning-bolt-outline", subtitle: "工具调用不弹出审批。" },
 ] as const;
-const transportOptions = ["auto", "sse", "websocket"] as const;
+const transportOptions = [
+  { title: "自动", value: "auto" },
+  { title: "SSE", value: "sse" },
+  { title: "WebSocket", value: "websocket" },
+] as const;
 
 const visionModelItems = computed(() =>
   rpc.availableModels.value
@@ -136,7 +150,7 @@ const visionModelItems = computed(() =>
       title: `${model.provider}/${model.id}`,
       value: modelKey(model),
       props: {
-        subtitle: model.contextWindow ? `${formatContextWindow(model.contextWindow)} context` : undefined,
+        subtitle: model.contextWindow ? `${formatContextWindow(model.contextWindow)} 上下文` : undefined,
       },
     }))
 );
@@ -348,9 +362,9 @@ async function downloadAndInstall(): Promise<void> {
           <div class="form-fields">
             <v-text-field v-model="defaultProvider" label="默认提供商" placeholder="例如 anthropic, openai" hint="新会话使用的提供商名称。" persistent-hint class="mb-4" />
             <v-text-field v-model="defaultModel" label="默认模型" placeholder="例如 claude-sonnet-4-6" hint="新会话使用的模型 ID。" persistent-hint class="mb-4" />
-            <v-select v-model="defaultThinkingLevel" label="默认思考级别" :items="thinkingLevels" class="mb-4" />
-            <v-select v-model="steeringMode" label="操控模式" :items="steeringModes" hint="流式输出期间操控消息的排队方式。" persistent-hint class="mb-4" />
-            <v-select v-model="followUpMode" label="跟进模式" :items="steeringModes" hint="流式输出期间跟进消息的发送方式。" persistent-hint class="mb-4" />
+            <v-select v-model="defaultThinkingLevel" label="默认思考级别" :items="thinkingLevelItems" item-title="title" item-value="value" class="mb-4" />
+            <v-select v-model="steeringMode" label="引导消息模式" :items="steeringModeItems" item-title="title" item-value="value" hint="流式输出期间引导消息的排队方式。" persistent-hint class="mb-4" />
+            <v-select v-model="followUpMode" label="跟进消息模式" :items="steeringModeItems" item-title="title" item-value="value" hint="流式输出期间跟进消息的发送方式。" persistent-hint class="mb-4" />
             <v-select v-model="executionMode" label="执行模式" :items="executionModeItems" item-title="title" item-value="value" hint="只读模式禁止修改；审批模式拦截高风险操作；无监管模式不弹出审批。" persistent-hint class="mb-4">
               <template #item="{ props, item }">
                 <v-list-item v-bind="props" :prepend-icon="item.raw.icon" :subtitle="item.raw.subtitle" />
@@ -374,7 +388,7 @@ async function downloadAndInstall(): Promise<void> {
           <p class="section-desc">模型可用性与传输配置。</p>
           <div class="form-fields">
             <v-text-field v-model="enabledModels" label="启用的模型（glob 模式）" placeholder="anthropic/*, openai/gpt-5*" hint="逗号分隔的 glob 模式。留空则启用所有模型。" persistent-hint class="mb-4" />
-            <v-select v-model="transport" label="传输方式" :items="transportOptions" hint="API 请求的 HTTP 传输方式。" persistent-hint class="mb-4" />
+            <v-select v-model="transport" label="传输方式" :items="transportOptions" item-title="title" item-value="value" hint="API 请求的 HTTP 传输方式。" persistent-hint class="mb-4" />
             <v-switch v-model="retryEnabled" label="自动重试" hint="自动重试失败的 API 请求。" persistent-hint class="mb-4" />
             <v-switch v-model="imageAutoResize" label="自动调整图片大小" hint="发送给模型前自动调整大图片尺寸。" persistent-hint class="mb-4" />
             <v-switch v-model="blockImages" label="阻止图片" hint="完全阻止将图片发送给模型。" persistent-hint class="mb-4" />
@@ -531,7 +545,7 @@ async function downloadAndInstall(): Promise<void> {
             <v-divider class="my-4" />
             <div class="advanced-info">
               <h3>诊断信息</h3>
-              <div class="info-row"><span>集成方式</span><span>Direct (AgentSession in-process)</span></div>
+              <div class="info-row"><span>集成方式</span><span>AgentSession 进程内直连</span></div>
               <div class="info-row"><span>数据目录</span><code>~/.pi/agent/</code></div>
               <div class="info-row"><span>会话存储</span><code>~/.pi/agent/sessions/</code></div>
               <div class="info-row"><span>设置文件</span><code>~/.pi/agent/settings.json</code></div>
@@ -561,14 +575,15 @@ async function downloadAndInstall(): Promise<void> {
 }
 
 .drag-bar {
-  height: 32px;
-  min-height: 32px;
+  height: var(--pix-window-controls-height);
+  min-height: var(--pix-window-controls-height);
   -webkit-app-region: drag;
   position: sticky;
   top: 0;
   z-index: 10;
-  background: var(--pix-bg-app);
-  margin-right: 64px;
+  background: var(--pix-bg-topbar);
+  border-bottom: 1px solid var(--pix-border-light);
+  margin-right: var(--pix-window-controls-width);
 }
 
 .settings-layout {
@@ -847,6 +862,31 @@ async function downloadAndInstall(): Promise<void> {
 }
 
 .settings-content :deep(.v-input) {
+  color: var(--pix-text-primary);
+}
+
+/* ── High-contrast settings text ──
+   A global rule forces every Vuetify label and hint to --pix-text-muted
+   (#7d859a), which washes out the settings form. Within settings, restore
+   clear, readable colors: labels in primary (near-black), hints and helper
+   text in secondary (readable slate). Scoped here so the rest of the app is
+   untouched. Only color is overridden - Vuetify's own disabled/focus opacity
+   is left intact. */
+.settings-page :deep(.v-label) {
+  color: var(--pix-text-primary) !important;
+}
+
+.settings-page :deep(.v-messages) {
+  color: var(--pix-text-secondary) !important;
+}
+
+.settings-page :deep(.text-medium-emphasis) {
+  color: var(--pix-text-secondary) !important;
+}
+
+/* Sidebar nav: inactive titles default to medium-emphasis gray; make them
+   primary so the navigation reads clearly. Active items keep their accent. */
+.settings-sidebar :deep(.v-list-item:not(.v-list-item--active) .v-list-item__title) {
   color: var(--pix-text-primary);
 }
 

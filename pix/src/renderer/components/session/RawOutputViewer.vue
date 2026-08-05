@@ -12,8 +12,8 @@ defineProps<{
 <template>
   <div class="raw-viewer">
     <div class="raw-header">
-      <span class="raw-label">Raw Event Output</span>
-      <span class="raw-hint">All AgentSessionEvent objects as JSON</span>
+      <span class="raw-label">原始事件输出</span>
+      <span class="raw-hint">以 JSON 显示全部 AgentSessionEvent 对象</span>
     </div>
     <pre class="raw-content">{{ rawJson }}</pre>
   </div>

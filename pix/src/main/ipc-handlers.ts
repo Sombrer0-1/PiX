@@ -17,6 +17,7 @@ import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
 import type { GuiSettings, ProjectInfo, RpcCommand, TeamCommand, ThinkingLevel } from "../shared/types.js";
 import type { TeamManager } from "./team-manager.js";
+import { readWorkspaceMode, teamSnapshotPath, writeWorkspaceMode } from "./team-persistence.js";
 
 const { autoUpdater } = electronUpdater;
 
@@ -159,14 +160,18 @@ function setCurrentWindow(win: BrowserWindow): void {
 
 function isPathInsideDirectory(candidatePath: string, directoryPath: string): boolean {
   const relativePath = relative(directoryPath, candidatePath);
-  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+  // Strictly INSIDE the directory: reject the directory itself (relativePath === "")
+  // and any path outside it or on a different drive root. Mirrors
+  // SessionBridge._assertSessionPathInNamespace, which throws on rel === "".
+  return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath);
 }
 
 export function registerIpcHandlers(
   win: BrowserWindow,
-  sessionBridge: SessionBridge,
+  singleSessionBridge: SessionBridge,
+  teamLeaderSessionBridge: SessionBridge,
   settingsStore: SettingsStore,
-  teamManager?: TeamManager
+  teamManager: TeamManager,
 ): void {
   setCurrentWindow(win);
 
@@ -213,36 +218,24 @@ export function registerIpcHandlers(
   // Session Lifecycle
   // =========================================================================
 
+  async function disposeTeamRuntime(preserveSnapshot: boolean): Promise<void> {
+    try {
+      if (teamManager.hasActiveTeam()) {
+        await teamManager.stopTeam({ deleteSnapshot: !preserveSnapshot });
+      }
+    } finally {
+      // Always detach the leader bridge even if worker shutdown reports an
+      // error; otherwise the old mode can keep receiving commands/events.
+      await teamLeaderSessionBridge.dispose();
+    }
+  }
+
   ipcMain.handle("start-pi", async (_event, projectDir: string) => {
     try {
-      await sessionBridge.start(projectDir, settingsStore.getAll());
-      // Initialize TeamManager with the same cwd and auth storage so it can launch workers
-      if (teamManager) {
-        const authStorage = sessionBridge.getAuthStorage();
-        if (!authStorage) {
-          const initErr = new Error("TeamManager initialization failed: auth storage unavailable");
-          console.error("[ipc] TeamManager init failed, rolling back session:", initErr);
-          try {
-            await sessionBridge.dispose();
-          } catch (disposeErr) {
-            console.error("[ipc] Session dispose during rollback also failed:", disposeErr);
-          }
-          throw initErr;
-        }
-        try {
-          await teamManager.initialize(projectDir, authStorage);
-        } catch (initErr) {
-          // Roll back: dispose the session since team init failed.
-          // Without this, the session is orphaned during startup.
-          console.error("[ipc] TeamManager init failed, rolling back session:", initErr);
-          try {
-            await sessionBridge.dispose();
-          } catch (disposeErr) {
-            console.error("[ipc] Session dispose during rollback also failed:", disposeErr);
-          }
-          throw initErr;
-        }
-      }
+      // Starting the single runtime is also a mode switch. Preserve any team
+      // snapshot so it can be restored when Team mode is entered again.
+      await disposeTeamRuntime(true);
+      await singleSessionBridge.start(projectDir, settingsStore.getAll());
       return { success: true };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -250,24 +243,67 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle("stop-pi", async () => {
-    // Stop the team first (if active) before disposing the session
-    if (teamManager) {
-      try {
-        if (teamManager.hasActiveTeam()) {
-          // Preserve the snapshot so the team can be restored when the project
-          // is reopened. Only an explicit "stop_team" command disbands it.
-          await teamManager.stopTeam({ deleteSnapshot: false });
-        }
-      } catch (err) {
-        console.error("[ipc] Error stopping team during session dispose:", err);
-      }
-    }
     try {
-      await sessionBridge.dispose();
+      await singleSessionBridge.dispose();
     } catch (err) {
-      console.error("[ipc] Error during session dispose:", err);
+      console.error("[ipc] Error during single session dispose:", err);
     }
     return { success: true };
+  });
+
+  ipcMain.handle("start-team-runtime", async (_event, projectDir: string) => {
+    try {
+      // A workspace has one active mode. Clear any previous Team runtime and
+      // stop the single runtime before bringing up the independent leader.
+      await disposeTeamRuntime(true);
+      await singleSessionBridge.dispose();
+      await teamLeaderSessionBridge.start(projectDir, settingsStore.getAll());
+      const authStorage = teamLeaderSessionBridge.getAuthStorage();
+      if (!authStorage) {
+        throw new Error("TeamManager initialization failed: auth storage unavailable");
+      }
+      await teamManager.initialize(projectDir, authStorage);
+      return { success: true };
+    } catch (err: unknown) {
+      try {
+        if (teamManager.hasActiveTeam()) {
+          await teamManager.stopTeam({ deleteSnapshot: false });
+        }
+      } catch (stopErr) {
+        console.error("[ipc] TeamManager rollback failed:", stopErr);
+      }
+      try {
+        await teamLeaderSessionBridge.dispose();
+      } catch (disposeErr) {
+        console.error("[ipc] Team leader rollback failed:", disposeErr);
+      }
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcMain.handle("stop-team-runtime", async () => {
+    try {
+      // Preserve the snapshot. Explicit stop_team remains the disband action.
+      await disposeTeamRuntime(true);
+    } catch (err) {
+      console.error("[ipc] Error during team leader session dispose:", err);
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle("has-team-snapshot", (_event, projectDir: string) => {
+    return typeof projectDir === "string" && projectDir.length > 0 && existsSync(teamSnapshotPath(projectDir));
+  });
+
+  ipcMain.handle("get-workspace-mode", async (_event, projectDir: string) => {
+    if (typeof projectDir !== "string" || projectDir.length === 0) return null;
+    return readWorkspaceMode(projectDir);
+  });
+
+  ipcMain.handle("set-workspace-mode", async (_event, projectDir: string, mode: "team" | "solo") => {
+    if (typeof projectDir !== "string" || projectDir.length === 0) return;
+    if (mode !== "team" && mode !== "solo") return;
+    await writeWorkspaceMode(projectDir, mode);
   });
 
   // =========================================================================
@@ -279,7 +315,7 @@ export function registerIpcHandlers(
       return { success: false, error: `Invalid command: ${JSON.stringify(command)}` };
     }
     try {
-      const result = await executeCommand(sessionBridge, command);
+      const result = await executeCommand(singleSessionBridge, command);
       return { success: true, data: result };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -292,7 +328,7 @@ export function registerIpcHandlers(
       return { success: false, error: `Invalid command: ${JSON.stringify(command)}` };
     }
     try {
-      await executeCommand(sessionBridge, command);
+      await executeCommand(singleSessionBridge, command);
       return { success: true };
     } catch (err) {
       console.error("[ipc] Async command error:", err);
@@ -305,9 +341,6 @@ export function registerIpcHandlers(
   // =========================================================================
 
   ipcMain.handle("team-command", async (_event, command: unknown) => {
-    if (!teamManager) {
-      return { success: false, code: "team_manager_unavailable", error: "TeamManager not available" };
-    }
     if (!isTeamCommand(command)) {
       return { success: false, code: "invalid_team_command", error: `Invalid team command: ${JSON.stringify(command)}` };
     }
@@ -316,6 +349,30 @@ export function registerIpcHandlers(
       return { success: true, data: result };
     } catch (err: unknown) {
       return { success: false, code: "team_command_failed", error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcMain.handle("team-leader-command", async (_event, command: unknown) => {
+    if (!isRpcCommand(command)) {
+      return { success: false, error: `Invalid command: ${JSON.stringify(command)}` };
+    }
+    try {
+      const result = await executeCommand(teamLeaderSessionBridge, command);
+      return { success: true, data: result };
+    } catch (err: unknown) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcMain.handle("team-leader-command-async", async (_event, command: unknown) => {
+    if (!isRpcCommand(command)) {
+      return { success: false, error: `Invalid command: ${JSON.stringify(command)}` };
+    }
+    try {
+      await executeCommand(teamLeaderSessionBridge, command);
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
   });
 
@@ -342,6 +399,15 @@ export function registerIpcHandlers(
     }
   });
 
+  ipcMain.handle("list-team-leader-sessions", async (_event, projectDir: string) => {
+    try {
+      return await teamLeaderSessionBridge.listSessions(projectDir);
+    } catch (err) {
+      console.error("[ipc] Error listing team leader sessions:", err);
+      return [];
+    }
+  });
+
   // =========================================================================
   // Settings
   // =========================================================================
@@ -352,7 +418,9 @@ export function registerIpcHandlers(
 
   ipcMain.handle("set-settings", (_event, settings: Record<string, unknown>) => {
     settingsStore.setMany(sanitizeSettings(settings));
-    sessionBridge.updateGuiSettings(settingsStore.getAll());
+    const nextSettings = settingsStore.getAll();
+    singleSessionBridge.updateGuiSettings(nextSettings);
+    teamLeaderSessionBridge.updateGuiSettings(nextSettings);
     return { success: true };
   });
 
@@ -369,15 +437,27 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle("is-pi-running", () => {
-    return sessionBridge.isRunning();
+    return singleSessionBridge.isRunning();
+  });
+
+  ipcMain.handle("is-team-leader-running", () => {
+    return teamLeaderSessionBridge.isRunning();
   });
 
   ipcMain.handle("get-background-tasks", () => {
-    return sessionBridge.getBackgroundTasks();
+    return singleSessionBridge.getBackgroundTasks();
   });
 
   ipcMain.handle("stop-background-task", (_event, taskId: string) => {
-    return sessionBridge.stopBackgroundTask(taskId);
+    return singleSessionBridge.stopBackgroundTask(taskId);
+  });
+
+  ipcMain.handle("get-team-leader-background-tasks", () => {
+    return teamLeaderSessionBridge.getBackgroundTasks();
+  });
+
+  ipcMain.handle("stop-team-leader-background-task", (_event, taskId: string) => {
+    return teamLeaderSessionBridge.stopBackgroundTask(taskId);
   });
 
 
@@ -386,19 +466,35 @@ export function registerIpcHandlers(
   // =========================================================================
 
   ipcMain.handle("mcp-get-servers", () => {
-    return sessionBridge.mcpGetServers();
+    return singleSessionBridge.mcpGetServers();
   });
 
   ipcMain.handle("mcp-get-config", () => {
-    return sessionBridge.mcpGetConfig();
+    return singleSessionBridge.mcpGetConfig();
   });
 
   ipcMain.handle("mcp-list-resources", async (_event, serverName?: string) => {
-    return sessionBridge.mcpListResources(serverName);
+    return singleSessionBridge.mcpListResources(serverName);
   });
 
   ipcMain.handle("mcp-read-resource", async (_event, serverName: string | undefined, uri: string) => {
-    return sessionBridge.mcpReadResource(serverName, uri);
+    return singleSessionBridge.mcpReadResource(serverName, uri);
+  });
+
+  ipcMain.handle("team-leader-mcp-get-servers", () => {
+    return teamLeaderSessionBridge.mcpGetServers();
+  });
+
+  ipcMain.handle("team-leader-mcp-get-config", () => {
+    return teamLeaderSessionBridge.mcpGetConfig();
+  });
+
+  ipcMain.handle("team-leader-mcp-list-resources", async (_event, serverName?: string) => {
+    return teamLeaderSessionBridge.mcpListResources(serverName);
+  });
+
+  ipcMain.handle("team-leader-mcp-read-resource", async (_event, serverName: string | undefined, uri: string) => {
+    return teamLeaderSessionBridge.mcpReadResource(serverName, uri);
   });
 
   // =========================================================================
@@ -490,8 +586,11 @@ export function registerIpcHandlers(
       const resolved = resolve(sessionPath);
       // Guard: only delete session files, never arbitrary paths
       const agentDir = resolve(getAgentDir());
-      const sessionsDir = resolve(join(agentDir, "sessions"));
-      if (!isPathInsideDirectory(resolved, sessionsDir)) {
+      const sessionDirs = [
+        resolve(join(agentDir, "sessions")),
+        resolve(join(agentDir, "team-leader-sessions")),
+      ];
+      if (!sessionDirs.some((sessionDir) => isPathInsideDirectory(resolved, sessionDir))) {
         return { success: false, error: "Invalid session path" };
       }
       if (existsSync(resolved)) {
@@ -532,6 +631,9 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       return null;
     case "abort":
       await bridge.abort();
+      return null;
+    case "retry":
+      await bridge.retry();
       return null;
     case "respond_user_input":
       bridge.respondUserInput(cmd.response);
@@ -670,31 +772,31 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
  */
 export function setupEventForwarding(
   getWin: () => BrowserWindow | null,
-  sessionBridge: SessionBridge,
-  teamManager?: TeamManager
+  singleSessionBridge: SessionBridge,
+  teamLeaderSessionBridge: SessionBridge,
+  teamManager: TeamManager,
 ): void {
   if (eventForwardingSetup) return;
   eventForwardingSetup = true;
 
-  // Forward team events
-  if (teamManager) {
-    eventForwardingUnsubscribes.push(teamManager.onEvent((event) => {
-      const win = getWin();
-      if (win && !win.isDestroyed()) {
-        win.webContents.send("team-event", event);
-      }
-    }));
-  }
+  // Forward TeamManager worker/task/protocol events independently from the
+  // leader AgentSession event stream.
+  eventForwardingUnsubscribes.push(teamManager.onEvent((event) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("team-event", event);
+    }
+  }));
 
-  // Forward agent session events
-  eventForwardingUnsubscribes.push(sessionBridge.onEvent((event) => {
+  // Forward ordinary session events.
+  eventForwardingUnsubscribes.push(singleSessionBridge.onEvent((event) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-event", event);
     }
   }));
 
-  eventForwardingUnsubscribes.push(sessionBridge.onUserInputRequest((request) => {
+  eventForwardingUnsubscribes.push(singleSessionBridge.onUserInputRequest((request) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("user-input-request", request);
@@ -702,7 +804,7 @@ export function setupEventForwarding(
   }));
 
   // Lifecycle: ready
-  eventForwardingUnsubscribes.push(sessionBridge.onLifecycle("ready", () => {
+  eventForwardingUnsubscribes.push(singleSessionBridge.onLifecycle("ready", () => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-ready");
@@ -710,7 +812,7 @@ export function setupEventForwarding(
   }));
 
   // Lifecycle: exit
-  eventForwardingUnsubscribes.push(sessionBridge.onLifecycle("exit", (data) => {
+  eventForwardingUnsubscribes.push(singleSessionBridge.onLifecycle("exit", (data) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-exit", data);
@@ -718,10 +820,46 @@ export function setupEventForwarding(
   }));
 
   // Lifecycle: error
-  eventForwardingUnsubscribes.push(sessionBridge.onLifecycle("error", (err) => {
+  eventForwardingUnsubscribes.push(singleSessionBridge.onLifecycle("error", (err) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-error", { message: err.message ?? String(err) });
+    }
+  }));
+
+  // Forward Team leader AgentSession events on dedicated channels.
+  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onEvent((event) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("team-leader-event", event);
+    }
+  }));
+
+  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onUserInputRequest((request) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("team-leader-user-input-request", request);
+    }
+  }));
+
+  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onLifecycle("ready", () => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("team-leader-ready");
+    }
+  }));
+
+  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onLifecycle("exit", (data) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("team-leader-exit", data);
+    }
+  }));
+
+  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onLifecycle("error", (err) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("team-leader-error", { message: err.message ?? String(err) });
     }
   }));
 }
@@ -804,28 +942,37 @@ async function executeTeamCommand(teamManager: TeamManager, cmd: TeamCommand): P
       await teamManager.sendMessageToWorker(cmd.agentId, cmd.message);
       return null;
     case "abort_worker":
-      teamManager.abortWorker(cmd.agentId);
+      teamManager.resumeRuntime("renderer_abort_worker");
+      await teamManager.abortWorker(cmd.agentId);
       return null;
     case "activate_member":
+      teamManager.resumeRuntime("renderer_activate_member");
       await teamManager.activateMember(cmd.agentId);
       return null;
     case "pause_member":
+      teamManager.resumeRuntime("renderer_pause_member");
       await teamManager.pauseMember(cmd.agentId);
       return null;
     case "create_task":
+      teamManager.resumeRuntime("renderer_create_task");
       return teamManager.createTask(cmd.subject, cmd.description, cmd.assignTo, cmd.blockedBy, cmd.taskType);
     case "delete_task":
+      teamManager.resumeRuntime("renderer_delete_task");
       teamManager.deleteTask(cmd.taskId);
       return null;
     case "request_shutdown":
+      teamManager.resumeRuntime("renderer_request_shutdown");
       return teamManager.requestShutdown(cmd.agentId);
     case "respond_permission":
+      teamManager.resumeRuntime("renderer_respond_permission");
       teamManager.respondPermission(cmd.requestId, cmd.approved, cmd.reason);
       return null;
     case "respond_plan_approval":
+      teamManager.resumeRuntime("renderer_respond_plan_approval");
       teamManager.respondPlanApproval(cmd.approvalId, cmd.approved, cmd.feedback);
       return null;
     case "restart_worker":
+      teamManager.resumeRuntime("renderer_restart_worker");
       await teamManager.restartWorker(cmd.agentId);
       return null;
     default:

@@ -4,17 +4,15 @@
  */
 import { computed, ref, onMounted, onUnmounted, watch } from "vue";
 import { useRouter } from "vue-router";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useProjectStore } from "../../stores/project-store";
 import { useTeamStore } from "../../stores/team-store";
 import TokenStats from "../status/TokenStats.vue";
-import WorkerDetailCard from "../team/WorkerDetailCard.vue";
-import FileChangeSummary from "../team/FileChangeSummary.vue";
 import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
 import { deriveSessionTitle } from "@/utils/session-title";
 import type { McpServerInfo } from "../../../shared/types";
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
 const projectStore = useProjectStore();
 const teamStore = useTeamStore();
 
@@ -42,12 +40,23 @@ const modelDisplay = computed(() => {
   return `${model.provider}/${model.id}`;
 });
 
-const thinkingLevel = computed(() => rpc.sessionState.value?.thinkingLevel || "medium");
+const thinkingLevel = computed(() => {
+  const level = rpc.sessionState.value?.thinkingLevel || "medium";
+  const labels: Record<string, string> = {
+    off: "关闭",
+    minimal: "轻量",
+    low: "低",
+    medium: "标准",
+    high: "深入",
+    xhigh: "极深",
+  };
+  return labels[level] ?? level;
+});
 const sessionId = computed(() => rpc.sessionState.value?.sessionId || "-");
 const sessionName = computed(() => {
   const explicitName = rpc.sessionState.value?.sessionName?.trim();
   if (explicitName) return explicitName;
-  return deriveSessionTitle(projectStore.currentSession);
+  return deriveSessionTitle(teamStore.teamMode ? projectStore.currentTeamSession : projectStore.currentSession);
 });
 const messageCount = computed(() => rpc.sessionState.value?.messageCount || 0);
 const projectPath = computed(() => projectStore.currentProject?.path || "-");
@@ -70,8 +79,8 @@ const goalStatusText = computed(() => {
 const goalBudgetText = computed(() => {
   const currentGoal = goal.value;
   if (!currentGoal) return "-";
-  const budget = currentGoal.tokenBudget == null ? "不限" : currentGoal.tokenBudget.toLocaleString();
-  return `${currentGoal.tokensUsed.toLocaleString()} / ${budget}`;
+  const budget = currentGoal.tokenBudget == null ? "不限" : currentGoal.tokenBudget.toLocaleString("zh-CN");
+  return `${currentGoal.tokensUsed.toLocaleString("zh-CN")} / ${budget}`;
 });
 const goalTimeText = computed(() => {
   const ms = goal.value?.timeUsedMs ?? 0;
@@ -100,8 +109,10 @@ const backgroundTasks = ref<BackgroundTask[]>([]);
 let bgTaskTimer: ReturnType<typeof setInterval> | undefined;
 
 async function refreshBackgroundTasks(): Promise<void> {
+  const mode = teamStore.teamMode;
   try {
-    backgroundTasks.value = await rpc.getBackgroundTasks();
+    const tasks = await rpc.getBackgroundTasks();
+    if (teamStore.teamMode === mode) backgroundTasks.value = tasks;
   } catch { /* session not ready */ }
 }
 
@@ -119,9 +130,9 @@ function stopBgPoll(): void {
 
 function formatBgDuration(ms: number): string {
   const seconds = Math.floor((Date.now() - ms) / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor((seconds % 3600) / 60)} 分`;
 }
 
 function truncateBgCommand(cmd: string, maxLen = 50): string {
@@ -129,8 +140,10 @@ function truncateBgCommand(cmd: string, maxLen = 50): string {
 }
 
 async function stopBackgroundTask(taskId: string): Promise<void> {
+  const mode = teamStore.teamMode;
   try {
-    await window.pixApi.stopBackgroundTask(taskId);
+    await rpc.stopBackgroundTask(taskId);
+    if (teamStore.teamMode !== mode) return;
     await refreshBackgroundTasks();
   } catch (err) {
     console.error("[RightPanel] Stop background task failed:", err);
@@ -145,10 +158,12 @@ const pendingMcpServers = computed(() =>
 );
 
 async function refreshMcp(): Promise<void> {
+  const mode = teamStore.teamMode;
   try {
-    mcpServers.value = await window.pixApi.mcpGetServers();
+    const servers = await rpc.mcpGetServers();
+    if (teamStore.teamMode === mode) mcpServers.value = servers;
   } catch {
-    mcpServers.value = [];
+    if (teamStore.teamMode === mode) mcpServers.value = [];
   }
 }
 
@@ -180,23 +195,30 @@ watch(() => rpc.isConnected.value, (connected) => {
     backgroundTasks.value = [];
   }
 });
+watch(() => teamStore.teamMode, () => {
+  mcpServers.value = [];
+  backgroundTasks.value = [];
+});
 </script>
 
 <template>
   <div class="right-panel">
     <!-- ====================================================================== -->
-    <!-- Team Mode: Worker Detail + File Changes -->
+    <!-- Solo Mode: protocol requests + full session info -->
     <!-- ====================================================================== -->
     <!-- Protocol requests (worker permission approvals) must be visible in
          every mode: a request raised while the user is outside team mode
-         would otherwise silently time out and fail the worker's task. -->
-    <TeamProtocolPanel />
+         would otherwise silently time out and fail the worker's task. In team
+         mode TeamDashboard renders this panel, so here it only needs to cover
+         solo mode. -->
+    <TeamProtocolPanel v-if="!teamStore.teamMode" />
 
     <template v-if="teamStore.teamMode">
-      <WorkerDetailCard v-if="teamStore.focusedAgentId" />
-      <FileChangeSummary />
-
-      <!-- Session info (compact: remove session name and project in team mode) -->
+      <!-- Leader session info (compact). TeamDashboard already renders worker
+           detail, file changes and protocol requests, so the team-mode
+           inspector stays slim and focuses on the leader session. The
+           TokenStats card below provides leader context usage and the manual
+           compaction control, which TeamDashboard has no equivalent for. -->
       <div class="info-card">
         <div class="card-title">会话信息</div>
         <div class="info-rows">

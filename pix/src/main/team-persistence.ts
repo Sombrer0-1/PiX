@@ -14,6 +14,41 @@ export function teamSnapshotPath(cwd: string): string {
   return join(getAgentDir(), "team-state", cwdHash, "team.json");
 }
 
+/** The user's last-chosen workspace mode for a project, persisted per-cwd. */
+export type WorkspaceMode = "team" | "solo";
+
+export function workspaceModePath(cwd: string): string {
+  const cwdHash = createHash("sha1").update(cwd).digest("hex");
+  return join(getAgentDir(), "team-state", cwdHash, "mode.json");
+}
+
+/** Read the persisted workspace mode. Returns null when no preference exists. */
+export async function readWorkspaceMode(cwd: string): Promise<WorkspaceMode | null> {
+  try {
+    const raw = await readFile(workspaceModePath(cwd), "utf-8");
+    const parsed = JSON.parse(raw) as { mode?: unknown };
+    return parsed.mode === "team" || parsed.mode === "solo" ? parsed.mode : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the user's chosen workspace mode for a project. */
+export async function writeWorkspaceMode(cwd: string, mode: WorkspaceMode): Promise<void> {
+  const path = workspaceModePath(cwd);
+  await mkdir(dirname(path), { recursive: true });
+  // Atomic write (same approach as the team snapshot) so a crash mid-write
+  // can never leave a half-written mode.json.
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify({ mode }, null, 2), "utf-8");
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
+}
+
 export function createPersistedTeamSnapshot(cwd: string, team: TeamData): PersistedTeamSnapshot {
   const messageHistory: Record<string, TeammateChatMessage[]> = {};
   for (const [agentId, worker] of team.workers) {

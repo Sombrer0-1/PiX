@@ -18,6 +18,7 @@ export type RpcCommand =
   | { id?: string; type: "steer"; message: string; filePaths?: string[]; images?: ClipboardImage[] }
   | { id?: string; type: "follow_up"; message: string; filePaths?: string[]; images?: ClipboardImage[] }
   | { id?: string; type: "abort" }
+  | { id?: string; type: "retry" }
   | { id?: string; type: "respond_user_input"; response: RequestUserInputResponse }
   | { id?: string; type: "new_session"; parentSession?: string }
   // State
@@ -163,6 +164,19 @@ export interface TakeHerEyesSettings {
   modelId?: string;
 }
 
+/**
+ * Classification of an API error, mirrored from @earendil-works/pi-ai.
+ * Drives the status badge and retry-button visibility in the UI.
+ */
+export type ApiErrorCategory =
+  | "auth"
+  | "quota"
+  | "overloaded"
+  | "server"
+  | "rate_limit"
+  | "network"
+  | "unknown";
+
 // ============================================================================
 // Agent Session Event Types (streamed from pi stdout)
 // ============================================================================
@@ -189,7 +203,15 @@ export type AgentSessionEvent =
   | { type: "eye_model_end"; id?: string; provider: string; modelId: string; imageCount: number; success: boolean; errorMessage?: string }
   | { type: "goal_update"; goal: ThreadGoal | undefined }
   | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
-  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+  | {
+      type: "api_error";
+      errorMessage: string;
+      category: ApiErrorCategory;
+      httpStatus?: number;
+      title: string;
+      retryable: boolean;
+    };
 
 export interface AgentMessage {
   role: string;
@@ -245,7 +267,7 @@ export type DisplayBlock =
   | { id: string; type: "vision-status"; provider: string; modelId: string; imageCount: number; status: "running" | "success" | "error"; timestamp: number }
   | { id: string; type: "work-status"; tools: ToolWorkItem[]; isStreaming: boolean; timestamp: number }
   | { id: string; type: "turn-separator"; timestamp: number }
-  | { id: string; type: "error"; message: string; source?: string; timestamp: number }
+  | { id: string; type: "error"; message: string; source?: string; category?: ApiErrorCategory; httpStatus?: number; title?: string; retryable?: boolean; timestamp: number }
   | { id: string; type: "compaction"; reason: string; result: string; aborted: boolean; timestamp: number }
   | { id: string; type: "retry"; success: boolean; attempt: number; maxAttempts: number; delayMs?: number; timestamp: number }
   | { id: string; type: "note"; text: string; timestamp: number }

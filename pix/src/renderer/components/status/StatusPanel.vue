@@ -13,9 +13,9 @@ const props = defineProps<{
 }>();
 
 const statusLabel = computed(() => {
-  if (props.isRunning) return "Running";
-  if (props.isError) return "Error";
-  return "Idle";
+  if (props.isRunning) return "运行中";
+  if (props.isError) return "错误";
+  return "空闲";
 });
 
 const statusClass = computed(() => {

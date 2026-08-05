@@ -51,7 +51,7 @@ defineExpose({ focus });
     ref="textareaRef"
     class="input-area"
     :value="modelValue"
-    :placeholder="placeholder || 'Type a task...'"
+    :placeholder="placeholder || '输入任务...'"
     :disabled="disabled"
     @input="onInput"
     @keydown="onKeydown"

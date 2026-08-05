@@ -328,7 +328,10 @@ describe("AgentSession retry and event characterization", () => {
 
 		await harness.session.prompt("hi");
 
-		expect(harness.events[harness.events.length - 1]?.type).toBe("agent_end");
+		// agent_end still terminates the run; a subsequent api_error surfaces the
+		// failure (with classification) to the UI.
+		expect(harness.eventsOfType("agent_end")).toHaveLength(1);
+		expect(harness.events[harness.events.length - 1]?.type).toBe("api_error");
 	});
 
 	it("emits agent_end for aborted runs and persists the aborted assistant message", async () => {

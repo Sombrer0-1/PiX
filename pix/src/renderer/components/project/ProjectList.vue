@@ -19,18 +19,18 @@ function formatDate(timestamp: number): string {
   const d = new Date(timestamp);
   const now = new Date();
   const diff = now.getTime() - d.getTime();
-  if (diff < 3600000) return "Just now";
-  if (diff < 86400000) return "Today";
-  if (diff < 172800000) return "Yesterday";
-  if (diff < 604800000) return `${Math.ceil(diff / 86400000)} days ago`;
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (diff < 3600000) return "刚刚";
+  if (diff < 86400000) return "今天";
+  if (diff < 172800000) return "昨天";
+  if (diff < 604800000) return `${Math.ceil(diff / 86400000)} 天前`;
+  return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }
 </script>
 
 <template>
   <div class="project-list">
     <div v-if="projects.length === 0" class="empty-state">
-      <p class="empty-text">No recent projects</p>
+      <p class="empty-text">暂无最近项目</p>
     </div>
     <button
       v-for="project in projects"
@@ -46,7 +46,7 @@ function formatDate(timestamp: number): string {
           <span>{{ formatDate(project.lastOpened) }}</span>
           <template v-if="project.sessionCount > 0">
             <span class="meta-sep">|</span>
-            <span>{{ project.sessionCount }} sessions</span>
+            <span>{{ project.sessionCount }} 个会话</span>
           </template>
         </div>
       </div>

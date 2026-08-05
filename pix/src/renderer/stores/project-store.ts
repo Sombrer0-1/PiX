@@ -26,7 +26,7 @@ function api(): PixApi {
       sendCommandAsync: async () => ({ success: false }),
       getSettings: async () => ({ theme: "light", recentProjects: [] }),
       setSettings: async () => ({ success: false }),
-      detectPi: async () => ({ found: true, path: "direct", note: "Direct integration" }),
+      detectPi: async () => ({ found: true, path: "direct", note: "进程内直连" }),
       getPiStderr: async () => "",
       isPiRunning: async () => false,
       onPiEvent: () => () => {},
@@ -36,6 +36,7 @@ function api(): PixApi {
       onPiReady: () => () => {},
       onUserInputRequest: () => () => {},
       listSessions: async () => [],
+      listTeamLeaderSessions: async () => [],
       windowMinimize: async () => {},
       windowMaximize: async () => {},
       windowClose: async () => {},
@@ -46,7 +47,7 @@ function api(): PixApi {
       mcpGetConfig: async () => ({ configPaths: [], errors: [] }),
       mcpListResources: async () => [],
       mcpReadResource: async () => ({ server: "", contents: [] }),
-    } as PixApi;
+    } as unknown as PixApi;
   }
   return window.pixApi;
 }
@@ -60,7 +61,10 @@ export const useProjectStore = defineStore("project", () => {
   const currentProject = ref<ProjectInfo | null>(null);
   const sessions = ref<SessionInfo[]>([]);
   const currentSession = ref<SessionInfo | null>(null);
+  const teamSessions = ref<SessionInfo[]>([]);
+  const currentTeamSession = ref<SessionInfo | null>(null);
   const isLoadingSessions = ref(false);
+  const isLoadingTeamSessions = ref(false);
 
   async function loadSettings(): Promise<void> {
     try {
@@ -71,7 +75,7 @@ export const useProjectStore = defineStore("project", () => {
     }
   }
 
-  async function openProject(dirPath: string): Promise<void> {
+  async function openProject(dirPath: string, options: { loadSessions?: boolean } = {}): Promise<void> {
     const name = dirPath.split(/[/\\]/).pop() || dirPath;
 
     currentProject.value = {
@@ -103,6 +107,15 @@ export const useProjectStore = defineStore("project", () => {
       // Non-critical
     }
 
+    if (options.loadSessions === false) {
+      sessions.value = [];
+      currentSession.value = null;
+      teamSessions.value = [];
+      currentTeamSession.value = null;
+      return;
+    }
+    teamSessions.value = [];
+    currentTeamSession.value = null;
     await listSessions();
   }
 
@@ -161,6 +174,23 @@ export const useProjectStore = defineStore("project", () => {
     }
   }
 
+  async function listTeamLeaderSessions(): Promise<void> {
+    const project = currentProject.value;
+    if (!project) return;
+    isLoadingTeamSessions.value = true;
+    try {
+      const sessionInfos = await api().listTeamLeaderSessions(project.path);
+      if (Array.isArray(sessionInfos)) {
+        if (currentProject.value?.path !== project.path) return;
+        teamSessions.value = sessionInfos;
+      }
+    } catch (err) {
+      console.error("[project-store] Failed to list team leader sessions:", err);
+    } finally {
+      isLoadingTeamSessions.value = false;
+    }
+  }
+
   function setCurrentSession(session: SessionInfo | null): void {
     currentSession.value = session;
   }
@@ -174,6 +204,21 @@ export const useProjectStore = defineStore("project", () => {
 
     currentSession.value = match ?? null;
     return currentSession.value;
+  }
+
+  function setCurrentTeamSession(session: SessionInfo | null): void {
+    currentTeamSession.value = session;
+  }
+
+  function syncCurrentTeamSession(sessionFile: string | undefined, sessionId: string | undefined): SessionInfo | null {
+    const normalizedSessionFile = normalizePath(sessionFile);
+    const match = teamSessions.value.find((session) => {
+      if (normalizedSessionFile && normalizePath(session.path) === normalizedSessionFile) return true;
+      return !!sessionId && session.id === sessionId;
+    });
+
+    currentTeamSession.value = match ?? null;
+    return currentTeamSession.value;
   }
 
   function addSession(session: SessionInfo): void {
@@ -193,14 +238,20 @@ export const useProjectStore = defineStore("project", () => {
     currentProject,
     sessions,
     currentSession,
+    teamSessions,
+    currentTeamSession,
     isLoadingSessions,
+    isLoadingTeamSessions,
     loadSettings,
     openProject,
     setCurrentProject,
     listSessions,
+    listTeamLeaderSessions,
     removeRecentProject,
     setCurrentSession,
     syncCurrentSession,
+    setCurrentTeamSession,
+    syncCurrentTeamSession,
     addSession,
   };
 });

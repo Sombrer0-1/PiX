@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useAuthStore } from "../../stores/auth-store";
 
 const emit = defineEmits<{
   close: [];
 }>();
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
 const authStore = useAuthStore();
 
 const searchQuery = ref("");
@@ -68,9 +68,9 @@ function getAuthStatus(provider: string): { configured: boolean; source?: string
 
 function formatContext(ctx?: number): string {
   if (!ctx) return "";
-  if (ctx >= 1_000_000) return `${(ctx / 1_000_000).toFixed(1)}M ctx`;
-  if (ctx >= 1000) return `${Math.round(ctx / 1000)}k ctx`;
-  return `${ctx} ctx`;
+  if (ctx >= 1_000_000) return `${(ctx / 1_000_000).toFixed(1)}M 上下文`;
+  if (ctx >= 1000) return `${Math.round(ctx / 1000)}k 上下文`;
+  return `${ctx} 上下文`;
 }
 
 watch(isConnected, (connected) => {

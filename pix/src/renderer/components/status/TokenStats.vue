@@ -5,20 +5,26 @@
  * Shows token counts and cost from pi's SessionStats.
  */
 import { computed } from "vue";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
 
 const stats = computed(() => rpc.sessionStats.value);
 const contextUsage = computed(() => stats.value?.contextUsage);
 const contextPercent = computed(() => contextUsage.value?.percent ?? null);
-const contextRingStyle = computed(() => {
+
+// SVG ring geometry. r = 34 inside an 80x80 viewBox; the progress arc is drawn
+// via stroke-dashoffset so it animates smoothly when the percent changes.
+const RING_RADIUS = 34;
+const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
+
+const ringDashoffset = computed(() => {
   const percent = contextPercent.value;
-  const safePercent = percent === null ? 0 : Math.max(0, Math.min(100, percent));
-  return {
-    background: `conic-gradient(var(--token-ring-color) ${safePercent}%, #eef0f6 0)`,
-  };
+  if (percent === null) return RING_CIRCUMFERENCE;
+  const safe = Math.max(0, Math.min(100, percent));
+  return RING_CIRCUMFERENCE * (1 - safe / 100);
 });
+
 const contextClass = computed(() => {
   const percent = contextPercent.value ?? 0;
   if (percent >= 90) return "danger";
@@ -53,15 +59,32 @@ function formatPercent(n: number | null): string {
   <div class="token-stats">
     <div v-if="stats" class="stats-content">
       <div v-if="stats.contextUsage" class="context-usage" :class="contextClass">
-        <div class="context-ring" :style="contextRingStyle">
-          <div class="context-ring-inner">
+        <div class="context-ring">
+          <svg width="80" height="80" viewBox="0 0 80 80">
+            <circle class="ring-track" cx="40" cy="40" :r="RING_RADIUS" fill="none" stroke-width="7" />
+            <circle
+              class="ring-progress"
+              cx="40"
+              cy="40"
+              :r="RING_RADIUS"
+              fill="none"
+              stroke-width="7"
+              stroke-linecap="round"
+              :stroke-dasharray="RING_CIRCUMFERENCE"
+              :stroke-dashoffset="ringDashoffset"
+            />
+          </svg>
+          <div class="context-ring-label">
             <span class="context-percent">{{ formatPercent(stats.contextUsage.percent) }}</span>
           </div>
         </div>
-        <div class="context-total">
-          <span>{{ formatContextTokens(stats.contextUsage.tokens) }}</span>
-          <span class="context-divider">/</span>
-          <span>{{ formatNumber(stats.contextUsage.contextWindow) }}</span>
+        <div class="context-meta">
+          <span class="context-meta-label">上下文占用</span>
+          <span class="context-meta-value">
+            {{ formatContextTokens(stats.contextUsage.tokens) }}
+            <span class="context-meta-divider">/</span>
+            {{ formatNumber(stats.contextUsage.contextWindow) }}
+          </span>
         </div>
       </div>
 
@@ -82,13 +105,16 @@ function formatPercent(n: number | null): string {
           <div class="stat-label">缓存写入</div>
           <div class="stat-value">{{ formatNumber(stats.tokens.cacheWrite) }}</div>
         </div>
-        <div class="stat-item total">
-          <div class="stat-label">总计</div>
-          <div class="stat-value">{{ formatNumber(stats.tokens.total) }}</div>
+      </div>
+
+      <div class="stats-summary">
+        <div class="summary-row">
+          <span class="summary-label">总计</span>
+          <span class="summary-value">{{ formatNumber(stats.tokens.total) }}</span>
         </div>
-        <div class="stat-item cost">
-          <div class="stat-label">费用</div>
-          <div class="stat-value">{{ formatCost(stats.cost) }}</div>
+        <div class="summary-row">
+          <span class="summary-label">费用</span>
+          <span class="summary-value cost">{{ formatCost(stats.cost) }}</span>
         </div>
       </div>
     </div>
@@ -101,7 +127,6 @@ function formatPercent(n: number | null): string {
 <style scoped>
 .token-stats {
   font-size: var(--pix-text-sm);
-  --token-ring-color: var(--pix-accent);
 }
 
 .stats-content {
@@ -110,106 +135,146 @@ function formatPercent(n: number | null): string {
   gap: var(--pix-space-md);
 }
 
+/* ── Context usage ring ── */
 .context-usage {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 14px;
-  padding-bottom: var(--pix-space-md);
-  border-bottom: 1px solid var(--pix-border-light);
+  gap: var(--pix-space-md);
+  padding: var(--pix-space-md);
+  background: var(--pix-bg-code);
+  border: 1px solid var(--pix-border-subtle);
+  border-radius: var(--pix-radius-lg);
 }
 
 .context-ring {
-  width: 92px;
-  height: 92px;
-  border-radius: 50%;
-  padding: 10px;
-  transition: background var(--pix-transition-base);
+  position: relative;
+  width: 80px;
+  height: 80px;
+  flex-shrink: 0;
 }
 
-.context-ring-inner {
-  width: 100%;
-  height: 100%;
-  border-radius: 50%;
-  background: var(--pix-bg-card);
-  box-shadow: inset 0 0 0 1px var(--pix-border-subtle);
+.context-ring svg {
+  transform: rotate(-90deg);
+}
+
+.ring-track {
+  stroke: var(--pix-border);
+}
+
+.ring-progress {
+  stroke: var(--pix-accent);
+  transition: stroke-dashoffset var(--pix-transition-slow), stroke var(--pix-transition-base);
+}
+
+.context-ring-label {
+  position: absolute;
+  inset: 0;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
 }
 
 .context-percent {
-  color: #000000;
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-lg);
+  font-size: var(--pix-text-md);
   font-weight: var(--pix-weight-semibold);
-  line-height: 1.2;
-}
-
-.context-total {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
-  min-width: 48px;
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
-  line-height: 1.2;
-  color: var(--pix-text-secondary);
-}
-
-.context-divider {
-  color: var(--pix-text-muted);
-  font-size: 10px;
+  color: var(--pix-text-primary);
   line-height: 1;
 }
 
-.context-usage.warning {
-  --token-ring-color: var(--pix-warning);
+.context-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
-.context-usage.danger {
-  --token-ring-color: var(--pix-error);
+.context-meta-label {
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-muted);
 }
 
+.context-meta-value {
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-semibold);
+  color: var(--pix-text-primary);
+  line-height: 1.3;
+}
+
+.context-meta-divider {
+  color: var(--pix-text-muted);
+  margin: 0 2px;
+}
+
+.context-usage.warning .ring-progress {
+  stroke: var(--pix-warning);
+}
+.context-usage.warning .context-percent {
+  color: var(--pix-warning);
+}
+
+.context-usage.danger .ring-progress {
+  stroke: var(--pix-error);
+}
+.context-usage.danger .context-percent {
+  color: var(--pix-error);
+}
+
+/* ── Token stats grid ── */
 .stats-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 7px var(--pix-space-md);
+  gap: var(--pix-space-xs);
 }
 
 .stat-item {
-  padding: 2px 0;
-}
-
-.stat-item.total,
-.stat-item.cost {
-  grid-column: span 2;
-  border-top: 1px solid var(--pix-border-light);
-  padding-top: var(--pix-space-sm);
-  margin-top: var(--pix-space-xs);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  background: var(--pix-bg-code);
+  border: 1px solid var(--pix-border-subtle);
+  border-radius: var(--pix-radius-md);
 }
 
 .stat-label {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-muted);
-  margin-bottom: 1px;
 }
 
 .stat-value {
-  font-family: var(--pix-font-mono);
   font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-medium);
+  font-weight: var(--pix-weight-semibold);
+  color: var(--pix-text-primary);
+  line-height: 1.3;
+}
+
+/* ── Summary (total + cost) ── */
+.stats-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-xs);
+  padding-top: var(--pix-space-sm);
+  border-top: 1px solid var(--pix-border-light);
+}
+
+.summary-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.summary-label {
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-muted);
+}
+
+.summary-value {
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-primary);
 }
 
-.total .stat-value {
-  font-weight: var(--pix-weight-semibold);
-}
-
-.cost .stat-value {
+.summary-value.cost {
   color: var(--pix-accent);
 }
 

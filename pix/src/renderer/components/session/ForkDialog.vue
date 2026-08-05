@@ -3,7 +3,8 @@
  * ForkDialog - Choose a user message to fork from.
  */
 import { ref, onMounted } from "vue";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
+import { useTeamStore } from "../../stores/team-store";
 import type { UserMessageForForking } from "@/types/rpc";
 
 const emit = defineEmits<{
@@ -11,21 +12,24 @@ const emit = defineEmits<{
   fork: [entryId: string, label?: string];
 }>();
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
+const teamStore = useTeamStore();
 const messages = ref<UserMessageForForking[]>([]);
 const loading = ref(true);
 const forkLabel = ref("");
 
 onMounted(async () => {
+  const mode = teamStore.teamMode;
   try {
     const result = await rpc.getUserMessagesForForking();
+    if (teamStore.teamMode !== mode) return;
     if (result) {
       messages.value = result;
     }
   } catch (err) {
     console.error("[ForkDialog] Failed to load messages:", err);
   } finally {
-    loading.value = false;
+    if (teamStore.teamMode === mode) loading.value = false;
   }
 });
 
@@ -43,12 +47,12 @@ function truncate(text: string, maxLen: number): string {
   <div class="fork-dialog-overlay" @click.self="emit('close')">
     <div class="fork-dialog">
       <div class="dialog-header">
-        <span class="dialog-title">Fork Session</span>
-        <button class="dialog-close" @click="emit('close')">&times;</button>
+        <span class="dialog-title">创建会话分支</span>
+        <button class="dialog-close" title="关闭" aria-label="关闭" @click="emit('close')">&times;</button>
       </div>
 
       <p class="dialog-desc">
-        Choose a message to fork from. A new session will be created with history up to that point.
+        选择分支起点。新会话将保留该消息之前的历史记录。
       </p>
 
       <div class="dialog-label-input">
@@ -56,14 +60,14 @@ function truncate(text: string, maxLen: number): string {
           v-model="forkLabel"
           type="text"
           class="form-input"
-          placeholder="Optional: label for the fork point"
+          placeholder="可选：为分支点添加标签"
           spellcheck="false"
         />
       </div>
 
       <div class="dialog-list">
-        <div v-if="loading" class="loading-state">Loading messages...</div>
-        <div v-else-if="messages.length === 0" class="empty-state">No user messages found in this session.</div>
+        <div v-if="loading" class="loading-state">正在加载消息...</div>
+        <div v-else-if="messages.length === 0" class="empty-state">此会话中没有用户消息。</div>
         <button
           v-for="msg in messages"
           :key="msg.entryId"

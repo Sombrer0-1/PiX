@@ -108,5 +108,7 @@
   --pix-left-width: 286px;
   --pix-right-width: 332px;
   --pix-topbar-height: 52px;
+  --pix-window-controls-width: 138px;
+  --pix-window-controls-height: 40px;
   --pix-content-max-width: 920px;
 }

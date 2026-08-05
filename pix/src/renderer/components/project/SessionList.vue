@@ -16,7 +16,7 @@ const emit = defineEmits<{
 
 function formatDate(dateStr: string): string {
   const d = new Date(dateStr);
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }
 
 function truncateText(text: string, maxLen: number): string {
@@ -29,11 +29,11 @@ function truncateText(text: string, maxLen: number): string {
   <div class="session-list">
     <div v-if="loading" class="loading-state">
       <span class="spinner"></span>
-      <span class="loading-text">Loading sessions...</span>
+      <span class="loading-text">正在加载会话...</span>
     </div>
 
     <div v-else-if="sessions.length === 0" class="empty-state">
-      <p class="empty-text">No sessions found</p>
+      <p class="empty-text">未找到会话</p>
     </div>
 
     <button
@@ -48,7 +48,7 @@ function truncateText(text: string, maxLen: number): string {
         <div class="session-date">{{ formatDate(session.modified) }}</div>
       </div>
       <div class="session-preview">{{ truncateText(session.firstMessage, 80) }}</div>
-      <div class="session-meta">{{ session.messageCount }} messages</div>
+      <div class="session-meta">{{ session.messageCount }} 条消息</div>
     </button>
   </div>
 </template>

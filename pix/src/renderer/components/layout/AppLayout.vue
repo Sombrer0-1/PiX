@@ -11,10 +11,14 @@
  * Left and Right are full-height. Center manages its own
  * internal header / content / composer structure.
  */
+defineProps<{
+  teamMode?: boolean;
+}>();
 </script>
 
 <template>
-  <div class="app-layout">
+  <div class="app-layout" :class="{ 'app-layout--team': teamMode }">
+    <div class="layout-titlebar-drag" aria-hidden="true"></div>
     <aside class="layout-left">
       <slot name="left" />
     </aside>
@@ -35,10 +39,21 @@
   height: 100%;
   overflow: hidden;
   gap: 8px;
-  padding: 10px 12px 10px 10px;
+  padding: calc(10px + var(--pix-window-controls-height)) 12px 10px 10px;
+  position: relative;
+  -webkit-app-region: no-drag;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(247, 248, 252, 0.94)),
     var(--pix-bg-app);
+}
+
+.layout-titlebar-drag {
+  position: absolute;
+  top: 0;
+  right: var(--pix-window-controls-width);
+  left: 0;
+  height: calc(var(--pix-window-controls-height) + 10px);
+  -webkit-app-region: drag;
 }
 
 .layout-left {
@@ -52,6 +67,7 @@
   display: flex;
   flex-direction: column;
   box-shadow: var(--pix-shadow-sm);
+  -webkit-app-region: no-drag;
 }
 
 .layout-center {
@@ -66,6 +82,7 @@
   box-shadow: var(--pix-shadow-sm);
   position: relative;
   z-index: 1;
+  -webkit-app-region: no-drag;
 }
 
 .layout-right {
@@ -79,5 +96,27 @@
   display: flex;
   flex-direction: column;
   box-shadow: var(--pix-shadow-sm);
+  -webkit-app-region: no-drag;
+}
+
+.app-layout--team .layout-left {
+  width: 264px;
+  min-width: 264px;
+}
+
+@media (max-width: 1180px) {
+  .app-layout {
+    padding: calc(8px + var(--pix-window-controls-height)) 8px 8px;
+    gap: 6px;
+  }
+
+  .layout-titlebar-drag {
+    height: calc(var(--pix-window-controls-height) + 8px);
+  }
+
+  .app-layout--team .layout-left {
+    width: 232px;
+    min-width: 232px;
+  }
 }
 </style>

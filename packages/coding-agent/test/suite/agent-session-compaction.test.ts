@@ -2,6 +2,7 @@ import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
+	isContextOverflow,
 	type Model,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,7 +11,12 @@ import { createHarness, type Harness } from "./harness.ts";
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
+	_overflowRecoveryAttempted: boolean;
 };
+
+// A generic proxy error that discards the upstream overflow detail.
+// isContextOverflow() cannot classify it and it is not retryable.
+const UNRECOGNIZED_OVERFLOW_ERROR = "400 Error from provider (Console Go): Upstream request failed";
 
 function createUsage(totalTokens: number) {
 	return {
@@ -312,6 +318,157 @@ describe("AgentSession compaction characterization", () => {
 		await sessionInternals._checkCompaction(errorAssistant);
 
 		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+	});
+
+	it("auto-retries after threshold compaction for an unrecognized overflow error near the hard limit", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const contextWindow = harness.getModel().contextWindow ?? 0;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: contextWindow - 1_000,
+			timestamp: Date.now(),
+		});
+		const errorAssistant = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: UNRECOGNIZED_OVERFLOW_ERROR,
+			timestamp: Date.now() + 1000,
+		});
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			{ role: "user", content: [{ type: "text", text: "retry" }], timestamp: Date.now() + 500 },
+			errorAssistant,
+		];
+
+		// Scenario premise: the error is an overflow that pattern matching cannot classify.
+		expect(isContextOverflow(errorAssistant, contextWindow)).toBe(false);
+
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(errorAssistant);
+
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", true);
+	});
+
+	it("does not auto-retry when context is near the compaction threshold but beyond the hard-limit margin", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const contextWindow = harness.getModel().contextWindow ?? 0;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: contextWindow - 13_000, // compacts, but 13k from the hard limit
+			timestamp: Date.now(),
+		});
+		const errorAssistant = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: UNRECOGNIZED_OVERFLOW_ERROR,
+			timestamp: Date.now() + 1000,
+		});
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			{ role: "user", content: [{ type: "text", text: "retry" }], timestamp: Date.now() + 500 },
+			errorAssistant,
+		];
+
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(errorAssistant);
+
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+	});
+
+	it("does not auto-retry quota limit errors even when context is near the hard limit", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const contextWindow = harness.getModel().contextWindow ?? 0;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: contextWindow - 1_000,
+			timestamp: Date.now(),
+		});
+		const errorAssistant = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: "GoUsageLimitError: Monthly usage limit reached",
+			timestamp: Date.now() + 1000,
+		});
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			{ role: "user", content: [{ type: "text", text: "retry" }], timestamp: Date.now() + 500 },
+			errorAssistant,
+		];
+
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(errorAssistant);
+
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+	});
+
+	it("does not auto-retry an error from a different model even when context is near the hard limit", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const contextWindow = harness.getModel().contextWindow ?? 0;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: contextWindow - 1_000,
+			timestamp: Date.now(),
+		});
+		const errorAssistant = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: UNRECOGNIZED_OVERFLOW_ERROR,
+			timestamp: Date.now() + 1000,
+		});
+		errorAssistant.provider = "other-provider";
+		errorAssistant.model = "other-model";
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			{ role: "user", content: [{ type: "text", text: "retry" }], timestamp: Date.now() + 500 },
+			errorAssistant,
+		];
+
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(errorAssistant);
+
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+	});
+
+	it("auto-retries an unrecognized overflow error at most once per consecutive-error streak", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const contextWindow = harness.getModel().contextWindow ?? 0;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: contextWindow - 1_000,
+			timestamp: Date.now(),
+		});
+		const errorAssistant = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: UNRECOGNIZED_OVERFLOW_ERROR,
+			timestamp: Date.now() + 1000,
+		});
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			{ role: "user", content: [{ type: "text", text: "retry" }], timestamp: Date.now() + 500 },
+			errorAssistant,
+		];
+
+		sessionInternals._overflowRecoveryAttempted = true;
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(errorAssistant);
+
+		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
 	});
 
 	it("does not trigger threshold compaction for error messages when no prior usage exists", async () => {

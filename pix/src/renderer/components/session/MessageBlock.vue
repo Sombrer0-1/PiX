@@ -16,7 +16,7 @@ defineProps<{
 const selectedAttachment = ref<ChatMessageAttachment | null>(null);
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString(undefined, {
+  return new Date(ts).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
     minute: "2-digit",
   });

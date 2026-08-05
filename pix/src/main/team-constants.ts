@@ -15,6 +15,17 @@ export const DEFAULT_WORKER_CONFIGS: WorkerConfig[] = [
 /** Agent name prefix for the team leader. */
 export const LEADER_AGENT_NAME = "team-lead";
 
+/**
+ * Ceiling (ms) for awaiting session.abort() when aborting a worker turn.
+ * abortCurrentTurn awaits the session's in-flight cancellation so a stopped
+ * turn cannot overlap the next one, but a tool call that ignores the abort
+ * signal would otherwise hang the Stop-turn / Stop-team buttons and mode
+ * switches indefinitely. When the ceiling is hit the abort returns to the
+ * caller (the worker may keep winding down in the background); the health
+ * check's stuck-turn recovery still bounds the runaway case.
+ */
+export const ABORT_TIMEOUT_MS = 5_000;
+
 /** Polling interval (ms) when worker is idle, waiting for new messages. */
 export const IDLE_POLL_INTERVAL_MS = 500;
 

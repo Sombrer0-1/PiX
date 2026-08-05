@@ -5,8 +5,9 @@
 import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
+import { useTeamLeaderRpc } from "../../composables/useTeamLeaderRpc";
 import { useProjectStore } from "../../stores/project-store";
-import { useSessionStore } from "../../stores/session-store";
+import { useSessionStore, useTeamLeaderSessionStore } from "../../stores/session-store";
 import { useTeamStore } from "../../stores/team-store";
 import { deriveSessionTitle, formatSessionTime } from "@/utils/session-title";
 import type { AgentMessage } from "@/types/rpc";
@@ -14,8 +15,10 @@ import type { SessionInfo } from "@/types/session";
 
 const router = useRouter();
 const rpc = useRpc();
+const teamLeaderRpc = useTeamLeaderRpc();
 const projectStore = useProjectStore();
 const sessionStore = useSessionStore();
+const teamLeaderSessionStore = useTeamLeaderSessionStore();
 const teamStore = useTeamStore();
 
 const searchQuery = ref("");
@@ -24,13 +27,20 @@ const deletingSession = ref<string | null>(null);
 const showDeleteDialog = ref(false);
 const confirmDeleteSession = ref<SessionInfo | null>(null);
 const deleteError = ref<string | null>(null);
+const showNewTeamDialog = ref(false);
+const isCreatingTeamSession = ref(false);
 
 const projectPath = computed(() => projectStore.currentProject?.path || "");
 const deleteSessionTitle = computed(() => deriveSessionTitle(confirmDeleteSession.value));
-const currentSessionId = computed(() => projectStore.currentSession?.id ?? rpc.sessionState.value?.sessionId ?? "");
+const currentSessionId = computed(() => {
+  if (teamStore.teamMode) {
+    return projectStore.currentTeamSession?.id ?? teamLeaderRpc.sessionState.value?.sessionId ?? "";
+  }
+  return projectStore.currentSession?.id ?? rpc.sessionState.value?.sessionId ?? "";
+});
 
 const filteredSessions = computed(() => {
-  const sessions = [...projectStore.sessions];
+  const sessions = [...(teamStore.teamMode ? projectStore.teamSessions : projectStore.sessions)];
   sessions.sort((a, b) => {
     const aPinned = pinnedIds.value.has(a.id);
     const bPinned = pinnedIds.value.has(b.id);
@@ -51,7 +61,7 @@ const filteredSessions = computed(() => {
 });
 
 function isCurrentTeamSession(session: SessionInfo): boolean {
-  return teamStore.isTeamActive && currentSessionId.value === session.id;
+  return teamStore.teamMode && currentSessionId.value === session.id;
 }
 
 async function refreshCurrentSession(): Promise<void> {
@@ -62,30 +72,92 @@ async function refreshCurrentSession(): Promise<void> {
   );
 }
 
-async function newSession(): Promise<void> {
-  const result = await rpc.newSession();
-  if (!result || result.cancelled) return;
-  teamStore.teamMode = false;
-  sessionStore.clearSession();
-  await refreshCurrentSession();
+async function refreshCurrentTeamSession(): Promise<void> {
+  await projectStore.listTeamLeaderSessions();
+  projectStore.syncCurrentTeamSession(
+    teamLeaderRpc.sessionState.value?.sessionFile,
+    teamLeaderRpc.sessionState.value?.sessionId,
+  );
 }
 
-async function newTeamSession(): Promise<void> {
-  // Only one team can exist per project: disband the previous one first so the
-  // new session starts with a fresh team instead of a "team already active" error.
-  if (teamStore.isTeamActive) {
-    const stopped = await teamStore.stopTeam();
-    if (!stopped) return;
+async function newSession(): Promise<void> {
+  if (teamStore.teamMode) {
+    const switched = await teamStore.toggleTeamMode(projectPath.value);
+    if (!switched) return;
   }
   const result = await rpc.newSession();
   if (!result || result.cancelled) return;
   sessionStore.clearSession();
   await refreshCurrentSession();
-  teamStore.teamMode = true;
-  await teamStore.createTeam();
+}
+
+async function newTeamSession(): Promise<void> {
+  if (!teamStore.teamMode) {
+    const switched = await teamStore.toggleTeamMode(projectPath.value);
+    if (!switched) {
+      // TeamDashboard only mounts once teamMode is true, so while still in
+      // solo mode teamStore.lastError is invisible. Surface the failure here
+      // so the button does not appear non-functional. Mirrors the alert used
+      // by HomePage.startFreshWorkspace on toggle failure.
+      alert(`启动团队失败：${teamStore.lastError || "未知错误"}`);
+      return;
+    }
+  }
+
+  // Team runtime startup may restore a snapshot before the renderer receives
+  // its team event. Query the authoritative state before deciding whether to
+  // create a fresh team.
+  await teamStore.fetchTeamState();
+
+  if (teamStore.isTeamActive) {
+    showNewTeamDialog.value = true;
+    return;
+  }
+
+  await createFreshTeamSession();
+}
+
+async function createFreshTeamSession(): Promise<void> {
+  if (isCreatingTeamSession.value) return;
+  isCreatingTeamSession.value = true;
+
+  try {
+    if (teamStore.isTeamActive) {
+      const stopped = await teamStore.stopTeam();
+      if (!stopped) return;
+      await teamStore.fetchTeamState();
+    }
+    const result = await teamLeaderRpc.newSession();
+    if (!result || result.cancelled) return;
+    teamLeaderSessionStore.clearSession();
+    await Promise.all([
+      teamLeaderRpc.refreshState(),
+      teamLeaderRpc.refreshCommands(),
+      teamLeaderRpc.refreshModels(),
+      teamLeaderRpc.refreshSessionStats(),
+    ]);
+    await refreshCurrentTeamSession();
+    await teamStore.createTeam();
+    showNewTeamDialog.value = false;
+  } finally {
+    isCreatingTeamSession.value = false;
+  }
 }
 
 async function handleSelectSession(session: SessionInfo): Promise<void> {
+  if (teamStore.teamMode) {
+    const result = await teamLeaderRpc.switchSession(session.path);
+    if (!result || result.cancelled) return;
+
+    projectStore.setCurrentTeamSession(session);
+    const messages = await teamLeaderRpc.getMessages();
+    if (Array.isArray(messages)) {
+      teamLeaderSessionStore.loadMessages(messages as AgentMessage[]);
+    }
+    await refreshCurrentTeamSession();
+    return;
+  }
+
   const result = await rpc.switchSession(session.path);
   if (!result || result.cancelled) return;
 
@@ -95,8 +167,6 @@ async function handleSelectSession(session: SessionInfo): Promise<void> {
     sessionStore.loadMessages(messages as AgentMessage[]);
   }
   await refreshCurrentSession();
-  await teamStore.fetchTeamState();
-  await teamStore.fetchTeamHistory();
 }
 
 function togglePin(sessionId: string): void {
@@ -116,6 +186,7 @@ async function executeDelete(): Promise<void> {
   const session = confirmDeleteSession.value;
   if (!session) return;
 
+  const deletingTeamSession = teamStore.teamMode;
   deletingSession.value = session.id;
   deleteError.value = null;
   const wasCurrentSession = currentSessionId.value === session.id;
@@ -123,25 +194,46 @@ async function executeDelete(): Promise<void> {
   try {
     const result = await window.pixApi.deleteSession(session.path);
     if (!result.success) {
-      deleteError.value = result.error || "Delete session failed";
+      deleteError.value = result.error || "删除会话失败";
       return;
     }
 
-    await projectStore.listSessions();
+    if (deletingTeamSession) {
+      await projectStore.listTeamLeaderSessions();
+    } else {
+      await projectStore.listSessions();
+    }
+
+    if (teamStore.teamMode !== deletingTeamSession) return;
+
     if (wasCurrentSession) {
-      const replacement = projectStore.sessions[0] ?? null;
+      const replacement = deletingTeamSession
+        ? projectStore.teamSessions[0] ?? null
+        : projectStore.sessions[0] ?? null;
       if (replacement) {
         await handleSelectSession(replacement);
       } else {
-        const newResult = await rpc.newSession();
+        const activeRpc = deletingTeamSession ? teamLeaderRpc : rpc;
+        const activeSessionStore = deletingTeamSession ? teamLeaderSessionStore : sessionStore;
+        const newResult = await activeRpc.newSession();
         if (newResult && !newResult.cancelled) {
-          sessionStore.clearSession();
-          await refreshCurrentSession();
+          activeSessionStore.clearSession();
+          if (deletingTeamSession) {
+            await refreshCurrentTeamSession();
+          } else {
+            await refreshCurrentSession();
+          }
         } else {
-          projectStore.setCurrentSession(null);
-          sessionStore.clearSession();
+          if (deletingTeamSession) {
+            projectStore.setCurrentTeamSession(null);
+          } else {
+            projectStore.setCurrentSession(null);
+          }
+          activeSessionStore.clearSession();
         }
       }
+    } else if (deletingTeamSession) {
+      await refreshCurrentTeamSession();
     } else {
       await refreshCurrentSession();
     }
@@ -162,15 +254,16 @@ function goSettings(): void { void router.push("/settings"); }
 </script>
 
 <template>
-  <div class="left-panel">
+  <div class="left-panel" :class="{ 'team-mode': teamStore.teamMode }">
     <div class="panel-header">
       <div class="project-name-row">
         <div class="project-icon">
           {{ (projectStore.currentProject?.name || "P")[0] }}
         </div>
         <div class="project-name" :title="projectStore.currentProject?.name">
-          {{ projectStore.currentProject?.name || "No project" }}
+          {{ projectStore.currentProject?.name || "未打开项目" }}
         </div>
+        <span class="project-mode-label">{{ teamStore.teamMode ? "团队" : "单人" }}</span>
       </div>
       <div class="project-path" :title="projectPath">{{ projectPath }}</div>
     </div>
@@ -178,19 +271,19 @@ function goSettings(): void { void router.push("/settings"); }
     <div class="panel-actions">
       <button
         class="new-session-btn"
-        :disabled="!rpc.isConnected.value"
+        :disabled="!projectPath || (!teamStore.teamMode && !rpc.isConnected.value) || teamStore.isLoading || isCreatingTeamSession"
         @click="newSession"
       >
         <span class="btn-icon">+</span>
-        <span>New Session</span>
+        <span>{{ teamStore.teamMode ? "新建单人会话" : "新建会话" }}</span>
       </button>
       <button
         class="new-team-session-btn"
-        :disabled="!rpc.isConnected.value"
+        :disabled="!projectPath || teamStore.isLoading || isCreatingTeamSession"
         @click="newTeamSession"
       >
         <v-icon icon="mdi-account-group-outline" size="15" />
-        <span>New Team Session</span>
+        <span>{{ isCreatingTeamSession ? "正在启动团队..." : "新建团队会话" }}</span>
       </button>
     </div>
 
@@ -203,13 +296,14 @@ function goSettings(): void { void router.push("/settings"); }
           v-model="searchQuery"
           type="text"
           class="search-input"
-          placeholder="Search sessions..."
+          :placeholder="teamStore.teamMode ? '搜索团队会话...' : '搜索会话...'"
           spellcheck="false"
         />
         <button
           v-if="searchQuery"
           class="search-clear"
-          title="Clear search"
+          title="清除搜索"
+          aria-label="清除搜索"
           @click="searchQuery = ''"
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -228,31 +322,31 @@ function goSettings(): void { void router.push("/settings"); }
         }"
         @click="handleSelectSession(session)"
       >
-        <span v-if="pinnedIds.has(session.id)" class="pin-marker" title="Pinned">
+        <span v-if="pinnedIds.has(session.id)" class="pin-marker" title="已置顶">
           <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M16,12V4H17V2H7V4H8V12L6,14V16H11.2V22H12.8V16H18V14L16,12Z"/></svg>
         </span>
-        <span v-if="isCurrentTeamSession(session)" class="team-marker" title="Active team session">
+        <span v-if="isCurrentTeamSession(session)" class="team-marker" title="当前团队会话">
           <v-icon icon="mdi-account-group-outline" size="12" />
         </span>
         <div class="session-info">
           <span class="session-name" :title="deriveSessionTitle(session)">
             {{ deriveSessionTitle(session) }}
           </span>
-          <span v-if="isCurrentTeamSession(session)" class="session-kind">Team</span>
+          <span v-if="isCurrentTeamSession(session)" class="session-kind">团队</span>
         </div>
         <span class="session-time">{{ formatSessionTime(session.modified) }}</span>
         <span class="hover-actions">
           <button
             class="hover-btn"
             :class="{ 'pin-active': pinnedIds.has(session.id) }"
-            :title="pinnedIds.has(session.id) ? 'Unpin' : 'Pin'"
+            :title="pinnedIds.has(session.id) ? '取消置顶' : '置顶'"
             @click.stop="togglePin(session.id)"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
           </button>
           <button
             class="hover-btn danger"
-            title="Delete session"
+            title="删除会话"
             @click.stop="requestDelete(session)"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
@@ -260,31 +354,46 @@ function goSettings(): void { void router.push("/settings"); }
         </span>
       </div>
       <div v-if="filteredSessions.length === 0" class="empty-hint">
-        {{ searchQuery ? "No matching sessions" : "No sessions yet" }}
+        {{ searchQuery ? "没有匹配的会话" : "暂无会话" }}
       </div>
     </div>
 
     <div class="panel-footer">
-      <button class="footer-btn" title="Settings" @click="goSettings">
+      <button class="footer-btn" title="设置" aria-label="设置" @click="goSettings">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </button>
-      <button class="footer-btn" title="Home" @click="goHome">
+      <button class="footer-btn" title="首页" aria-label="首页" @click="goHome">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
       </button>
     </div>
 
+    <v-dialog v-model="showNewTeamDialog" max-width="420" :persistent="isCreatingTeamSession">
+      <v-card class="delete-dialog-card">
+        <div class="delete-dialog-title">新建团队会话</div>
+        <div class="delete-dialog-text">
+          当前团队 <strong class="delete-session-name">{{ teamStore.teamName }}</strong> 将停止并解散，已完成的工作会保留在项目中。
+        </div>
+        <v-card-actions class="delete-dialog-actions">
+          <v-spacer />
+          <v-btn variant="text" :disabled="isCreatingTeamSession" @click="showNewTeamDialog = false">取消</v-btn>
+          <v-btn color="error" variant="tonal" :loading="isCreatingTeamSession" @click="createFreshTeamSession">
+            停止并新建
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="showDeleteDialog" max-width="400">
       <v-card class="delete-dialog-card">
-        <div class="delete-dialog-title">Delete Session</div>
+        <div class="delete-dialog-title">删除会话</div>
         <div class="delete-dialog-text">
-          Delete <strong class="delete-session-name">{{ deleteSessionTitle }}</strong>?
-          This cannot be undone.
+          确定删除 <strong class="delete-session-name">{{ deleteSessionTitle }}</strong>？此操作无法撤销。
         </div>
         <div v-if="deleteError" class="delete-dialog-error">{{ deleteError }}</div>
         <v-card-actions class="delete-dialog-actions">
           <v-spacer />
-          <v-btn variant="text" @click="showDeleteDialog = false">Cancel</v-btn>
-          <v-btn color="error" variant="tonal" :loading="!!deletingSession" @click="executeDelete">Delete</v-btn>
+          <v-btn variant="text" @click="showDeleteDialog = false">取消</v-btn>
+          <v-btn color="error" variant="tonal" :loading="!!deletingSession" @click="executeDelete">删除</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -336,6 +445,29 @@ function goSettings(): void { void router.push("/settings"); }
   line-height: 1.3;
 }
 
+.project-mode-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 6px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-muted);
+  font-size: 9px;
+  font-weight: var(--pix-weight-semibold);
+  text-transform: uppercase;
+}
+
+.team-mode .project-mode-label {
+  background: #eaf6f1;
+  color: #13795b;
+}
+
+.team-mode .project-icon {
+  background: #13795b;
+  box-shadow: 0 10px 22px rgba(19, 121, 91, 0.2);
+}
+
 .project-path {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-muted);
@@ -367,6 +499,20 @@ function goSettings(): void { void router.push("/settings"); }
   font-family: var(--pix-font-ui);
   cursor: pointer;
   transition: box-shadow var(--pix-transition-fast), transform var(--pix-transition-fast), filter var(--pix-transition-fast);
+}
+
+.team-mode .new-session-btn {
+  border: 1px solid var(--pix-border-light);
+  background: #ffffff;
+  color: var(--pix-accent);
+  box-shadow: none;
+}
+
+.team-mode .new-team-session-btn {
+  border-color: #13795b;
+  background: #13795b;
+  color: #ffffff;
+  box-shadow: 0 10px 20px rgba(19, 121, 91, 0.18);
 }
 
 .new-session-btn {

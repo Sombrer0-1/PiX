@@ -5,7 +5,9 @@
 export type {
   DisplayBlock,
   ChatMessageAttachment,
+  ToolWorkItem,
   ProjectInfo,
   SessionInfo,
   GuiSettings,
+  ApiErrorCategory,
 } from "../../shared/types";

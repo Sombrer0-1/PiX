@@ -20,6 +20,17 @@ export interface WorkerState {
   unsubscribeEvents?: () => void;
   /** Worker runner instance (manages the execution loop). */
   runner: WorkerRunner | null;
+  /** Internal identity of the current turn, used to reject stale callbacks. */
+  activeTurnId?: string;
+  /** Runtime epoch captured by the current turn. */
+  activeTurnEpoch?: number;
+  /**
+   * Whether the current turn already sent a worker->leader message (which wakes
+   * the leader on its own). Set in sendTeamMessage, reset at turn start, read by
+   * the turn-outcome handlers to avoid a duplicate orphan-turn wake - and the
+   * feedback loop that duplicate would create for ordinary peer conversation.
+   */
+  sentLeaderMessageThisTurn?: boolean;
   /** Message timeline for this worker. */
   messageHistory: TeammateChatMessage[];
 }

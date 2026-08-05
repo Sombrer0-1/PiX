@@ -6,14 +6,17 @@ import { ref, onMounted, computed } from "vue";
 import { useRouter } from "vue-router";
 import { useSettingsStore } from "../stores/settings-store";
 import { useProjectStore } from "../stores/project-store";
-import { useSessionStore } from "../stores/session-store";
+import { useSessionStore, useTeamLeaderSessionStore } from "../stores/session-store";
 import { useRpc } from "../composables/useRpc";
+import { useTeamStore } from "../stores/team-store";
 import type { ProjectInfo } from "@/types/session";
 
 const router = useRouter();
 const settingsStore = useSettingsStore();
 const projectStore = useProjectStore();
 const sessionStore = useSessionStore();
+const teamLeaderSessionStore = useTeamLeaderSessionStore();
+const teamStore = useTeamStore();
 const rpc = useRpc();
 
 const piDetection = ref<{ found: boolean; path: string; note?: string } | null>(null);
@@ -23,30 +26,76 @@ onMounted(async () => {
   try {
     piDetection.value = await settingsStore.detectPi();
   } catch {
-    piDetection.value = { found: true, path: "direct", note: "Direct AgentSession integration" };
+    piDetection.value = { found: true, path: "direct", note: "AgentSession 进程内直连" };
   }
 });
 
 const recentProjects = computed(() => projectStore.recentProjects);
 
+async function finishSoloStartup(dirPath: string): Promise<void> {
+  await projectStore.openProject(dirPath);
+  const result = await rpc.newSession();
+  if (!result || result.cancelled) {
+    alert(`新建会话失败：${rpc.lastError.value || "未知错误"}`);
+    return;
+  }
+  sessionStore.clearSession();
+  await projectStore.listSessions();
+  projectStore.syncCurrentSession(
+    rpc.sessionState.value?.sessionFile,
+    rpc.sessionState.value?.sessionId
+  );
+  await router.push("/workspace");
+}
+
 async function startFreshWorkspace(dirPath: string): Promise<void> {
-  if (await rpc.startPi(dirPath)) {
-    await projectStore.openProject(dirPath);
-    const result = await rpc.newSession();
-    if (!result || result.cancelled) {
-      alert(`Failed to create a new session: ${rpc.lastError.value || "Unknown error"}`);
+  // Determine the target mode from persisted state BEFORE touching runtimes,
+  // so a fire-and-forget setWorkspaceMode from a prior toggle cannot leave a
+  // stale mode.json read here.
+  const hasTeamSnapshot = await window.pixApi.hasTeamSnapshot(dirPath);
+  const lastMode = await window.pixApi.getWorkspaceMode(dirPath);
+  const targetTeam = lastMode === "team" && hasTeamSnapshot;
+  const sameProject = projectStore.currentProject?.path === dirPath;
+
+  if (targetTeam) {
+    // Only (re)start the team when we are not already in team mode for this
+    // same project: a stop+restart would discard in-flight worker work for no
+    // reason. A different project still gets a fresh team via the toggle.
+    const needsTeamStart = !teamStore.teamMode || !sameProject;
+    if (needsTeamStart) {
+      const started = await teamStore.toggleTeamMode(dirPath);
+      if (!started) {
+        alert(`Pi 启动失败：${teamStore.lastError || "未知错误"}`);
+        return;
+      }
+    }
+    await projectStore.openProject(dirPath, { loadSessions: false });
+    if (needsTeamStart) {
+      teamLeaderSessionStore.clearSession();
+    }
+    await router.push("/workspace");
+    return;
+  }
+
+  // Solo target. If a team is active, toggle to solo (which starts the solo
+  // runtime) and skip rpc.startPi below so the solo runtime is not started
+  // twice on the same singleton.
+  if (teamStore.teamMode) {
+    const switched = await teamStore.toggleTeamMode(dirPath);
+    if (!switched) {
+      alert(`Pi 启动失败：${teamStore.lastError || "未知错误"}`);
       return;
     }
-    sessionStore.clearSession();
-    await projectStore.listSessions();
-    projectStore.syncCurrentSession(
-      rpc.sessionState.value?.sessionFile,
-      rpc.sessionState.value?.sessionId
-    );
-    router.push("/workspace");
-  } else {
-    alert(`Failed to start Pi: ${rpc.lastError.value || "Unknown error"}`);
+    await finishSoloStartup(dirPath);
+    return;
   }
+
+  // Already solo: start the solo runtime directly, then open the project.
+  if (!(await rpc.startPi(dirPath))) {
+    alert(`Pi 启动失败：${rpc.lastError.value || "未知错误"}`);
+    return;
+  }
+  await finishSoloStartup(dirPath);
 }
 
 async function openProject(): Promise<void> {
@@ -69,7 +118,7 @@ function formatDate(timestamp: number): string {
   const diff = now.getTime() - d.getTime();
   if (diff < 86400000) return "今天";
   if (diff < 172800000) return "昨天";
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }
 </script>
 
@@ -165,11 +214,13 @@ function formatDate(timestamp: number): string {
 }
 
 .drag-bar {
-  height: 32px;
-  min-height: 32px;
+  height: var(--pix-window-controls-height);
+  min-height: var(--pix-window-controls-height);
   -webkit-app-region: drag;
   flex-shrink: 0;
-  margin-right: 64px;
+  margin-right: var(--pix-window-controls-width);
+  background: var(--pix-bg-topbar);
+  border-bottom: 1px solid var(--pix-border-light);
 }
 
 .home-container-wrapper {

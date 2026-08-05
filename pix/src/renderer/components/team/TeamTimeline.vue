@@ -4,9 +4,10 @@
  *
  * Shows rich bus messages with from/to direction, role colors, and kind badges.
  * Falls back to legacy per-worker messages when bus messages are empty.
- * Auto-scrolls to bottom when new messages arrive.
+ * Auto-scrolls to bottom when new messages arrive, unless the user scrolled up
+ * to read history; a scroll-to-bottom button re-enables auto-scroll.
  */
-import { ref, watch, nextTick, computed } from "vue";
+import { ref, watch, nextTick, computed, onMounted } from "vue";
 import type { TeammateChatMessage, TeammateInfo, TeamMessage } from "@shared/types.js";
 
 const props = defineProps<{
@@ -22,10 +23,11 @@ const props = defineProps<{
 }>();
 
 const scrollContainer = ref<HTMLElement | null>(null);
+const shouldAutoScroll = ref(true);
 
 /** Resolve an agentId to a display name. */
 function agentName(agentId: string): string {
-  if (agentId === props.leadAgentId) return "leader";
+  if (agentId === props.leadAgentId) return "负责人";
   const info = props.teammates[agentId];
   return info?.name ?? agentId.split("::")[0];
 }
@@ -67,7 +69,7 @@ const timeline = computed<TimelineEntry[]>(() => {
         fromName: agentName(m.fromAgentId),
         fromRole: m.fromRole,
         fromColor: agentDisplayColor(m.fromAgentId, m.fromRole),
-        toName: m.toAgentId === "*" ? "all" : agentName(m.toAgentId),
+        toName: m.toAgentId === "*" ? "全员" : agentName(m.toAgentId),
         toRole,
         toColor: m.toAgentId === "*" ? roleColor("broadcast") : agentDisplayColor(m.toAgentId, toRole),
         text: m.text,
@@ -89,7 +91,7 @@ const timeline = computed<TimelineEntry[]>(() => {
       if (msg.role === "user") {
         entries.push({
           id: msg.id,
-          fromName: "leader",
+          fromName: "负责人",
           fromRole: "leader",
           fromColor: roleColor("leader"),
           toName: name,
@@ -106,7 +108,7 @@ const timeline = computed<TimelineEntry[]>(() => {
           fromName: name,
           fromRole: role,
           fromColor: color,
-          toName: "leader",
+          toName: "负责人",
           toRole: "leader",
           toColor: roleColor("leader"),
           text: msg.content,
@@ -166,57 +168,74 @@ const kindColor = (kind: string): string => {
 
 const kindLabel = (kind: string): string => {
   switch (kind) {
-    case "shutdown": return "Shutdown";
-    case "leader_message": return "Leader";
-    case "peer_message": return "Peer";
-    case "broadcast": return "Broadcast";
-    case "task_message": return "Task";
-    case "question": return "Question";
-    case "answer": return "Answer";
-    case "proposal": return "Proposal";
-    case "objection": return "Objection";
-    case "decision": return "Decision";
-    case "handoff": return "Handoff";
-    case "review_request": return "Review";
-    case "fix_request": return "Fix";
-    case "task_result": return "Result";
-    case "blocked": return "Blocked";
-    case "permission_request": return "Permission";
-    case "permission_response": return "Permission";
-    case "plan_approval": return "Plan";
-    case "worker_summary": return "Summary";
+    case "shutdown": return "停止";
+    case "leader_message": return "负责人";
+    case "peer_message": return "成员";
+    case "broadcast": return "广播";
+    case "task_message": return "任务";
+    case "question": return "提问";
+    case "answer": return "回答";
+    case "proposal": return "建议";
+    case "objection": return "异议";
+    case "decision": return "决定";
+    case "handoff": return "交接";
+    case "review_request": return "审查";
+    case "fix_request": return "修复";
+    case "task_result": return "结果";
+    case "blocked": return "阻塞";
+    case "permission_request": return "权限";
+    case "permission_response": return "权限";
+    case "plan_approval": return "计划";
+    case "worker_summary": return "摘要";
     default: return kind;
   }
 };
 
 const formatTime = (ts: number): string => {
   const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 };
 
-// Auto-scroll to bottom when timeline grows
+// Auto-scroll to bottom when timeline grows, unless the user scrolled up.
 watch(
   () => timeline.value.length,
   async () => {
+    if (!shouldAutoScroll.value) return;
     await nextTick();
-    const el = scrollContainer.value;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-    }
+    scrollToBottom();
   }
 );
+
+onMounted(async () => {
+  if (timeline.value.length > 0) {
+    await nextTick();
+    scrollToBottom();
+  }
+});
+
+function scrollToBottom(): void {
+  const el = scrollContainer.value;
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
+function handleScroll(): void {
+  const el = scrollContainer.value;
+  if (!el) return;
+  const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+  shouldAutoScroll.value = distance <= 48;
+}
 </script>
 
 <template>
   <div class="team-timeline" :class="{ 'team-timeline--compact': compact }">
     <div v-if="!compact" class="team-timeline__header">
       <v-icon icon="mdi-message-text-outline" size="16" />
-      <span>Team messages</span>
+      <span>团队消息</span>
       <span class="team-timeline__count">{{ timeline.length }}</span>
     </div>
-    <div ref="scrollContainer" class="team-timeline__body">
+    <div ref="scrollContainer" class="team-timeline__body" @scroll="handleScroll">
       <div v-if="timeline.length === 0" class="team-timeline__empty">
-        No messages yet
+        暂无消息
       </div>
       <div
         v-for="entry in timeline"
@@ -256,6 +275,15 @@ watch(
         <div class="team-timeline__content">{{ entry.text }}</div>
       </div>
     </div>
+    <div v-if="!shouldAutoScroll && timeline.length > 0" class="team-timeline__scroll-btn">
+      <v-btn
+        size="x-small"
+        variant="flat"
+        icon="mdi-chevron-down"
+        color="primary"
+        @click="shouldAutoScroll = true; scrollToBottom()"
+      />
+    </div>
   </div>
 </template>
 
@@ -269,6 +297,7 @@ watch(
   border-radius: var(--pix-radius-lg);
   overflow: hidden;
   background: var(--pix-bg-card);
+  position: relative;
 }
 
 .team-timeline--compact {
@@ -352,7 +381,7 @@ watch(
   font-size: 9px;
   font-weight: var(--pix-weight-semibold);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   padding: 1px 4px;
   border-radius: 3px;
   border: 1px solid;
@@ -386,5 +415,12 @@ watch(
 
 .team-timeline--compact .team-timeline__content {
   max-height: 72px;
+}
+
+.team-timeline__scroll-btn {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  z-index: 1;
 }
 </style>

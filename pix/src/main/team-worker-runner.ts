@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { TeammateChatMessage, TeamMessage, TeammateRole } from "../shared/types.js";
 import {
+  ABORT_TIMEOUT_MS,
   IDLE_POLL_INTERVAL_MS,
   LEADER_AGENT_NAME,
   PROTOCOL_MESSAGE_KINDS,
@@ -39,6 +40,7 @@ export class WorkerRunner {
   private _lifecycleAbortController: AbortController;
   private _running = false;
   private _disposed = false;
+  private _abortPromise: Promise<void> | null = null;
 
   constructor(
     agentId: string,
@@ -100,11 +102,18 @@ export class WorkerRunner {
    * Uses session.abort() for proper in-flight cancellation, then the worker
    * returns to idle and waits for the next message.
    */
-  abortCurrentTurn(): void {
+  async abortCurrentTurn(): Promise<void> {
+    if (this._abortPromise) {
+      await this._awaitAbort();
+      return;
+    }
+
     this._teamManager.logTeamDebug("worker_runner.abort_current_turn", {
       agentId: this._agentId,
       status: this._workerState.info.status,
       hasWorkAbortController: Boolean(this._workerState.workAbortController),
+      turnId: this._workerState.activeTurnId,
+      runtimeEpoch: this._workerState.activeTurnEpoch,
     });
     // Signal the work-level abort controller (used by _waitForIdle race)
     this._workerState.workAbortController?.abort();
@@ -115,13 +124,40 @@ export class WorkerRunner {
 
     // Also call session.abort() which properly cancels the agent run,
     // aborts retries, and waits for idle
-    void this._session.abort().catch((err) => {
+    this._session.clearQueue();
+    this._abortPromise = this._session.abort().catch((err) => {
       console.error(`[TeamManager] Error during session.abort() for ${this._agentId}:`, err);
       this._teamManager.logTeamDebug("worker_runner.abort_current_turn.error", {
         agentId: this._agentId,
         error: err,
       });
+    }).finally(() => {
+      this._abortPromise = null;
     });
+    await this._awaitAbort();
+  }
+
+  /**
+   * Await the in-flight session.abort() with a hard ceiling. A tool call that
+   * ignores the abort signal would otherwise keep the Stop-turn / Stop-team
+   * buttons and mode switches blocked indefinitely; when the ceiling is hit the
+   * abort returns to the caller while the session may keep winding down in the
+   * background (the health check's stuck-turn recovery still bounds the worst
+   * case).
+   */
+  private async _awaitAbort(): Promise<void> {
+    if (!this._abortPromise) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this._abortPromise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, ABORT_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** Dispose the worker: abort lifecycle, dispose session. */
@@ -179,12 +215,17 @@ export class WorkerRunner {
     // Idle loop: wait for messages, execute, repeat.
     // Workers persist indefinitely; only lifecycle abort or dispose breaks the loop.
     while (!signal.aborted && !this._disposed) {
+      if (!this._teamManager.isRuntimeActive()) {
+        await sleep(IDLE_POLL_INTERVAL_MS, signal);
+        continue;
+      }
       this._teamManager.updateWorkerStatus(this._agentId, "idle");
       this._teamManager.logTeamDebug("worker_runner.wait_for_message", { agentId: this._agentId });
 
       const next = await this._waitForNextMessage(signal);
       if (!next || signal.aborted || this._disposed) break;
       const { message, taskId, shutdownDecision } = next;
+      if (!this._teamManager.isRuntimeActive()) continue;
 
       this._teamManager.updateWorkerStatus(this._agentId, "running");
       this._workerState.info.lastActiveAt = Date.now();
@@ -247,14 +288,24 @@ export class WorkerRunner {
    * - session.abort() is called by abortCurrentTurn() for proper in-flight cancellation
    */
   private async _executeTurn(text: string, signal: AbortSignal, taskId: string | null, reportOutcome = true): Promise<void> {
-    if (signal.aborted) return;
+    if (signal.aborted || !this._teamManager.isRuntimeActive()) return;
 
     // Create a work-level AbortController for this turn
     const workController = new AbortController();
     this._workerState.workAbortController = workController;
+    const turnId = randomUUID();
+    const runtimeEpoch = this._teamManager.getRuntimeEpoch();
+    this._workerState.activeTurnId = turnId;
+    this._workerState.activeTurnEpoch = runtimeEpoch;
+    // Reset the per-turn leader-message flag so the outcome handler can tell
+    // whether this turn already delivered content to the leader on its own.
+    this._workerState.sentLeaderMessageThisTurn = false;
     const turnStartedAt = Date.now();
     this._teamManager.logTeamDebug("worker_runner.turn.start", {
       agentId: this._agentId,
+      turnId,
+      runtimeEpoch,
+      taskId,
       prompt: summarizeText(text, 2_000),
     });
 
@@ -267,7 +318,18 @@ export class WorkerRunner {
 
       // Lifecycle abort: worker is being torn down; do not touch task state.
       if (idleResult === "lifecycle_aborted") {
-        this._teamManager.logTeamDebug("worker_runner.turn.lifecycle_aborted", { agentId: this._agentId });
+        this._teamManager.logTeamDebug("worker_runner.turn.lifecycle_aborted", { agentId: this._agentId, turnId, runtimeEpoch });
+        return;
+      }
+
+      if (!this._teamManager.isRuntimeEpochCurrent(runtimeEpoch)) {
+        this._teamManager.logTeamDebug("worker_runner.turn.stale", {
+          agentId: this._agentId,
+          turnId,
+          runtimeEpoch,
+          currentRuntimeEpoch: this._teamManager.getRuntimeEpoch(),
+          reason: "runtime_epoch_changed",
+        });
         return;
       }
 
@@ -275,6 +337,9 @@ export class WorkerRunner {
       const lastAssistant = this._session.getLastAssistantText();
       this._teamManager.logTeamDebug("worker_runner.turn.idle", {
         agentId: this._agentId,
+        turnId,
+        runtimeEpoch,
+        taskId,
         durationMs: Date.now() - turnStartedAt,
         outcome: idleResult,
         assistant: summarizeText(lastAssistant ?? "", 2_000),
@@ -297,50 +362,69 @@ export class WorkerRunner {
       // failed turn so the leader is woken to decide next steps.
       if (idleResult === "work_aborted") {
         if (reportOutcome) {
-          this._teamManager.handleWorkerTurnFailed(this._agentId, "Worker turn was interrupted before completion.", taskId);
+          this._teamManager.handleWorkerTurnFailed(this._agentId, "Worker turn was aborted.", taskId, runtimeEpoch, turnId);
         }
+        this._teamManager.logTeamDebug("worker_runner.turn.work_aborted", { agentId: this._agentId, turnId, runtimeEpoch, taskId });
         this._workerState.info.lastActiveAt = Date.now();
         return;
       }
       if (idleResult === "timeout") {
         if (reportOutcome) {
-          this._teamManager.handleWorkerTurnFailed(this._agentId, "Worker turn timed out before reaching idle.", taskId);
+          this._teamManager.handleWorkerTurnFailed(this._agentId, "Worker turn timed out before reaching idle.", taskId, runtimeEpoch, turnId);
         }
         this._workerState.info.lastActiveAt = Date.now();
         return;
       }
 
       if (reportOutcome) {
-        this._teamManager.handleWorkerTurnFinished(this._agentId, lastAssistant, taskId);
+        this._teamManager.handleWorkerTurnFinished(this._agentId, lastAssistant, taskId, runtimeEpoch, turnId);
       }
       this._workerState.info.lastActiveAt = Date.now();
     } catch (err) {
       if (signal.aborted) {
         // Lifecycle abort: worker is being shut down.
-        this._teamManager.logTeamDebug("worker_runner.turn.lifecycle_aborted", { agentId: this._agentId });
+        this._teamManager.logTeamDebug("worker_runner.turn.lifecycle_aborted", { agentId: this._agentId, turnId, runtimeEpoch });
         return;
       }
       if (workController.signal.aborted) {
         // Work abort: turn was interrupted, worker will return to idle.
-        this._teamManager.logTeamDebug("worker_runner.turn.work_aborted", { agentId: this._agentId });
         if (reportOutcome) {
-          this._teamManager.handleWorkerTurnFailed(this._agentId, "Worker turn was interrupted before completion.", taskId);
+          this._teamManager.handleWorkerTurnFailed(this._agentId, "Worker turn was aborted.", taskId, runtimeEpoch, turnId);
         }
+        this._teamManager.logTeamDebug("worker_runner.turn.work_aborted", { agentId: this._agentId, turnId, runtimeEpoch, taskId });
+        return;
+      }
+      if (!this._teamManager.isRuntimeEpochCurrent(runtimeEpoch)) {
+        this._teamManager.logTeamDebug("worker_runner.turn.stale", {
+          agentId: this._agentId,
+          turnId,
+          runtimeEpoch,
+          currentRuntimeEpoch: this._teamManager.getRuntimeEpoch(),
+          reason: "runtime_epoch_changed_during_error",
+        });
         return;
       }
       this._teamManager.logTeamDebug("worker_runner.turn.failed", {
         agentId: this._agentId,
+        turnId,
+        runtimeEpoch,
         error: err,
       });
       if (reportOutcome) {
-        this._teamManager.handleWorkerTurnFailed(this._agentId, err instanceof Error ? err.message : String(err), taskId);
+        this._teamManager.handleWorkerTurnFailed(this._agentId, err instanceof Error ? err.message : String(err), taskId, runtimeEpoch, turnId);
       }
       // Actual error: re-throw so _runLoop can catch and decide.
       throw err;
     } finally {
       this._workerState.workAbortController = null;
+      if (this._workerState.activeTurnId === turnId) {
+        this._workerState.activeTurnId = undefined;
+        this._workerState.activeTurnEpoch = undefined;
+      }
       this._teamManager.logTeamDebug("worker_runner.turn.end", {
         agentId: this._agentId,
+        turnId,
+        runtimeEpoch,
         durationMs: Date.now() - turnStartedAt,
       });
     }
@@ -360,6 +444,11 @@ export class WorkerRunner {
 
     type IdleOutcome = "idle" | "work_aborted" | "lifecycle_aborted" | "timeout";
     const timeoutController = new AbortController();
+    // Track the abort listeners so we can detach them in finally. The
+    // lifecycleSignal is long-lived (per worker); without removal each turn
+    // would strand one listener on it, accumulating over the worker's lifetime.
+    let workAbortListener: (() => void) | null = null;
+    let lifecycleAbortListener: (() => void) | null = null;
     try {
       // Race: agent idle vs work abort vs lifecycle abort vs hard ceiling.
       // Inactivity-based stuck-turn recovery is the health check's job (it
@@ -373,11 +462,13 @@ export class WorkerRunner {
         this._session.agent.waitForIdle().then(() => "idle" as const),
         new Promise<IdleOutcome>((resolve) => {
           if (workSignal.aborted) { resolve("work_aborted"); return; }
-          workSignal.addEventListener("abort", () => resolve("work_aborted"), { once: true });
+          workAbortListener = () => resolve("work_aborted");
+          workSignal.addEventListener("abort", workAbortListener, { once: true });
         }),
         new Promise<IdleOutcome>((resolve) => {
           if (lifecycleSignal.aborted) { resolve("lifecycle_aborted"); return; }
-          lifecycleSignal.addEventListener("abort", () => resolve("lifecycle_aborted"), { once: true });
+          lifecycleAbortListener = () => resolve("lifecycle_aborted");
+          lifecycleSignal.addEventListener("abort", lifecycleAbortListener, { once: true });
         }),
         sleep(WORKER_TURN_HARD_TIMEOUT_MS, timeoutController.signal).then(() => "timeout" as const),
       ]);
@@ -406,6 +497,11 @@ export class WorkerRunner {
       });
       throw err;
     } finally {
+      // Detach abort listeners that never fired (e.g. race resolved via the
+      // "idle" path). If they did fire, { once: true } already removed them
+      // and removeEventListener is a harmless no-op.
+      if (workAbortListener) workSignal.removeEventListener("abort", workAbortListener);
+      if (lifecycleAbortListener) lifecycleSignal.removeEventListener("abort", lifecycleAbortListener);
       timeoutController.abort();
     }
   }
@@ -424,6 +520,10 @@ export class WorkerRunner {
    */
   private async _waitForNextMessage(signal: AbortSignal): Promise<{ message: TeamMessage; taskId: string | null; shutdownDecision?: boolean } | null> {
     while (!signal.aborted && !this._disposed) {
+      if (!this._teamManager.isRuntimeActive()) {
+        await sleep(IDLE_POLL_INTERVAL_MS, signal);
+        continue;
+      }
       // 1. Check bus for pending messages (priority-ordered). Messages take priority over tasks.
       const message = this._bus.consumeNext(this._agentId);
       if (message) {
@@ -541,6 +641,7 @@ export class WorkerRunner {
       }
 
       // 2. Try to auto-claim a task from the shared task list
+      if (!this._teamManager.isRuntimeActive()) continue;
       const claimed = this._teamManager.tryClaimNextTask(this._agentId);
       if (claimed) {
         this._teamManager.logTeamDebug("worker_runner.auto_claim", {

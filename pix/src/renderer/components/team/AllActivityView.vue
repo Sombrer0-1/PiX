@@ -57,7 +57,7 @@ function handleScroll(): void {
 }
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function agentName(agentId: string): string {
@@ -80,20 +80,20 @@ function agentColor(agentId: string): string {
 function eventSummary(tagged: TaggedSessionEvent): string {
   const ev = tagged.event;
   switch (ev.type) {
-    case "tool_execution_start": return `Started ${ev.toolName}`;
-    case "tool_execution_end": return ev.isError ? `Error in ${ev.toolName}` : `Completed ${ev.toolName}`;
+    case "tool_execution_start": return `开始执行 ${ev.toolName}`;
+    case "tool_execution_end": return ev.isError ? `${ev.toolName} 执行出错` : `${ev.toolName} 执行完成`;
     case "message_update":
     case "message_start":
     case "message_end":
-      return "Message update";
-    case "file_change": return `${ev.toolName}: ${ev.change.filePath} (+${ev.change.addedLines}/-${ev.change.removedLines})`;
-    case "turn_start": return "Turn started";
-    case "turn_end": return "Turn completed";
-    case "agent_start": return "Agent started";
-    case "agent_end": return "Agent ended";
-    case "compaction_start": return "Compacting...";
-    case "compaction_end": return "Compaction done";
-    case "verification_gate": return "Verification gate";
+      return "消息更新";
+    case "file_change": return `${ev.toolName}: ${ev.change.path || "(未知文件)"} (+${ev.change.added}/-${ev.change.removed})`;
+    case "turn_start": return "新一轮开始";
+    case "turn_end": return "本轮完成";
+    case "agent_start": return "Agent 已启动";
+    case "agent_end": return "Agent 已结束";
+    case "compaction_start": return "正在压缩上下文...";
+    case "compaction_end": return "上下文压缩完成";
+    case "verification_gate": return "等待完成前验证";
     default: return ev.type;
   }
 }
@@ -102,7 +102,7 @@ function isFileChangeEvent(ev: AgentSessionEvent): ev is {
   type: "file_change";
   toolCallId: string;
   toolName: string;
-  change: { filePath: string; addedLines: number; removedLines: number };
+  change: { path?: string; added: number; removed: number };
   aggregate: unknown;
 } {
   return ev.type === "file_change";
@@ -121,7 +121,7 @@ function isToolEnd(ev: AgentSessionEvent): ev is { type: "tool_execution_end"; t
   <div class="all-activity-view">
     <div v-if="allEvents.length === 0" class="aav-empty">
       <v-icon icon="mdi-clock-outline" size="36" color="grey-lighten-1" />
-      <p>No activity yet. Waiting for workers...</p>
+      <p>暂无活动，正在等待团队成员...</p>
     </div>
 
     <div

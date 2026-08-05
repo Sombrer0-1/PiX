@@ -75,6 +75,12 @@ export class TeamMessageBus {
     }
   }
 
+  /** Record a message in the durable timeline without creating a mailbox item. */
+  recordHistoryOnly(message: TeamMessage): void {
+    if (message.toAgentId === message.fromAgentId) return;
+    this._recordHistory(message);
+  }
+
   /**
    * Read and remove the highest-priority pending message for the given agent.
    * Merges the agent's dedicated queue with undelivered broadcasts,
@@ -143,6 +149,15 @@ export class TeamMessageBus {
   clearAgent(agentId: string): void {
     this._queues.delete(agentId);
     this._deliveredBroadcasts.delete(agentId);
+  }
+
+  /** Clear pending mailbox messages while preserving the append-only history. */
+  clearPending(): number {
+    const removed = this.size();
+    this._queues.clear();
+    this._broadcasts.length = 0;
+    this._deliveredBroadcasts.clear();
+    return removed;
   }
 
   /** Clear all messages for the entire team. */

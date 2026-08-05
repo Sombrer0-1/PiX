@@ -6,8 +6,10 @@
  * Read-only; server configuration is managed via mcp.json files.
  */
 import { ref, onMounted } from "vue";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import type { McpServerInfo, McpConfigInfo } from "../../../shared/types";
 
+const rpc = useWorkspaceRpc();
 const loading = ref(true);
 const servers = ref<McpServerInfo[]>([]);
 const configInfo = ref<McpConfigInfo>({ configPaths: [], errors: [] });
@@ -32,8 +34,8 @@ async function load(): Promise<void> {
   error.value = "";
   try {
     const [s, c] = await Promise.all([
-      window.pixApi.mcpGetServers(),
-      window.pixApi.mcpGetConfig(),
+      rpc.mcpGetServers(),
+      rpc.mcpGetConfig(),
     ]);
     servers.value = s;
     configInfo.value = c;
@@ -46,7 +48,7 @@ async function load(): Promise<void> {
 
 async function refresh(): Promise<void> {
   try {
-    await window.pixApi.sendCommand({ type: "reload_resources" });
+    await rpc.reloadResources();
     // Wait briefly for MCP servers to reconnect
     await new Promise((r) => setTimeout(r, 500));
   } catch {
@@ -57,7 +59,7 @@ async function refresh(): Promise<void> {
 
 function truncatedStderr(stderr: string): string {
   const max = 2000;
-  return stderr.length > max ? stderr.slice(-max) + "\n... (truncated)" : stderr;
+  return stderr.length > max ? stderr.slice(-max) + "\n...（已截断）" : stderr;
 }
 
 onMounted(load);

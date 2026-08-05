@@ -24,6 +24,10 @@ export interface OrchestrationEvent {
   messageText?: string;
   result?: string;
   attempts?: number;
+  /** Internal source identity used to suppress duplicate wakes. */
+  sourceId?: string;
+  /** Runtime epoch that produced this event. Stale epochs are never retried. */
+  runtimeEpoch?: number;
 }
 
 export interface OrchestrationRetryPlan {
@@ -38,6 +42,7 @@ const MAX_ORCHESTRATOR_WAKE_ATTEMPTS = 5;
 export const ORCHESTRATOR_WAKE_BASE_RETRY_MS = 500;
 const ORCHESTRATOR_WAKE_MAX_RETRY_MS = 10_000;
 const ORCHESTRATOR_WAKE_CIRCUIT_BREAK_MS = 30_000;
+export const MAX_COORDINATION_GENERATION = 3;
 
 export type TeamResultSignal = "issues" | "passed" | "unknown";
 
@@ -62,6 +67,8 @@ export function planOrchestrationRetry(events: OrchestrationEvent[]): Orchestrat
 
 export class OrchestrationEventQueue {
   private readonly _events: OrchestrationEvent[] = [];
+  private readonly _eventKeys = new Set<string>();
+  private readonly _inFlightKeys = new Set<string>();
 
   get length(): number {
     return this._events.length;
@@ -71,18 +78,34 @@ export class OrchestrationEventQueue {
     return this._events.length > 0;
   }
 
-  enqueue(event: OrchestrationEvent): void {
+  enqueue(event: OrchestrationEvent): boolean {
+    const key = orchestrationEventKey(event);
+    if (this._eventKeys.has(key)) return false;
     this._events.push({ ...event });
+    this._eventKeys.add(key);
+    return true;
   }
 
   takeAll(): OrchestrationEvent[] {
     const events = this._events.map((event) => ({ ...event }));
     this._events.length = 0;
+    for (const event of events) this._inFlightKeys.add(orchestrationEventKey(event));
     return events;
   }
 
   requeueFront(events: OrchestrationEvent[]): void {
-    this._events.unshift(...events.map((event) => ({ ...event })));
+    const accepted: OrchestrationEvent[] = [];
+    for (const event of events) {
+      const key = orchestrationEventKey(event);
+      if (this._inFlightKeys.has(key)) {
+        this._inFlightKeys.delete(key);
+        this._eventKeys.delete(key);
+      }
+      if (this._eventKeys.has(key)) continue;
+      this._eventKeys.add(key);
+      accepted.push({ ...event });
+    }
+    this._events.unshift(...accepted);
   }
 
   requeueFailed(events: OrchestrationEvent[]): OrchestrationRetryPlan {
@@ -93,6 +116,17 @@ export class OrchestrationEventQueue {
 
   clear(): void {
     this._events.length = 0;
+    this._eventKeys.clear();
+    this._inFlightKeys.clear();
+  }
+
+  /** Confirm successful processing of an in-flight event batch. */
+  ack(events: OrchestrationEvent[]): void {
+    for (const event of events) {
+      const key = orchestrationEventKey(event);
+      this._inFlightKeys.delete(key);
+      this._eventKeys.delete(key);
+    }
   }
 
   snapshot(): OrchestrationEvent[] {
@@ -120,9 +154,10 @@ export async function processOrchestrationWakeQueue(options: {
   canProcess: () => boolean;
   buildPrompt: (events: OrchestrationEvent[]) => string;
   scheduleRetry: (delayMs: number) => void;
+  canRetry?: (events: OrchestrationEvent[]) => boolean;
   onWakeFailed?: (error: unknown, retry: OrchestrationRetryPlan) => void;
 }): Promise<OrchestrationWakeProcessResult> {
-  const { queue, session, canProcess, buildPrompt, scheduleRetry, onWakeFailed } = options;
+  const { queue, session, canProcess, buildPrompt, scheduleRetry, canRetry, onWakeFailed } = options;
   const result: OrchestrationWakeProcessResult = {
     prompted: 0,
     retried: false,
@@ -142,11 +177,22 @@ export async function processOrchestrationWakeQueue(options: {
     }
 
     const events = queue.takeAll();
-    const prompt = buildPrompt(events);
     try {
+      const prompt = buildPrompt(events);
       await session.prompt(prompt, { expandPromptTemplates: false });
+      queue.ack(events);
       result.prompted++;
     } catch (error) {
+      if (canRetry && !canRetry(events)) {
+        queue.ack(events);
+        onWakeFailed?.(error, {
+          events: [],
+          attempts: 0,
+          delayMs: 0,
+          circuitOpen: true,
+        });
+        return result;
+      }
       const retry = queue.requeueFailed(events);
       onWakeFailed?.(error, retry);
       scheduleRetry(retry.delayMs);
@@ -440,4 +486,13 @@ export function classifyTeamResult(result?: string): TeamResultSignal {
   if (negative && !noIssues) return "issues";
   if (positive) return "passed";
   return "unknown";
+}
+
+function orchestrationEventKey(event: OrchestrationEvent): string {
+  return [
+    event.runtimeEpoch ?? 0,
+    event.type,
+    event.sourceId ?? event.taskId ?? event.fromAgentId ?? "",
+    event.messageKind ?? "",
+  ].join("|");
 }

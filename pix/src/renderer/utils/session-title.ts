@@ -72,5 +72,5 @@ export function formatSessionTime(value: string | number | Date | undefined): st
   if (diff < 2 * day) return "昨天";
   if (diff < 7 * day) return `${Math.floor(diff / day)} 天`;
 
-  return new Date(time).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return new Date(time).toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }

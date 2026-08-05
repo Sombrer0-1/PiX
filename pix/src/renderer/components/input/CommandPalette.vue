@@ -6,10 +6,11 @@
  * Shows available commands filtered by the search text.
  */
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { useCommandsStore } from "../../stores/commands-store";
+import type { RpcSlashCommand } from "@/types/rpc";
 
 const props = defineProps<{
   search: string;
+  commands: RpcSlashCommand[];
 }>();
 
 const emit = defineEmits<{
@@ -17,11 +18,17 @@ const emit = defineEmits<{
   close: [];
 }>();
 
-const commandsStore = useCommandsStore();
 const selectedIndex = ref(0);
 
 const results = computed(() => {
-  return commandsStore.searchCommands(props.search).slice(0, 10);
+  const query = props.search.toLowerCase().replace(/^\//, "");
+  const commands = query
+    ? props.commands.filter((command) =>
+        command.name.toLowerCase().includes(query) ||
+        (command.description?.toLowerCase().includes(query) ?? false),
+      )
+    : props.commands;
+  return commands.slice(0, 10);
 });
 
 // Reset selection when results change
@@ -65,10 +72,10 @@ onUnmounted(() => {
 
 function getSourceLabel(source: string): string {
   switch (source) {
-    case "builtin": return "built-in";
-    case "skill": return "skill";
-    case "prompt": return "prompt";
-    case "extension": return "ext";
+    case "builtin": return "内置";
+    case "skill": return "技能";
+    case "prompt": return "提示";
+    case "extension": return "扩展";
     default: return "";
   }
 }
@@ -90,7 +97,7 @@ function getSourceLabel(source: string): string {
       </button>
     </div>
     <div class="palette-hint">
-      <span>&uarr;&darr; to navigate, Enter to select, Esc to close</span>
+      <span>&uarr;&darr; 移动，Enter 选择，Esc 关闭</span>
     </div>
   </div>
 </template>

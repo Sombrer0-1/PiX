@@ -16,6 +16,7 @@ import type { OrchestrationEvent } from "./team-orchestration.js";
 
 export interface TeamToolHost {
   getTeam(): TeamData | null;
+  isRuntimeActive(): boolean;
   setLeaderTurnActive(active: boolean): void;
   scheduleOrchestratorQueue(delayMs?: number): void;
   sendTeamMessage(fromAgentId: string, toAgentId: string, text: string, summary?: string, kind?: MessageKind): Promise<void>;

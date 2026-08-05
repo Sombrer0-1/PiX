@@ -13,6 +13,7 @@ import {
   buildTeamOrchestrationPrompt,
   buildTeamOrchestrationBrief,
   classifyTeamResult,
+  MAX_COORDINATION_GENERATION,
   normalizeRestoredTeamTasks,
   OrchestrationEventQueue,
   planOrchestrationRetry,
@@ -192,6 +193,37 @@ console.log("\n=== TeamMessageBus Tests ===\n");
 }
 
 console.log("\n=== TeamTaskList Tests ===\n");
+
+// Test 4e: abort clears pending mailboxes but preserves the timeline
+{
+  const bus = new TeamMessageBus();
+  const pending: TeamMessage = {
+    id: "pending-after-abort",
+    teamName: "t",
+    fromAgentId: "leader",
+    toAgentId: "worker",
+    text: "pending",
+    timestamp: Date.now(),
+    read: false,
+    delivered: false,
+    summary: "pending",
+    kind: "leader_message",
+    fromRole: "leader",
+  };
+  const historyOnly: TeamMessage = {
+    ...pending,
+    id: "history-only",
+    toAgentId: "leader",
+    fromAgentId: "worker",
+    fromRole: "coder",
+  };
+  bus.send(pending);
+  bus.recordHistoryOnly(historyOnly);
+  assertEqual(bus.size(), 1, "History-only Leader message does not enter a worker mailbox");
+  assertEqual(bus.clearPending(), 1, "Abort clears pending mailbox entries");
+  assertEqual(bus.size(), 0, "Pending mailbox is empty after clearPending");
+  assertEqual(bus.history().length, 2, "clearPending preserves both timeline messages");
+}
 
 // Test 5: Create and get task
 {
@@ -537,6 +569,22 @@ console.log("\n=== TeamTaskList Tests ===\n");
   assertEqual(queue.hasPending, false, "Queue clear removes pending events");
 }
 
+// Test 16b: orchestration wakes deduplicate by source and epoch
+{
+  const queue = new OrchestrationEventQueue();
+  const event: OrchestrationEvent = {
+    type: "team_message",
+    sourceId: "message-1",
+    runtimeEpoch: 7,
+    messageKind: "question",
+  };
+  assertEqual(queue.enqueue(event), true, "First orchestration event is accepted");
+  assertEqual(queue.enqueue(event), false, "Duplicate orchestration event is ignored");
+  assertEqual(queue.length, 1, "Duplicate wake does not grow the queue");
+  queue.clear();
+  assertEqual(queue.enqueue({ ...event, runtimeEpoch: 8 }), true, "A new runtime epoch is accepted");
+}
+
 // Test 17: orchestration wake runtime with fake leader session
 {
   const queue = new OrchestrationEventQueue();
@@ -589,6 +637,33 @@ console.log("\n=== TeamTaskList Tests ===\n");
   assertEqual(streaming.deferred, true, "Wake runtime defers while leader is streaming");
   assertEqual(streamingQueue.hasPending, true, "Streaming deferral keeps events queued");
   assertEqual(streamingScheduled[0], 500, "Streaming deferral schedules base retry");
+}
+
+// Test 17b: a stale wake batch is dropped instead of requeued after abort
+{
+  const queue = new OrchestrationEventQueue();
+  queue.enqueue({ type: "team_message", sourceId: "stale", runtimeEpoch: 1 });
+  const scheduled: number[] = [];
+  const result = await processOrchestrationWakeQueue({
+    queue,
+    session: {
+      isStreaming: false,
+      prompt: async () => { throw new Error("aborted"); },
+    },
+    canProcess: () => true,
+    canRetry: () => false,
+    buildPrompt: () => "stale",
+    scheduleRetry: (delayMs) => scheduled.push(delayMs),
+  });
+  assertEqual(result.retried, false, "Stale wake is not retried");
+  assertEqual(queue.hasPending, false, "Stale wake is removed from the queue");
+  assertEqual(scheduled.length, 0, "Stale wake does not schedule another prompt");
+}
+
+// Test 17c: automatic review/fix follow-ups have a bounded generation
+{
+  assertEqual(MAX_COORDINATION_GENERATION, 3, "Coordination generation has a bounded safety limit");
+  assert(MAX_COORDINATION_GENERATION > 0, "Coordination limit preserves the normal review/fix workflow");
 }
 
 // Test 18: task status transition policy

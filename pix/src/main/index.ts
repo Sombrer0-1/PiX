@@ -20,9 +20,10 @@ const __dirname = dirname(__filename);
 let mainWindow: BrowserWindow | null = null;
 /** Mutable ref that always points to the current active window (survives close/reopen). */
 let activeWin: BrowserWindow | null = null;
-let sessionBridge: SessionBridge | null = null;
+let singleSessionBridge: SessionBridge | null = null;
+let teamLeaderSessionBridge: SessionBridge | null = null;
 let settingsStore: SettingsStore;
-let teamManager: TeamManager;
+let teamManager: TeamManager | null = null;
 
 function isSafeExternalUrl(url: string): boolean {
   try {
@@ -114,11 +115,18 @@ async function cleanup(): Promise<void> {
       console.error("[main] Error during team manager cleanup:", err);
     }
   }
-  if (sessionBridge) {
+  if (teamLeaderSessionBridge) {
     try {
-      await sessionBridge.dispose();
+      await teamLeaderSessionBridge.dispose();
     } catch (err) {
-      console.error("[main] Error during session bridge cleanup:", err);
+      console.error("[main] Error during team leader session cleanup:", err);
+    }
+  }
+  if (singleSessionBridge) {
+    try {
+      await singleSessionBridge.dispose();
+    } catch (err) {
+      console.error("[main] Error during single session cleanup:", err);
     }
   }
 }
@@ -135,9 +143,9 @@ app.whenReady().then(() => {
   }
 
   try {
-    sessionBridge = new SessionBridge();
+    singleSessionBridge = new SessionBridge({ role: "single" });
   } catch (err) {
-    console.error("[main] SessionBridge FAILED:", err);
+    console.error("[main] Single SessionBridge FAILED:", err);
     throw err;
   }
 
@@ -149,25 +157,28 @@ app.whenReady().then(() => {
   }
 
   // Wire TeamManager → SessionBridge so Leader tools are registered on the main session
-  if (sessionBridge && teamManager) {
-    sessionBridge.setTeamManager(teamManager);
+  try {
+    teamLeaderSessionBridge = new SessionBridge({ role: "team-leader", teamManager: teamManager ?? undefined });
+  } catch (err) {
+    console.error("[main] Team leader SessionBridge FAILED:", err);
+    throw err;
   }
 
   createWindow();
   activeWin = mainWindow;
 
-  if (activeWin) {
-    registerIpcHandlers(activeWin, sessionBridge, settingsStore, teamManager);
-    setupEventForwarding(() => activeWin, sessionBridge, teamManager);
+  if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager) {
+    registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager);
+    setupEventForwarding(() => activeWin, singleSessionBridge, teamLeaderSessionBridge, teamManager);
   }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
       activeWin = mainWindow;
-      if (activeWin && sessionBridge) {
+      if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager) {
         // Re-register IPC handlers for the new window (handler guard prevents duplicates)
-        registerIpcHandlers(activeWin, sessionBridge, settingsStore, teamManager);
+        registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager);
         // Event forwarding is already set up with a getter; updating activeWin is enough.
       }
     }

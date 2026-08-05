@@ -25,7 +25,7 @@ function api(): PixApi {
       sendCommandAsync: async () => ({ success: false }),
       getSettings: async () => ({ theme: "light", recentProjects: [] }),
       setSettings: async () => ({ success: false }),
-      detectPi: async () => ({ found: true, path: "direct", note: "Direct integration" }),
+      detectPi: async () => ({ found: true, path: "direct", note: "进程内直连" }),
       getPiStderr: async () => "",
       isPiRunning: async () => false,
       onPiEvent: () => () => {},
@@ -45,7 +45,7 @@ function api(): PixApi {
       mcpGetConfig: async () => ({ configPaths: [], errors: [] }),
       mcpListResources: async () => [],
       mcpReadResource: async () => ({ server: "", contents: [] }),
-    } as PixApi;
+    } as unknown as PixApi;
   }
   return window.pixApi;
 }
@@ -84,7 +84,7 @@ export const useSettingsStore = defineStore("settings", () => {
     try {
       return await api().detectPi();
     } catch {
-      return { found: true, path: "direct", note: "Using direct AgentSession integration" };
+      return { found: true, path: "direct", note: "使用 AgentSession 进程内直连" };
     }
   }
 

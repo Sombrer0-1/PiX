@@ -4,6 +4,9 @@
  */
 
 export type {
+  ClipboardImage,
+  GuiSettings,
+  AuthStatusMap,
   RpcCommand,
   RpcSessionState,
   RpcSlashCommand,
@@ -16,4 +19,12 @@ export type {
   ThreadGoalStatus,
   RequestUserInputRequest,
   RequestUserInputResponse,
+  ThemeInfo,
+  TreeEntry,
+  UserMessageForForking,
+  ResourceStatus,
+  McpConfigInfo,
+  McpResourceContent,
+  McpResourceInfo,
+  McpServerInfo,
 } from "../../shared/types";

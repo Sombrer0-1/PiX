@@ -64,6 +64,32 @@ function resolvePackage(baseDir, name) {
   }
 }
 
+function readPackageInfo(packageDir) {
+  const packageJsonPath = join(packageDir, "package.json");
+  if (!existsSync(packageJsonPath)) return null;
+
+  try {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    if (typeof packageJson.version !== "string") return null;
+    return { dir: packageDir, version: packageJson.version };
+  } catch {
+    return null;
+  }
+}
+
+function resolveBuildPackage(baseDir, name, localPackages) {
+  const localPackage = localPackages.get(name);
+  if (localPackage) {
+    const packageInfo = readPackageInfo(localPackage.buildDir);
+    if (packageInfo) return packageInfo;
+  }
+  return resolvePackage(baseDir, name);
+}
+
+function normalizePathForCompare(value) {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
 function readDeps(pkgDir) {
   try {
     const json = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8"));
@@ -74,7 +100,7 @@ function readDeps(pkgDir) {
 }
 
 /** For one installed workspace package, compute and copy the mismatch closure. */
-function syncPackage(name, buildDir, installedDir) {
+function syncPackage(name, buildDir, installedDir, localPackages) {
   if (!existsSync(join(installedDir, "dist"))) return [];
   const nestedRoot = join(installedDir, "node_modules");
 
@@ -90,11 +116,17 @@ function syncPackage(name, buildDir, installedDir) {
   const toNest = [];
   while (queue.length) {
     const { name: dep, buildBase, pkgBase } = queue.shift();
-    const fromBuild = resolvePackage(buildBase, dep);
+    const fromBuild = resolveBuildPackage(buildBase, dep, localPackages);
     if (!fromBuild) continue; // optional/absent dependency
     const fromPkg = resolvePackage(pkgBase, dep);
 
-    if (!fromPkg || fromPkg.version !== fromBuild.version) {
+    const isLocalWorkspaceDependency = localPackages.has(dep);
+    const resolvesDifferentLocalPackage =
+      isLocalWorkspaceDependency &&
+      fromPkg &&
+      normalizePathForCompare(fromPkg.dir) !== normalizePathForCompare(fromBuild.dir);
+
+    if (!fromPkg || fromPkg.version !== fromBuild.version || resolvesDifferentLocalPackage) {
       toNest.push({ name: dep, srcDir: fromBuild.dir, version: fromBuild.version });
       // After nesting, this dep's own deps resolve from the nested location,
       // walking up through nestedRoot. Follow them from the build version.
@@ -123,12 +155,13 @@ const pixPkg = JSON.parse(readFileSync(join(PIX_DIR, "package.json"), "utf8"));
 const fileDeps = Object.entries(pixPkg.dependencies || {})
   .filter(([, spec]) => typeof spec === "string" && spec.startsWith("file:"))
   .map(([name, spec]) => ({ name, buildDir: join(PIX_DIR, spec.slice("file:".length)) }));
+const localPackages = new Map(fileDeps.map((dependency) => [dependency.name, dependency]));
 
 let total = 0;
 for (const { name, buildDir } of fileDeps) {
   const installedDir = join(PIX_MODULES, ...name.split("/"));
   if (!existsSync(installedDir) || !existsSync(buildDir)) continue;
-  const nested = syncPackage(name, buildDir, installedDir);
+  const nested = syncPackage(name, buildDir, installedDir, localPackages);
   if (nested.length) {
     total += nested.length;
     console.log(`[sync-nested-deps] ${name}: nested ${nested.join(", ")}`);

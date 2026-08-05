@@ -5,6 +5,7 @@
 import { createApp } from "vue";
 import { createPinia } from "pinia";
 import { createVuetify } from "vuetify";
+import { zhHans } from "vuetify/locale";
 import * as vuetifyComponents from "vuetify/components";
 import * as vuetifyDirectives from "vuetify/directives";
 import "vuetify/styles";
@@ -17,6 +18,11 @@ import "./types/ipc"; // Register global type declarations
 const vuetify = createVuetify({
   components: { ...vuetifyComponents },
   directives: { ...vuetifyDirectives },
+  locale: {
+    locale: "zhHans",
+    fallback: "zhHans",
+    messages: { zhHans },
+  },
   defaults: {
     global: {
       ripple: false,

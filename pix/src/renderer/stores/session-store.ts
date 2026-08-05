@@ -12,6 +12,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import type { AgentMessage, AgentSessionEvent } from "@/types/rpc";
 import type { ChatMessageAttachment, DisplayBlock, ToolWorkItem } from "@/types/session";
+import { classifyApiError } from "@/utils/api-error";
 
 function nextBlockId(): string {
   return `block_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
@@ -80,11 +81,19 @@ function parseTeammateMessageNote(text: string): string | null {
     /^<teammate-message\s+from="([^"]*)"(?:\s+role="([^"]*)")?[^>]*>\r?\n?([\s\S]*?)\r?\n?<\/teammate-message>\s*$/,
   );
   if (!match) return null;
-  const from = match[1] || "teammate";
+  const from = match[1] || "团队成员";
   const role = match[2];
   const body = (match[3] ?? "").trim();
-  const label = role && role !== from ? `${from} (${role})` : from;
-  return `Teammate report from ${label}:\n${body}`;
+  const roleLabels: Record<string, string> = {
+    planner: "规划",
+    coder: "开发",
+    reviewer: "审查",
+    tester: "测试",
+    researcher: "调研",
+  };
+  const roleLabel = role ? roleLabels[role] ?? role : undefined;
+  const label = roleLabel && role !== from ? `${from}（${roleLabel}）` : from;
+  return `来自 ${label} 的成员汇报：\n${body}`;
 }
 
 /**
@@ -94,12 +103,12 @@ function parseTeammateMessageNote(text: string): string | null {
  */
 function summarizeOrchestratorEvent(text: string): string {
   const events = [...text.matchAll(/^EVENT: (\S+)/gm)].map((m) => m[1]);
-  if (events.length === 0) return "Team coordination event";
+  if (events.length === 0) return "团队协调事件";
   const workers = [...new Set([...text.matchAll(/^Worker: ([^\n(]+)/gm)].map((m) => m[1].trim()))];
   const tasks = [...new Set([...text.matchAll(/^Task: "([^"]+)"/gm)].map((m) => m[1]))];
-  const parts = [`Team event: ${[...new Set(events)].join(", ")}`];
-  if (workers.length > 0) parts.push(`worker: ${workers.join(", ")}`);
-  if (tasks.length > 0) parts.push(`task: ${tasks.slice(0, 2).join("; ")}`);
+  const parts = [`团队事件：${[...new Set(events)].join("、")}`];
+  if (workers.length > 0) parts.push(`成员：${workers.join("、")}`);
+  if (tasks.length > 0) parts.push(`任务：${tasks.slice(0, 2).join("；")}`);
   return parts.join(" · ");
 }
 
@@ -166,11 +175,17 @@ function extractMessageDisplay(message: AgentMessage): MessageDisplay {
 const MAX_EVENTS = 50000;
 const MAX_DISPLAY_BLOCKS = 20000;
 
-export const useSessionStore = defineStore("session", () => {
+export function createSessionStore(id: string, options: { teamLeader?: boolean } = {}) {
+  return defineStore(id, () => {
+  const renderTeamLeaderNotes = options.teamLeader === true;
   const events = ref<AgentSessionEvent[]>([]);
   const displayBlocks = ref<DisplayBlock[]>([]);
   const isStreaming = ref(false);
   const errorMessage = ref<string | null>(null);
+  // Tracks the most recent retryable API error block so the retry button only
+  // renders on the latest error while the agent is idle. Cleared when a new
+  // turn starts or the user sends a new message.
+  const lastRetryableError = ref<{ blockId: string } | null>(null);
 
   let currentAgentBlockId: string | null = null;
   let currentWorkStatusId: string | null = null;
@@ -209,24 +224,24 @@ export const useSessionStore = defineStore("session", () => {
     return id;
   }
 
-  function appendUserOrNoteMessage(msg: AgentMessage): boolean {
+  function appendUserOrNoteMessage(msg: AgentMessage, showLiveThinking = false): boolean {
     if (msg.role === "user") {
       const rawText = extractContentText(msg).trimStart();
       // Internal orchestration turn: show a compact note (so the leader's
       // upcoming response has visible context) instead of the raw payload,
       // plus the thinking indicator since a leader turn is starting.
-      if (rawText.startsWith("<orchestrator-event>")) {
+      if (renderTeamLeaderNotes && rawText.startsWith("<orchestrator-event>")) {
         displayBlocks.value.push({
           id: nextBlockId(),
           type: "note",
           text: summarizeOrchestratorEvent(rawText),
           timestamp: messageTimestamp(msg),
         });
-        showThinkingBlock(messageTimestamp(msg));
+        if (showLiveThinking) showThinkingBlock(messageTimestamp(msg));
         return false;
       }
       // Steered worker report: render as a styled note, not a fake "user" bubble.
-      const teammateNote = parseTeammateMessageNote(rawText);
+      const teammateNote = renderTeamLeaderNotes ? parseTeammateMessageNote(rawText) : null;
       if (teammateNote) {
         displayBlocks.value.push({
           id: nextBlockId(),
@@ -284,6 +299,8 @@ export const useSessionStore = defineStore("session", () => {
     const attachments = filePaths.map(attachmentFromPath);
     if (!text.trim() && attachments.length === 0) return null;
 
+    // Starting a new turn invalidates the retry affordance on any prior error.
+    lastRetryableError.value = null;
     const timestamp = Date.now();
     closeCurrentWorkStatus(true);
     const separatorId = appendTurnSeparator(timestamp);
@@ -317,7 +334,7 @@ export const useSessionStore = defineStore("session", () => {
       id: nextBlockId(),
       type: "error",
       message,
-      source: "send",
+      source: "发送",
       timestamp: Date.now(),
     });
   }
@@ -418,7 +435,7 @@ export const useSessionStore = defineStore("session", () => {
       (b) => b.id === currentWorkStatusId && b.type === "work-status"
     );
     if (!ws || ws.type !== "work-status") {
-      throw new Error("Failed to create work status block");
+      throw new Error("创建工作状态块失败");
     }
     return ws;
   }
@@ -449,6 +466,7 @@ export const useSessionStore = defineStore("session", () => {
       case "agent_start": {
         isStreaming.value = true;
         errorMessage.value = null;
+        lastRetryableError.value = null;
         break;
       }
       case "agent_end": {
@@ -463,7 +481,7 @@ export const useSessionStore = defineStore("session", () => {
         const msg = event.message;
         if (msg.role === "user" || msg.role === "custom") {
           if (msg.role === "custom" && msg.display === false) break;
-          const appended = appendUserOrNoteMessage(msg);
+          const appended = appendUserOrNoteMessage(msg, true);
           if (msg.role === "user" && appended) {
             showThinkingBlock(messageTimestamp(msg));
           }
@@ -583,7 +601,7 @@ export const useSessionStore = defineStore("session", () => {
             ? String((event.result as Record<string, unknown>).summary)
             : undefined) ||
           event.errorMessage ||
-          "Compacted";
+          "压缩完成";
         displayBlocks.value.push({
           id: nextBlockId(),
           type: "compaction",
@@ -608,17 +626,37 @@ export const useSessionStore = defineStore("session", () => {
         break;
       }
       case "auto_retry_end": {
+        // On success, show a "retry succeeded" notice. On failure, skip the
+        // block here - the subsequent api_error event surfaces the full error
+        // (status code + retry button) and a second "retry failed" notice
+        // would be redundant.
+        if (event.success) {
+          displayBlocks.value.push({
+            id: nextBlockId(),
+            type: "retry",
+            success: true,
+            attempt: event.attempt,
+            maxAttempts: 0,
+            timestamp: Date.now(),
+          });
+        }
+        break;
+      }
+
+      case "api_error": {
+        const blockId = nextBlockId();
         displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "retry",
-          success: event.success,
-          attempt: event.attempt,
-          maxAttempts: 0,
+          id: blockId,
+          type: "error",
+          message: event.errorMessage,
+          category: event.category,
+          httpStatus: event.httpStatus,
+          title: event.title,
+          retryable: event.retryable,
           timestamp: Date.now(),
         });
-        if (!event.success && event.finalError) {
-          errorMessage.value = event.finalError;
-        }
+        // Only the latest retryable error (while idle) offers a retry button.
+        lastRetryableError.value = event.retryable ? { blockId } : null;
         break;
       }
 
@@ -650,7 +688,7 @@ export const useSessionStore = defineStore("session", () => {
       const ws = ensureWorkStatusBlock(timestamp);
       const item: ToolWorkItem = {
         toolCallId,
-        toolName: block.name || "task",
+        toolName: block.name || "任务",
         args: block.arguments,
         result: null,
         isError: false,
@@ -668,6 +706,15 @@ export const useSessionStore = defineStore("session", () => {
       currentWorkStatusId = null;
     }
 
+    // The retry button belongs on the most recent failed assistant turn, but a
+    // failed turn is not necessarily the last array element: agent-session's
+    // finally block flushes pending bash toolResult messages after it. Track
+    // the last assistant index so trailing tool results do not hide the button.
+    let lastAssistantIndex = -1;
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === "assistant") lastAssistantIndex = i;
+    }
+
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
 
@@ -676,7 +723,31 @@ export const useSessionStore = defineStore("session", () => {
         appendUserOrNoteMessage(msg);
       } else if (msg.role === "assistant") {
         const timestamp = messageTimestamp(msg);
-        if (Array.isArray(msg.content)) {
+        // A failed assistant turn (stopReason "error") carries its details in
+        // errorMessage, not in content (which is empty). Render it as an error
+        // block so the failure survives reloads / mode switches / restarts.
+        if (msg.stopReason === "error" && typeof msg.errorMessage === "string" && msg.errorMessage) {
+          const classified = classifyApiError(msg.errorMessage);
+          const errorBlockId = nextBlockId();
+          displayBlocks.value.push({
+            id: errorBlockId,
+            type: "error",
+            message: msg.errorMessage,
+            category: classified.category,
+            httpStatus: classified.httpStatus,
+            title: classified.title,
+            retryable: classified.retryable,
+            timestamp,
+          });
+          // Keep the retry affordance for the latest error after a reload: the
+          // solo session persists across mode switches, so retryLastTurn still
+          // works. Match the last *assistant* message (not the last array
+          // element: a failed turn can be followed by flushed bash toolResult
+          // messages). Historical errors render without a button.
+          if (i === lastAssistantIndex && classified.retryable) {
+            lastRetryableError.value = { blockId: errorBlockId };
+          }
+        } else if (Array.isArray(msg.content)) {
           for (const block of msg.content) {
             if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
               createAgentBlock(block.text, false, timestamp);
@@ -712,6 +783,7 @@ export const useSessionStore = defineStore("session", () => {
     displayBlocks.value = [];
     isStreaming.value = false;
     errorMessage.value = null;
+    lastRetryableError.value = null;
     currentAgentBlockId = null;
     currentWorkStatusId = null;
     currentThinkingBlockId = null;
@@ -729,6 +801,7 @@ export const useSessionStore = defineStore("session", () => {
     displayBlocks,
     isStreaming,
     errorMessage,
+    lastRetryableError,
     addEvent,
     addEvents,
     appendOptimisticUserMessage,
@@ -737,4 +810,8 @@ export const useSessionStore = defineStore("session", () => {
     clearSession,
     getRawEventsJson,
   };
-});
+  });
+}
+
+export const useSessionStore = createSessionStore("session");
+export const useTeamLeaderSessionStore = createSessionStore("team-leader-session", { teamLeader: true });

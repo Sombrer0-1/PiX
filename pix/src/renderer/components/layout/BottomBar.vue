@@ -6,13 +6,13 @@
  * Supports slash command triggering.
  */
 import { ref, computed, nextTick } from "vue";
-import { useRpc } from "../../composables/useRpc";
-import { useSessionStore } from "../../stores/session-store";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
+import { useWorkspaceSessionStore } from "../../composables/useWorkspaceSessionStore";
 import CommandPalette from "../input/CommandPalette.vue";
 import ModelSelector from "../input/ModelSelector.vue";
 
-const rpc = useRpc();
-const sessionStore = useSessionStore();
+const rpc = useWorkspaceRpc();
+const sessionStore = useWorkspaceSessionStore();
 
 const inputText = ref("");
 const searchQuery = ref("");
@@ -25,7 +25,7 @@ const canSend = computed(() => inputText.value.trim().length > 0 && rpc.isConnec
 const isStreaming = computed(() => rpc.isStreaming.value);
 const modelDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  return model ? `${model.provider}/${model.id}` : "No model";
+  return model ? `${model.provider}/${model.id}` : "未选择模型";
 });
 
 function handleInput(e: Event): void {
@@ -139,6 +139,7 @@ function autoResize(): void {
       <CommandPalette
         v-if="showCommandPalette"
         :search="searchQuery"
+        :commands="rpc.commands.value"
         @select="onCommandSelected"
         @close="showCommandPalette = false"
       />
@@ -148,7 +149,7 @@ function autoResize(): void {
         <textarea
           ref="textareaRef"
           class="input-textarea"
-          :placeholder="isStreaming ? 'Agent is running... type to queue a follow-up or steering message' : 'Type a task or / for commands...'"
+          :placeholder="isStreaming ? 'Agent 正在运行，可输入跟进或引导消息...' : '输入任务，或按 / 使用命令...'"
           @input="handleInput"
           @keydown="handleKeydown"
           rows="1"
@@ -178,7 +179,7 @@ function autoResize(): void {
             class="control-btn stop-btn"
             @click="stopAgent"
           >
-            Stop
+            停止
           </button>
           <button
             v-else
@@ -186,7 +187,7 @@ function autoResize(): void {
             :disabled="!canSend"
             @click="sendMessage"
           >
-            Send
+            发送
           </button>
         </div>
       </div>

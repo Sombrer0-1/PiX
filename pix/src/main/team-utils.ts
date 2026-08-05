@@ -64,7 +64,21 @@ export function pickTeammateColor(index: number): string {
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal?.aborted) { resolve(); return; }
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal!.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onTimeout = () => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const timer = setTimeout(onTimeout, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }

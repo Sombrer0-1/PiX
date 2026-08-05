@@ -58,6 +58,7 @@ import {
   buildWorkerUnavailableOrchestrationEvents,
   classifyTeamResult,
   MAX_AUTO_COMPLETION_RESULT_LENGTH,
+  MAX_COORDINATION_GENERATION,
   ORCHESTRATOR_WAKE_BASE_RETRY_MS,
   OrchestrationEventQueue,
   planTeamCoordination,
@@ -110,6 +111,8 @@ export class TeamManager {
   private _launchingAgents = new Set<string>();
   /** Pending worker-context-hygiene timers, cleared on team stop/dispose. */
   private _hygieneTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** Pending leader-steer retry timers, cleared on team stop/dispose. */
+  private _steerRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   /** Queue of orchestration events waiting to be processed by the Leader. */
   private _orchestratorEvents = new OrchestrationEventQueue();
   /** Prevent overlapping Leader wake prompts from racing each other. */
@@ -118,6 +121,17 @@ export class TeamManager {
   private _orchestratorRetryDueAt = 0;
   private _persistTimer: ReturnType<typeof setTimeout> | null = null;
   private _isRestoringTeam = false;
+  /**
+   * Worker->leader messages that were being steered into a leader turn when the
+   * runtime epoch changed (abort). The leader wake path is a no-op while the
+   * runtime is paused, so without deferral these messages would be permanently
+   * lost; resumeRuntime re-delivers them.
+   */
+  private _deferredLeaderMessages: TeamMessage[] = [];
+  /** Runtime execution gate; a restored Team is viewable but paused. */
+  private _executionState: "active" | "paused" = "paused";
+  /** Invalidates all callbacks from work that was aborted or superseded. */
+  private _runtimeEpoch = 0;
   private _debugLogger = new TeamDebugLogger();
   /**
    * Last contextual state emitted to the debug log. Each logTeamDebug line only
@@ -150,7 +164,7 @@ export class TeamManager {
       clearTimeout(this._orchestratorRetryTimer);
       this._orchestratorRetryTimer = null;
     }
-    if (session && this._orchestratorEvents.hasPending) {
+    if (session && this.isRuntimeActive() && this._orchestratorEvents.hasPending) {
       this._scheduleOrchestratorQueue();
     }
   }
@@ -168,6 +182,8 @@ export class TeamManager {
   async initialize(cwd: string, authStorage: AuthStorage): Promise<void> {
     this._cwd = cwd;
     this._authStorage = authStorage;
+    this._executionState = "paused";
+    this._runtimeEpoch++;
     this.logTeamDebug("manager.initialize", { cwd, hasAuthStorage: Boolean(authStorage) });
     await this._restorePersistedTeamIfPresent();
   }
@@ -223,6 +239,8 @@ export class TeamManager {
     const name = teamName ?? generateTeamName();
     const now = Date.now();
     const leadAgentId = formatAgentId(LEADER_AGENT_NAME, name);
+    this._executionState = "active";
+    this._runtimeEpoch++;
 
     const workerConfigs: WorkerConfig[] = DEFAULT_WORKER_CONFIGS;
 
@@ -339,8 +357,8 @@ export class TeamManager {
     activateNow?: boolean;
   }): Promise<TeammateInfo> {
     const team = this._team;
+    this._assertRuntimeActive("spawn_teammate");
     if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
 
     const usedNames = new Set(Array.from(team.workers.values()).map((worker) => worker.info.name));
     const worker = this._buildWorkerEntry(team.name, {
@@ -389,6 +407,12 @@ export class TeamManager {
       this.logTeamDebug("team.stop.ignored", { reason: "already_stopping" });
       return;
     }
+
+    // Invalidate worker/Leader callbacks before any teardown or snapshot work.
+    // The TeamData snapshot remains compatible because runtime execution state
+    // is intentionally not persisted.
+    this._executionState = "paused";
+    this._runtimeEpoch++;
 
     // When preserving, flush a final restorable snapshot while the team is still
     // "active" (isRestorableTeamSnapshot rejects "stopping"). This captures the
@@ -474,7 +498,9 @@ export class TeamManager {
     this._setLeaderTurnActive(false);
     this._orchestratorEvents.clear();
     this._leaderWakeInFlight = false;
+    this._deferredLeaderMessages = [];
     this._clearHygieneTimers();
+    this._clearSteerRetryTimers();
     if (this._orchestratorRetryTimer) {
       clearTimeout(this._orchestratorRetryTimer);
       this._orchestratorRetryTimer = null;
@@ -510,6 +536,68 @@ export class TeamManager {
   /** Check if a team is currently active. */
   hasActiveTeam(): boolean {
     return this._team !== null && this._team.status === "active";
+  }
+
+  /** Whether Team work is currently allowed to consume messages or mutate tasks. */
+  isRuntimeActive(): boolean {
+    return this.hasActiveTeam() && this._executionState === "active";
+  }
+
+  /** Current internal execution epoch used by workers to reject stale callbacks. */
+  getRuntimeEpoch(): number {
+    return this._runtimeEpoch;
+  }
+
+  isRuntimeEpochCurrent(epoch: number): boolean {
+    return this.isRuntimeActive() && epoch === this._runtimeEpoch;
+  }
+
+  /** Resume a restored or user-paused Team after an explicit Team action. */
+  resumeRuntime(reason = "explicit_action"): void {
+    const team = this._team;
+    if (!team || team.status !== "active") return;
+
+    const wasPaused = this._executionState !== "active";
+    if (wasPaused) {
+      this._executionState = "active";
+      this._runtimeEpoch++;
+      this.logTeamDebug("team.runtime.resumed", {
+        reason,
+        runtimeEpoch: this._runtimeEpoch,
+      });
+    }
+    this._startHealthCheck();
+
+    // Restored workers have roster state but no live sessions. Explicit
+    // activity is the only point at which those sessions may be recreated.
+    for (const [agentId, worker] of team.workers) {
+      const hasOwnedOpenTask = team.taskList.getAll().some((task) =>
+        task.ownerAgentId === agentId && (task.status === "assigned" || task.status === "in_progress"),
+      );
+      if (worker.info.activationPolicy !== "always" && !hasOwnedOpenTask) continue;
+      if (worker.info.status === "shutdown" || worker.info.status === "error") continue;
+      if (worker.session && worker.runner) continue;
+      void this._launchWorker(agentId).catch((err) => {
+        console.error(`[TeamManager] Failed to resume worker ${agentId}:`, err);
+        this.logTeamDebug("worker.resume_launch.error", { agentId, error: err });
+        this.updateWorkerStatus(agentId, "error", String(err));
+      });
+    }
+
+    if (wasPaused) {
+      // Re-engage the leader for work paused by an abort or restored from a
+      // snapshot, and flush any messages/events deferred during the pause.
+      this._reengageLeaderAfterResume(team);
+    }
+  }
+
+  private _assertRuntimeActive(operation: string): void {
+    if (!this._team || this._team.status !== "active") {
+      throw new Error("No active team.");
+    }
+    if (this._executionState !== "active") {
+      throw new Error(`Team runtime is paused; ${operation} requires an explicit Team action to resume it.`);
+    }
   }
 
   /**
@@ -562,15 +650,22 @@ export class TeamManager {
    * worker turns, pending protocol waits, and queued orchestration wakes should
    * all stop together so stale internal events do not resume as a new turn.
    */
-  abortActiveTurns(): void {
+  async abortActiveTurns(): Promise<void> {
     const team = this._team;
     if (!team || team.status !== "active") return;
 
+    const abortRequestId = randomUUID();
+    this._executionState = "paused";
+    this._runtimeEpoch++;
     this.logTeamDebug("team.abort_active_turns", {
+      abortRequestId,
+      runtimeEpoch: this._runtimeEpoch,
       workers: Array.from(team.workers.values()).map((worker) => ({
         agentId: worker.info.agentId,
         status: worker.info.status,
         hasWorkAbortController: Boolean(worker.workAbortController),
+        turnId: worker.activeTurnId,
+        turnEpoch: worker.activeTurnEpoch,
       })),
     });
     this._orchestratorEvents.clear();
@@ -580,15 +675,39 @@ export class TeamManager {
       this._orchestratorRetryDueAt = 0;
     }
     this._leaderWakeInFlight = false;
+    this._setLeaderTurnActive(false);
+    const clearedMessages = team.bus.clearPending();
+    this.logTeamDebug("team.abort_pending_messages_cleared", {
+      abortRequestId,
+      clearedMessages,
+      historyLength: team.bus.history().length,
+    });
 
+    // Keep in-progress/assigned tasks with their owners. Releasing them to
+    // pending here would let workers auto-reclaim on the next resume and
+    // silently restart the in-flight work the user just stopped; the leader
+    // re-engages with the paused tasks on resume instead (see resumeRuntime).
+
+    const abortPromises: Promise<void>[] = [];
     for (const [agentId, worker] of team.workers) {
       team.protocolManager.cancelAllForAgent(agentId);
       if (worker.info.status === "running" || worker.workAbortController) {
         if (worker.runner) {
-          worker.runner.abortCurrentTurn();
+          abortPromises.push(worker.runner.abortCurrentTurn());
         } else {
           worker.workAbortController?.abort();
         }
+      }
+    }
+    await Promise.allSettled(abortPromises);
+
+    // Reset worker statuses so the UI does not keep showing "running" workers
+    // with a Stop button that can never succeed while the runtime is paused:
+    // the idle loop's isRuntimeActive() gate prevents the natural "idle" reset
+    // while paused, so without this the statuses stay "running" after Stop.
+    for (const [agentId, worker] of team.workers) {
+      if (worker.info.status === "running") {
+        this.updateWorkerStatus(agentId, "idle");
       }
     }
   }
@@ -767,6 +886,7 @@ export class TeamManager {
    * Send a message to a specific worker. Backward-compatible API that delegates to the bus.
    */
   async sendMessageToWorker(agentId: string, message: string): Promise<void> {
+    this.resumeRuntime("send_message_to_worker");
     const team = this._team;
     if (!team) throw new Error("No active team.");
     if (team.status !== "active") throw new Error("Team is not active.");
@@ -795,8 +915,8 @@ export class TeamManager {
     kind?: MessageKind,
   ): Promise<void> {
     const team = this._team;
+    this._assertRuntimeActive("send_team_message");
     if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
     this.logTeamDebug("message.send.request", {
       fromAgentId,
       toAgentId,
@@ -857,8 +977,14 @@ export class TeamManager {
       fromRole,
     };
 
-    // Push to bus
-    team.bus.send(msg);
+    // The Leader has no WorkerRunner mailbox. Keep worker-to-Leader messages
+    // in the timeline for history/UI, but only enqueue messages that a worker
+    // can actually consume.
+    if (toAgentId === team.leadAgentId) {
+      team.bus.recordHistoryOnly(msg);
+    } else {
+      team.bus.send(msg);
+    }
     this.logTeamDebug("message.bus.sent", {
       message: summarizeTeamMessage(msg),
       busSize: team.bus.size(),
@@ -888,6 +1014,9 @@ export class TeamManager {
           summary: summaryText,
         });
 
+        // This turn delivered content to the leader; record it so the
+        // turn-outcome handler does not emit a duplicate orphan-turn wake.
+        senderWorker!.sentLeaderMessageThisTurn = true;
         const leaderBusy = this._leaderTurnActive || (this._leaderSession?.isStreaming ?? false);
         if (this._leaderSession && leaderBusy) {
           this._steerLeaderWithRetry(summaryText, msg);
@@ -896,6 +1025,7 @@ export class TeamManager {
         }
       } else if (this._shouldWakeLeaderForMessage(msg)) {
         // Broadcasts and coordination-relevant peer traffic wake the leader.
+        senderWorker!.sentLeaderMessageThisTurn = true;
         this._wakeLeaderForMessage(msg);
       }
     }
@@ -908,7 +1038,29 @@ export class TeamManager {
    * fails and a source message is provided, fall back to the orchestration wake
    * so the leader still learns about the report.
    */
-  private _steerLeaderWithRetry(text: string, sourceMessage?: TeamMessage, attempt = 0): void {
+  private _steerLeaderWithRetry(
+    text: string,
+    sourceMessage?: TeamMessage,
+    attempt = 0,
+    runtimeEpoch = this._runtimeEpoch,
+  ): void {
+    if (!this.isRuntimeEpochCurrent(runtimeEpoch)) {
+      // The runtime epoch changed (typically an abort) while this steer was in
+      // flight or queued for retry. The leader wake path is a no-op while the
+      // runtime is paused, so silently returning here would lose the
+      // worker->leader message forever. Defer it for re-delivery on resume.
+      if (sourceMessage) {
+        this._deferLeaderMessage(sourceMessage);
+      }
+      this.logTeamDebug("leader.steer.skipped_stale", {
+        attempt,
+        runtimeEpoch,
+        currentRuntimeEpoch: this._runtimeEpoch,
+        sourceMessageId: sourceMessage?.id,
+        deferred: Boolean(sourceMessage),
+      });
+      return;
+    }
     const session = this._leaderSession;
     if (!session) {
       if (sourceMessage) this._wakeLeaderForMessage(sourceMessage);
@@ -923,7 +1075,11 @@ export class TeamManager {
         return;
       }
       const delayMs = 500 * 2 ** attempt;
-      setTimeout(() => this._steerLeaderWithRetry(text, sourceMessage, attempt + 1), delayMs);
+      const timer = setTimeout(() => {
+        this._steerRetryTimers.delete(timer);
+        this._steerLeaderWithRetry(text, sourceMessage, attempt + 1, runtimeEpoch);
+      }, delayMs);
+      this._steerRetryTimers.add(timer);
     });
   }
 
@@ -956,8 +1112,8 @@ export class TeamManager {
     metadata?: Record<string, unknown>,
   ): TeamTask {
     const team = this._team;
+    this._assertRuntimeActive("create_task");
     if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
     this.logTeamDebug("task.create.request", {
       subject,
       assignTo,
@@ -1050,6 +1206,7 @@ export class TeamManager {
     ownerAgentId?: string;
   }): TeamTask {
     const team = this._team;
+    this._assertRuntimeActive("update_task");
     if (!team) throw new Error("No active team.");
 
     taskId = team.taskList.resolveTaskId(taskId) ?? taskId;
@@ -1085,6 +1242,7 @@ export class TeamManager {
    */
   deleteTask(taskId: string): void {
     const team = this._team;
+    this._assertRuntimeActive("delete_task");
     if (!team) throw new Error("No active team.");
 
     taskId = team.taskList.resolveTaskId(taskId) ?? taskId;
@@ -1102,8 +1260,8 @@ export class TeamManager {
    */
   assignTask(taskId: string, agentId: string): TeamTask | null {
     const team = this._team;
+    this._assertRuntimeActive("assign_task");
     if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
     this.logTeamDebug("task.assign.request", { taskId, agentId });
 
     // Verify agent exists
@@ -1231,7 +1389,7 @@ export class TeamManager {
    */
   tryClaimNextTask(agentId: string): { task: TeamTask; prompt: string } | null {
     const team = this._team;
-    if (!team || team.status !== "active") return null;
+    if (!team || team.status !== "active" || !this.isRuntimeActive()) return null;
 
     // Get worker role for capability check
     const worker = team.workers.get(agentId);
@@ -1270,7 +1428,7 @@ export class TeamManager {
    */
   claimTask(taskId: string, agentId: string): { task: TeamTask; prompt: string } | null {
     const team = this._team;
-    if (!team || team.status !== "active") return null;
+    if (!team || team.status !== "active" || !this.isRuntimeActive()) return null;
 
     const task = team.taskList.claimTask(taskId, agentId);
     if (!task) {
@@ -1649,8 +1807,8 @@ export class TeamManager {
    */
   async requestShutdown(agentId?: string): Promise<{ agentId: string; confirmed: boolean }[]> {
     const team = this._team;
+    this._assertRuntimeActive("request_shutdown");
     if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
     this.logTeamDebug("protocol.shutdown.request", { agentId });
 
     const targetIds = agentId
@@ -1771,6 +1929,7 @@ export class TeamManager {
    */
   respondShutdown(agentId: string, confirmed: boolean, reason?: string): boolean {
     const team = this._team;
+    this._assertRuntimeActive("respond_to_shutdown");
     if (!team) throw new Error("No active team.");
 
     const request = team.protocolManager.respondShutdown(agentId, confirmed, reason);
@@ -1804,6 +1963,7 @@ export class TeamManager {
     signal?: AbortSignal,
   ): Promise<{ approved: boolean; reason?: string }> {
     const team = this._team;
+    this._assertRuntimeActive("request_permission");
     if (!team) throw new Error("No active team.");
     this.logTeamDebug("protocol.permission.request", {
       agentId,
@@ -1887,6 +2047,7 @@ export class TeamManager {
    */
   respondPermission(requestId: string, approved: boolean, reason?: string): void {
     const team = this._team;
+    this._assertRuntimeActive("respond_permission");
     if (!team) throw new Error("No active team.");
 
     const request = team.protocolManager.respondPermission(requestId, approved, reason);
@@ -1938,6 +2099,7 @@ export class TeamManager {
     signal?: AbortSignal,
   ): Promise<{ approved: boolean; feedback?: string }> {
     const team = this._team;
+    this._assertRuntimeActive("submit_plan");
     if (!team) throw new Error("No active team.");
     this.logTeamDebug("protocol.plan.request", {
       agentId,
@@ -1982,6 +2144,8 @@ export class TeamManager {
     this._emitEvent({ type: "team_message", teamName: team.name, message: timelineMsg });
     this._wakeLeaderForOrchestration({
       type: "plan_submitted",
+      sourceId: approval.id,
+      runtimeEpoch: this._runtimeEpoch,
       workerName,
       workerRole,
       fromAgentId: agentId,
@@ -2034,6 +2198,7 @@ export class TeamManager {
    */
   respondPlanApproval(approvalId: string, approved: boolean, feedback?: string): boolean {
     const team = this._team;
+    this._assertRuntimeActive("respond_to_plan_approval");
     if (!team) throw new Error("No active team.");
 
     const approval = team.protocolManager.respondPlanApproval(approvalId, approved, feedback);
@@ -2081,8 +2246,8 @@ export class TeamManager {
    */
   async activateMember(agentId: string): Promise<void> {
     const team = this._team;
+    this._assertRuntimeActive("activate_member");
     if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
 
     const worker = team.workers.get(agentId);
     if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
@@ -2110,6 +2275,7 @@ export class TeamManager {
    */
   async pauseMember(agentId: string): Promise<void> {
     const team = this._team;
+    this._assertRuntimeActive("pause_member");
     if (!team) throw new Error("No active team.");
 
     const worker = team.workers.get(agentId);
@@ -2155,8 +2321,9 @@ export class TeamManager {
    * Abort a specific worker's current turn (does not kill the worker).
    * After abort, the worker returns to idle and can receive new messages.
    */
-  abortWorker(agentId: string): void {
+  async abortWorker(agentId: string): Promise<void> {
     const team = this._team;
+    this._assertRuntimeActive("abort_worker");
     if (!team) throw new Error("No active team.");
 
     const worker = team.workers.get(agentId);
@@ -2165,8 +2332,15 @@ export class TeamManager {
       console.warn(`[TeamManager] abortWorker called on non-running worker ${agentId} (status: ${worker.info.status})`);
     }
 
+    // Abort the in-flight turn only. Do NOT release the worker's open tasks to
+    // pending: the runtime stays active, so the worker would immediately
+    // re-claim and re-execute the turn the user just stopped. The worker's
+    // work_aborted path calls handleWorkerTurnFailed, which marks the active
+    // task blocked and wakes the leader to decide whether to reassign; tasks
+    // the worker already resolved during the turn are left untouched.
+    team.bus.clearAgent(agentId);
     if (worker.runner) {
-      worker.runner.abortCurrentTurn();
+      await worker.runner.abortCurrentTurn();
     } else {
       worker.workAbortController?.abort();
     }
@@ -2179,6 +2353,7 @@ export class TeamManager {
    */
   async stopWorker(agentId: string): Promise<void> {
     const team = this._team;
+    this._assertRuntimeActive("stop_worker");
     if (!team) throw new Error("No active team.");
 
     const worker = team.workers.get(agentId);
@@ -2281,15 +2456,36 @@ export class TeamManager {
     });
   }
 
+  private _isCurrentWorkerTurn(agentId: string, turnEpoch: number, turnId?: string): boolean {
+    const worker = this._team?.workers.get(agentId);
+    return this.isRuntimeEpochCurrent(turnEpoch) && (!turnId || worker?.activeTurnId === turnId);
+  }
+
   /**
    * Called after a worker turn finishes. If the worker forgot to call the
    * task-status tool, close its current task using the final assistant text so
    * the leader workflow does not stall with everyone idle.
    */
-  handleWorkerTurnFinished(agentId: string, assistantText?: string, taskId?: string | null): void {
+  handleWorkerTurnFinished(
+    agentId: string,
+    assistantText?: string,
+    taskId?: string | null,
+    turnEpoch = this._runtimeEpoch,
+    turnId?: string,
+  ): void {
     const team = this._team;
     if (!team || team.status !== "active") {
       this.logTeamDebug("worker.turn_finished.skipped", { agentId, reason: "no_active_team" });
+      return;
+    }
+    if (!this._isCurrentWorkerTurn(agentId, turnEpoch, turnId)) {
+      this.logTeamDebug("worker.turn_finished.stale", {
+        agentId,
+        taskId: taskId ?? null,
+        turnId,
+        turnEpoch,
+        currentRuntimeEpoch: this._runtimeEpoch,
+      });
       return;
     }
 
@@ -2313,15 +2509,25 @@ export class TeamManager {
         });
         return;
       }
-      // No task at all (plain-message or initial-prompt turn). Previously this
-      // returned silently and stranded the leader. Report it so the leader can
-      // record/route the work and the team cannot deadlock.
-      this.logTeamDebug("worker.turn_finished.no_active_task", {
-        agentId,
-        taskId: taskId ?? null,
-        assistantText: summarizeText(assistantText),
-      });
-      this._reportOrphanedWorkerTurn(agentId, assistantText, false);
+      // No task at all is a normal outcome for a peer-message turn. The message
+      // send path already wakes the Leader when the message is actionable, so a
+      // turn that already delivered a worker->leader message must not wake again
+      // (that would duplicate the content and feedback-loop ordinary peer
+      // conversation). A turn that produced output WITHOUT reaching the leader,
+      // however, deadlocks an idle leader that never learns the work happened -
+      // surface it as an orphaned turn so the leader can record, route, or fold
+      // it into the plan.
+      const workerState = team.workers.get(agentId);
+      if (!workerState?.sentLeaderMessageThisTurn) {
+        this._reportOrphanedWorkerTurn(agentId, assistantText, false, turnId);
+      } else {
+        this.logTeamDebug("worker.turn_finished.no_active_task", {
+          agentId,
+          taskId: taskId ?? null,
+          assistantText: summarizeText(assistantText),
+          alreadyWokeLeader: true,
+        });
+      }
       return;
     }
 
@@ -2354,6 +2560,8 @@ export class TeamManager {
       });
       this._wakeLeaderForOrchestration({
         type: "task_blocked",
+        sourceId: `${activeTask.id}:blocked`,
+        runtimeEpoch: turnEpoch,
         taskId: blockedTask.id,
         taskSubject: blockedTask.subject,
         taskType: blockedTask.taskType,
@@ -2377,10 +2585,26 @@ export class TeamManager {
     this._coordinateAfterTaskCompletion(completedTask, agentId, result);
   }
 
-  handleWorkerTurnFailed(agentId: string, error: string, taskId?: string | null): void {
+  handleWorkerTurnFailed(
+    agentId: string,
+    error: string,
+    taskId?: string | null,
+    turnEpoch = this._runtimeEpoch,
+    turnId?: string,
+  ): void {
     const team = this._team;
     if (!team || team.status !== "active") {
       this.logTeamDebug("worker.turn_failed.skipped", { agentId, error, reason: "no_active_team" });
+      return;
+    }
+    if (!this._isCurrentWorkerTurn(agentId, turnEpoch, turnId)) {
+      this.logTeamDebug("worker.turn_failed.stale", {
+        agentId,
+        taskId: taskId ?? null,
+        turnId,
+        turnEpoch,
+        currentRuntimeEpoch: this._runtimeEpoch,
+      });
       return;
     }
 
@@ -2401,10 +2625,12 @@ export class TeamManager {
         });
         return;
       }
-      // Orphaned (message/initial) turn failure: surface it so a timeout or abort
-      // on a non-task turn is not silently lost and the leader can react.
-      this.logTeamDebug("worker.turn_failed.no_active_task", { agentId, taskId: taskId ?? null, error });
-      this._reportOrphanedWorkerTurn(agentId, error, true);
+      // A failure of a message-only turn (timeout, abort, thrown error) is not
+      // task progress, but it can still stall an idle leader that never learns
+      // the turn did not complete. Surface it as an orphaned failure so the
+      // leader can react; the originating message path carries intent, not the
+      // failure outcome.
+      this._reportOrphanedWorkerTurn(agentId, error, true, turnId);
       return;
     }
 
@@ -2426,6 +2652,8 @@ export class TeamManager {
     });
     this._wakeLeaderForOrchestration({
       type: "task_blocked",
+      sourceId: `${activeTask.id}:failed`,
+      runtimeEpoch: turnEpoch,
       taskId: blockedTask.id,
       taskSubject: blockedTask.subject,
       taskType: blockedTask.taskType,
@@ -2446,7 +2674,7 @@ export class TeamManager {
    * leader with a team_message event carrying the worker's latest output so it
    * can record, route, or fold the work into the plan.
    */
-  private _reportOrphanedWorkerTurn(agentId: string, text: string | undefined, failed: boolean): void {
+  private _reportOrphanedWorkerTurn(agentId: string, text: string | undefined, failed: boolean, turnId?: string): void {
     const team = this._team;
     if (!team || team.status !== "active") return;
 
@@ -2475,6 +2703,7 @@ export class TeamManager {
     });
     this._wakeLeaderForOrchestration({
       type: "team_message",
+      sourceId: `orphan:${turnId ?? randomUUID()}`,
       fromAgentId: agentId,
       workerName,
       workerRole,
@@ -2483,6 +2712,70 @@ export class TeamManager {
         ? "Worker turn ended outside task tracking after a failure."
         : "Worker produced output outside task tracking.",
     });
+  }
+
+  /**
+   * Queue a worker->leader message that could not be delivered because the
+   * runtime epoch changed (abort paused the runtime). resumeRuntime drains the
+   * list so the message is not permanently lost.
+   */
+  private _deferLeaderMessage(message: TeamMessage): void {
+    // No active team: the message belongs to a team that was stopped. Deferring
+    // it would leak a stale worker->leader message into the next team created in
+    // this manager (createTeam does not clear _deferredLeaderMessages).
+    if (!this._team) return;
+    if (this._deferredLeaderMessages.some((m) => m.id === message.id)) return;
+    this._deferredLeaderMessages.push(message);
+    this.logTeamDebug("leader.deferred_message.queued", {
+      messageId: message.id,
+      count: this._deferredLeaderMessages.length,
+    });
+  }
+
+  /**
+   * Re-engage the leader after the runtime resumes from a pause. Work paused by
+   * an abort (in-progress tasks whose owner is no longer running) or restored
+   * from a snapshot (blocked/failed tasks) has no event-driven wake of its own:
+   * workers cannot re-claim in_progress tasks they own, and the stall heartbeat
+   * does not cover blocked/failed tasks. Wake the leader once per resume so it
+   * decides whether to resume, reassign, or finalize - rather than silently
+   * restarting or stranding the work. Also flush messages/events deferred
+   * during the pause.
+   */
+  private _reengageLeaderAfterResume(team: TeamData): void {
+    const blockedOrFailed = team.taskList.getAll().filter((task) =>
+      task.status === "blocked" || task.status === "failed",
+    );
+    const staleInProgress = team.taskList.getAll("in_progress").filter((task) => {
+      const owner = task.ownerAgentId ? team.workers.get(task.ownerAgentId) : undefined;
+      return !owner || owner.info.status !== "running";
+    });
+
+    if (blockedOrFailed.length > 0 || staleInProgress.length > 0) {
+      this._wakeLeaderForOrchestration({
+        type: "team_message",
+        sourceId: `resume:${blockedOrFailed.map((t) => t.id).join(",")}:${staleInProgress.map((t) => t.id).join(",")}`,
+        runtimeEpoch: this._runtimeEpoch,
+        messageText:
+          "Team runtime resumed after being paused. The following work was in flight and needs a decision: " +
+          `${blockedOrFailed.length} blocked/failed task(s) and ${staleInProgress.length} in-progress task(s) with no active worker. ` +
+          "Review the task list and decide whether to resume, reassign, split, or finalize each item; do not silently restart interrupted work.",
+        result: "Resumed after pause with in-flight work requiring a leader decision.",
+      });
+    }
+
+    if (this._deferredLeaderMessages.length > 0) {
+      const deferred = this._deferredLeaderMessages;
+      this._deferredLeaderMessages = [];
+      this.logTeamDebug("leader.deferred_messages.redelivered", { count: deferred.length });
+      for (const msg of deferred) {
+        this._wakeLeaderForMessage(msg);
+      }
+    }
+
+    if (this._orchestratorEvents.hasPending) {
+      this._scheduleOrchestratorQueue();
+    }
   }
 
   private _releaseWorkerOpenTasks(agentId: string, reason: string): TeamTask[] {
@@ -2505,7 +2798,11 @@ export class TeamManager {
       workerRole,
       reason,
     })) {
-      this._wakeLeaderForOrchestration(event);
+      this._wakeLeaderForOrchestration({
+        ...event,
+        sourceId: `${event.taskId ?? agentId}:released`,
+        runtimeEpoch: this._runtimeEpoch,
+      });
     }
 
     return released;
@@ -2559,6 +2856,8 @@ export class TeamManager {
 
     this._wakeLeaderForOrchestration({
       type: "task_completed",
+      sourceId: `${task.id}:completed`,
+      runtimeEpoch: this._runtimeEpoch,
       taskId: task.id,
       taskSubject: task.subject,
       taskType: task.taskType,
@@ -2582,7 +2881,21 @@ export class TeamManager {
 
     const followUps: TeamTask[] = [];
     const policy = this._coordinationPolicyForTask(task, result);
-    if (policy.needsReview) {
+    const generation = this._coordinationGeneration(task);
+    const rootTaskId = this._coordinationRootTaskId(task);
+    const canCreateFollowUp = generation < MAX_COORDINATION_GENERATION;
+
+    if (!canCreateFollowUp && (policy.needsReview || policy.needsFix)) {
+      this.logTeamDebug("coordination.followup.limit_reached", {
+        taskId: task.id,
+        rootTaskId,
+        generation,
+        maxGeneration: MAX_COORDINATION_GENERATION,
+        signal: policy.signal,
+      });
+    }
+
+    if (policy.needsReview && canCreateFollowUp) {
       const evidenceText = this._formatTaskEvidenceForPrompt(task, result);
       const handoffText = this._formatTaskHandoffForPrompt(task, result);
       followUps.push(this.createTask(
@@ -2607,11 +2920,17 @@ export class TeamManager {
         undefined,
         [],
         "review",
-        { generatedBy: "coordinator", parentTaskId: task.id, gate: "review" },
+        {
+          generatedBy: "coordinator",
+          parentTaskId: task.id,
+          rootTaskId,
+          coordinationGeneration: generation + 1,
+          gate: "review",
+        },
       ));
     }
 
-    if (policy.needsFix) {
+    if (policy.needsFix && canCreateFollowUp) {
       followUps.push(this.createTask(
         `Fix: ${task.subject}`,
         [
@@ -2624,11 +2943,30 @@ export class TeamManager {
         undefined,
         [],
         "fix",
-        { generatedBy: "coordinator", parentTaskId: task.id, gate: "fix" },
+        {
+          generatedBy: "coordinator",
+          parentTaskId: task.id,
+          rootTaskId,
+          coordinationGeneration: generation + 1,
+          gate: "fix",
+        },
       ));
     }
 
     return followUps;
+  }
+
+  private _coordinationGeneration(task: TeamTask): number {
+    const value = task.metadata?.coordinationGeneration;
+    return typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? Math.floor(value)
+      : 0;
+  }
+
+  private _coordinationRootTaskId(task: TeamTask): string {
+    const rootTaskId = task.metadata?.rootTaskId;
+    if (typeof rootTaskId === "string" && rootTaskId) return rootTaskId;
+    return task.id;
   }
 
   private _hasCoordinatorChild(parentTaskId: string, gate: "review" | "fix"): boolean {
@@ -2733,6 +3071,14 @@ export class TeamManager {
     this._hygieneTimers.clear();
   }
 
+  /** Cancel all pending leader-steer retry timers (team stop / dispose). */
+  private _clearSteerRetryTimers(): void {
+    for (const timer of this._steerRetryTimers) {
+      clearTimeout(timer);
+    }
+    this._steerRetryTimers.clear();
+  }
+
   // ==========================================================================
   // Cleanup
   // ==========================================================================
@@ -2752,7 +3098,9 @@ export class TeamManager {
     this._setLeaderTurnActive(false);
     this._orchestratorEvents.clear();
     this._leaderWakeInFlight = false;
+    this._deferredLeaderMessages = [];
     this._clearHygieneTimers();
+    this._clearSteerRetryTimers();
     if (this._orchestratorRetryTimer) {
       clearTimeout(this._orchestratorRetryTimer);
       this._orchestratorRetryTimer = null;
@@ -2784,7 +3132,7 @@ export class TeamManager {
   /** Check worker health and auto-recover stuck workers. */
   private _checkWorkerHealth(): void {
     const team = this._team;
-    if (!team || team.status !== "active") return;
+    if (!team || !this.isRuntimeActive()) return;
 
     // Prune fully-delivered broadcasts to prevent unbounded memory growth
     const activeAgentIds = Array.from(team.workers.entries())
@@ -2850,7 +3198,7 @@ export class TeamManager {
    */
   private _maybeRecoverOrchestrationStall(): void {
     const team = this._team;
-    if (!team || team.status !== "active") return;
+    if (!team || !this.isRuntimeActive()) return;
     const leaderSession = this._leaderSession;
     if (!leaderSession) return;
 
@@ -2886,6 +3234,8 @@ export class TeamManager {
     });
     this._wakeLeaderForOrchestration({
       type: "team_message",
+      sourceId: `stall:${readyTasks.map((task) => task.id).join(",")}:${stuckInProgress.map((task) => task.id).join(",")}`,
+      runtimeEpoch: this._runtimeEpoch,
       messageText:
         "Orchestration heartbeat: the team is idle but runnable work is stranded " +
         `(${readyTasks.length} ready task(s), ${stuckInProgress.length} in-progress task(s) with no active worker). ` +
@@ -2919,8 +3269,8 @@ export class TeamManager {
    */
   async restartWorker(agentId: string): Promise<void> {
     const team = this._team;
+    this._assertRuntimeActive("restart_worker");
     if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
 
     const worker = team.workers.get(agentId);
     if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
@@ -3038,6 +3388,8 @@ export class TeamManager {
     try {
       const team = hydratePersistedTeam(snapshot);
       this._team = team;
+      this._executionState = "paused";
+      this._runtimeEpoch++;
       this._lastLoggedContext = {};
       this._debugLogger.start(this._cwd, team.name, "restore_persisted_team");
       this.logTeamDebug("team.restore.start", {
@@ -3045,57 +3397,33 @@ export class TeamManager {
         teamCreatedAt: snapshot.team.createdAt,
         workerCount: team.workers.size,
         taskCount: team.taskList.size(),
+        executionState: this._executionState,
+        runtimeEpoch: this._runtimeEpoch,
       });
       this._refreshFileConflicts();
-      this._startHealthCheck();
+
+      const openTasks = team.taskList.getAll().filter((task) =>
+        task.status === "assigned" || task.status === "pending" || task.status === "blocked" || task.status === "failed",
+      );
+      for (const [, worker] of team.workers) {
+        const hasOwnedOpenTask = openTasks.some((task) =>
+          task.ownerAgentId === worker.info.agentId && task.status !== "blocked",
+        );
+        if (worker.info.activationPolicy !== "always" && !hasOwnedOpenTask && worker.info.status === "idle") {
+          // The roster is restored for viewing, but no session exists yet.
+          // Standby makes the lack of a live worker explicit until resume.
+          worker.info.status = "standby";
+          worker.info.statusChangedAt = Date.now();
+        }
+      }
 
       const state = this.getTeamState();
       if (state) {
         this._emitEvent({ type: "team_created", team: state });
         this._emitEvent({ type: "team_state_changed", team: state });
       }
-
-      const openTasks = team.taskList.getAll().filter((task) =>
-        task.status === "assigned" || task.status === "pending" || task.status === "blocked" || task.status === "failed",
-      );
-      for (const [agentId, worker] of team.workers) {
-        const hasOwnedOpenTask = openTasks.some((task) => task.ownerAgentId === agentId && task.status !== "blocked");
-        if (worker.info.activationPolicy !== "always" && !hasOwnedOpenTask) {
-          // Not relaunching this worker, so it has no session or runner. A
-          // restored "idle" status would strand later messages (idle skips the
-          // activation path in sendTeamMessage); "standby" routes them through
-          // activateMember correctly.
-          if (worker.info.status === "idle") {
-            worker.info.status = "standby";
-            worker.info.statusChangedAt = Date.now();
-          }
-          continue;
-        }
-        void this._launchWorker(agentId).catch((err) => {
-          console.error(`[TeamManager] Failed to restore worker ${agentId}:`, err);
-          this.logTeamDebug("worker.restore_launch.error", { agentId, error: err });
-          this.updateWorkerStatus(agentId, "error", String(err));
-        });
-      }
-
-      // Re-engage the leader when unfinished work survived the restart.
-      // Without this, restored blocked/failed tasks never fire an event-driven
-      // wake and the team can sit silent until (or past) the stall heartbeat.
-      if (openTasks.length > 0) {
-        const byStatus: Record<string, number> = {};
-        for (const task of openTasks) {
-          byStatus[task.status] = (byStatus[task.status] ?? 0) + 1;
-        }
-        this._wakeLeaderForOrchestration({
-          type: "team_message",
-          messageText:
-            `The team "${team.name}" was restored from a previous session with ${openTasks.length} open task(s) ` +
-            `(${Object.entries(byStatus).map(([status, count]) => `${status}=${count}`).join(", ")}). ` +
-            "Review the task and worker state below, resume coordination, and unblock or reassign anything stranded. " +
-            "If the remaining work is genuinely done or obsolete, close it out and summarize for the user.",
-          result: "Team restored with open tasks.",
-        });
-      }
+      // Restore is deliberately history-only. A user viewing a completed Team
+      // must not start a new Leader turn or revive workers just by opening it.
     } finally {
       this._isRestoringTeam = false;
       this._schedulePersist();
@@ -3140,6 +3468,8 @@ export class TeamManager {
 
     this._wakeLeaderForOrchestration({
       type: eventType,
+      sourceId: message.id,
+      runtimeEpoch: this._runtimeEpoch,
       fromAgentId: message.fromAgentId,
       toAgentId: message.toAgentId,
       messageKind: message.kind,
@@ -3172,6 +3502,13 @@ export class TeamManager {
    * drains any pending events.
    */
   private _setLeaderTurnActive(active: boolean): void {
+    if (active && this._team && !this.isRuntimeActive()) {
+      this.logTeamDebug("orchestrator.leader_turn.ignored", {
+        reason: "team_runtime_paused",
+        runtimeEpoch: this._runtimeEpoch,
+      });
+      return;
+    }
     this._leaderTurnActive = active;
     if (this._leaderTurnWatchdog) {
       clearTimeout(this._leaderTurnWatchdog);
@@ -3186,7 +3523,7 @@ export class TeamManager {
           timeoutMs: LEADER_STUCK_TURN_TIMEOUT_MS,
         });
         this._leaderTurnActive = false;
-        if (this._orchestratorEvents.hasPending && this._leaderSession) {
+        if (this.isRuntimeActive() && this._orchestratorEvents.hasPending && this._leaderSession) {
           this._scheduleOrchestratorQueue();
         }
       }, LEADER_STUCK_TURN_TIMEOUT_MS);
@@ -3198,17 +3535,22 @@ export class TeamManager {
    * If the Leader is idle, processes immediately. If busy, queues for agent_end.
    */
   private _wakeLeaderForOrchestration(event: OrchestrationEvent): void {
-    if (!this._team || !this._leaderSession) {
+    if (!this.isRuntimeActive() || !this._leaderSession) {
       this.logTeamDebug("orchestrator.wake.skipped", {
-        reason: !this._team ? "no_team" : "no_leader_session",
+        reason: !this._team ? "no_team" : this._executionState !== "active" ? "runtime_paused" : "no_leader_session",
         event,
       });
       return;
     }
 
-    this._orchestratorEvents.enqueue(event);
+    const queuedEvent = {
+      ...event,
+      runtimeEpoch: event.runtimeEpoch ?? this._runtimeEpoch,
+    };
+    const accepted = this._orchestratorEvents.enqueue(queuedEvent);
     this.logTeamDebug("orchestrator.event.enqueued", {
-      event,
+      event: queuedEvent,
+      accepted,
       queueLength: this._orchestratorEvents.length,
       leaderTurnActive: this._leaderTurnActive,
       leaderStreaming: this._leaderSession.isStreaming,
@@ -3222,6 +3564,7 @@ export class TeamManager {
   }
 
   private _scheduleOrchestratorQueue(delayMs = 0): void {
+    if (!this.isRuntimeActive()) return;
     const normalizedDelay = Math.max(0, delayMs);
     const dueAt = Date.now() + normalizedDelay;
     if (this._orchestratorRetryTimer) {
@@ -3258,6 +3601,10 @@ export class TeamManager {
    * Batches multiple events into a single prompt for efficiency.
    */
   private async _processOrchestratorQueue(): Promise<void> {
+    if (!this.isRuntimeActive()) {
+      this.logTeamDebug("orchestrator.process.skipped", { reason: "runtime_paused" });
+      return;
+    }
     if (this._leaderWakeInFlight || this._leaderTurnActive) {
       this.logTeamDebug("orchestrator.process.skipped", {
         reason: this._leaderWakeInFlight ? "wake_in_flight" : "leader_turn_active",
@@ -3295,9 +3642,10 @@ export class TeamManager {
       const result = await processOrchestrationWakeQueue({
         queue: this._orchestratorEvents,
         session: this._leaderSession,
-        canProcess: () => !this._leaderTurnActive && Boolean(this._leaderSession && this._team),
+        canProcess: () => this.isRuntimeActive() && !this._leaderTurnActive && Boolean(this._leaderSession && this._team),
         buildPrompt: (events) => this._buildOrchestrationPrompt(events),
         scheduleRetry: (delayMs) => this._scheduleOrchestratorQueue(delayMs),
+        canRetry: (events) => this.isRuntimeActive() && events.every((event) => event.runtimeEpoch === this._runtimeEpoch),
         onWakeFailed: (err, retry) => {
           console.error("[TeamManager] Orchestrator wake failed, re-queuing events:", err);
           this.logTeamDebug("orchestrator.process.wake_failed", { error: err, retry });
@@ -3310,6 +3658,7 @@ export class TeamManager {
     } finally {
       this._leaderWakeInFlight = false;
       if (
+        this.isRuntimeActive() &&
         this._orchestratorEvents.hasPending &&
         !this._leaderTurnActive &&
         this._leaderSession
@@ -3350,6 +3699,7 @@ export class TeamManager {
   private _teamToolHost(): TeamToolHost {
     return {
       getTeam: () => this._team,
+      isRuntimeActive: () => this.isRuntimeActive(),
       setLeaderTurnActive: (active) => { this._setLeaderTurnActive(active); },
       scheduleOrchestratorQueue: (delayMs) => this._scheduleOrchestratorQueue(delayMs),
       sendTeamMessage: (fromAgentId, toAgentId, text, summary, kind) =>

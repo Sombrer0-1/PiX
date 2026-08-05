@@ -14,6 +14,7 @@ const teamStore = useTeamStore();
 
 const scrollContainer = ref<HTMLElement | null>(null);
 const shouldAutoScroll = ref(true);
+const expandedErrors = ref<Record<string, boolean>>({});
 
 const focusedId = computed(() => teamStore.focusedAgentId);
 const focusedAgent = computed(() => {
@@ -149,7 +150,7 @@ function handleScroll(): void {
 }
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function extractText(content: string | Array<{ type: string; text?: string }>): string {
@@ -164,15 +165,47 @@ function formatToolArgs(args: unknown): string {
   return raw.length > 140 ? `${raw.slice(0, 140)}...` : raw;
 }
 
+function formatToolResult(result: unknown): string {
+  if (result === undefined || result === null) return "";
+  if (typeof result === "string") return result;
+  if (typeof result === "object") {
+    const obj = result as Record<string, unknown>;
+    if (typeof obj.message === "string") return obj.message;
+    if (typeof obj.error === "string") return obj.error;
+    if (typeof obj.errorMessage === "string") return obj.errorMessage;
+    try {
+      return JSON.stringify(result);
+    } catch {
+      return String(result);
+    }
+  }
+  return String(result);
+}
+
+function toggleErrorExpand(toolCallId: string): void {
+  expandedErrors.value[toolCallId] = !expandedErrors.value[toolCallId];
+}
+
 function statusLabel(status?: string): string {
   switch (status) {
-    case "running": return "Working";
-    case "idle": return "Ready";
-    case "standby": return "Ready";
-    case "dormant": return "Paused";
-    case "error": return "Issue";
-    case "shutdown": return "Stopped";
+    case "running": return "工作中";
+    case "idle": return "就绪";
+    case "standby": return "就绪";
+    case "dormant": return "已暂停";
+    case "error": return "有问题";
+    case "shutdown": return "已停止";
     default: return status ?? "";
+  }
+}
+
+function roleLabel(role?: string): string {
+  switch (role) {
+    case "planner": return "规划";
+    case "coder": return "开发";
+    case "reviewer": return "审查";
+    case "tester": return "测试";
+    case "researcher": return "调研";
+    default: return role ?? "成员";
   }
 }
 
@@ -188,7 +221,7 @@ function isFileChange(ev: AgentSessionEvent): ev is {
   type: "file_change";
   toolCallId: string;
   toolName: string;
-  change: { filePath: string; addedLines: number; removedLines: number };
+  change: { path?: string; added: number; removed: number };
   aggregate: unknown;
 } {
   return ev.type === "file_change";
@@ -207,27 +240,27 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   <div class="worker-session-view">
     <div v-if="!focusedId" class="wsv-empty">
       <v-icon icon="mdi-account-group-outline" size="36" color="grey-lighten-1" />
-      <p>Select a worker above to watch its live work process.</p>
+      <p>未选择团队成员。</p>
     </div>
 
     <template v-else>
       <div class="wsv-header">
         <div class="wsv-worker">
           <strong>{{ focusedAgent?.name ?? focusedId.split('::')[0] }}</strong>
-          <span>{{ focusedAgent?.role ?? "worker" }}</span>
+          <span>{{ roleLabel(focusedAgent?.role) }}</span>
           <em>{{ statusLabel(focusedAgent?.status) }}</em>
         </div>
         <div class="wsv-stats">
-          <span>{{ streamEntries.length }} events</span>
-          <span>{{ workStats.tools }} tools</span>
-          <span>{{ workStats.files }} files</span>
-          <span v-if="workStats.errors" class="wsv-stat-error">{{ workStats.errors }} errors</span>
+          <span>{{ streamEntries.length }} 条事件</span>
+          <span>{{ workStats.tools }} 次工具调用</span>
+          <span>{{ workStats.files }} 个文件</span>
+          <span v-if="workStats.errors" class="wsv-stat-error">{{ workStats.errors }} 个错误</span>
         </div>
       </div>
 
       <div v-if="streamEntries.length === 0" class="wsv-empty wsv-empty--inside">
         <v-icon icon="mdi-clock-outline" size="32" color="grey-lighten-1" />
-        <p>This worker is idle — no events yet.</p>
+        <p>该成员当前空闲，暂无事件。</p>
       </div>
 
       <div
@@ -243,9 +276,9 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
           >
             <div class="wsv-msg-header">
               <v-icon icon="mdi-comment-text-outline" size="14" color="purple" />
-              <span class="wsv-msg-label">Assistant</span>
+              <span class="wsv-msg-label">助手</span>
               <span class="wsv-msg-count" v-if="entry.entry.events.length > 1">
-                {{ entry.entry.events.length }} chunks
+                {{ entry.entry.events.length }} 个片段
               </span>
             </div>
             <div class="wsv-msg-body">
@@ -257,7 +290,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
           <template v-else>
             <div v-if="isTurnStart(entry.tagged.event)" class="wsv-turn-sep">
               <span class="wsv-turn-line"></span>
-              <span class="wsv-turn-label">New turn</span>
+              <span class="wsv-turn-label">新一轮</span>
               <span class="wsv-turn-line"></span>
             </div>
 
@@ -270,31 +303,53 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
               <span class="wsv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
             </div>
 
-            <div v-else-if="isToolEnd(entry.tagged.event)" class="wsv-entry wsv-entry--tool-end">
-              <v-icon
-                :icon="entry.tagged.event.isError ? 'mdi-alert-circle' : 'mdi-check-circle'"
-                size="14"
-                class="wsv-entry-icon"
-                :color="entry.tagged.event.isError ? 'red' : 'green'"
-              />
-              <span class="wsv-entry-tool">{{ entry.tagged.event.toolName }}</span>
-              <span v-if="entry.tagged.event.isError" class="wsv-entry-error">Error</span>
-              <span class="wsv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
-            </div>
+            <template v-else-if="isToolEnd(entry.tagged.event)">
+              <div class="wsv-entry wsv-entry--tool-end">
+                <v-icon
+                  :icon="entry.tagged.event.isError ? 'mdi-alert-circle' : 'mdi-check-circle'"
+                  size="14"
+                  class="wsv-entry-icon"
+                  :color="entry.tagged.event.isError ? 'red' : 'green'"
+                />
+                <span class="wsv-entry-tool">{{ entry.tagged.event.toolName }}</span>
+                <span
+                  v-if="entry.tagged.event.isError"
+                  class="wsv-entry-error"
+                  :class="{ 'wsv-entry-error--toggle': formatToolResult(entry.tagged.event.result) }"
+                  :title="formatToolResult(entry.tagged.event.result) || undefined"
+                  @click="formatToolResult(entry.tagged.event.result) && toggleErrorExpand(entry.tagged.event.toolCallId)"
+                >
+                  错误
+                  <v-icon
+                    v-if="formatToolResult(entry.tagged.event.result)"
+                    :icon="expandedErrors[entry.tagged.event.toolCallId] ? 'mdi-chevron-up' : 'mdi-chevron-down'"
+                    size="11"
+                    class="wsv-entry-error-chev"
+                  />
+                </span>
+                <span class="wsv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
+              </div>
+              <div
+                v-if="entry.tagged.event.isError && expandedErrors[entry.tagged.event.toolCallId] && formatToolResult(entry.tagged.event.result)"
+                class="wsv-entry-error-detail"
+              >
+                <pre class="wsv-error-text">{{ formatToolResult(entry.tagged.event.result) }}</pre>
+              </div>
+            </template>
 
             <div v-else-if="isFileChange(entry.tagged.event)" class="wsv-entry wsv-entry--file-change">
               <v-icon icon="mdi-file-edit-outline" size="14" class="wsv-entry-icon" color="amber" />
-              <span class="wsv-entry-path">{{ entry.tagged.event.change.filePath }}</span>
+              <span class="wsv-entry-path">{{ entry.tagged.event.change.path || '(未知文件)' }}</span>
               <span class="wsv-entry-diff">
-                <span class="wsv-diff-add">+{{ entry.tagged.event.change.addedLines }}</span>
-                <span class="wsv-diff-rem">-{{ entry.tagged.event.change.removedLines }}</span>
+                <span class="wsv-diff-add">+{{ entry.tagged.event.change.added }}</span>
+                <span class="wsv-diff-rem">-{{ entry.tagged.event.change.removed }}</span>
               </span>
               <span class="wsv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
             </div>
 
             <div v-else-if="isTurnEnd(entry.tagged.event)" class="wsv-turn-sep wsv-turn-sep--end">
               <span class="wsv-turn-line"></span>
-              <span class="wsv-turn-label">Turn complete</span>
+              <span class="wsv-turn-label">本轮完成</span>
               <span class="wsv-turn-line"></span>
             </div>
           </template>
@@ -306,7 +361,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
           v-model="directMessage"
           class="wsv-composer-input"
           type="text"
-          :placeholder="`Message ${focusedAgent?.name ?? 'this worker'} directly...`"
+          :placeholder="`直接向 ${focusedAgent?.name ?? '该成员'} 发送消息...`"
           :disabled="isSendingDirect"
           @keydown.enter.prevent="sendDirectMessage"
         />
@@ -314,7 +369,8 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
           class="wsv-composer-send"
           type="button"
           :disabled="!directMessage.trim() || isSendingDirect"
-          title="Send direct message to this worker"
+          title="向该成员发送直接消息"
+          aria-label="向该成员发送直接消息"
           @click="sendDirectMessage"
         >
           <v-icon icon="mdi-send" size="14" />
@@ -446,7 +502,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0;
   flex-shrink: 0;
 }
 
@@ -510,6 +566,37 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   color: var(--pix-error);
   font-size: 10px;
   flex-shrink: 0;
+}
+
+.wsv-entry-error--toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.wsv-entry-error-chev {
+  flex-shrink: 0;
+}
+
+.wsv-entry-error-detail {
+  margin: 0 7px 2px 16px;
+  padding: 4px 6px;
+  border-left: 2px solid var(--pix-error);
+  background: var(--pix-error-bg);
+  border-radius: var(--pix-radius-sm);
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.wsv-error-text {
+  margin: 0;
+  font-family: var(--pix-font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--pix-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .wsv-entry-path {

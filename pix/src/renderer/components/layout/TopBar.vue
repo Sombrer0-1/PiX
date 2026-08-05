@@ -7,10 +7,10 @@
  * all in one tight 28px bar.
  */
 import { computed } from "vue";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useProjectStore } from "../../stores/project-store";
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
 const projectStore = useProjectStore();
 
 const projectName = computed(() => projectStore.currentProject?.name || "");
@@ -35,10 +35,10 @@ const sessionName = computed(() => rpc.sessionState.value?.sessionName || "");
       <span
         class="topbar-status"
         :class="{ connected: rpc.isConnected.value }"
-        :title="rpc.isConnected.value ? 'Pi connected' : 'Disconnected'"
+        :title="rpc.isConnected.value ? 'Pi 已连接' : '未连接'"
       >
         <span class="topbar-dot"></span>
-        {{ rpc.isConnected.value ? 'Pi' : 'Offline' }}
+        {{ rpc.isConnected.value ? 'Pi' : '离线' }}
       </span>
     </div>
   </div>

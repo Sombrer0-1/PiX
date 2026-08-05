@@ -19,7 +19,7 @@ const props = defineProps<{
 const expanded = ref(false);
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString(undefined, {
+  return new Date(ts).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
     minute: "2-digit",
   });
@@ -27,7 +27,7 @@ function formatTime(ts: number): string {
 
 const resultText = computed(() => {
   if (props.result === null || props.result === undefined) {
-    return props.isStreaming ? "Running..." : "No result";
+    return props.isStreaming ? "运行中..." : "无结果";
   }
 
   if (typeof props.result === "string") {
@@ -86,11 +86,11 @@ function toggleExpand(): void {
     <button class="tool-header" @click="toggleExpand">
       <span class="tool-icon">
         <span v-if="isStreaming" class="spinner"></span>
-        <span v-else-if="isError" class="status-mark error-mark" aria-label="Failed"></span>
-        <span v-else class="status-mark success-mark" aria-label="Succeeded"></span>
+        <span v-else-if="isError" class="status-mark error-mark" aria-label="失败"></span>
+        <span v-else class="status-mark success-mark" aria-label="成功"></span>
       </span>
       <span class="tool-name">{{ toolName }}</span>
-      <span v-if="mcpServer" class="mcp-chip" :title="'MCP server: ' + mcpServer">MCP:{{ mcpServer }}</span>
+      <span v-if="mcpServer" class="mcp-chip" :title="'MCP 服务器：' + mcpServer">MCP:{{ mcpServer }}</span>
       <span v-if="argsSummary" class="tool-args">{{ argsSummary }}</span>
       <span class="tool-time">{{ formatTime(timestamp) }}</span>
       <span class="tool-toggle">{{ expanded ? 'v' : '>' }}</span>
@@ -99,13 +99,13 @@ function toggleExpand(): void {
     <div v-if="expanded" class="tool-body">
       <!-- Arguments -->
       <div v-if="args" class="tool-section">
-        <div class="tool-section-label">Arguments</div>
+        <div class="tool-section-label">参数</div>
         <pre class="tool-code">{{ JSON.stringify(args, null, 2) }}</pre>
       </div>
 
       <!-- Result -->
       <div class="tool-section">
-        <div class="tool-section-label">Result</div>
+        <div class="tool-section-label">结果</div>
         <pre class="tool-code">{{ resultText }}</pre>
       </div>
     </div>

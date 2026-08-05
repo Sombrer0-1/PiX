@@ -24,8 +24,9 @@ import type {
 	AgentTool,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai";
+import type { ApiErrorCategory, AssistantMessage, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai";
 import {
+	classifyApiError,
 	clampThinkingLevel,
 	cleanupSessionResources,
 	getSupportedThinkingLevels,
@@ -191,7 +192,15 @@ export type AgentSessionEvent =
 			errorMessage?: string;
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| {
+			type: "api_error";
+			errorMessage: string;
+			category: ApiErrorCategory;
+			httpStatus?: number;
+			title: string;
+			retryable: boolean;
+	  };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -322,6 +331,15 @@ interface ToolDefinitionEntry {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+
+/**
+ * Margin from the hard context limit used to decide whether a failed turn is
+ * likely an unrecognized context overflow. The estimate under-reports the
+ * context actually sent (the failed request can exceed the last successful
+ * usage), so 4096 keeps the heuristic conservative without misfiring on
+ * ordinary errors.
+ */
+const OVERFLOW_RECOVERY_MARGIN = 4096;
 
 // ============================================================================
 // AgentSession Class
@@ -1245,6 +1263,56 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Manually retry the last failed turn.
+	 *
+	 * Removes the trailing failed assistant message from agent state and re-runs
+	 * the agent on the existing user context via `agent.continue()`. This is
+	 * user-initiated and bypasses the auto-retry setting (the user explicitly
+	 * asked to retry). No-op if the agent is busy or the last message is not a
+	 * failed assistant response.
+	 */
+	async retryLastTurn(): Promise<void> {
+		// Don't interfere with an in-progress run or auto-retry backoff.
+		if (this.isStreaming || this._retryAbortController) {
+			return;
+		}
+
+		const messages = this.agent.state.messages;
+		const last = messages[messages.length - 1] as AssistantMessage | undefined;
+		if (!last || last.role !== "assistant" || last.stopReason !== "error") {
+			return;
+		}
+
+		// Drop the failed assistant message so continue() resumes from the
+		// preceding user/toolResult message (mirrors _prepareRetry's removal).
+		this.agent.state.messages = messages.slice(0, -1);
+		this._retryAttempt = 0;
+		this._overflowRecoveryAttempted = false;
+		this._lastAssistantMessage = undefined;
+
+		try {
+			await this.agent.continue();
+			while (await this._handlePostAgentRun()) {
+				await this.agent.continue();
+			}
+		} catch (err) {
+			// Restore the failed assistant message so the in-memory transcript
+			// stays consistent with persistence and a second retry click can
+			// still find a trailing error turn to retry. Without this, a non-API
+			// rejection (e.g. "Agent is already processing" or a thrown extension
+			// error before the run starts) would leave the failed turn permanently
+			// missing from agent state and make every later retry silently no-op.
+			const current = this.agent.state.messages;
+			if (current[current.length - 1] !== last) {
+				this.agent.state.messages = [...current, last];
+			}
+			throw err;
+		} finally {
+			this._flushPendingBashMessages();
+		}
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
@@ -1270,6 +1338,32 @@ export class AgentSession {
 			return true;
 		}
 
+		// Surface API errors before any continuation logic (queued messages,
+		// verification gates, goal continuation) so the api_error badge and retry
+		// affordance appear consistently in both normal and goal-driven sessions.
+		// In goal mode, _prepareGoalContinuationIfNeeded queues a no-backoff
+		// follow-up and returns true; hasQueuedMessages and
+		// _prepareVerificationContinuationIfNeeded can also return true earlier.
+		// All of them suppress the api_error on the first API error if this block
+		// is placed after them. Retry and compaction (above) are recovery paths
+		// that own the turn when they succeed, so api_error fires only when no
+		// recovery happened. Context-overflow errors are owned by the compaction
+		// flow (compaction_end) and are not re-emitted here.
+		if (msg.stopReason === "error" && msg.errorMessage) {
+			const contextWindow = this.model?.contextWindow ?? 0;
+			if (!isContextOverflow(msg, contextWindow)) {
+				const classified = classifyApiError(msg.errorMessage);
+				this._emit({
+					type: "api_error",
+					errorMessage: msg.errorMessage,
+					category: classified.category,
+					httpStatus: classified.httpStatus,
+					title: classified.title,
+					retryable: classified.retryable,
+				});
+			}
+		}
+
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
 		if (this.agent.hasQueuedMessages()) {
@@ -1280,7 +1374,11 @@ export class AgentSession {
 			return true;
 		}
 
-		return this._prepareGoalContinuationIfNeeded();
+		if (this._prepareGoalContinuationIfNeeded()) {
+			return true;
+		}
+
+		return false;
 	}
 
 	private _prepareVerificationContinuationIfNeeded(): boolean {
@@ -2419,6 +2517,33 @@ export class AgentSession {
 			contextTokens = calculateContextTokens(assistantMessage.usage);
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			// A failed turn whose error the existing retry classification cannot
+			// recognize, with context near the hard limit, is most likely a context
+			// overflow that isContextOverflow() failed to classify (the provider or
+			// proxy may have lost the upstream overflow detail). Compaction has just
+			// freed the context the failed request needed, so auto-retry once.
+			// Bounded by same model, near-limit context, non-retryable error
+			// (retryable ones already got their maxRetries chances), and non-quota
+			// errors (explicitly classified as limits). Heuristic cost: a rare
+			// auth/permission error near the limit triggers one compact-and-retry,
+			// which stops immediately if it fails again.
+			const nearContextLimit = contextWindow > 0 && contextTokens >= contextWindow - OVERFLOW_RECOVERY_MARGIN;
+			if (
+				sameModel &&
+				assistantMessage.stopReason === "error" &&
+				nearContextLimit &&
+				!this._isRetryableError(assistantMessage) &&
+				!this._isNonRetryableProviderLimitError(assistantMessage.errorMessage ?? "")
+			) {
+				// Shares the recovery budget with the recognized-overflow path:
+				// at most one recovery per consecutive-error streak (the flag resets
+				// on non-error assistant messages and user messages - existing contract).
+				if (this._overflowRecoveryAttempted) {
+					return false;
+				}
+				this._overflowRecoveryAttempted = true;
+				return await this._runAutoCompaction("threshold", true);
+			}
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;

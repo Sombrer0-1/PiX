@@ -79,7 +79,7 @@ function enhanceCodeBlocks(html: string): string {
 }
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
 function toolSummary(tools: ToolWorkItem[]): string {
@@ -253,7 +253,11 @@ function resultPreview(result: unknown): string {
 
 const props = defineProps<{
   blocks: DisplayBlock[];
+  /** blockId of the latest retryable error eligible for a retry button (null while streaming). */
+  activeRetryBlockId?: string | null;
 }>();
+
+const emit = defineEmits<{ retry: [] }>();
 
 const expandedWorkStatus = ref<Set<string>>(new Set());
 const expandedTools = ref<Set<string>>(new Set());
@@ -470,6 +474,12 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         v-else-if="block.type === 'error'"
         :message="block.message"
         :source="block.source"
+        :category="block.category"
+        :http-status="block.httpStatus"
+        :title="block.title"
+        :retryable="block.retryable"
+        :can-retry="block.id === activeRetryBlockId"
+        @retry="emit('retry')"
       />
 
       <!-- Compaction Notice -->

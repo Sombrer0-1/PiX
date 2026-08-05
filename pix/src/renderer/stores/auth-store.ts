@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import type { AuthStatusMap } from "@/types/rpc";
-import { useRpc } from "@/composables/useRpc";
+import { useWorkspaceRpc } from "@/composables/useWorkspaceRpc";
 
 /**
  * Auth Store
@@ -29,7 +29,7 @@ export const useAuthStore = defineStore("auth", () => {
   const configuredCount = computed(() => configuredProviders.value.length);
 
   async function refreshStatus(): Promise<void> {
-    const rpc = useRpc();
+    const rpc = useWorkspaceRpc();
     if (!rpc.isConnected.value) {
       authStatus.value = {};
       isLoaded.value = false;

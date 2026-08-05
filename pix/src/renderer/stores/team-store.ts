@@ -7,7 +7,10 @@
  */
 
 import { defineStore } from "pinia";
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
+import { useRpc } from "../composables/useRpc";
+import { useTeamLeaderRpc } from "../composables/useTeamLeaderRpc";
+import { useProjectStore } from "./project-store";
 import type {
   TeamState,
   TeamEvent,
@@ -45,6 +48,10 @@ function extractText(content: string | Array<{ type: string; text?: string }>): 
 }
 
 export const useTeamStore = defineStore("team", () => {
+  const singleRpc = useRpc();
+  const teamLeaderRpc = useTeamLeaderRpc();
+  const projectStore = useProjectStore();
+
   // ==========================================================================
   // State
   // ==========================================================================
@@ -138,7 +145,7 @@ export const useTeamStore = defineStore("team", () => {
         const tagged = events[i];
         const ev = tagged.event;
         if (ev.type === "tool_execution_start") {
-          result[agentId] = ev.toolName === "bash" ? `Running: ${truncate(String(ev.args), 60)}` : `Using: ${ev.toolName}`;
+          result[agentId] = ev.toolName === "bash" ? `正在运行：${truncate(String(ev.args), 60)}` : `正在使用：${ev.toolName}`;
           break;
         }
         if (ev.type === "message_update" || ev.type === "message_start") {
@@ -149,7 +156,7 @@ export const useTeamStore = defineStore("team", () => {
           }
         }
         if (ev.type === "tool_execution_end") {
-          result[agentId] = ev.isError ? `Error in ${ev.toolName}` : `Completed: ${ev.toolName}`;
+          result[agentId] = ev.isError ? `${ev.toolName} 执行出错` : `已完成：${ev.toolName}`;
           break;
         }
       }
@@ -204,7 +211,7 @@ export const useTeamStore = defineStore("team", () => {
         }
         return true;
       }
-      lastError.value = result.error ?? "Failed to create team";
+      lastError.value = result.error ?? "创建团队失败";
       return false;
     } catch (err) {
       lastError.value = err instanceof Error ? err.message : String(err);
@@ -244,6 +251,13 @@ export const useTeamStore = defineStore("team", () => {
         // should open the team workbench without requiring a manual toggle.
         if (next?.status === "active" && !teamState.value) {
           teamMode.value = true;
+        }
+        // If the team is gone but teamMode is still on (e.g. leader crashed
+        // while the workbench was unmounted and the watcher that would
+        // auto-recover was disposed), drop out of team mode so the workspace
+        // falls back to solo instead of showing a dead team UI.
+        if (next === null && teamMode.value) {
+          teamMode.value = false;
         }
         teamState.value = next;
       }
@@ -303,7 +317,7 @@ export const useTeamStore = defineStore("team", () => {
         // re-populate already-cleared stores.
         return true;
       }
-      lastError.value = result.error ?? "Failed to stop team";
+      lastError.value = result.error ?? "停止团队失败";
       return false;
     } catch (err) {
       lastError.value = err instanceof Error ? err.message : String(err);
@@ -322,7 +336,7 @@ export const useTeamStore = defineStore("team", () => {
         message,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to send message";
+        lastError.value = result.error ?? "发送消息失败";
         return false;
       }
       return true;
@@ -340,7 +354,7 @@ export const useTeamStore = defineStore("team", () => {
         agentId,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to abort worker";
+        lastError.value = result.error ?? "停止成员当前任务失败";
         return false;
       }
       return true;
@@ -358,7 +372,7 @@ export const useTeamStore = defineStore("team", () => {
         agentId,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to bring member in";
+        lastError.value = result.error ?? "唤醒团队成员失败";
         return false;
       }
       return true;
@@ -376,7 +390,7 @@ export const useTeamStore = defineStore("team", () => {
         agentId,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to pause member";
+        lastError.value = result.error ?? "暂停团队成员失败";
         return false;
       }
       return true;
@@ -391,13 +405,93 @@ export const useTeamStore = defineStore("team", () => {
     lastError.value = null;
   }
 
-  /** Toggle team mode on/off. */
-  function toggleTeamMode(): void {
-    teamMode.value = !teamMode.value;
-    if (!teamMode.value) {
-      focusedAgentId.value = null;
+  /** Switch the workspace between the independent single and Team runtimes. */
+  async function toggleTeamMode(projectDir?: string): Promise<boolean> {
+    if (isLoading.value) return false;
+    if (!projectDir) {
+      lastError.value = "切换模式前需要先打开项目目录";
+      return false;
+    }
+
+    isLoading.value = true;
+    lastError.value = null;
+    try {
+      if (teamMode.value) {
+        await teamLeaderRpc.stopTeamRuntime();
+        const started = await singleRpc.startRuntime(projectDir);
+        if (!started) {
+          lastError.value = singleRpc.lastError.value || "启动单人运行环境失败";
+          // Solo failed to start; restore the team runtime so the workspace is
+          // not left with both runtimes down while the UI still shows team mode.
+          const restored = await teamLeaderRpc.startTeamRuntime(projectDir);
+          if (!restored) {
+            lastError.value = `${lastError.value}\n恢复团队运行环境也失败：${teamLeaderRpc.lastError.value || "未知错误"}`;
+            // Both runtimes are down. Drop to solo mode so the workspace shows a
+            // retryable solo error state instead of a dead team workspace. The
+            // piStatus recovery watch below does not fire here because
+            // stopTeamRuntime already set piStatus to "stopped" during this
+            // isLoading-guarded toggle, so there is no later status change to
+            // react to.
+            teamMode.value = false;
+          }
+          return false;
+        }
+        teamMode.value = false;
+        void window.pixApi.setWorkspaceMode(projectDir, "solo");
+        focusedAgentId.value = null;
+        return true;
+      }
+
+      const started = await teamLeaderRpc.startTeamRuntime(projectDir);
+      if (!started) {
+        lastError.value = teamLeaderRpc.lastError.value || "启动团队运行环境失败";
+        // start-team-runtime stops the single runtime before starting the
+        // leader, so restore ordinary mode if Team startup fails.
+        const restored = await singleRpc.startRuntime(projectDir);
+        if (!restored) {
+          lastError.value = `${lastError.value}\n恢复单人运行环境也失败：${singleRpc.lastError.value || "未知错误"}`;
+        }
+        return false;
+      }
+      teamMode.value = true;
+      void window.pixApi.setWorkspaceMode(projectDir, "team");
+      return true;
+    } catch (err) {
+      lastError.value = err instanceof Error ? err.message : String(err);
+      return false;
+    } finally {
+      isLoading.value = false;
     }
   }
+
+  // If the team leader runtime exits while the workspace is in team mode
+  // (e.g. it crashed while the user was on another page and the CenterPanel
+  // canUseTeamMode auto-recovery watcher had been disposed with the
+  // component), recover to a functional solo workspace from the store: stop the
+  // dead leader and start the single runtime. Running this in the singleton
+  // store means it fires even when WorkspacePage/CenterPanel are unmounted, so
+  // navigating back lands in a working solo workspace instead of a dead team
+  // UI. This matters because a crash does not clear TeamManager._team, so
+  // fetchTeamState still returns non-null stale state and the canUseTeamMode
+  // watcher (no immediate, and disposed while away) never re-fires.
+  //
+  // The isLoading guard inside toggleTeamMode prevents a double switch when
+  // CenterPanel's canUseTeamMode watcher fires at the same time, and also
+  // blocks this callback during a normal team->solo toggle - whose
+  // stopTeamRuntime also flips piStatus to "stopped" while teamMode is still
+  // true. Only an unsolicited leader exit (status becomes "stopped" outside a
+  // toggle) triggers recovery.
+  watch(teamLeaderRpc.piStatus, (status) => {
+    if (status !== "stopped" || !teamMode.value || isLoading.value) return;
+    const projectDir = projectStore.currentProject?.path;
+    if (projectDir) {
+      void toggleTeamMode(projectDir);
+    } else {
+      // Team mode requires an open project, so this branch is defensive: at
+      // least drop team mode so the UI does not render a dead team workspace.
+      teamMode.value = false;
+    }
+  });
 
   /** Focus on a specific worker. Auto-creates event buffer if missing. */
   function focusWorker(agentId: string): void {
@@ -449,6 +543,7 @@ export const useTeamStore = defineStore("team", () => {
         }
         teamState.value = null;
         resetTeamCollections();
+        teamMode.value = false;
         break;
       case "teammate_status_changed":
         if (teamState.value && teamState.value.teammates[event.agentId]) {
@@ -637,7 +732,7 @@ export const useTeamStore = defineStore("team", () => {
       if (result.success && result.data) {
         return result.data;
       }
-      lastError.value = result.error ?? "Failed to create task";
+      lastError.value = result.error ?? "创建任务失败";
       return null;
     } catch (err) {
       lastError.value = err instanceof Error ? err.message : String(err);
@@ -653,7 +748,7 @@ export const useTeamStore = defineStore("team", () => {
         taskId,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to delete task";
+        lastError.value = result.error ?? "删除任务失败";
         return false;
       }
       return true;
@@ -677,7 +772,7 @@ export const useTeamStore = defineStore("team", () => {
         reason,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to respond to permission request";
+        lastError.value = result.error ?? "响应权限请求失败";
         return false;
       }
       return true;
@@ -697,7 +792,7 @@ export const useTeamStore = defineStore("team", () => {
         feedback,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to respond to plan approval";
+        lastError.value = result.error ?? "响应计划审批失败";
         return false;
       }
       return true;
@@ -715,7 +810,7 @@ export const useTeamStore = defineStore("team", () => {
         agentId,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to request shutdown";
+        lastError.value = result.error ?? "请求停止成员失败";
         return false;
       }
       return true;
@@ -733,7 +828,7 @@ export const useTeamStore = defineStore("team", () => {
         agentId,
       });
       if (!result.success) {
-        lastError.value = result.error ?? "Failed to restart worker";
+        lastError.value = result.error ?? "重启团队成员失败";
         return false;
       }
       return true;

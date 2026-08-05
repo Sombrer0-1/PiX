@@ -34,6 +34,11 @@ export interface PixApi {
   // Pi lifecycle
   startPi: (projectDir: string) => Promise<{ success: boolean; error?: string }>;
   stopPi: () => Promise<{ success: boolean }>;
+  startTeamRuntime: (projectDir: string) => Promise<{ success: boolean; error?: string }>;
+  stopTeamRuntime: () => Promise<{ success: boolean }>;
+  hasTeamSnapshot: (projectDir: string) => Promise<boolean>;
+  getWorkspaceMode: (projectDir: string) => Promise<"team" | "solo" | null>;
+  setWorkspaceMode: (projectDir: string, mode: "team" | "solo") => Promise<void>;
 
   // RPC commands
   sendCommand: <T = unknown>(command: RpcCommand) => Promise<{ success: boolean; data?: T; error?: string }>;
@@ -47,6 +52,7 @@ export interface PixApi {
   detectPi: () => Promise<{ found: boolean; path: string; note?: string }>;
   getPiStderr: () => Promise<string>;
   isPiRunning: () => Promise<boolean>;
+  isTeamLeaderRunning: () => Promise<boolean>;
 
   // Event subscriptions
   onPiEvent: (callback: (event: AgentSessionEvent) => void) => () => void;
@@ -55,9 +61,15 @@ export interface PixApi {
   onPiError: (callback: (err: { message: string }) => void) => () => void;
   onPiReady: (callback: () => void) => () => void;
   onUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => () => void;
+  onTeamLeaderEvent: (callback: (event: AgentSessionEvent) => void) => () => void;
+  onTeamLeaderExit: (callback: (data: { code: number | null; signal: string | null; stderr: string }) => void) => () => void;
+  onTeamLeaderError: (callback: (err: { message: string }) => void) => () => void;
+  onTeamLeaderReady: (callback: () => void) => () => void;
+  onTeamLeaderUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => () => void;
 
   // Session management
   listSessions: (projectDir: string) => Promise<SessionInfo[]>;
+  listTeamLeaderSessions: (projectDir: string) => Promise<SessionInfo[]>;
 
   // Window controls (frameless window)
   windowMinimize: () => Promise<void>;
@@ -94,7 +106,17 @@ export interface PixApi {
 
   // Team commands
   sendTeamCommand: <T = unknown>(command: TeamCommand) => Promise<{ success: boolean; data?: T; error?: string; code?: string }>;
+  sendTeamLeaderCommand: <T = unknown>(command: RpcCommand) => Promise<{ success: boolean; data?: T; error?: string }>;
+  sendTeamLeaderCommandAsync: (command: RpcCommand) => Promise<{ success: boolean; error?: string }>;
   onTeamEvent: (callback: (event: TeamEvent) => void) => () => void;
+
+  // Team leader background tasks and MCP queries
+  getTeamLeaderBackgroundTasks: () => Promise<Array<{ taskId: string; command: string; pid?: number; startedAt: number; status: string }>>;
+  stopTeamLeaderBackgroundTask: (taskId: string) => Promise<{ found: boolean }>;
+  teamLeaderMcpGetServers: () => Promise<McpServerInfo[]>;
+  teamLeaderMcpGetConfig: () => Promise<McpConfigInfo>;
+  teamLeaderMcpListResources: (serverName?: string) => Promise<McpResourceInfo[]>;
+  teamLeaderMcpReadResource: (serverName: string | undefined, uri: string) => Promise<McpResourceContent>;
 }
 
 const api: PixApi = {
@@ -107,6 +129,11 @@ const api: PixApi = {
 
   startPi: (projectDir: string) => ipcRenderer.invoke("start-pi", projectDir),
   stopPi: () => ipcRenderer.invoke("stop-pi"),
+  startTeamRuntime: (projectDir: string) => ipcRenderer.invoke("start-team-runtime", projectDir),
+  stopTeamRuntime: () => ipcRenderer.invoke("stop-team-runtime"),
+  hasTeamSnapshot: (projectDir: string) => ipcRenderer.invoke("has-team-snapshot", projectDir),
+  getWorkspaceMode: (projectDir: string) => ipcRenderer.invoke("get-workspace-mode", projectDir),
+  setWorkspaceMode: (projectDir: string, mode: "team" | "solo") => ipcRenderer.invoke("set-workspace-mode", projectDir, mode),
 
   sendCommand: <T = unknown>(command: RpcCommand) =>
     ipcRenderer.invoke("rpc-command", command) as Promise<{ success: boolean; data?: T; error?: string }>,
@@ -119,6 +146,7 @@ const api: PixApi = {
   detectPi: () => ipcRenderer.invoke("detect-pi"),
   getPiStderr: () => ipcRenderer.invoke("get-pi-stderr"),
   isPiRunning: () => ipcRenderer.invoke("is-pi-running"),
+  isTeamLeaderRunning: () => ipcRenderer.invoke("is-team-leader-running"),
 
   onPiEvent: (callback: (event: AgentSessionEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: AgentSessionEvent) => callback(data);
@@ -149,8 +177,33 @@ const api: PixApi = {
     ipcRenderer.on("user-input-request", handler);
     return () => ipcRenderer.removeListener("user-input-request", handler);
   },
+  onTeamLeaderEvent: (callback: (event: AgentSessionEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: AgentSessionEvent) => callback(data);
+    ipcRenderer.on("team-leader-event", handler);
+    return () => ipcRenderer.removeListener("team-leader-event", handler);
+  },
+  onTeamLeaderExit: (callback: (data: { code: number | null; signal: string | null; stderr: string }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { code: number | null; signal: string | null; stderr: string }) => callback(data);
+    ipcRenderer.on("team-leader-exit", handler);
+    return () => ipcRenderer.removeListener("team-leader-exit", handler);
+  },
+  onTeamLeaderError: (callback: (err: { message: string }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { message: string }) => callback(data);
+    ipcRenderer.on("team-leader-error", handler);
+    return () => ipcRenderer.removeListener("team-leader-error", handler);
+  },
+  onTeamLeaderReady: (callback: () => void) => {
+    ipcRenderer.on("team-leader-ready", callback);
+    return () => ipcRenderer.removeListener("team-leader-ready", callback);
+  },
+  onTeamLeaderUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: RequestUserInputRequest) => callback(data);
+    ipcRenderer.on("team-leader-user-input-request", handler);
+    return () => ipcRenderer.removeListener("team-leader-user-input-request", handler);
+  },
 
   listSessions: (projectDir: string) => ipcRenderer.invoke("list-sessions", projectDir),
+  listTeamLeaderSessions: (projectDir: string) => ipcRenderer.invoke("list-team-leader-sessions", projectDir),
 
   // Window controls
   windowMinimize: () => ipcRenderer.invoke("window-minimize"),
@@ -192,6 +245,19 @@ const api: PixApi = {
     ipcRenderer.on("team-event", handler);
     return () => ipcRenderer.removeListener("team-event", handler);
   },
+  sendTeamLeaderCommand: <T = unknown>(command: RpcCommand) =>
+    ipcRenderer.invoke("team-leader-command", command) as Promise<{ success: boolean; data?: T; error?: string }>,
+  sendTeamLeaderCommandAsync: (command: RpcCommand) =>
+    ipcRenderer.invoke("team-leader-command-async", command) as Promise<{ success: boolean; error?: string }>,
+  getTeamLeaderBackgroundTasks: () =>
+    ipcRenderer.invoke("get-team-leader-background-tasks") as Promise<Array<{ taskId: string; command: string; pid?: number; startedAt: number; status: string }>>,
+  stopTeamLeaderBackgroundTask: (taskId: string) =>
+    ipcRenderer.invoke("stop-team-leader-background-task", taskId) as Promise<{ found: boolean }>,
+  teamLeaderMcpGetServers: () => ipcRenderer.invoke("team-leader-mcp-get-servers"),
+  teamLeaderMcpGetConfig: () => ipcRenderer.invoke("team-leader-mcp-get-config"),
+  teamLeaderMcpListResources: (serverName?: string) => ipcRenderer.invoke("team-leader-mcp-list-resources", serverName),
+  teamLeaderMcpReadResource: (serverName: string | undefined, uri: string) =>
+    ipcRenderer.invoke("team-leader-mcp-read-resource", serverName, uri),
 };
 
 contextBridge.exposeInMainWorld("pixApi", api);

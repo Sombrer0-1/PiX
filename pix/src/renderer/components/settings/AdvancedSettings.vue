@@ -4,9 +4,9 @@
  */
 
 import { ref } from "vue";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
 const stderrOutput = ref("");
 const showingStderr = ref(false);
 

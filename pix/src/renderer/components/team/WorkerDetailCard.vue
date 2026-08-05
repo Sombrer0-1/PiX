@@ -6,7 +6,7 @@
  * conversation. A small set of lifecycle controls (abort turn, restart, wake)
  * is exposed for direct intervention when a worker misbehaves.
  */
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useTeamStore } from "../../stores/team-store";
 import type { TeammateInfo } from "@shared/types.js";
 
@@ -40,13 +40,52 @@ const activity = computed(() => {
   return teamStore.currentActivity[focusedId.value] ?? "";
 });
 
+// Runtime display must tick while a worker is running; Date.now() is not a
+// reactive dependency, so drive elapsed time from a `now` ref updated by a
+// 1s interval that only runs while the focused agent is in "running" state.
+const now = ref(Date.now());
+let runtimeTimer: ReturnType<typeof setInterval> | undefined;
+
+function startRuntimeTick(): void {
+  if (runtimeTimer) return;
+  runtimeTimer = setInterval(() => {
+    now.value = Date.now();
+  }, 1000);
+}
+
+function stopRuntimeTick(): void {
+  if (runtimeTimer) {
+    clearInterval(runtimeTimer);
+    runtimeTimer = undefined;
+  }
+}
+
+const isRunning = computed(() => focusedAgent.value?.status === "running");
+
+watch(
+  isRunning,
+  (running) => {
+    if (running) {
+      now.value = Date.now();
+      startRuntimeTick();
+    } else {
+      stopRuntimeTick();
+    }
+  },
+  { immediate: true },
+);
+
+onUnmounted(() => {
+  stopRuntimeTick();
+});
+
 const runtime = computed(() => {
   const agent = focusedAgent.value;
   if (!agent?.statusChangedAt) return "";
-  const ms = Date.now() - agent.statusChangedAt;
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
-  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`;
-  return `${Math.floor(ms / 3_600_000)}h ${Math.floor((ms % 3_600_000) / 60_000)}m`;
+  const ms = now.value - agent.statusChangedAt;
+  if (ms < 60_000) return `${Math.round(ms / 1000)} 秒`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)} 分钟`;
+  return `${Math.floor(ms / 3_600_000)} 小时 ${Math.floor((ms % 3_600_000) / 60_000)} 分钟`;
 });
 
 function roleIcon(role: string): string {
@@ -62,13 +101,25 @@ function roleIcon(role: string): string {
 
 function statusLabel(status: string): string {
   switch (status) {
-    case "running": return "Working";
-    case "idle": return "Ready";
-    case "standby": return "Ready";
-    case "dormant": return "Paused";
-    case "error": return "Issue";
-    case "shutdown": return "Stopped";
+    case "running": return "工作中";
+    case "idle": return "就绪";
+    case "standby": return "就绪";
+    case "dormant": return "已暂停";
+    case "error": return "有问题";
+    case "shutdown": return "已停止";
     default: return status;
+  }
+}
+
+function roleLabel(role: string): string {
+  switch (role) {
+    case "planner": return "规划";
+    case "coder": return "开发";
+    case "reviewer": return "审查";
+    case "tester": return "测试";
+    case "researcher": return "调研";
+    case "leader": return "负责人";
+    default: return role;
   }
 }
 
@@ -98,8 +149,8 @@ function statusDot(status: string): string {
 <template>
   <div class="info-card">
     <div class="card-title">
-      <span v-if="focusedAgent">Worker Detail</span>
-      <span v-else>Team Overview</span>
+      <span v-if="focusedAgent">成员详情</span>
+      <span v-else>团队概览</span>
     </div>
 
     <template v-if="focusedAgent">
@@ -118,27 +169,27 @@ function statusDot(status: string): string {
 
       <div class="info-rows">
         <div class="info-row">
-          <span class="info-label">Role</span>
-          <span class="info-value">{{ focusedAgent.role }}</span>
+          <span class="info-label">角色</span>
+          <span class="info-value">{{ roleLabel(focusedAgent.role) }}</span>
         </div>
         <div class="info-row">
-          <span class="info-label">Model</span>
-          <span class="info-value">{{ focusedAgent.model ?? "default" }}</span>
+          <span class="info-label">模型</span>
+          <span class="info-value">{{ focusedAgent.model ?? "默认" }}</span>
         </div>
         <div v-if="focusedAgent.status === 'running' && runtime" class="info-row">
-          <span class="info-label">Runtime</span>
+          <span class="info-label">运行时长</span>
           <span class="info-value">{{ runtime }}</span>
         </div>
         <div v-if="focusedAgent.specialization" class="info-row info-row--stack">
-          <span class="info-label">Specialization</span>
+          <span class="info-label">专长</span>
           <span class="info-value wd-activity">{{ focusedAgent.specialization }}</span>
         </div>
         <div v-if="activity" class="info-row info-row--stack">
-          <span class="info-label">Activity</span>
+          <span class="info-label">当前活动</span>
           <span class="info-value wd-activity">{{ activity }}</span>
         </div>
         <div v-if="focusedAgent.error" class="info-row info-row--stack">
-          <span class="info-label error-label">Error</span>
+          <span class="info-label error-label">错误</span>
           <span class="info-value wd-error">{{ focusedAgent.error }}</span>
         </div>
       </div>
@@ -153,7 +204,7 @@ function statusDot(status: string): string {
           :disabled="actionInFlight"
           @click="runWorkerAction(teamStore.abortWorker)"
         >
-          Stop turn
+          停止本轮
         </v-btn>
         <v-btn
           v-if="canRestart"
@@ -164,7 +215,7 @@ function statusDot(status: string): string {
           :disabled="actionInFlight"
           @click="runWorkerAction(teamStore.restartWorker)"
         >
-          Restart
+          重启
         </v-btn>
         <v-btn
           v-if="canWake"
@@ -175,12 +226,12 @@ function statusDot(status: string): string {
           :disabled="actionInFlight"
           @click="runWorkerAction(teamStore.activateMember)"
         >
-          Wake
+          唤醒
         </v-btn>
       </div>
 
       <div class="wd-note">
-        Coordinate through the Leader in the main conversation.
+        请通过主对话中的团队负责人进行协调。
       </div>
     </template>
 

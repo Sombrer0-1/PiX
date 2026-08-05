@@ -5,8 +5,8 @@
  * Owns the main session layout and team-mode split view.
  */
 import { computed, ref, watch, nextTick, onMounted } from "vue";
-import { useSessionStore } from "../../stores/session-store";
-import { useRpc } from "../../composables/useRpc";
+import { useWorkspaceSessionStore } from "../../composables/useWorkspaceSessionStore";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useProjectStore } from "../../stores/project-store";
 import SessionView from "../session/SessionView.vue";
 import RawOutputViewer from "../session/RawOutputViewer.vue";
@@ -24,8 +24,8 @@ import TeamDashboard from "../team/TeamDashboard.vue";
 import WorkerStatusBar from "../team/WorkerStatusBar.vue";
 import type { RequestUserInputRequest, RequestUserInputQuestion } from "@/types/rpc";
 
-const sessionStore = useSessionStore();
-const rpc = useRpc();
+const sessionStore = useWorkspaceSessionStore();
+const rpc = useWorkspaceRpc();
 const projectStore = useProjectStore();
 const settingsStore = useSettingsStore();
 const teamStore = useTeamStore();
@@ -49,12 +49,27 @@ const emit = defineEmits<{
 
 type ViewMode = "session" | "raw" | "tree";
 type ExecutionMode = "read-only" | "approval" | "unattended";
+type WorkspaceMode = "solo" | "team";
 const viewMode = ref<ViewMode>("session");
 const showExportMenu = ref(false);
 const showForkDialog = ref(false);
+const showSwitchToSoloConfirmDialog = ref(false);
 const showExecutionModeMenu = ref(false);
 const contentArea = ref<HTMLElement | null>(null);
 const shouldStickToBottom = ref(true);
+
+// Only the latest retryable API error is eligible for a retry button, and only
+// while the agent is idle. Once a new turn starts this becomes null, so older
+// error blocks render without an actionable button.
+const activeRetryBlockId = computed(() =>
+  sessionStore.isStreaming.value ? null : (sessionStore.lastRetryableError.value?.blockId ?? null),
+);
+
+async function retryLastTurn(): Promise<void> {
+  void rpc.sendCommandAsync({ type: "retry" }).catch((error) => {
+    console.error("[CenterPanel] retry failed:", error instanceof Error ? error.message : error);
+  });
+}
 
 // Composer state
 const inputText = ref("");
@@ -82,7 +97,7 @@ const projectName = computed(() => projectStore.currentProject?.name || "");
 const sessionName = computed(() => {
   const explicitName = rpc.sessionState.value?.sessionName?.trim();
   if (explicitName) return explicitName;
-  return deriveSessionTitle(projectStore.currentSession);
+  return deriveSessionTitle(teamStore.teamMode ? projectStore.currentTeamSession : projectStore.currentSession);
 });
 const canSend = computed(() =>
   (inputText.value.trim().length > 0 || attachments.value.length > 0) &&
@@ -93,17 +108,17 @@ const isStreaming = computed(() => rpc.isStreaming.value);
 const canUseTeamMode = computed(() => Boolean(projectStore.currentProject && rpc.isConnected.value));
 
 const composerPlaceholder = computed(() => {
-  if (rpc.isStreaming.value) return "AI is running... type to steer";
+  if (rpc.isStreaming.value) return "AI 正在运行，可输入消息调整方向...";
   if (teamStore.teamMode && teamStore.isTeamActive) {
-    return "Message the team leader — it will plan and delegate to the team...";
+    return "向团队负责人发送任务，由其规划并分派...";
   }
-  return "Type a task or press / for commands...";
+  return "输入任务，或按 / 使用命令...";
 });
 
 const statusText = computed(() => {
-  if (rpc.isStreaming.value) return "Running";
-  if (rpc.sessionState.value?.isCompacting) return "Compacting";
-  return "Idle";
+  if (rpc.isStreaming.value) return "运行中";
+  if (rpc.sessionState.value?.isCompacting) return "压缩中";
+  return "空闲";
 });
 
 const statusClass = computed(() => {
@@ -114,24 +129,24 @@ const statusClass = computed(() => {
 
 const modelDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  return model ? `${model.provider}/${model.id}` : "No model";
+  return model ? `${model.provider}/${model.id}` : "未选择模型";
 });
 
 const thinkingDisplay = computed(() => {
   const labels: Record<string, string> = {
-    off: "Off",
-    minimal: "Minimal",
-    low: "Low",
-    medium: "Medium",
-    high: "High",
-    xhigh: "XHigh",
+    off: "关闭",
+    minimal: "轻量",
+    low: "低",
+    medium: "标准",
+    high: "深入",
+    xhigh: "极深",
   };
-  return labels[rpc.sessionState.value?.thinkingLevel || "medium"] || rpc.sessionState.value?.thinkingLevel || "Medium";
+  return labels[rpc.sessionState.value?.thinkingLevel || "medium"] || rpc.sessionState.value?.thinkingLevel || "标准";
 });
 
 const modelButtonDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  if (!model) return "No model";
+  if (!model) return "未选择模型";
   return `${model.provider}/${model.id} / ${thinkingDisplay.value}`;
 });
 
@@ -143,22 +158,22 @@ const currentModelInfo = computed(() => {
 
 const modelOnlyDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
-  return model ? `${model.provider}/${model.id}` : "No model";
+  return model ? `${model.provider}/${model.id}` : "未选择模型";
 });
 
 const cleanThinkingDisplay = computed(() => {
   const labels: Record<string, string> = {
-    off: "Off",
-    minimal: "Minimal",
-    low: "Low",
-    medium: "Medium",
-    high: "High",
-    xhigh: "XHigh",
+    off: "关闭",
+    minimal: "轻量",
+    low: "低",
+    medium: "标准",
+    high: "深入",
+    xhigh: "极深",
   };
   const level = rpc.sessionState.value?.thinkingLevel || "medium";
   return labels[level] || level;
 });
-const thinkingButtonDisplay = computed(() => `Thinking ${cleanThinkingDisplay.value}`);
+const thinkingButtonDisplay = computed(() => `思考：${cleanThinkingDisplay.value}`);
 const thinkingButtonDisabled = computed(() => !rpc.sessionState.value?.model);
 
 const takeHerEyesEnabled = computed(() => settingsStore.settings.takeHerEyes?.enabled ?? false);
@@ -172,16 +187,16 @@ const imagesBlocked = computed(() => rpc.sessionState.value?.blockImages ?? fals
 const eyeIndicatorVisible = computed(() => takeHerEyesEnabled.value);
 const eyeIndicatorActive = computed(() => takeHerEyesConfigured.value && !currentModelSupportsImages.value && !imagesBlocked.value);
 const eyeIndicatorTitle = computed(() => {
-  if (!takeHerEyesConfigured.value) return "Vision bridge is not configured.";
-  if (imagesBlocked.value) return "Images are blocked for this session.";
-  if (currentModelSupportsImages.value) return "Current model supports images directly.";
-  return "Vision bridge is active.";
+  if (!takeHerEyesConfigured.value) return "尚未配置视觉桥接模型。";
+  if (imagesBlocked.value) return "当前会话已禁止发送图片。";
+  if (currentModelSupportsImages.value) return "当前模型可直接处理图片。";
+  return "视觉桥接已启用。";
 });
 
 const executionModes: Array<{ value: ExecutionMode; label: string; description: string; icon: string }> = [
-  { value: "read-only", label: "Read only", description: "Read and inspect only.", icon: "mdi-eye-outline" },
-  { value: "approval", label: "Approval", description: "Ask before risky changes.", icon: "mdi-shield-check-outline" },
-  { value: "unattended", label: "Unattended", description: "Run tools without approval prompts.", icon: "mdi-lightning-bolt-outline" },
+  { value: "read-only", label: "只读", description: "仅允许读取和检查。", icon: "mdi-eye-outline" },
+  { value: "approval", label: "需要审批", description: "高风险操作前请求确认。", icon: "mdi-shield-check-outline" },
+  { value: "unattended", label: "自动执行", description: "工具调用无需逐次确认。", icon: "mdi-lightning-bolt-outline" },
 ];
 const executionMode = computed<ExecutionMode>(() => rpc.sessionState.value?.executionMode ?? "approval");
 const currentExecutionMode = computed(() =>
@@ -191,7 +206,7 @@ const isSwitchingExecutionMode = ref(false);
 
 // Auto-scroll
 watch(
-  () => sessionStore.displayBlocks,
+  () => sessionStore.displayBlocks.value,
   async () => {
     await nextTick();
     if (shouldStickToBottom.value) {
@@ -203,13 +218,13 @@ watch(
 
 watch(canUseTeamMode, (available) => {
   if (!available && teamStore.teamMode) {
-    teamStore.toggleTeamMode();
+    void teamStore.toggleTeamMode(projectStore.currentProject?.path);
   }
 });
 
 // Scroll to bottom on mount when there are existing blocks (e.g. navigating back from settings)
 onMounted(async () => {
-  if (sessionStore.displayBlocks.length > 0) {
+  if (sessionStore.displayBlocks.value.length > 0) {
     await nextTick();
     scrollContentToBottom();
   }
@@ -254,10 +269,41 @@ async function setExecutionMode(mode: ExecutionMode): Promise<void> {
   }
 }
 
+async function setWorkspaceMode(mode: WorkspaceMode): Promise<void> {
+  const nextTeamMode = mode === "team";
+  if (teamStore.teamMode === nextTeamMode || teamStore.isLoading) return;
+
+  // Switching Team -> Solo disbands the running team and interrupts live
+  // worker work (only the on-disk snapshot survives). The dashboard's
+  // explicit "Stop Team" requires confirmation; the topbar toggle should not
+  // silently do the same. Confirm before disbanding an active team.
+  if (!nextTeamMode && teamStore.isTeamActive) {
+    showSwitchToSoloConfirmDialog.value = true;
+    return;
+  }
+
+  const ok = await teamStore.toggleTeamMode(projectStore.currentProject?.path);
+  if (!ok) {
+    // toggleTeamMode returns false on failure (it does not throw) and records
+    // the cause in teamStore.lastError. TeamDashboard renders lastError, but
+    // it is not mounted while still in solo mode, so surface the failure here
+    // instead of leaving the button looking non-functional.
+    alert(`启动团队失败：${teamStore.lastError || "未知错误"}`);
+  }
+}
+
+async function confirmSwitchToSolo(): Promise<void> {
+  showSwitchToSoloConfirmDialog.value = false;
+  const ok = await teamStore.toggleTeamMode(projectStore.currentProject?.path);
+  if (!ok) {
+    alert(`切换到单人模式失败：${teamStore.lastError || "未知错误"}`);
+  }
+}
+
 async function exportHtml(): Promise<void> {
   try {
     const result = await rpc.exportHtml();
-    if (result) alert(`Session exported to: ${result}`);
+    if (result) alert(`会话已导出到：${result}`);
   } catch (err) {
     console.error("[CenterPanel] Export HTML failed:", err);
   }
@@ -266,15 +312,27 @@ async function exportHtml(): Promise<void> {
 async function exportJsonl(): Promise<void> {
   try {
     const result = await rpc.exportJsonl();
-    if (result) alert(`Session exported to: ${result}`);
+    if (result) alert(`会话已导出到：${result}`);
   } catch (err) {
     console.error("[CenterPanel] Export JSONL failed:", err);
   }
 }
 
 async function handleFork(entryId: string, label?: string): Promise<void> {
+  const mode = teamStore.teamMode;
   try {
-    await rpc.forkSession(entryId, "before", label);
+    const result = await rpc.forkSession(entryId, "before", label);
+    // forkSession returns null on failure (it does not throw) and records the
+    // cause in rpc.lastError. Without this check a failed fork would silently
+    // close the dialog, clear the session display, and reload the unchanged
+    // current session, leaving the user with no actionable feedback. Keep the
+    // dialog open and surface the error so the user can retry or cancel.
+    if (!result) {
+      alert(`创建分支失败：${rpc.lastError.value || "未知错误"}`);
+      return;
+    }
+    if (result.cancelled) return;
+    if (teamStore.teamMode !== mode) return;
     showForkDialog.value = false;
     sessionStore.clearSession();
     await rpc.getMessages().then((msgs: unknown) => {
@@ -283,11 +341,19 @@ async function handleFork(entryId: string, label?: string): Promise<void> {
       }
     });
     await rpc.refreshState();
-    await projectStore.listSessions();
-    projectStore.syncCurrentSession(
-      rpc.sessionState.value?.sessionFile,
-      rpc.sessionState.value?.sessionId
-    );
+    if (mode) {
+      await projectStore.listTeamLeaderSessions();
+      projectStore.syncCurrentTeamSession(
+        rpc.sessionState.value?.sessionFile,
+        rpc.sessionState.value?.sessionId,
+      );
+    } else {
+      await projectStore.listSessions();
+      projectStore.syncCurrentSession(
+        rpc.sessionState.value?.sessionFile,
+        rpc.sessionState.value?.sessionId
+      );
+    }
   } catch (err) {
     console.error("[CenterPanel] Fork failed:", err);
   }
@@ -551,12 +617,20 @@ function autoResize(): void {
 }
 
 // New-session onboarding
-const onboardingHints = [
-  { icon: "mdi-code-braces", label: "Build a feature", prompt: "Implement a focused feature and verify it with tests." },
-  { icon: "mdi-bug-outline", label: "Fix a bug", prompt: "Find the cause of this bug, fix it, and explain the change." },
-  { icon: "mdi-file-tree-outline", label: "Explore the project", prompt: "Read the project structure and summarize the main architecture." },
-  { icon: "mdi-test-tube", label: "Add tests", prompt: "Add or improve tests for the current change." },
+const soloOnboardingHints = [
+  { icon: "mdi-code-braces", label: "开发功能", prompt: "实现一个范围明确的功能，并通过测试进行验证。" },
+  { icon: "mdi-bug-outline", label: "修复问题", prompt: "查明这个问题的原因，完成修复并说明改动。" },
+  { icon: "mdi-file-tree-outline", label: "了解项目", prompt: "阅读项目结构并概述主要架构。" },
+  { icon: "mdi-test-tube", label: "补充测试", prompt: "为当前改动新增或完善测试。" },
 ];
+
+const teamOnboardingHints = [
+  { icon: "mdi-map-outline", label: "规划并开发", prompt: "规划这项工作，将可独立执行的部分分派给团队，整合结果并完成验证。" },
+  { icon: "mdi-bug-outline", label: "并行排查问题", prompt: "并行调查这个问题，确认根因、实现修复并完成验证。" },
+  { icon: "mdi-source-branch", label: "并行审查改动", prompt: "并行审查当前改动的正确性、潜在回归和缺失的验证。" },
+];
+
+const onboardingHints = computed(() => teamStore.teamMode ? teamOnboardingHints : soloOnboardingHints);
 
 function sendQuickStart(prompt: string): void {
   inputText.value = prompt;
@@ -590,41 +664,57 @@ function sendQuickStart(prompt: string): void {
           class="view-tab"
           :class="{ active: viewMode === 'session' }"
           @click="viewMode = 'session'"
-        >Session</button>
+        >会话</button>
         <button
           class="view-tab"
           :class="{ active: viewMode === 'tree' }"
           @click="viewMode = 'tree'"
-        >Tree</button>
+        >分支树</button>
         <button
           class="view-tab"
           :class="{ active: viewMode === 'raw' }"
           @click="viewMode = 'raw'"
-        >Raw</button>
-        <button
-          v-if="canUseTeamMode"
-          class="view-tab view-tab--team"
-          :class="{ active: teamStore.teamMode }"
-          @click="teamStore.toggleTeamMode()"
-        >
-          Team
-          <span v-if="teamStore.pendingProtocolCount > 0" class="team-tab-badge">
-            {{ teamStore.pendingProtocolCount }}
-          </span>
-        </button>
-        <button class="topbar-action" @click="showForkDialog = true">Branch</button>
+        >原始事件</button>
+        <button class="topbar-action" @click="showForkDialog = true">创建分支</button>
         <v-menu v-model="showExportMenu" :close-on-content-click="true" location="bottom end">
           <template #activator="{ props: menuProps }">
-            <button class="topbar-action" v-bind="menuProps">Export</button>
+            <button class="topbar-action" v-bind="menuProps">导出</button>
           </template>
           <v-list density="compact">
-            <v-list-item @click="exportHtml(); showExportMenu = false" title="Export HTML" />
-            <v-list-item @click="exportJsonl(); showExportMenu = false" title="Export JSONL" />
+            <v-list-item @click="exportHtml(); showExportMenu = false" title="导出为 HTML" />
+            <v-list-item @click="exportJsonl(); showExportMenu = false" title="导出为 JSONL" />
           </v-list>
         </v-menu>
       </div>
 
       <div class="topbar-right">
+        <div v-if="canUseTeamMode" class="workspace-mode-toggle" role="group" aria-label="工作区模式">
+          <button
+            class="workspace-mode-option"
+            :class="{ active: !teamStore.teamMode }"
+            type="button"
+            title="单人工作区"
+            :disabled="teamStore.isLoading"
+            @click="setWorkspaceMode('solo')"
+          >
+            <v-icon icon="mdi-account-outline" size="14" />
+            <span>单人</span>
+          </button>
+          <button
+            class="workspace-mode-option"
+            :class="{ active: teamStore.teamMode }"
+            type="button"
+            title="团队工作区"
+            :disabled="teamStore.isLoading"
+            @click="setWorkspaceMode('team')"
+          >
+            <v-icon icon="mdi-account-group-outline" size="14" />
+            <span>团队</span>
+            <span v-if="teamStore.pendingProtocolCount > 0" class="team-tab-badge">
+              {{ teamStore.pendingProtocolCount }}
+            </span>
+          </button>
+        </div>
         <v-menu v-model="showExecutionModeMenu" location="bottom end" :close-on-content-click="false">
           <template #activator="{ props: menuProps }">
             <button
@@ -632,7 +722,7 @@ function sendQuickStart(prompt: string): void {
               :class="executionMode"
               type="button"
               :title="currentExecutionMode.description"
-              :aria-label="`Execution mode: ${currentExecutionMode.label}`"
+              :aria-label="`执行模式：${currentExecutionMode.label}`"
               :disabled="isSwitchingExecutionMode"
               v-bind="menuProps"
             >
@@ -663,7 +753,7 @@ function sendQuickStart(prompt: string): void {
         </v-menu>
         <span class="conn-pill" :class="rpc.isConnected.value ? 'connected' : 'offline'">
           <span class="conn-dot"></span>
-          {{ rpc.isConnected.value ? 'Connected' : 'Offline' }}
+          {{ rpc.isConnected.value ? '已连接' : '离线' }}
         </span>
       </div>
     </div>
@@ -675,11 +765,27 @@ function sendQuickStart(prompt: string): void {
 
       <!-- Leader conversation + team workbench -->
       <div class="team-middle">
-        <div class="team-conversation" ref="contentArea" @scroll="handleContentScroll">
-          <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks" />
-          <SessionTreeView v-else-if="viewMode === 'tree'" />
-          <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
-        </div>
+        <section class="team-conversation-pane">
+          <header class="team-pane-header">
+            <div class="team-pane-title">
+              <span>负责人对话</span>
+              <strong>{{ sessionName || "新团队会话" }}</strong>
+            </div>
+            <span class="team-leader-state" :class="statusClass">
+              <span class="status-dot"></span>
+              {{ statusText }}
+            </span>
+          </header>
+          <div class="team-conversation" ref="contentArea" @scroll="handleContentScroll">
+            <div v-if="sessionStore.displayBlocks.value.length === 0" class="team-conversation-empty">
+              <v-icon icon="mdi-account-star-outline" size="28" />
+              <strong>团队负责人已就绪</strong>
+            </div>
+            <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
+            <SessionTreeView v-else-if="viewMode === 'tree'" />
+            <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
+          </div>
+        </section>
         <div class="team-console-sidebar">
           <TeamDashboard />
         </div>
@@ -689,18 +795,18 @@ function sendQuickStart(prompt: string): void {
     <!-- Session content (normal mode) -->
     <template v-else>
     <div class="session-content" ref="contentArea" @scroll="handleContentScroll">
-      <div v-if="sessionStore.displayBlocks.length === 0" class="empty-state">
+      <div v-if="sessionStore.displayBlocks.value.length === 0" class="empty-state">
         <div class="empty-orbit" aria-hidden="true">
           <span class="empty-planet"></span>
           <span class="empty-ring"></span>
           <span class="empty-star empty-star-a"></span>
           <span class="empty-star empty-star-b"></span>
         </div>
-        <p class="empty-title">New session</p>
-        <p class="empty-hint">Describe a task below to start using Pi.</p>
+        <p class="empty-title">新会话</p>
+        <p class="empty-hint">在下方描述任务即可开始使用 Pi。</p>
       </div>
 
-      <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks" />
+      <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
       <SessionTreeView v-else-if="viewMode === 'tree'" />
       <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
     </div>
@@ -719,6 +825,7 @@ function sendQuickStart(prompt: string): void {
         <CommandPalette
           v-if="showCommandPalette"
           :search="searchQuery"
+          :commands="rpc.commands.value"
           @select="onCommandSelected"
           @close="showCommandPalette = false"
         />
@@ -748,10 +855,10 @@ function sendQuickStart(prompt: string): void {
 
         <!-- New-session onboarding hints -->
         <div
-          v-if="!pendingUserInput && sessionStore.displayBlocks.length === 0 && !isStreaming"
+          v-if="!pendingUserInput && sessionStore.displayBlocks.value.length === 0 && !isStreaming"
           class="onboarding-hints"
         >
-          <span class="onboarding-label">Start with a common task:</span>
+          <span class="onboarding-label">从常见任务开始：</span>
           <div class="onboarding-chips">
             <button
               v-for="hint in onboardingHints"
@@ -777,7 +884,7 @@ function sendQuickStart(prompt: string): void {
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
             </span>
             <span class="attachment-name">{{ file.name }}</span>
-            <button class="attachment-remove" @click="removeAttachment(file.path)" title="Remove attachment">
+            <button class="attachment-remove" @click="removeAttachment(file.path)" title="移除附件" aria-label="移除附件">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
             </button>
           </span>
@@ -800,7 +907,8 @@ function sendQuickStart(prompt: string): void {
             <button
               class="composer-icon-btn"
               @click="pickFiles"
-              title="Attach files"
+              title="添加附件"
+              aria-label="添加附件"
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
@@ -843,8 +951,8 @@ function sendQuickStart(prompt: string): void {
               class="composer-action-btn primary-action"
               type="button"
               :disabled="!canSend"
-              title="Send steer message"
-              aria-label="Send steer message"
+              title="发送引导消息"
+              aria-label="发送引导消息"
               @click="sendMessage"
             >
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -856,8 +964,8 @@ function sendQuickStart(prompt: string): void {
               v-if="isStreaming"
               class="composer-action-btn stop-action"
               type="button"
-              title="Stop"
-              aria-label="Stop"
+              title="停止"
+              aria-label="停止"
               @click="stopAgent"
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -869,8 +977,8 @@ function sendQuickStart(prompt: string): void {
               class="composer-action-btn primary-action"
               type="button"
               :disabled="!canSend"
-              title="Send"
-              aria-label="Send"
+              title="发送"
+              aria-label="发送"
               @click="sendMessage"
             >
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -884,6 +992,20 @@ function sendQuickStart(prompt: string): void {
     </div>
 
     <ForkDialog v-if="showForkDialog" @close="showForkDialog = false" @fork="handleFork" />
+
+    <v-dialog v-model="showSwitchToSoloConfirmDialog" max-width="400">
+      <v-card class="confirm-dialog-card">
+        <div class="confirm-dialog-title">切换到单人模式</div>
+        <div class="confirm-dialog-text">
+          切换到单人模式将停止并解散当前团队 <strong>{{ teamStore.teamName || "当前团队" }}</strong>，所有成员会被中断，已完成的工作会保留在项目中。确定继续？
+        </div>
+        <v-card-actions class="confirm-dialog-actions">
+          <v-spacer />
+          <v-btn variant="text" @click="showSwitchToSoloConfirmDialog = false">取消</v-btn>
+          <v-btn color="error" variant="tonal" @click="confirmSwitchToSolo">切换并解散团队</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
@@ -928,7 +1050,7 @@ function sendQuickStart(prompt: string): void {
   font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-primary);
   flex-shrink: 0;
-  letter-spacing: 0.3px;
+  letter-spacing: 0;
 }
 
 .topbar-sep {
@@ -1036,17 +1158,6 @@ function sendQuickStart(prompt: string): void {
   box-shadow: var(--pix-shadow-xs);
 }
 
-.view-tab--team {
-  margin-left: 4px;
-  border-left: 1px solid var(--pix-border-subtle);
-  padding-left: 12px;
-}
-
-.view-tab--team.active {
-  color: var(--pix-accent);
-  background: var(--pix-accent-light);
-}
-
 .team-tab-badge {
   display: inline-flex;
   align-items: center;
@@ -1086,6 +1197,46 @@ function sendQuickStart(prompt: string): void {
   flex-shrink: 0;
   margin-left: auto;
   -webkit-app-region: no-drag;
+}
+
+.workspace-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--pix-border-subtle);
+  border-radius: var(--pix-radius-lg);
+  background: var(--pix-bg-hover);
+}
+
+.workspace-mode-option {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 66px;
+  min-height: 28px;
+  padding: 4px 9px;
+  border-radius: var(--pix-radius-md);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+}
+
+.workspace-mode-option:hover:not(:disabled) {
+  color: var(--pix-text-primary);
+}
+
+.workspace-mode-option.active {
+  color: var(--pix-accent);
+  background: #ffffff;
+  box-shadow: var(--pix-shadow-xs);
+}
+
+.workspace-mode-option:disabled {
+  opacity: 0.55;
+  cursor: wait;
 }
 
 .execution-mode-select {
@@ -1244,13 +1395,106 @@ function sendQuickStart(prompt: string): void {
   display: flex;
   min-height: 0;
   overflow: hidden;
+  background: #f8f9fc;
+}
+
+.team-conversation-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--pix-bg-content);
+}
+
+.team-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pix-space-md);
+  min-height: 48px;
+  padding: 7px var(--pix-space-lg);
+  border-bottom: 1px solid var(--pix-border-subtle);
+  background: rgba(255, 255, 255, 0.88);
+}
+
+.team-pane-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.team-pane-title span {
+  color: var(--pix-text-muted);
+  font-size: 10px;
+  font-weight: var(--pix-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.team-pane-title strong {
+  overflow: hidden;
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.team-leader-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  color: var(--pix-text-secondary);
+  font-size: 10px;
+  font-weight: var(--pix-weight-medium);
+}
+
+.team-leader-state .status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--pix-text-muted);
+}
+
+.team-leader-state.status-running {
+  color: var(--pix-accent);
+}
+
+.team-leader-state.status-running .status-dot {
+  background: var(--pix-accent);
+  animation: status-pulse 1.5s ease-in-out infinite;
+}
+
+.team-leader-state.status-compacting {
+  color: var(--pix-warning);
+}
+
+.team-leader-state.status-compacting .status-dot {
+  background: var(--pix-warning);
 }
 
 .team-conversation {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: var(--pix-space-3xl) var(--pix-space-xl) var(--pix-space-xl);
+  padding: var(--pix-space-xl);
+}
+
+.team-conversation-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--pix-space-xs);
+  min-height: 180px;
+  color: var(--pix-text-muted);
+}
+
+.team-conversation-empty strong {
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-medium);
 }
 
 .team-console-sidebar {
@@ -1262,6 +1506,48 @@ function sendQuickStart(prompt: string): void {
   min-height: 0;
   overflow: hidden;
   background: var(--pix-bg-content);
+}
+
+@media (max-width: 1100px) {
+  .center-topbar {
+    padding-right: var(--pix-space-md);
+    padding-left: var(--pix-space-md);
+  }
+
+  .topbar-path:last-of-type,
+  .conn-pill {
+    display: none;
+  }
+
+  .team-middle {
+    flex-direction: column;
+  }
+
+  .team-conversation-pane {
+    min-height: 280px;
+  }
+
+  .team-console-sidebar {
+    width: 100%;
+    flex: 0 0 44%;
+    min-height: 260px;
+    border-top: 1px solid var(--pix-border-subtle);
+    border-left: 0;
+  }
+}
+
+@media (max-width: 900px) {
+  .topbar-left .status-pill,
+  .execution-mode-select span,
+  .workspace-mode-option span:not(.team-tab-badge) {
+    display: none;
+  }
+
+  .workspace-mode-option {
+    min-width: 30px;
+    width: 30px;
+    padding: 4px;
+  }
 }
 
 /* Session content */
@@ -1694,5 +1980,27 @@ function sendQuickStart(prompt: string): void {
 .composer-action-btn.stop-action:hover {
   background: var(--pix-error-light);
   transform: translateY(-1px);
+}
+
+.confirm-dialog-card {
+  padding: var(--pix-space-lg);
+  border-radius: var(--pix-radius-xl) !important;
+}
+
+.confirm-dialog-title {
+  margin-bottom: var(--pix-space-sm);
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-md);
+  font-weight: var(--pix-weight-semibold);
+}
+
+.confirm-dialog-text {
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-sm);
+  line-height: 1.5;
+}
+
+.confirm-dialog-actions {
+  padding: var(--pix-space-sm) 0 0 !important;
 }
 </style>

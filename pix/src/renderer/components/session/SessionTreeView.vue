@@ -5,18 +5,25 @@
  * Shows the session's tree structure with entry types and labels.
  * Clicking an entry navigates to that branch.
  */
-import { ref, onMounted } from "vue";
-import { useRpc } from "../../composables/useRpc";
+import { ref, onMounted, watch } from "vue";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
+import { useTeamStore } from "../../stores/team-store";
 import type { TreeEntry } from "@/types/rpc";
 
-const rpc = useRpc();
+const rpc = useWorkspaceRpc();
+const teamStore = useTeamStore();
 const tree = ref<TreeEntry[]>([]);
 const loading = ref(true);
 const expandedNodes = ref<Set<string>>(new Set());
 
-onMounted(async () => {
+async function loadTree(): Promise<void> {
+  const mode = teamStore.teamMode;
+  loading.value = true;
+  tree.value = [];
+  expandedNodes.value = new Set();
   try {
     const result = await rpc.getTree();
+    if (teamStore.teamMode !== mode) return;
     if (result) {
       tree.value = result;
       // Auto-expand all nodes
@@ -31,9 +38,12 @@ onMounted(async () => {
   } catch (err) {
     console.error("[SessionTreeView] Failed to load tree:", err);
   } finally {
-    loading.value = false;
+    if (teamStore.teamMode === mode) loading.value = false;
   }
-});
+}
+
+onMounted(() => void loadTree());
+watch(() => teamStore.teamMode, () => void loadTree());
 
 function toggleNode(id: string): void {
   const next = new Set(expandedNodes.value);
@@ -48,7 +58,7 @@ function toggleNode(id: string): void {
 async function navigateTo(targetId: string): Promise<void> {
   try {
     await rpc.navigateTree(targetId);
-    alert("Navigated to tree entry. The session view will reload.");
+    alert("已切换到所选分支节点，会话视图将重新加载。");
   } catch (err) {
     console.error("[SessionTreeView] Navigation failed:", err);
   }
@@ -74,12 +84,22 @@ function getEntryLabel(entry: TreeEntry): string {
     const preview = entry.messagePreview.slice(0, 60);
     return entry.messagePreview.length > 60 ? preview + "..." : preview;
   }
-  return entry.type;
+  switch (entry.type) {
+    case "message": return "消息";
+    case "model_change": return "模型变更";
+    case "thinking_level_change": return "思考级别变更";
+    case "compaction": return "上下文压缩";
+    case "branch_summary": return "分支摘要";
+    case "custom": return "自定义事件";
+    case "custom_message": return "自定义消息";
+    case "label": return "标签";
+    default: return entry.type;
+  }
 }
 
 function formatTime(ts: string): string {
   try {
-    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
   } catch {
     return "";
   }
@@ -96,8 +116,8 @@ function isExpanded(node: TreeEntry): boolean {
 
 <template>
   <div class="tree-view">
-    <div v-if="loading" class="tree-loading">Loading tree...</div>
-    <div v-else-if="tree.length === 0" class="tree-empty">No session tree available.</div>
+    <div v-if="loading" class="tree-loading">正在加载分支树...</div>
+    <div v-else-if="tree.length === 0" class="tree-empty">暂无会话分支树。</div>
     <div v-else class="tree-content">
       <template v-for="root in tree" :key="root.id">
         <TreeItem
@@ -152,10 +172,20 @@ const TreeItem = defineComponent({
           const preview = entry.messagePreview.slice(0, 60);
           return entry.messagePreview.length > 60 ? preview + "..." : preview;
         }
-        return entry.type;
+        switch (entry.type) {
+          case "message": return "消息";
+          case "model_change": return "模型变更";
+          case "thinking_level_change": return "思考级别变更";
+          case "compaction": return "上下文压缩";
+          case "branch_summary": return "分支摘要";
+          case "custom": return "自定义事件";
+          case "custom_message": return "自定义消息";
+          case "label": return "标签";
+          default: return entry.type;
+        }
       },
       formatTime: (ts: string) => {
-        try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+        try { return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }); }
         catch { return ""; }
       },
     };
