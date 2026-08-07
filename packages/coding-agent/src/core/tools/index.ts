@@ -1,4 +1,10 @@
 export {
+	type ExecutionBackend,
+	type ToolMutationKeyResolver,
+	type ToolPathContext,
+	type ToolPathResolver,
+} from "./execution-backend.ts";
+export {
 	type BashOperations,
 	type BashSpawnContext,
 	type BashSpawnHook,
@@ -83,6 +89,7 @@ export {
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { BackgroundTaskRegistry } from "../background-task-registry.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import type { ExecutionBackend, ToolPathContext } from "./execution-backend.ts";
 import { type BashToolOptions, createBashTool, createBashToolDefinition } from "./bash.ts";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
 import { createFindTool, createFindToolDefinition, type FindToolOptions } from "./find.ts";
@@ -100,6 +107,7 @@ export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "l
 export const allToolNames: Set<ToolName> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
 export interface ToolsOptions {
+	executionBackend?: ExecutionBackend;
 	read?: ReadToolOptions;
 	bash?: BashToolOptions;
 	write?: WriteToolOptions;
@@ -109,105 +117,142 @@ export interface ToolsOptions {
 	ls?: LsToolOptions;
 }
 
+/**
+ * Merge per-tool options with the execution backend's operations and path context.
+ *
+ * Priority: explicit per-tool operations/pathContext > backend > local default.
+ * The spread is applied first to preserve all existing per-tool fields
+ * (autoResizeImages, commandPrefix, shellPath, spawnHook).
+ *
+ * pathContext is added to per-tool option types in S2; until then it is set
+ * on the object at runtime and ignored by tool factories.
+ */
+function withBackend<T extends object>(
+	perToolOptions: T | undefined,
+	backendOperations: unknown,
+	paths: ToolPathContext | undefined,
+): T | undefined {
+	if (!backendOperations && !paths) {
+		return perToolOptions;
+	}
+	const existing = (perToolOptions ?? {}) as T & {
+		operations?: unknown;
+		pathContext?: ToolPathContext;
+	};
+	return {
+		...existing,
+		operations: existing.operations ?? backendOperations,
+		pathContext: existing.pathContext ?? paths,
+	} as T;
+}
+
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
+	const backend = options?.executionBackend;
 	switch (toolName) {
 		case "read":
-			return createReadToolDefinition(cwd, options?.read);
+			return createReadToolDefinition(cwd, withBackend(options?.read, backend?.read, backend?.paths));
 		case "bash":
-			return createBashToolDefinition(cwd, options?.bash);
+			return createBashToolDefinition(cwd, withBackend(options?.bash, backend?.bash, backend?.paths));
 		case "edit":
-			return createEditToolDefinition(cwd, options?.edit);
+			return createEditToolDefinition(cwd, withBackend(options?.edit, backend?.edit, backend?.paths));
 		case "write":
-			return createWriteToolDefinition(cwd, options?.write);
+			return createWriteToolDefinition(cwd, withBackend(options?.write, backend?.write, backend?.paths));
 		case "grep":
-			return createGrepToolDefinition(cwd, options?.grep);
+			return createGrepToolDefinition(cwd, withBackend(options?.grep, backend?.grep, backend?.paths));
 		case "find":
-			return createFindToolDefinition(cwd, options?.find);
+			return createFindToolDefinition(cwd, withBackend(options?.find, backend?.find, backend?.paths));
 		case "ls":
-			return createLsToolDefinition(cwd, options?.ls);
+			return createLsToolDefinition(cwd, withBackend(options?.ls, backend?.ls, backend?.paths));
 		default:
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
 }
 
 export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptions): Tool {
+	const backend = options?.executionBackend;
 	switch (toolName) {
 		case "read":
-			return createReadTool(cwd, options?.read);
+			return createReadTool(cwd, withBackend(options?.read, backend?.read, backend?.paths));
 		case "bash":
-			return createBashTool(cwd, options?.bash);
+			return createBashTool(cwd, withBackend(options?.bash, backend?.bash, backend?.paths));
 		case "edit":
-			return createEditTool(cwd, options?.edit);
+			return createEditTool(cwd, withBackend(options?.edit, backend?.edit, backend?.paths));
 		case "write":
-			return createWriteTool(cwd, options?.write);
+			return createWriteTool(cwd, withBackend(options?.write, backend?.write, backend?.paths));
 		case "grep":
-			return createGrepTool(cwd, options?.grep);
+			return createGrepTool(cwd, withBackend(options?.grep, backend?.grep, backend?.paths));
 		case "find":
-			return createFindTool(cwd, options?.find);
+			return createFindTool(cwd, withBackend(options?.find, backend?.find, backend?.paths));
 		case "ls":
-			return createLsTool(cwd, options?.ls);
+			return createLsTool(cwd, withBackend(options?.ls, backend?.ls, backend?.paths));
 		default:
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
 }
 
 export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
+	const backend = options?.executionBackend;
 	return [
-		createReadToolDefinition(cwd, options?.read),
-		createBashToolDefinition(cwd, options?.bash),
-		createEditToolDefinition(cwd, options?.edit),
-		createWriteToolDefinition(cwd, options?.write),
+		createReadToolDefinition(cwd, withBackend(options?.read, backend?.read, backend?.paths)),
+		createBashToolDefinition(cwd, withBackend(options?.bash, backend?.bash, backend?.paths)),
+		createEditToolDefinition(cwd, withBackend(options?.edit, backend?.edit, backend?.paths)),
+		createWriteToolDefinition(cwd, withBackend(options?.write, backend?.write, backend?.paths)),
 	];
 }
 
 export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
+	const backend = options?.executionBackend;
 	return [
-		createReadToolDefinition(cwd, options?.read),
-		createGrepToolDefinition(cwd, options?.grep),
-		createFindToolDefinition(cwd, options?.find),
-		createLsToolDefinition(cwd, options?.ls),
+		createReadToolDefinition(cwd, withBackend(options?.read, backend?.read, backend?.paths)),
+		createGrepToolDefinition(cwd, withBackend(options?.grep, backend?.grep, backend?.paths)),
+		createFindToolDefinition(cwd, withBackend(options?.find, backend?.find, backend?.paths)),
+		createLsToolDefinition(cwd, withBackend(options?.ls, backend?.ls, backend?.paths)),
 	];
 }
 
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
+	const backend = options?.executionBackend;
 	return {
-		read: createReadToolDefinition(cwd, options?.read),
-		bash: createBashToolDefinition(cwd, options?.bash),
-		edit: createEditToolDefinition(cwd, options?.edit),
-		write: createWriteToolDefinition(cwd, options?.write),
-		grep: createGrepToolDefinition(cwd, options?.grep),
-		find: createFindToolDefinition(cwd, options?.find),
-		ls: createLsToolDefinition(cwd, options?.ls),
+		read: createReadToolDefinition(cwd, withBackend(options?.read, backend?.read, backend?.paths)),
+		bash: createBashToolDefinition(cwd, withBackend(options?.bash, backend?.bash, backend?.paths)),
+		edit: createEditToolDefinition(cwd, withBackend(options?.edit, backend?.edit, backend?.paths)),
+		write: createWriteToolDefinition(cwd, withBackend(options?.write, backend?.write, backend?.paths)),
+		grep: createGrepToolDefinition(cwd, withBackend(options?.grep, backend?.grep, backend?.paths)),
+		find: createFindToolDefinition(cwd, withBackend(options?.find, backend?.find, backend?.paths)),
+		ls: createLsToolDefinition(cwd, withBackend(options?.ls, backend?.ls, backend?.paths)),
 	};
 }
 
 export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
+	const backend = options?.executionBackend;
 	return [
-		createReadTool(cwd, options?.read),
-		createBashTool(cwd, options?.bash),
-		createEditTool(cwd, options?.edit),
-		createWriteTool(cwd, options?.write),
+		createReadTool(cwd, withBackend(options?.read, backend?.read, backend?.paths)),
+		createBashTool(cwd, withBackend(options?.bash, backend?.bash, backend?.paths)),
+		createEditTool(cwd, withBackend(options?.edit, backend?.edit, backend?.paths)),
+		createWriteTool(cwd, withBackend(options?.write, backend?.write, backend?.paths)),
 	];
 }
 
 export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[] {
+	const backend = options?.executionBackend;
 	return [
-		createReadTool(cwd, options?.read),
-		createGrepTool(cwd, options?.grep),
-		createFindTool(cwd, options?.find),
-		createLsTool(cwd, options?.ls),
+		createReadTool(cwd, withBackend(options?.read, backend?.read, backend?.paths)),
+		createGrepTool(cwd, withBackend(options?.grep, backend?.grep, backend?.paths)),
+		createFindTool(cwd, withBackend(options?.find, backend?.find, backend?.paths)),
+		createLsTool(cwd, withBackend(options?.ls, backend?.ls, backend?.paths)),
 	];
 }
 
 export function createAllTools(cwd: string, options?: ToolsOptions): Record<ToolName, Tool> {
+	const backend = options?.executionBackend;
 	return {
-		read: createReadTool(cwd, options?.read),
-		bash: createBashTool(cwd, options?.bash),
-		edit: createEditTool(cwd, options?.edit),
-		write: createWriteTool(cwd, options?.write),
-		grep: createGrepTool(cwd, options?.grep),
-		find: createFindTool(cwd, options?.find),
-		ls: createLsTool(cwd, options?.ls),
+		read: createReadTool(cwd, withBackend(options?.read, backend?.read, backend?.paths)),
+		bash: createBashTool(cwd, withBackend(options?.bash, backend?.bash, backend?.paths)),
+		edit: createEditTool(cwd, withBackend(options?.edit, backend?.edit, backend?.paths)),
+		write: createWriteTool(cwd, withBackend(options?.write, backend?.write, backend?.paths)),
+		grep: createGrepTool(cwd, withBackend(options?.grep, backend?.grep, backend?.paths)),
+		find: createFindTool(cwd, withBackend(options?.find, backend?.find, backend?.paths)),
+		ls: createLsTool(cwd, withBackend(options?.ls, backend?.ls, backend?.paths)),
 	};
 }
 

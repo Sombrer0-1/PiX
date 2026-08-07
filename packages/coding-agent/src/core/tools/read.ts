@@ -12,6 +12,7 @@ import { formatDimensionNote, resizeImage } from "../../utils/image-resize.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { formatPathRelativeToCwdOrAbsolute } from "../../utils/paths.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 import { resolveReadPathAsync, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, renderToolPath, replaceTabs, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -60,6 +61,8 @@ export interface ReadToolOptions {
 	autoResizeImages?: boolean;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
+	/** Path context for a remote execution backend (for example WSL). */
+	pathContext?: ToolPathContext;
 }
 
 type ReadRenderArgs = { path?: string; file_path?: string; offset?: number; limit?: number };
@@ -71,8 +74,8 @@ function formatReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): st
 	return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
 }
 
-function formatReadCall(args: ReadRenderArgs | undefined, theme: Theme, cwd: string): string {
-	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd);
+function formatReadCall(args: ReadRenderArgs | undefined, theme: Theme, cwd: string, pathContext?: ToolPathContext): string {
+	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd, { pathContext });
 	return `${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}${formatReadLineRange(args, theme)}`;
 }
 
@@ -117,11 +120,12 @@ function getPiDocsClassification(absolutePath: string): CompactReadClassificatio
 function getCompactReadClassification(
 	args: ReadRenderArgs | undefined,
 	cwd: string,
+	pathContext?: ToolPathContext,
 ): CompactReadClassification | undefined {
 	const rawPath = str(args?.file_path ?? args?.path);
 	if (!rawPath) return undefined;
 
-	const absolutePath = resolveToCwd(rawPath, cwd);
+	const absolutePath = resolveToCwd(rawPath, cwd, pathContext);
 	const fileName = basename(absolutePath);
 	if (fileName === "SKILL.md") {
 		return { kind: "skill", label: basename(dirname(absolutePath)) || fileName };
@@ -206,6 +210,7 @@ export function createReadToolDefinition(
 ): ToolDefinition<typeof readSchema, ReadToolDetails | undefined> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	const ops = options?.operations ?? defaultReadOperations;
+	const pathContext = options?.pathContext;
 	return {
 		name: "read",
 		label: "read",
@@ -235,7 +240,7 @@ export function createReadToolDefinition(
 
 					(async () => {
 						try {
-							const absolutePath = await resolveReadPathAsync(path, cwd);
+							const absolutePath = await resolveReadPathAsync(path, cwd, pathContext);
 							if (aborted) return;
 							// Check if file exists and is readable.
 							await ops.access(absolutePath);
@@ -339,11 +344,11 @@ export function createReadToolDefinition(
 		},
 		renderCall(args, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			const classification = !context.expanded ? getCompactReadClassification(args, context.cwd) : undefined;
+			const classification = !context.expanded ? getCompactReadClassification(args, context.cwd, pathContext) : undefined;
 			text.setText(
 				classification
 					? formatCompactReadCall(classification, args, theme)
-					: formatReadCall(args, theme, context.cwd),
+					: formatReadCall(args, theme, context.cwd, pathContext),
 			);
 			return text;
 		},

@@ -20,12 +20,13 @@ const authStore = useAuthStore();
 const rpc = useWorkspaceRpc();
 
 // ---- Navigation ----
-type SettingsSection = "general" | "model" | "shell" | "resources" | "mcp" | "auth" | "advanced";
+type SettingsSection = "general" | "model" | "shell" | "wsl" | "resources" | "mcp" | "auth" | "advanced";
 const activeSection = ref<SettingsSection>("general");
 const sections: { key: SettingsSection; label: string; icon: string }[] = [
   { key: "general", label: "常规", icon: "mdi-cog-outline" },
   { key: "model", label: "模型", icon: "mdi-cube-outline" },
   { key: "shell", label: "Shell", icon: "mdi-bash" },
+  { key: "wsl", label: "WSL", icon: "mdi-linux" },
   { key: "resources", label: "资源", icon: "mdi-package-variant" },
   { key: "mcp", label: "MCP", icon: "mdi-puzzle-outline" },
   { key: "auth", label: "认证", icon: "mdi-shield-key" },
@@ -57,6 +58,12 @@ const shellPath = ref("");
 const shellCommandPrefix = ref("");
 const npmCommand = ref("");
 const httpIdleTimeoutMs = ref(0);
+
+// WSL global defaults. These only seed new-project dialog defaults; the
+// persisted per-project environment remains authoritative (wsl_plan §6.1).
+const wslEnabled = ref(false);
+const wslDistro = ref("");
+const wslDefaultCwd = ref("/home");
 
 const extensionPaths = ref("");
 const skillPaths = ref("");
@@ -155,6 +162,19 @@ const visionModelItems = computed(() =>
     }))
 );
 
+const wslDistroItems = computed(() =>
+  settingsStore.wslDistros.map((d) => ({
+    title: d.name,
+    value: d.name,
+    subtitle: `v${d.version} · ${d.state}`,
+  })),
+);
+
+const wslDefaultCwdValid = computed(() => {
+  const value = wslDefaultCwd.value.trim();
+  return value.startsWith("/") && !value.includes("\\");
+});
+
 function modelKey(model: { provider: string; id: string }): string {
   return `${model.provider}/${model.id}`;
 }
@@ -193,6 +213,13 @@ onMounted(async () => {
     settingsStore.settings.takeHerEyes?.provider && settingsStore.settings.takeHerEyes?.modelId
       ? `${settingsStore.settings.takeHerEyes.provider}/${settingsStore.settings.takeHerEyes.modelId}`
       : "";
+  wslEnabled.value = settingsStore.settings.wsl?.enabled ?? false;
+  wslDistro.value = settingsStore.settings.wsl?.distro ?? "";
+  wslDefaultCwd.value = settingsStore.settings.wsl?.defaultCwd || "/home";
+  // Probe distros for the WSL section. Failures land in wslDiagnostic and only
+  // disable the WSL controls, never the rest of the settings page. The store
+  // tracks wslDistrosLoaded internally; the page only reads the results.
+  void settingsStore.loadWslDistros();
 
   if (rpc.isConnected.value) {
     try {
@@ -258,6 +285,11 @@ async function saveSettings(): Promise<void> {
         enabled: takeHerEyesEnabled.value,
         provider: selectedEyeModel?.provider,
         modelId: selectedEyeModel?.modelId,
+      },
+      wsl: {
+        enabled: wslEnabled.value,
+        distro: wslDistro.value,
+        defaultCwd: wslDefaultCwd.value.trim() || "/home",
       },
     });
     if (rpc.isConnected.value) {
@@ -432,10 +464,69 @@ async function downloadAndInstall(): Promise<void> {
           <h2 class="section-title">Shell</h2>
           <p class="section-desc">Bash 执行与网络配置。</p>
           <div class="form-fields">
-            <v-text-field v-model="shellPath" label="Shell 路径" placeholder="自动检测" hint="Shell 可执行文件路径。" persistent-hint class="mb-4" />
-            <v-text-field v-model="shellCommandPrefix" label="Shell 命令前缀" placeholder="无" hint="每个 bash 命令的前缀（例如 wsl）。" persistent-hint class="mb-4" />
+            <v-text-field v-model="shellPath" label="Shell 路径" placeholder="自动检测" hint="Shell 可执行文件路径。如需在 WSL 中运行，请在「WSL」分区配置，不要在此填入 wsl。" persistent-hint class="mb-4" />
+            <v-text-field v-model="shellCommandPrefix" label="Shell 命令前缀" placeholder="无" hint="每个 bash 命令的前缀。不要填入 wsl——WSL 执行请在「WSL」分区启用，否则会触发 Shell 配置错误。" persistent-hint class="mb-4" />
             <v-text-field v-model="npmCommand" label="npm 命令" placeholder="npm" hint="空格分隔的 npm 命令及参数。" persistent-hint class="mb-4" />
             <v-text-field v-model.number="httpIdleTimeoutMs" label="HTTP 空闲超时（毫秒）" type="number" min="0" placeholder="服务器默认" hint="HTTP 空闲超时毫秒数。0 = 服务器默认值。" persistent-hint style="max-width:240px" class="mb-4" />
+          </div>
+        </div>
+
+        <!-- ============ WSL ============ -->
+        <div v-show="activeSection === 'wsl'" class="section-panel">
+          <h2 class="section-title">WSL2</h2>
+          <p class="section-desc">全局 WSL2 默认值，用于新建项目对话框的初始环境。</p>
+          <div class="form-fields">
+            <v-alert
+              v-if="settingsStore.wslDiagnostic"
+              type="warning"
+              variant="tonal"
+              density="comfortable"
+              class="mb-4"
+              title="WSL 不可用"
+            >
+              {{ settingsStore.wslDiagnostic }}
+            </v-alert>
+
+            <v-switch
+              v-model="wslEnabled"
+              label="启用 WSL2"
+              hint="开启后，打开项目时可选择 WSL2 发行版作为执行环境。不影响已打开的项目。"
+              persistent-hint
+              class="mb-4"
+            />
+
+            <v-select
+              v-model="wslDistro"
+              label="默认发行版"
+              :items="wslDistroItems"
+              item-title="title"
+              item-value="value"
+              no-data-text="未发现 WSL2 发行版"
+              hint="仅作为新项目对话框的默认值；每个项目必须显式选择发行版，不会使用系统默认发行版。"
+              persistent-hint
+              :disabled="!wslEnabled || wslDistroItems.length === 0"
+              class="mb-4"
+            >
+              <template #item="{ props: itemProps, item }">
+                <v-list-item v-bind="itemProps" :subtitle="item.raw.subtitle" />
+              </template>
+            </v-select>
+
+            <v-text-field
+              v-model="wslDefaultCwd"
+              label="默认项目目录（Linux 路径）"
+              placeholder="/home"
+              hint="新项目对话框中 WSL 工作目录的初始值，需为绝对 POSIX 路径。"
+              persistent-hint
+              :disabled="!wslEnabled"
+              :error-messages="wslDefaultCwd && !wslDefaultCwdValid ? '请输入以 / 开头的绝对 Linux 路径' : ''"
+              style="max-width:420px"
+              class="mb-4"
+            />
+
+            <div class="inline-hint">
+              全局默认值仅影响新建项目。已打开项目的执行环境以该项目记录为准；更改发行版或目录需停止并重新打开项目会话。
+            </div>
           </div>
         </div>
 

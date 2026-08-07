@@ -1,6 +1,7 @@
 import { accessSync, constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { normalizePath, resolvePath } from "../../utils/paths.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 
 const NARROW_NO_BREAK_SPACE = "\u202F";
 
@@ -44,13 +45,26 @@ export function expandPath(filePath: string): string {
 /**
  * Resolve a path relative to the given cwd.
  * Handles ~ expansion and absolute paths.
+ *
+ * When a ToolPathContext is provided, resolution is delegated to the backend's
+ * resolvePath so the result lives in the runtime namespace (POSIX under WSL).
  */
-export function resolveToCwd(filePath: string, cwd: string): string {
+export function resolveToCwd(filePath: string, cwd: string, paths?: ToolPathContext): string {
+	if (paths) {
+		return paths.resolvePath(filePath, cwd);
+	}
 	return resolvePath(filePath, cwd, { normalizeUnicodeSpaces: true, stripAtPrefix: true });
 }
 
-export function resolveReadPath(filePath: string, cwd: string): string {
-	const resolved = resolveToCwd(filePath, cwd);
+export function resolveReadPath(filePath: string, cwd: string, paths?: ToolPathContext): string {
+	const resolved = resolveToCwd(filePath, cwd, paths);
+
+	// The macOS AM/PM, NFD and curly-quote probes are host-filesystem lookups
+	// for screenshot naming quirks. They are meaningless under a remote backend
+	// (WSL), where the operations layer owns physical access; skip them there.
+	if (paths) {
+		return resolved;
+	}
 
 	if (fileExists(resolved)) {
 		return resolved;
@@ -83,8 +97,13 @@ export function resolveReadPath(filePath: string, cwd: string): string {
 	return resolved;
 }
 
-export async function resolveReadPathAsync(filePath: string, cwd: string): Promise<string> {
-	const resolved = resolveToCwd(filePath, cwd);
+export async function resolveReadPathAsync(filePath: string, cwd: string, paths?: ToolPathContext): Promise<string> {
+	const resolved = resolveToCwd(filePath, cwd, paths);
+
+	// See resolveReadPath: macOS-specific probes are skipped under a remote backend.
+	if (paths) {
+		return resolved;
+	}
 
 	if (await pathExists(resolved)) {
 		return resolved;

@@ -23,7 +23,9 @@ import type {
   AgentSessionEvent,
   PermissionRequest,
   PlanApproval,
+  ProjectLocation,
 } from "@shared/types.js";
+import { toPlain } from "../utils/plain";
 
 /** Wrapper for a worker's raw AgentSessionEvent, tagged with agentId. */
 export interface TaggedSessionEvent {
@@ -405,25 +407,33 @@ export const useTeamStore = defineStore("team", () => {
     lastError.value = null;
   }
 
-  /** Switch the workspace between the independent single and Team runtimes. */
-  async function toggleTeamMode(projectDir?: string): Promise<boolean> {
+  /** Switch the workspace between the independent single and Team runtimes.
+   *  The full ProjectLocation is passed so the main process can validate the
+   *  execution environment and reject leader/worker environment mismatch;
+   *  switching environment (e.g. Windows <-> WSL) requires a stop + new runtime,
+   *  which the main process enforces via SessionBridge.start candidate-then-takeover. */
+  async function toggleTeamMode(location?: ProjectLocation): Promise<boolean> {
     if (isLoading.value) return false;
-    if (!projectDir) {
+    if (!location) {
       lastError.value = "切换模式前需要先打开项目目录";
       return false;
     }
+
+    // projectStore.currentProject is a Vue reactive proxy; strip reactivity
+    // before the location crosses the contextBridge/IPC boundary.
+    const target = toPlain(location);
 
     isLoading.value = true;
     lastError.value = null;
     try {
       if (teamMode.value) {
         await teamLeaderRpc.stopTeamRuntime();
-        const started = await singleRpc.startRuntime(projectDir);
+        const started = await singleRpc.startRuntime(target);
         if (!started) {
           lastError.value = singleRpc.lastError.value || "启动单人运行环境失败";
           // Solo failed to start; restore the team runtime so the workspace is
           // not left with both runtimes down while the UI still shows team mode.
-          const restored = await teamLeaderRpc.startTeamRuntime(projectDir);
+          const restored = await teamLeaderRpc.startTeamRuntime(target);
           if (!restored) {
             lastError.value = `${lastError.value}\n恢复团队运行环境也失败：${teamLeaderRpc.lastError.value || "未知错误"}`;
             // Both runtimes are down. Drop to solo mode so the workspace shows a
@@ -437,24 +447,24 @@ export const useTeamStore = defineStore("team", () => {
           return false;
         }
         teamMode.value = false;
-        void window.pixApi.setWorkspaceMode(projectDir, "solo");
+        void window.pixApi.setWorkspaceMode(target, "solo");
         focusedAgentId.value = null;
         return true;
       }
 
-      const started = await teamLeaderRpc.startTeamRuntime(projectDir);
+      const started = await teamLeaderRpc.startTeamRuntime(target);
       if (!started) {
         lastError.value = teamLeaderRpc.lastError.value || "启动团队运行环境失败";
         // start-team-runtime stops the single runtime before starting the
         // leader, so restore ordinary mode if Team startup fails.
-        const restored = await singleRpc.startRuntime(projectDir);
+        const restored = await singleRpc.startRuntime(target);
         if (!restored) {
           lastError.value = `${lastError.value}\n恢复单人运行环境也失败：${singleRpc.lastError.value || "未知错误"}`;
         }
         return false;
       }
       teamMode.value = true;
-      void window.pixApi.setWorkspaceMode(projectDir, "team");
+      void window.pixApi.setWorkspaceMode(target, "team");
       return true;
     } catch (err) {
       lastError.value = err instanceof Error ? err.message : String(err);
@@ -483,9 +493,9 @@ export const useTeamStore = defineStore("team", () => {
   // toggle) triggers recovery.
   watch(teamLeaderRpc.piStatus, (status) => {
     if (status !== "stopped" || !teamMode.value || isLoading.value) return;
-    const projectDir = projectStore.currentProject?.path;
-    if (projectDir) {
-      void toggleTeamMode(projectDir);
+    const location = projectStore.currentProject;
+    if (location) {
+      void toggleTeamMode(location);
     } else {
       // Team mode requires an open project, so this branch is defensive: at
       // least drop team mode so the UI does not render a dead team workspace.

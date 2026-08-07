@@ -7,17 +7,22 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
   AgentSessionEvent,
+  ExecutionEnvironmentInfo,
   GuiSettings,
   McpConfigInfo,
   McpResourceContent,
   McpResourceInfo,
   McpServerInfo,
+  ProjectLocation,
+  ProjectLocationInput,
   RequestUserInputRequest,
+  ResolveProjectLocationResult,
   RpcCommand,
   SessionInfo,
   TeamCommand,
   TeamEvent,
   TeamState,
+  WslDistroListResult,
 } from "../shared/types.js";
 
 export interface PixApi {
@@ -32,13 +37,18 @@ export interface PixApi {
   openExternal: (url: string) => void;
 
   // Pi lifecycle
-  startPi: (projectDir: string) => Promise<{ success: boolean; error?: string }>;
+  startPi: (location: ProjectLocation) => Promise<{ success: boolean; error?: string }>;
   stopPi: () => Promise<{ success: boolean }>;
-  startTeamRuntime: (projectDir: string) => Promise<{ success: boolean; error?: string }>;
+  startTeamRuntime: (location: ProjectLocation) => Promise<{ success: boolean; error?: string }>;
   stopTeamRuntime: () => Promise<{ success: boolean }>;
-  hasTeamSnapshot: (projectDir: string) => Promise<boolean>;
-  getWorkspaceMode: (projectDir: string) => Promise<"team" | "solo" | null>;
-  setWorkspaceMode: (projectDir: string, mode: "team" | "solo") => Promise<void>;
+  hasTeamSnapshot: (location: ProjectLocation) => Promise<boolean>;
+  getWorkspaceMode: (location: ProjectLocation) => Promise<"team" | "solo" | null>;
+  setWorkspaceMode: (location: ProjectLocation, mode: "team" | "solo") => Promise<void>;
+
+  // Project location, distro & execution environment
+  listWslDistros: () => Promise<WslDistroListResult>;
+  resolveProjectLocation: (input: ProjectLocationInput) => Promise<ResolveProjectLocationResult>;
+  getExecutionEnvironment: () => Promise<ExecutionEnvironmentInfo | null>;
 
   // RPC commands
   sendCommand: <T = unknown>(command: RpcCommand) => Promise<{ success: boolean; data?: T; error?: string }>;
@@ -68,8 +78,8 @@ export interface PixApi {
   onTeamLeaderUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => () => void;
 
   // Session management
-  listSessions: (projectDir: string) => Promise<SessionInfo[]>;
-  listTeamLeaderSessions: (projectDir: string) => Promise<SessionInfo[]>;
+  listSessions: (location: ProjectLocation) => Promise<SessionInfo[]>;
+  listTeamLeaderSessions: (location: ProjectLocation) => Promise<SessionInfo[]>;
 
   // Window controls (frameless window)
   windowMinimize: () => Promise<void>;
@@ -127,13 +137,16 @@ const api: PixApi = {
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
 
-  startPi: (projectDir: string) => ipcRenderer.invoke("start-pi", projectDir),
+  startPi: (location: ProjectLocation) => ipcRenderer.invoke("start-pi", location),
   stopPi: () => ipcRenderer.invoke("stop-pi"),
-  startTeamRuntime: (projectDir: string) => ipcRenderer.invoke("start-team-runtime", projectDir),
+  startTeamRuntime: (location: ProjectLocation) => ipcRenderer.invoke("start-team-runtime", location),
   stopTeamRuntime: () => ipcRenderer.invoke("stop-team-runtime"),
-  hasTeamSnapshot: (projectDir: string) => ipcRenderer.invoke("has-team-snapshot", projectDir),
-  getWorkspaceMode: (projectDir: string) => ipcRenderer.invoke("get-workspace-mode", projectDir),
-  setWorkspaceMode: (projectDir: string, mode: "team" | "solo") => ipcRenderer.invoke("set-workspace-mode", projectDir, mode),
+  hasTeamSnapshot: (location: ProjectLocation) => ipcRenderer.invoke("has-team-snapshot", location),
+  getWorkspaceMode: (location: ProjectLocation) => ipcRenderer.invoke("get-workspace-mode", location),
+  setWorkspaceMode: (location: ProjectLocation, mode: "team" | "solo") => ipcRenderer.invoke("set-workspace-mode", location, mode),
+  listWslDistros: () => ipcRenderer.invoke("list-wsl-distros"),
+  resolveProjectLocation: (input: ProjectLocationInput) => ipcRenderer.invoke("resolve-project-location", input),
+  getExecutionEnvironment: () => ipcRenderer.invoke("get-execution-environment"),
 
   sendCommand: <T = unknown>(command: RpcCommand) =>
     ipcRenderer.invoke("rpc-command", command) as Promise<{ success: boolean; data?: T; error?: string }>,
@@ -202,8 +215,8 @@ const api: PixApi = {
     return () => ipcRenderer.removeListener("team-leader-user-input-request", handler);
   },
 
-  listSessions: (projectDir: string) => ipcRenderer.invoke("list-sessions", projectDir),
-  listTeamLeaderSessions: (projectDir: string) => ipcRenderer.invoke("list-team-leader-sessions", projectDir),
+  listSessions: (location: ProjectLocation) => ipcRenderer.invoke("list-sessions", location),
+  listTeamLeaderSessions: (location: ProjectLocation) => ipcRenderer.invoke("list-team-leader-sessions", location),
 
   // Window controls
   windowMinimize: () => ipcRenderer.invoke("window-minimize"),

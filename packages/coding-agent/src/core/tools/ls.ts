@@ -6,6 +6,7 @@ import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -36,6 +37,12 @@ export interface LsOperations {
 	stat: (absolutePath: string) => Promise<{ isDirectory: () => boolean }> | { isDirectory: () => boolean };
 	/** Read directory entries */
 	readdir: (absolutePath: string) => Promise<string[]> | string[];
+	/**
+	 * Read directory entries with type information (d_type). When provided,
+	 * the per-entry stat loop is skipped. Broken symlinks are listable here
+	 * (isDirectory false) instead of failing the whole directory.
+	 */
+	readdirWithTypes?: (absolutePath: string) => Promise<Array<{ name: string; isDirectory: boolean }>>;
 }
 
 const defaultLsOperations: LsOperations = {
@@ -47,11 +54,18 @@ const defaultLsOperations: LsOperations = {
 export interface LsToolOptions {
 	/** Custom operations for directory listing. Default: local filesystem */
 	operations?: LsOperations;
+	/** Path context for a remote execution backend (for example WSL). */
+	pathContext?: ToolPathContext;
 }
 
-function formatLsCall(args: { path?: string; limit?: number } | undefined, theme: Theme, cwd: string): string {
+function formatLsCall(
+	args: { path?: string; limit?: number } | undefined,
+	theme: Theme,
+	cwd: string,
+	pathContext?: ToolPathContext,
+): string {
 	const limit = args?.limit;
-	const pathDisplay = renderToolPath(str(args?.path), theme, cwd, { emptyFallback: "." });
+	const pathDisplay = renderToolPath(str(args?.path), theme, cwd, { emptyFallback: ".", pathContext });
 	let text = `${theme.fg("toolTitle", theme.bold("ls"))} ${pathDisplay}`;
 	if (limit !== undefined) {
 		text += theme.fg("toolOutput", ` (limit ${limit})`);
@@ -97,6 +111,8 @@ export function createLsToolDefinition(
 	options?: LsToolOptions,
 ): ToolDefinition<typeof lsSchema, LsToolDetails | undefined> {
 	const ops = options?.operations ?? defaultLsOperations;
+	const pathContext = options?.pathContext;
+	const pathApi = pathContext?.pathStyle === "posix" ? nodePath.posix : nodePath;
 	return {
 		name: "ls",
 		label: "ls",
@@ -121,7 +137,7 @@ export function createLsToolDefinition(
 
 				(async () => {
 					try {
-						const dirPath = resolveToCwd(path || ".", cwd);
+						const dirPath = resolveToCwd(path || ".", cwd, pathContext);
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 
 						// Check if path exists.
@@ -137,37 +153,63 @@ export function createLsToolDefinition(
 							return;
 						}
 
-						// Read directory entries.
-						let entries: string[];
-						try {
-							entries = await ops.readdir(dirPath);
-						} catch (e: any) {
-							reject(new Error(`Cannot read directory: ${e.message}`));
-							return;
-						}
-
-						// Sort alphabetically, case-insensitive.
-						entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
-
 						// Format entries with directory indicators.
 						const results: string[] = [];
 						let entryLimitReached = false;
-						for (const entry of entries) {
-							if (results.length >= effectiveLimit) {
-								entryLimitReached = true;
-								break;
+
+						// Prefer typed directory entries when the backend provides them
+						// (for example WSL readdir with d_type): this skips the per-entry
+						// stat loop and lists broken symlinks (isDirectory false) instead
+						// of failing the whole directory. The stat fallback below stays
+						// unchanged for the local Windows filesystem.
+						if (ops.readdirWithTypes) {
+							let typedEntries: Array<{ name: string; isDirectory: boolean }>;
+							try {
+								typedEntries = await ops.readdirWithTypes(dirPath);
+							} catch (e: any) {
+								reject(new Error(`Cannot read directory: ${e.message}`));
+								return;
+							}
+							typedEntries.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+							for (const entry of typedEntries) {
+								if (results.length >= effectiveLimit) {
+									entryLimitReached = true;
+									break;
+								}
+								results.push(entry.name + (entry.isDirectory ? "/" : ""));
+							}
+						} else {
+							// Read directory entries.
+							let entries: string[];
+							try {
+								entries = await ops.readdir(dirPath);
+							} catch (e: any) {
+								reject(new Error(`Cannot read directory: ${e.message}`));
+								return;
 							}
 
-							const fullPath = nodePath.join(dirPath, entry);
-							let suffix = "";
-							try {
-								const entryStat = await ops.stat(fullPath);
-								if (entryStat.isDirectory()) suffix = "/";
-							} catch {
-								// Skip entries we cannot stat.
-								continue;
+							// Sort alphabetically, case-insensitive.
+							entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+
+							for (const entry of entries) {
+								if (results.length >= effectiveLimit) {
+									entryLimitReached = true;
+									break;
+								}
+
+								// Use path.posix.join under a POSIX backend (WSL) so Linux
+								// paths are not mangled by win32 join before reaching ops.stat.
+								const fullPath = pathApi.join(dirPath, entry);
+								let suffix = "";
+								try {
+									const entryStat = await ops.stat(fullPath);
+									if (entryStat.isDirectory()) suffix = "/";
+								} catch {
+									// Skip entries we cannot stat (broken symlinks under the stat fallback).
+									continue;
+								}
+								results.push(entry + suffix);
 							}
-							results.push(entry + suffix);
 						}
 
 						signal?.removeEventListener("abort", onAbort);
@@ -209,7 +251,7 @@ export function createLsToolDefinition(
 		},
 		renderCall(args, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatLsCall(args, theme, context.cwd));
+			text.setText(formatLsCall(args, theme, context.cwd, pathContext));
 			return text;
 		},
 		renderResult(result, options, theme, context) {

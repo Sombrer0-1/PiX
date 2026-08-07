@@ -11,6 +11,7 @@ export interface ShellConfig {
 function isPosixLikeShell(shell: string): boolean {
 	const normalized = shell.replace(/\\/g, "/").toLowerCase();
 	const basename = normalized.split("/").pop() ?? normalized;
+	if (basename === "wsl" || basename === "wsl.exe") return true;
 	return /^(ba|da|k|z)?sh(?:\.exe)?$/.test(basename) || basename === "fish.exe" || basename === "fish";
 }
 

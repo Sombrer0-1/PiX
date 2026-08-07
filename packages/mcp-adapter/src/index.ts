@@ -76,6 +76,13 @@ export interface McpAdapterOptions {
 	registerResourceTools?: boolean;
 	startupTimeoutMs?: number;
 	requestTimeoutMs?: number;
+	/**
+	 * Whether stdio MCP servers may be spawned on the host. Defaults to true.
+	 * WSL-backed sessions pass false: the Windows host cannot launch a Linux
+	 * stdio server, so it is filtered with a clear diagnostic instead of a
+	 * confusing spawn failure (wsl_plan.md §4.10). HTTP/SSE are unaffected.
+	 */
+	allowStdio?: boolean;
 }
 
 interface LoadedConfig {
@@ -479,6 +486,7 @@ class McpServerConnection {
 	private onResourcesChanged: (serverName: string) => void;
 	private startupTimeoutMs: number;
 	private requestTimeoutMs: number;
+	private readonly allowStdio: boolean;
 	private lastReconnectAttempt = 0;
 	private healthCheckTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly HEALTH_CHECK_INTERVAL_MS = 30_000;
@@ -486,7 +494,7 @@ class McpServerConnection {
 	constructor(
 		name: string,
 		config: McpServerConfig,
-		options: { startupTimeoutMs: number; requestTimeoutMs: number },
+		options: { startupTimeoutMs: number; requestTimeoutMs: number; allowStdio: boolean },
 		onToolsChanged: (serverName: string, tools: Tool[]) => void,
 		onResourcesChanged: (serverName: string) => void,
 	) {
@@ -494,6 +502,7 @@ class McpServerConnection {
 		this.config = config;
 		this.startupTimeoutMs = config.startupTimeoutMs ?? config.timeoutMs ?? options.startupTimeoutMs;
 		this.requestTimeoutMs = config.requestTimeoutMs ?? config.timeoutMs ?? options.requestTimeoutMs;
+		this.allowStdio = options.allowStdio;
 		this.onToolsChanged = onToolsChanged;
 		this.onResourcesChanged = onResourcesChanged;
 	}
@@ -571,7 +580,21 @@ class McpServerConnection {
 		this.error = undefined;
 		this.lastStderr = "";
 
-		const transport = this.createTransport();
+		// createTransport() can throw synchronously (e.g. stdio disabled in WSL
+		// mode, or missing command/url). Wrap it so the failure is recorded as
+		// status="failed" with a per-server error before re-throwing, instead of
+		// escaping with status stuck at "connecting" and error undefined.
+		// wsl_plan.md §4.10: diagnostic must land in BOTH McpConfigInfo.errors
+		// AND McpServerStatus.error.
+		let transport: Transport;
+		try {
+			transport = this.createTransport();
+		} catch (error) {
+			this.status = "failed";
+			this.error = error instanceof Error ? error.message : String(error);
+			log("error", `"${this.name}" connection failed: ${this.error}`);
+			throw error;
+		}
 		this.transport = transport;
 		transport.onclose = () => {
 			if (this.transport !== transport) return;
@@ -659,6 +682,11 @@ class McpServerConnection {
 	private createTransport(): Transport {
 		const kind = getTransportKind(this.config);
 		if (kind === "stdio") {
+			if (!this.allowStdio) {
+				throw new Error(
+					"MCP stdio server is disabled in WSL mode; use HTTP/SSE or run the server inside WSL",
+				);
+			}
 			if (!this.config.command) {
 				throw new Error(`MCP server "${this.name}" is missing command`);
 			}
@@ -937,6 +965,7 @@ export class McpAdapter {
 				{
 					startupTimeoutMs: this.options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
 					requestTimeoutMs: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+					allowStdio: this.options.allowStdio ?? true,
 				},
 				(serverName, tools) => {
 					if (this.activePi) {

@@ -6,6 +6,7 @@ import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 import {
 	applyEditsToNormalizedContent,
 	computeEditsDiff,
@@ -89,6 +90,8 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
+	/** Path context for a remote execution backend (for example WSL). */
+	pathContext?: ToolPathContext;
 }
 
 function prepareEditArguments(input: unknown): EditToolInput {
@@ -192,8 +195,8 @@ function getRenderablePreviewInput(args: RenderableEditArgs | undefined): { path
 	return null;
 }
 
-function formatEditCall(args: RenderableEditArgs | undefined, theme: Theme, cwd: string): string {
-	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd);
+function formatEditCall(args: RenderableEditArgs | undefined, theme: Theme, cwd: string, pathContext?: ToolPathContext): string {
+	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd, { pathContext });
 	return `${theme.fg("toolTitle", theme.bold("edit"))} ${pathDisplay}`;
 }
 
@@ -248,10 +251,11 @@ function buildEditCallComponent(
 	args: RenderableEditArgs | undefined,
 	theme: Theme,
 	cwd: string,
+	pathContext?: ToolPathContext,
 ): EditCallRenderComponent {
 	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 	component.clear();
-	component.addChild(new Text(formatEditCall(args, theme, cwd), 0, 0));
+	component.addChild(new Text(formatEditCall(args, theme, cwd, pathContext), 0, 0));
 
 	if (!component.preview) {
 		return component;
@@ -289,6 +293,7 @@ export function createEditToolDefinition(
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
+	const pathContext = options?.pathContext;
 	return {
 		name: "edit",
 		label: "edit",
@@ -307,7 +312,7 @@ export function createEditToolDefinition(
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
 			const { path, edits } = validateEditInput(input);
-			const absolutePath = resolveToCwd(path, cwd);
+			const absolutePath = resolveToCwd(path, cwd, pathContext);
 
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
@@ -358,7 +363,7 @@ export function createEditToolDefinition(
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
 				};
-			});
+			}, { getKey: pathContext?.getMutationKey });
 		},
 		renderCall(args, theme, context) {
 			const component = getEditCallRenderComponent(context.state, context.lastComponent);
@@ -377,7 +382,14 @@ export function createEditToolDefinition(
 			if (context.argsComplete && previewInput && !component.preview && !component.previewPending) {
 				component.previewPending = true;
 				const requestKey = argsKey;
-				void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd).then((preview) => {
+				// Under a remote path context (WSL), route the preview read through the
+				// same operations and resolver as execution so the preview reflects the
+				// physical file. Without a path context, leave the 3-arg local-fs path
+				// unchanged to preserve Windows preview behavior byte-for-byte.
+				const previewOptions = pathContext
+					? { operations: { access: ops.access, readFile: ops.readFile }, paths: pathContext }
+					: undefined;
+				void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd, previewOptions).then((preview) => {
 					if (component.previewArgsKey === requestKey) {
 						setEditPreview(component, preview, requestKey);
 						context.invalidate();
@@ -385,7 +397,7 @@ export function createEditToolDefinition(
 				});
 			}
 
-			return buildEditCallComponent(component, args, theme, context.cwd);
+			return buildEditCallComponent(component, args, theme, context.cwd, pathContext);
 		},
 		renderResult(result, _options, theme, context) {
 			const callComponent = context.state.callComponent;
@@ -415,6 +427,7 @@ export function createEditToolDefinition(
 						context.args as RenderableEditArgs | undefined,
 						theme,
 						context.cwd,
+						pathContext,
 					);
 				}
 			}

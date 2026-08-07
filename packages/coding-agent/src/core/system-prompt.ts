@@ -24,6 +24,12 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/**
+	 * Optional formatter that translates a skill's physical load path into a
+	 * model-visible logical path (for example under WSL). When omitted, the raw
+	 * skill filePath is shown.
+	 */
+	skillPathFormatter?: (filePath: string) => string;
 }
 
 export interface RuntimeEnvironmentContext {
@@ -35,7 +41,7 @@ export interface RuntimeEnvironmentContext {
 	shell?: {
 		path?: string;
 		args?: string[];
-		kind?: "posix" | "powershell" | "cmd" | "unknown";
+		kind?: "posix" | "powershell" | "cmd" | "unknown" | "wsl";
 		error?: string;
 	};
 }
@@ -127,6 +133,7 @@ function shellKindFromPath(shellPath: string | undefined): NonNullable<RuntimeEn
 	if (!shellPath) return "unknown";
 	const normalized = shellPath.replace(/\\/g, "/").toLowerCase();
 	const basename = normalized.split("/").pop() ?? normalized;
+	if (basename === "wsl" || basename === "wsl.exe") return "wsl";
 	if (/^(ba|da|k|z)?sh(?:\.exe)?$/.test(basename) || basename === "fish" || basename === "fish.exe") {
 		return "posix";
 	}
@@ -178,7 +185,20 @@ function renderEnvironmentContext(date: string, cwd: string, environment?: Runti
 	} else if (shell?.path) {
 		const args = shell.args && shell.args.length > 0 ? ` ${shell.args.join(" ")}` : "";
 		lines.push(`Command shell for bash tool: ${shell.path}${args}`);
-		if (shellKind === "posix") {
+		if (shellKind === "wsl") {
+			lines.push(
+				"Shell syntax for bash tool: native Linux bash inside WSL2. Use POSIX/Linux syntax: forward slashes, /dev/null, apt, no .exe suffix, no PowerShell or cmd.exe-only syntax.",
+			);
+			lines.push(
+				"WSL immersion: the current working directory, file tools (read/write/edit/ls/find/grep), and path diagnostics all operate on Linux paths. Use /home/... or /mnt/<drive>/... paths; path conversion to the host filesystem is handled for you. Do not use Windows drive letters (C:\\) or UNC paths (\\\\wsl.localhost\\...) in built-in file tools or as the cwd.",
+			);
+			lines.push(
+				"WSL path boundary: MCP servers and extensions run on the host and may return Windows paths (C:\\... or \\\\wsl.localhost\\...). If a tool result contains such a path, translate it to /mnt/<drive>/... before passing it to bash, or hand it back to the same host tool. This boundary does not weaken the Linux immersion above.",
+			);
+			lines.push(
+				"WSL reserved names: when writing under /mnt/<drive>/ (NTFS), avoid Windows reserved filenames such as nul, con, prn, aux, com1, or lpt1; they can create undeletable files.",
+			);
+		} else if (shellKind === "posix") {
 			lines.push(
 				"Shell syntax for bash tool: POSIX shell/bash syntax. Do not write PowerShell-only or cmd.exe-only syntax unless you explicitly invoke powershell.exe or cmd.exe from bash.",
 			);
@@ -254,9 +274,21 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		runtimeEnvironment,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
+		skillPathFormatter,
 	} = options;
 	const resolvedCwd = cwd;
 	const promptCwd = resolvedCwd.replace(/\\/g, "/");
+	// Platform drives platform-conditional prompt text (editing_contract). A WSL
+	// backend overrides platform to "linux" so Windows-only guidance is dropped
+	// while the /mnt/<drive> NTFS reserved-name warning is preserved.
+	const runtimePlatform = runtimeEnvironment?.platform ?? process.platform;
+	const isWslPlatform = runtimePlatform === "linux" && runtimeEnvironment?.shell?.kind === "wsl";
+	const reservedNamesLine = isWslPlatform
+		? "- When writing under /mnt/<drive>/ (NTFS), avoid Windows reserved filenames such as nul, con, prn, aux, com1, or lpt1; they can create undeletable files."
+		: "- Do not create files named Windows reserved devices such as nul, con, prn, aux, com1, or lpt1.";
+	const nullDeviceLine = isWslPlatform
+		? "- Discard command output with /dev/null (native Linux null device)."
+		: "- On Windows bash/POSIX shells, discard output with /dev/null, not bare nul/NUL.";
 
 	const now = new Date();
 	const year = now.getFullYear();
@@ -283,7 +315,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		// Append skills section (only if read tool is available)
 		const customPromptHasRead = !selectedTools || selectedTools.includes("read");
 		if (customPromptHasRead && skills.length > 0) {
-			prompt += formatSkillsForPrompt(skills);
+			prompt += formatSkillsForPrompt(skills, skillPathFormatter);
 		}
 
 		// Add runtime environment last so the model sees the live shell/cwd context.
@@ -424,8 +456,8 @@ For creative writing, essays, brainstorming, translation, general analysis, and 
 - Prefer edit for precise replacements and write for new files or deliberate full rewrites.
 - Preserve line endings and existing style when practical.
 - Avoid ad hoc text manipulation when a structured parser or project helper is the normal path.
-- Do not create files named Windows reserved devices such as nul, con, prn, aux, com1, or lpt1.
-- On Windows bash/POSIX shells, discard output with /dev/null, not bare nul/NUL.
+${reservedNamesLine}
+${nullDeviceLine}
 
 When running shell commands:
 - Use the shell syntax shown in environment_context.
@@ -496,7 +528,7 @@ When project instructions are present, apply them to work in that project, but d
 
 	// Append skills section (only if read tool is available)
 	if (hasRead && skills.length > 0) {
-		prompt += formatSkillsForPrompt(skills);
+		prompt += formatSkillsForPrompt(skills, skillPathFormatter);
 	}
 
 	// Add runtime environment last so the model sees the live shell/cwd context.

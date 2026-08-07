@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, posix as posixPath } from "node:path";
 
 export interface DiffStat {
 	added: number;
@@ -58,11 +58,19 @@ export function getPathFromToolArgs(args: unknown): string | undefined {
 	return undefined;
 }
 
-export function isPathInsideCwd(path: string, cwd: string): boolean {
-	const resolvedPath = resolve(cwd, path);
-	const resolvedCwd = resolve(cwd);
-	const rel = relative(resolvedCwd, resolvedPath);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+/**
+ * Whether `path` resolves inside `cwd`.
+ *
+ * Pass `{ posix: true }` to judge the edit boundary against a logical (POSIX)
+ * cwd, for example a WSL runtime cwd. The platform default (win32 on Windows)
+ * is unchanged when no option is provided.
+ */
+export function isPathInsideCwd(path: string, cwd: string, options?: { posix?: boolean }): boolean {
+	const pathApi = options?.posix ? posixPath : { isAbsolute, relative, resolve };
+	const resolvedPath = pathApi.resolve(cwd, path);
+	const resolvedCwd = pathApi.resolve(cwd);
+	const rel = pathApi.relative(resolvedCwd, resolvedPath);
+	return rel === "" || (!rel.startsWith("..") && !pathApi.isAbsolute(rel));
 }
 
 export function extractFileChangeFromToolResult(options: {

@@ -6,6 +6,7 @@ import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 import { generateDiffString, generateUnifiedPatch, normalizeToLF, stripBom } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -47,6 +48,8 @@ const defaultWriteOperations: WriteOperations = {
 export interface WriteToolOptions {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
+	/** Path context for a remote execution backend (for example WSL). */
+	pathContext?: ToolPathContext;
 }
 
 type WriteHighlightCache = {
@@ -144,10 +147,11 @@ function formatWriteCall(
 	theme: Theme,
 	cache: WriteHighlightCache | undefined,
 	cwd: string,
+	pathContext?: ToolPathContext,
 ): string {
 	const rawPath = str(args?.file_path ?? args?.path);
 	const fileContent = str(args?.content);
-	const pathDisplay = renderToolPath(rawPath, theme, cwd);
+	const pathDisplay = renderToolPath(rawPath, theme, cwd, { pathContext });
 	let text = `${theme.fg("toolTitle", theme.bold("write"))} ${pathDisplay}`;
 
 	if (fileContent === null) {
@@ -219,6 +223,7 @@ export function createWriteToolDefinition(
 	options?: WriteToolOptions,
 ): ToolDefinition<typeof writeSchema, WriteToolDetails | undefined> {
 	const ops = options?.operations ?? defaultWriteOperations;
+	const pathContext = options?.pathContext;
 	return {
 		name: "write",
 		label: "write",
@@ -234,7 +239,7 @@ export function createWriteToolDefinition(
 			_onUpdate?,
 			_ctx?,
 		) {
-			const absolutePath = resolveToCwd(path, cwd);
+			const absolutePath = resolveToCwd(path, cwd, pathContext);
 			const dir = dirname(absolutePath);
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
@@ -262,7 +267,7 @@ export function createWriteToolDefinition(
 					content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
 					details,
 				};
-			});
+			}, { getKey: pathContext?.getMutationKey });
 		},
 		renderCall(args, theme, context) {
 			const renderArgs = args as { path?: string; file_path?: string; content?: string } | undefined;
@@ -284,6 +289,7 @@ export function createWriteToolDefinition(
 					theme,
 					component.cache,
 					context.cwd,
+					pathContext,
 				),
 			);
 			return component;

@@ -1,4 +1,5 @@
 import { readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
@@ -9,6 +10,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -53,6 +55,13 @@ export interface GrepOperations {
 	isDirectory: (absolutePath: string) => Promise<boolean> | boolean;
 	/** Read file contents for context lines */
 	readFile: (absolutePath: string) => Promise<string> | string;
+	/**
+	 * Spawn ripgrep in the runtime namespace (for example inside WSL).
+	 * Must return a live ChildProcess so the existing readline/JSON/limit
+	 * early-kill flow is preserved. cwd and absolutePath params are runtime
+	 * (POSIX logical) paths; converting to physical is the backend's job.
+	 */
+	spawnRipgrep?: (args: string[], cwd: string, env: NodeJS.ProcessEnv) => ChildProcessWithoutNullStreams;
 }
 
 const defaultGrepOperations: GrepOperations = {
@@ -63,15 +72,38 @@ const defaultGrepOperations: GrepOperations = {
 export interface GrepToolOptions {
 	/** Custom operations for grep. Default: local filesystem plus ripgrep */
 	operations?: GrepOperations;
+	/** Path context for a remote execution backend (for example WSL). */
+	pathContext?: ToolPathContext;
+}
+
+/**
+ * Base timeout for a ripgrep spawn when a backend owns execution (WSL).
+ * The local Windows fallback keeps its existing signal-only behavior.
+ */
+const GREP_SPAWN_TIMEOUT_MS = 120_000;
+
+/**
+ * Compute the ripgrep spawn timeout for a backend-managed search.
+ * Cross-boundary searches under /mnt/<drive> (NTFS via 9P) are doubled
+ * because metadata reads are noticeably slower than on native ext4.
+ */
+function computeGrepTimeoutMs(searchPath: string, pathStyle: "win32" | "posix"): number | undefined {
+	if (pathStyle !== "posix") return undefined;
+	// /mnt/<single-letter-drive>/ is a Windows drive mounted into WSL (9P).
+	if (/^\/mnt\/[a-zA-Z]\//.test(searchPath) || /^\/mnt\/[a-zA-Z]$/.test(searchPath)) {
+		return GREP_SPAWN_TIMEOUT_MS * 2;
+	}
+	return GREP_SPAWN_TIMEOUT_MS;
 }
 
 function formatGrepCall(
 	args: { pattern: string; path?: string; glob?: string; limit?: number } | undefined,
 	theme: Theme,
+	home?: string,
 ): string {
 	const pattern = str(args?.pattern);
 	const rawPath = str(args?.path);
-	const path = rawPath !== null ? shortenPath(rawPath || ".") : null;
+	const path = rawPath !== null ? shortenPath(rawPath || ".", home) : null;
 	const glob = str(args?.glob);
 	const limit = args?.limit;
 	const invalidArg = invalidArgText(theme);
@@ -125,6 +157,9 @@ export function createGrepToolDefinition(
 	options?: GrepToolOptions,
 ): ToolDefinition<typeof grepSchema, GrepToolDetails | undefined> {
 	const customOps = options?.operations;
+	const pathContext = options?.pathContext;
+	const pathStyle = pathContext?.pathStyle ?? "win32";
+	const pathApi = pathStyle === "posix" ? path.posix : path;
 	return {
 		name: "grep",
 		label: "grep",
@@ -169,13 +204,20 @@ export function createGrepToolDefinition(
 
 				(async () => {
 					try {
-						const rgPath = await ensureTool("rg", true);
-						if (!rgPath) {
-							settle(() => reject(new Error("ripgrep (rg) is not available and could not be downloaded")));
-							return;
+						const spawnRipgrep = customOps?.spawnRipgrep;
+						// Only probe/download a host rg binary when no backend owns the spawn.
+						// A WSL backend spawns rg inside the distro and surfaces a missing-rg
+						// error itself (with distro name + apt hint).
+						let rgPath: string | undefined;
+						if (!spawnRipgrep) {
+							rgPath = await ensureTool("rg", true);
+							if (!rgPath) {
+								settle(() => reject(new Error("ripgrep (rg) is not available and could not be downloaded")));
+								return;
+							}
 						}
 
-						const searchPath = resolveToCwd(searchDir || ".", cwd);
+						const searchPath = resolveToCwd(searchDir || ".", cwd, pathContext);
 						const ops = customOps ?? defaultGrepOperations;
 						let isDirectory: boolean;
 						try {
@@ -189,12 +231,12 @@ export function createGrepToolDefinition(
 						const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
 						const formatPath = (filePath: string): string => {
 							if (isDirectory) {
-								const relative = path.relative(searchPath, filePath);
+								const relative = pathApi.relative(searchPath, filePath);
 								if (relative && !relative.startsWith("..")) {
 									return relative.replace(/\\/g, "/");
 								}
 							}
-							return path.basename(filePath);
+							return pathApi.basename(filePath);
 						};
 
 						const fileCache = new Map<string, string[]>();
@@ -218,7 +260,9 @@ export function createGrepToolDefinition(
 						if (glob) args.push("--glob", glob);
 						args.push("--", pattern, searchPath);
 
-						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const child: ChildProcessWithoutNullStreams = spawnRipgrep
+							? spawnRipgrep(args, searchPath, process.env)
+							: (spawn(rgPath as string, args, { stdio: ["ignore", "pipe", "pipe"] }) as unknown as ChildProcessWithoutNullStreams);
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						let matchCount = 0;
@@ -226,11 +270,13 @@ export function createGrepToolDefinition(
 						let linesTruncated = false;
 						let aborted = false;
 						let killedDueToLimit = false;
+						let timedOut = false;
 						const outputLines: string[] = [];
 
 						const cleanup = () => {
 							rl.close();
 							signal?.removeEventListener("abort", onAbort);
+							if (timeoutHandle) clearTimeout(timeoutHandle);
 						};
 						const stopChild = (dueToLimit = false) => {
 							if (!child.killed) {
@@ -243,6 +289,15 @@ export function createGrepToolDefinition(
 							stopChild();
 						};
 						signal?.addEventListener("abort", onAbort, { once: true });
+						// Independent timeout for backend-managed spawns (WSL). The local
+						// Windows fallback keeps its existing signal-only behavior.
+						const grepTimeoutMs = spawnRipgrep ? computeGrepTimeoutMs(searchPath, pathStyle) : undefined;
+						const timeoutHandle: NodeJS.Timeout | undefined = grepTimeoutMs
+							? setTimeout(() => {
+									timedOut = true;
+									stopChild();
+								}, grepTimeoutMs)
+							: undefined;
 						child.stderr?.on("data", (chunk) => {
 							stderr += chunk.toString();
 						});
@@ -299,6 +354,10 @@ export function createGrepToolDefinition(
 							cleanup();
 							if (aborted) {
 								settle(() => reject(new Error("Operation aborted")));
+								return;
+							}
+							if (timedOut) {
+								settle(() => reject(new Error(`ripgrep timed out after ${grepTimeoutMs}ms`)));
 								return;
 							}
 							if (!killedDueToLimit && code !== 0 && code !== 1) {
@@ -369,7 +428,7 @@ export function createGrepToolDefinition(
 		},
 		renderCall(args, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatGrepCall(args, theme));
+			text.setText(formatGrepCall(args, theme, pathContext?.homeDir));
 			return text;
 		},
 		renderResult(result, options, theme, context) {

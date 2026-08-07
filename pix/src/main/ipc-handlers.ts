@@ -10,14 +10,25 @@
 import { existsSync, rmSync } from "fs";
 import { isAbsolute, join, relative, resolve } from "path";
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
-import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import electronUpdater from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
+import { resolveProjectLocation } from "./execution-context.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
-import type { GuiSettings, ProjectInfo, RpcCommand, TeamCommand, ThinkingLevel } from "../shared/types.js";
+import type {
+  GuiSettings,
+  ProjectInfo,
+  ProjectLocation,
+  ProjectLocationInput,
+  RpcCommand,
+  TeamCommand,
+  ThinkingLevel,
+  WslSettings,
+} from "../shared/types.js";
 import type { TeamManager } from "./team-manager.js";
 import { readWorkspaceMode, teamSnapshotPath, writeWorkspaceMode } from "./team-persistence.js";
+import { WslDistroResolver } from "./wsl/wsl-distro.js";
 
 const { autoUpdater } = electronUpdater;
 
@@ -35,6 +46,7 @@ const SETTING_KEYS = new Set([
   "defaultModel",
   "defaultThinkingLevel",
   "takeHerEyes",
+  "wsl",
 ]);
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -54,6 +66,48 @@ function isProjectInfo(value: unknown): value is ProjectInfo {
   );
 }
 
+function isProjectEnvironment(value: unknown): value is ProjectLocation["environment"] {
+  if (!value || typeof value !== "object") return false;
+  const env = value as Record<string, unknown>;
+  if (env.kind === "windows") return true;
+  if (env.kind === "wsl") return typeof env.distro === "string" && env.distro.length > 0;
+  return false;
+}
+
+/**
+ * Runtime type guard for ProjectLocation received from the renderer. Structural
+ * only; deeper validation (distro existence, directory probes) happens in
+ * resolveProjectLocation / createProjectExecutionContext. physicalPath must be
+ * non-empty because it is the sole hash/key input in the main process
+ * (wsl_plan.md §4.8).
+ */
+function isProjectLocation(value: unknown): value is ProjectLocation {
+  if (!value || typeof value !== "object") return false;
+  const loc = value as Record<string, unknown>;
+  return (
+    typeof loc.path === "string" &&
+    typeof loc.physicalPath === "string" &&
+    loc.physicalPath.length > 0 &&
+    typeof loc.name === "string" &&
+    isProjectEnvironment(loc.environment)
+  );
+}
+
+/**
+ * Runtime type guard for ProjectLocationInput received from the renderer. The
+ * resolver validates distro/version/path absoluteness and returns a structured
+ * error; this guard only ensures the shape is safe to hand to it.
+ */
+function isProjectLocationInput(value: unknown): value is ProjectLocationInput {
+  if (!value || typeof value !== "object") return false;
+  const input = value as Record<string, unknown>;
+  if (!isProjectEnvironment(input.environment)) return false;
+  if (input.logicalPath !== undefined && typeof input.logicalPath !== "string") return false;
+  if (input.physicalPath !== undefined && typeof input.physicalPath !== "string") return false;
+  if (input.name !== undefined && typeof input.name !== "string") return false;
+  return true;
+}
+
 function sanitizeTakeHerEyes(value: unknown): GuiSettings["takeHerEyes"] | undefined {
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
@@ -67,6 +121,16 @@ function sanitizeTakeHerEyes(value: unknown): GuiSettings["takeHerEyes"] | undef
     result.modelId = raw.modelId;
   }
   return result;
+}
+
+function sanitizeWslSettings(value: unknown): WslSettings | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  return {
+    enabled: raw.enabled === true,
+    distro: typeof raw.distro === "string" ? raw.distro : "",
+    defaultCwd: typeof raw.defaultCwd === "string" ? raw.defaultCwd : "/home",
+  };
 }
 
 function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSettings> {
@@ -115,6 +179,15 @@ function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSetting
     } else {
       const cleaned = sanitizeTakeHerEyes(value);
       if (cleaned) sanitized.takeHerEyes = cleaned;
+    }
+  }
+  if (Object.hasOwn(settings, "wsl")) {
+    const value = settings.wsl;
+    if (value === undefined) {
+      sanitized.wsl = undefined;
+    } else {
+      const cleaned = sanitizeWslSettings(value);
+      if (cleaned) sanitized.wsl = cleaned;
     }
   }
 
@@ -230,12 +303,15 @@ export function registerIpcHandlers(
     }
   }
 
-  ipcMain.handle("start-pi", async (_event, projectDir: string) => {
+  ipcMain.handle("start-pi", async (_event, location: unknown) => {
+    if (!isProjectLocation(location)) {
+      return { success: false, error: "Invalid project location." };
+    }
     try {
       // Starting the single runtime is also a mode switch. Preserve any team
       // snapshot so it can be restored when Team mode is entered again.
       await disposeTeamRuntime(true);
-      await singleSessionBridge.start(projectDir, settingsStore.getAll());
+      await singleSessionBridge.start(location, settingsStore.getAll());
       return { success: true };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -251,18 +327,28 @@ export function registerIpcHandlers(
     return { success: true };
   });
 
-  ipcMain.handle("start-team-runtime", async (_event, projectDir: string) => {
+  ipcMain.handle("start-team-runtime", async (_event, location: unknown) => {
+    if (!isProjectLocation(location)) {
+      return { success: false, error: "Invalid project location." };
+    }
     try {
       // A workspace has one active mode. Clear any previous Team runtime and
       // stop the single runtime before bringing up the independent leader.
       await disposeTeamRuntime(true);
       await singleSessionBridge.dispose();
-      await teamLeaderSessionBridge.start(projectDir, settingsStore.getAll());
+      await teamLeaderSessionBridge.start(location, settingsStore.getAll());
+      // TeamManager.initialize takes the borrowed leader context (S8); the
+      // leader SessionBridge owns the backend and TeamManager never disposes it
+      // (wsl_plan.md §4.8).
+      const context = teamLeaderSessionBridge.getExecutionContext();
+      if (!context) {
+        throw new Error("TeamManager initialization failed: execution context unavailable");
+      }
       const authStorage = teamLeaderSessionBridge.getAuthStorage();
       if (!authStorage) {
         throw new Error("TeamManager initialization failed: auth storage unavailable");
       }
-      await teamManager.initialize(projectDir, authStorage);
+      await teamManager.initialize(context, authStorage);
       return { success: true };
     } catch (err: unknown) {
       try {
@@ -291,19 +377,72 @@ export function registerIpcHandlers(
     return { success: true };
   });
 
-  ipcMain.handle("has-team-snapshot", (_event, projectDir: string) => {
-    return typeof projectDir === "string" && projectDir.length > 0 && existsSync(teamSnapshotPath(projectDir));
+  ipcMain.handle("has-team-snapshot", (_event, location: unknown) => {
+    // Snapshot existence is keyed by the physical cwd hash (team-persistence.ts);
+    // the logical path never participates in the key (wsl_plan.md §4.8).
+    if (!isProjectLocation(location)) return false;
+    return existsSync(teamSnapshotPath(location.physicalPath));
   });
 
-  ipcMain.handle("get-workspace-mode", async (_event, projectDir: string) => {
-    if (typeof projectDir !== "string" || projectDir.length === 0) return null;
-    return readWorkspaceMode(projectDir);
+  ipcMain.handle("get-workspace-mode", async (_event, location: unknown) => {
+    if (!isProjectLocation(location)) return null;
+    return readWorkspaceMode(location.physicalPath);
   });
 
-  ipcMain.handle("set-workspace-mode", async (_event, projectDir: string, mode: "team" | "solo") => {
-    if (typeof projectDir !== "string" || projectDir.length === 0) return;
+  ipcMain.handle("set-workspace-mode", async (_event, location: unknown, mode: "team" | "solo") => {
+    if (!isProjectLocation(location)) return;
     if (mode !== "team" && mode !== "solo") return;
-    await writeWorkspaceMode(projectDir, mode);
+    await writeWorkspaceMode(location.physicalPath, mode);
+  });
+
+  // =========================================================================
+  // Project location, distro & execution environment
+  // =========================================================================
+
+  ipcMain.handle("list-wsl-distros", async () => {
+    try {
+      const resolver = new WslDistroResolver();
+      const distros = await resolver.list();
+      // v1 accepts only WSL2 (version 2) distros (wsl_plan §4.4 / §1.5). Filter
+      // at the source so both the open-project dialog and the global settings
+      // page only ever offer v2 distros; a v1-only host surfaces a diagnostic
+      // instead of a selectable-but-failing list (wsl_plan §5.1 step 2).
+      const v2Distros = distros.filter((d) => d.version === 2);
+      if (v2Distros.length === 0) {
+        const diagnostic =
+          distros.length === 0
+            ? "No WSL2 distros found. Install WSL2 and at least one distro (e.g. `wsl --install -d Ubuntu`), then ensure it is version 2."
+            : "Found WSL distros, but none are version 2. Convert or reinstall a distro as version 2 (e.g. `wsl --set-version <Distro> 2`).";
+        return { distros: v2Distros, diagnostic };
+      }
+      return { distros: v2Distros };
+    } catch (err: unknown) {
+      return {
+        distros: [],
+        diagnostic: err instanceof Error ? err.message : String(err),
+      };
+    }
+  });
+
+  ipcMain.handle("resolve-project-location", async (_event, input: unknown) => {
+    if (!isProjectLocationInput(input)) {
+      return { success: false, error: "Invalid project location input." };
+    }
+    try {
+      const location = await resolveProjectLocation(input);
+      return { success: true, location };
+    } catch (err: unknown) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcMain.handle("get-execution-environment", () => {
+    // The workspace has one active mode. Prefer the team leader environment
+    // when a team runtime is active; otherwise report the single runtime.
+    return (
+      teamLeaderSessionBridge.getExecutionEnvironment() ??
+      singleSessionBridge.getExecutionEnvironment()
+    );
   });
 
   // =========================================================================
@@ -380,28 +519,23 @@ export function registerIpcHandlers(
   // Session listing
   // =========================================================================
 
-  ipcMain.handle("list-sessions", async (_event, projectDir: string) => {
+  ipcMain.handle("list-sessions", async (_event, location: unknown) => {
+    if (!isProjectLocation(location)) return [];
     try {
-      const sessions = await SessionManager.list(projectDir);
-      return sessions.map((session) => ({
-        path: session.path,
-        id: session.id,
-        cwd: session.cwd || projectDir,
-        name: session.name,
-        created: session.created.toISOString(),
-        modified: session.modified.toISOString(),
-        messageCount: session.messageCount,
-        firstMessage: session.firstMessage,
-      }));
+      // Route through SessionBridge so SessionInfo.cwd is translated back to
+      // the logical path in WSL mode (wsl_plan.md §4.8). The bridge lists from
+      // disk and does not require an active session.
+      return await singleSessionBridge.listSessions(location);
     } catch (err) {
       console.error("[ipc] Error listing sessions:", err);
       return [];
     }
   });
 
-  ipcMain.handle("list-team-leader-sessions", async (_event, projectDir: string) => {
+  ipcMain.handle("list-team-leader-sessions", async (_event, location: unknown) => {
+    if (!isProjectLocation(location)) return [];
     try {
-      return await teamLeaderSessionBridge.listSessions(projectDir);
+      return await teamLeaderSessionBridge.listSessions(location);
     } catch (err) {
       console.error("[ipc] Error listing team leader sessions:", err);
       return [];

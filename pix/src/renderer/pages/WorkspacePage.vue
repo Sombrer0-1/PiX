@@ -20,7 +20,9 @@ import AppLayout from "../components/layout/AppLayout.vue";
 import LeftPanel from "../components/layout/LeftPanel.vue";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import RightPanel from "../components/layout/RightPanel.vue";
+import { toPlain } from "../utils/plain";
 import type { AgentMessage, RequestUserInputRequest } from "@/types/rpc";
+import type { ProjectLocation } from "@/types/session";
 
 const router = useRouter();
 const singleSessionStore = useSessionStore();
@@ -41,6 +43,11 @@ const userInputAnswers = ref<Record<string, string>>({});
 const currentQuestionIndex = ref(0);
 const currentAnswer = ref("");
 const subscriptionsReady = ref(false);
+
+/** Concrete backend startup error (distro/path diagnostics from the main
+ *  process), surfaced on the workspace so WSL setup failures stay actionable
+ *  instead of being folded into a generic startup failure. */
+const startupError = ref<string | null>(null);
 
 const currentQuestion = computed(() => {
   const req = pendingUserInput.value;
@@ -216,7 +223,10 @@ function subscribeToModeEvents(): void {
   });
 }
 
-async function attachTeamRuntimeIfNeeded(projectDir: string): Promise<boolean> {
+async function attachTeamRuntimeIfNeeded(location: ProjectLocation): Promise<boolean> {
+  // projectStore.currentProject is a Vue reactive proxy; strip reactivity
+  // before it crosses the contextBridge/IPC boundary.
+  const target = toPlain(location);
   // A team leader still running from a previous process (e.g. the app crashed
   // and reopened) is always re-attached: the team is live and must resume in
   // team mode regardless of the persisted preference.
@@ -234,14 +244,39 @@ async function attachTeamRuntimeIfNeeded(projectDir: string): Promise<boolean> {
   // resume the team later), but restoring purely on its existence caused the
   // workspace to jump back to team mode on every remount - including after a
   // visit to settings - discarding the user's solo choice.
-  const lastMode = await window.pixApi.getWorkspaceMode(projectDir);
+  const lastMode = await window.pixApi.getWorkspaceMode(target);
   if (lastMode !== "team") return false;
-  if (!(await window.pixApi.hasTeamSnapshot(projectDir))) return false;
-  return teamStore.toggleTeamMode(projectDir);
+  if (!(await window.pixApi.hasTeamSnapshot(target))) return false;
+  const started = await teamStore.toggleTeamMode(target);
+  if (!started) {
+    // toggleTeamMode stores the concrete error in teamStore.lastError, which
+    // has no visible surface while still in solo mode (TeamDashboard is not
+    // mounted). Keep the distro/path diagnostic visible on the workspace.
+    startupError.value = teamStore.lastError || "启动团队运行环境失败";
+    return false;
+  }
+  startupError.value = null;
+  return true;
+}
+
+/** Re-attempt a failed team runtime startup from the error banner. */
+async function retryStartup(): Promise<void> {
+  const location = projectStore.currentProject;
+  if (!location) {
+    startupError.value = null;
+    return;
+  }
+  const started = await attachTeamRuntimeIfNeeded(location);
+  if (!started) {
+    startupError.value = teamStore.lastError || startupError.value;
+  }
 }
 
 watch(() => teamStore.teamMode, async () => {
   if (!subscriptionsReady.value) return;
+  // A fresh mode switch supersedes any stale startup error from the previous
+  // one; failures of the new switch surface via their own alerts/banner.
+  startupError.value = null;
   discardUserInput();
   singleSessionStore.clearSession();
   teamLeaderSessionStore.clearSession();
@@ -254,19 +289,20 @@ watch(() => teamStore.teamMode, async () => {
 });
 
 onMounted(async () => {
-  const projectDir = projectStore.currentProject?.path;
+  // Strip reactivity so the location can cross the IPC boundary.
+  const location = toPlain(projectStore.currentProject);
   if (!singleRpc.isConnected.value) {
     const attached = await singleRpc.attachToRunningSession();
-    const teamLeaderRunning = projectDir ? await window.pixApi.isTeamLeaderRunning() : false;
-    const hasTeamSnapshot = projectDir ? await window.pixApi.hasTeamSnapshot(projectDir) : false;
+    const teamLeaderRunning = location ? await window.pixApi.isTeamLeaderRunning() : false;
+    const hasTeamSnapshot = location ? await window.pixApi.hasTeamSnapshot(location) : false;
     if (!attached && !teamLeaderRunning && !hasTeamSnapshot) {
       await router.push("/");
       return;
     }
   }
 
-  if (projectDir && !teamStore.teamMode) {
-    const teamStarted = await attachTeamRuntimeIfNeeded(projectDir);
+  if (location && !teamStore.teamMode) {
+    const teamStarted = await attachTeamRuntimeIfNeeded(location);
     if (teamStarted) {
       // Team runtime startup owns the leader session and TeamManager. The
       // subscriptions below are installed only after the mode is selected.
@@ -294,7 +330,16 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <AppLayout :team-mode="teamStore.teamMode">
+  <div class="workspace-page">
+    <div v-if="startupError" class="startup-error-banner" role="alert">
+      <span class="startup-error-icon">
+        <v-icon icon="mdi-alert-circle-outline" size="16" />
+      </span>
+      <span class="startup-error-text">启动失败：{{ startupError }}</span>
+      <button class="startup-error-btn" type="button" @click="retryStartup">重试</button>
+      <button class="startup-error-btn" type="button" @click="startupError = null">关闭</button>
+    </div>
+    <AppLayout :team-mode="teamStore.teamMode">
     <template #left>
       <LeftPanel />
     </template>
@@ -315,9 +360,68 @@ onUnmounted(() => {
     <template #right>
       <RightPanel />
     </template>
-  </AppLayout>
+    </AppLayout>
+  </div>
 </template>
 
 
 <style scoped>
+.workspace-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* The child AppLayout keeps its own height:100% rule; as a flex item it is
+   shrunk by the banner instead of overflowing. */
+.workspace-page > .app-layout {
+  flex: 1 1 0;
+  min-height: 0;
+  height: auto;
+}
+
+.startup-error-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-sm);
+  margin: calc(var(--pix-window-controls-height) + 4px) 12px 0;
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  border: 1px solid var(--pix-error-light);
+  border-radius: var(--pix-radius-lg);
+  background: var(--pix-error-bg);
+  color: var(--pix-error);
+  flex-shrink: 0;
+}
+
+.startup-error-icon {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.startup-error-text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--pix-text-sm);
+  line-height: var(--pix-leading-base);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.startup-error-btn {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border: 1px solid var(--pix-error-light);
+  border-radius: var(--pix-radius-md);
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--pix-error);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  font-family: var(--pix-font-ui);
+  cursor: pointer;
+}
+
+.startup-error-btn:hover {
+  background: #ffffff;
+}
 </style>

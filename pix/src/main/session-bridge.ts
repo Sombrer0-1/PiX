@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { existsSync, statSync } from "fs";
-import { isAbsolute, join, relative, resolve } from "path";
+import { basename, isAbsolute, join, relative, resolve } from "path";
 import { shell } from "electron";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
@@ -30,15 +30,22 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
 import type { TeamManager } from "./team-manager.js";
+import {
+	createProjectExecutionContext,
+	disposeProjectExecutionContext,
+	type ProjectExecutionContext,
+} from "./execution-context.js";
 import type {
 	AgentSessionEvent,
 	ClipboardImage,
+	ExecutionEnvironmentInfo,
 	GuiSettings,
 	McpConfigInfo,
 	McpResourceContent,
 	McpResourceInfo,
 	McpServerInfo,
 	ModelInfo,
+	ProjectLocation,
 	RpcSessionState,
 	RpcSlashCommand,
 	SessionStats,
@@ -135,7 +142,12 @@ export class SessionBridge {
 	private _sessionManager: SessionManager | null = null;
 	private _authStorage: AuthStorage | null = null;
 	private _mcpAdapter: McpAdapter | null = null;
-	private _cwd = "";
+	/** Physical/host cwd: bootstrap (settings/resource/session), IO, hash key. */
+	private _physicalCwd = "";
+	/** Logical/runtime cwd: model-visible, passed to createAgentSession as runtimeCwd. */
+	private _logicalCwd = "";
+	/** Sole-owned execution context (backend lifecycle). Borrowed refs must not dispose. */
+	private _executionContext: ProjectExecutionContext | null = null;
 	private _guiSettings: GuiSettings | undefined;
 	private _teamManager: TeamManager | null = null;
 	private _unsubscribe: (() => void) | null = null;
@@ -166,37 +178,74 @@ export class SessionBridge {
 		this._teamManager = this._role === "team-leader" ? options.teamManager ?? null : null;
 	}
 
-	async start(projectDir: string, guiSettings?: GuiSettings): Promise<void> {
-		this._assertProjectDirectory(projectDir);
-		await this._closeCurrentSession("quit");
+	async start(location: ProjectLocation | string, guiSettings?: GuiSettings): Promise<void> {
+		const projectLocation = this._coerceLocation(location);
+		this._assertProjectDirectory(projectLocation);
 
-		this._cwd = projectDir;
+		// Create + warm the candidate context FIRST. On failure the previous
+		// runtime is left untouched (wsl_plan.md §4.8). For Windows this is a
+		// trivial no-backend context; for WSL it validates the distro, `test -d`
+		// the logical cwd, and warms the backend before we touch the old session.
+		const candidateContext = await createProjectExecutionContext(projectLocation);
+
+		// Candidate succeeded: stop the old runtime and take over the new context.
+		const previousContext = this._executionContext;
+		await this._closeCurrentSession("quit");
+		await disposeProjectExecutionContext(previousContext);
+
+		this._executionContext = candidateContext;
+		this._physicalCwd = candidateContext.physicalCwd;
+		this._logicalCwd = candidateContext.logicalCwd;
 		this._guiSettings = guiSettings;
 
 		const agentDir = getAgentDir();
 		this._authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 
-		const settingsManager = this._createSettingsManager(projectDir);
-		const sessionDir = this._getSessionDir(projectDir, settingsManager.getSessionDir());
-		this._sessionManager = SessionManager.continueRecent(projectDir, sessionDir);
+		const settingsManager = this._createSettingsManager(this._physicalCwd);
+		const sessionDir = this._getSessionDir(this._physicalCwd, settingsManager.getSessionDir());
+		this._sessionManager = SessionManager.continueRecent(this._physicalCwd, sessionDir);
 
-		const result = await this._createSession(projectDir, this._sessionManager, {
-			type: "session_start",
-			reason: "startup",
-		});
-		await this._activateSession(result.session);
+		try {
+			const result = await this._createSession(this._physicalCwd, this._sessionManager, {
+				type: "session_start",
+				reason: "startup",
+			});
+			await this._activateSession(result.session);
+		} catch (err) {
+			// AgentSession init failure: release the candidate and enter
+			// stopped/error. Do not fake-recover the previous runtime.
+			this._executionContext = null;
+			this._sessionManager = null;
+			this._mcpAdapter = null;
+			this._physicalCwd = "";
+			this._logicalCwd = "";
+			await disposeProjectExecutionContext(candidateContext);
+			throw err;
+		}
 	}
 
 	async dispose(): Promise<void> {
 		const hadSession = await this._closeCurrentSession("quit");
+		const previousContext = this._executionContext;
+		this._executionContext = null;
+		this._physicalCwd = "";
+		this._logicalCwd = "";
+		// SessionBridge is the sole owner of the context/backend; release it here.
+		// Borrowed references (Team workers) never dispose.
+		await disposeProjectExecutionContext(previousContext);
 		if (hadSession) {
 			this._emitLifecycle("exit", { code: 0, signal: null, stderr: "" });
 		}
 	}
 
+	/** Alias for dispose() to match the §4.8 SessionBridge contract. */
+	async stop(): Promise<void> {
+		await this.dispose();
+	}
+
 	/** Get the current working directory (empty if no session started). */
 	getCwd(): string {
-		return this._cwd;
+		return this._physicalCwd;
 	}
 
 	/** Get the auth storage instance (null if no session started). */
@@ -204,16 +253,52 @@ export class SessionBridge {
 		return this._authStorage;
 	}
 
+	/** Active project location, or null if no session started. */
+	getLocation(): ProjectLocation | null {
+		return this._executionContext?.location ?? null;
+	}
+
+	/**
+	 * Borrowed execution context; callers must not dispose it. Null if no session
+	 * is started. TeamManager reuses the leader backend object identity from here
+	 * (wsl_plan.md §4.8).
+	 */
+	getExecutionContext(): ProjectExecutionContext | null {
+		return this._executionContext;
+	}
+
+	/** Execution environment of the active session, or null if not started. */
+	getExecutionEnvironment(): ExecutionEnvironmentInfo | null {
+		const context = this._executionContext;
+		if (!context) return null;
+		const env = context.location.environment;
+		if (env.kind === "wsl") {
+			return {
+				kind: "wsl",
+				distro: env.distro,
+				logicalCwd: context.logicalCwd,
+				ready: true,
+			};
+		}
+		return { kind: "windows", logicalCwd: context.logicalCwd };
+	}
+
 	/** List persisted sessions in this bridge's session namespace. */
-	async listSessions(projectDir: string): Promise<SessionInfo[]> {
-		this._assertProjectDirectory(projectDir);
-		const settingsManager = this._createSettingsManager(projectDir);
-		const sessionDir = this._getSessionDir(projectDir, settingsManager.getSessionDir());
-		const sessions = await SessionManager.list(projectDir, sessionDir);
+	async listSessions(location: ProjectLocation | string): Promise<SessionInfo[]> {
+		const projectLocation = this._coerceLocation(location);
+		this._assertProjectDirectory(projectLocation);
+		const physicalPath = projectLocation.physicalPath;
+		const settingsManager = this._createSettingsManager(physicalPath);
+		const sessionDir = this._getSessionDir(physicalPath, settingsManager.getSessionDir());
+		const sessions = await SessionManager.list(physicalPath, sessionDir);
+		// SessionInfo.cwd is model-visible: translate the stored physical cwd back
+		// to logical in WSL mode. SessionInfo.path is the physical JSONL path and
+		// is not shown to the model (wsl_plan.md §4.8).
+		const displayPath = this._executionContext?.executionBackend?.paths.displayPath;
 		return sessions.map((session) => ({
 			path: session.path,
 			id: session.id,
-			cwd: session.cwd || projectDir,
+			cwd: this._toLogicalCwd(session.cwd, projectLocation, displayPath),
 			name: session.name,
 			created: session.created.toISOString(),
 			modified: session.modified.toISOString(),
@@ -286,12 +371,12 @@ export class SessionBridge {
 		const sessionDir = this._sessionManager?.getSessionDir();
 		await this._closeCurrentSession("new");
 
-		this._sessionManager = SessionManager.create(this._cwd, sessionDir);
+		this._sessionManager = SessionManager.create(this._physicalCwd, sessionDir);
 		if (parentSession) {
 			this._sessionManager.newSession({ parentSession });
 		}
 
-		const result = await this._createSession(this._cwd, this._sessionManager, {
+		const result = await this._createSession(this._physicalCwd, this._sessionManager, {
 			type: "session_start",
 			reason: "new",
 			previousSessionFile,
@@ -309,9 +394,11 @@ export class SessionBridge {
 		const previousSessionFile = this._session?.sessionFile;
 		await this._closeCurrentSession("resume", sessionPath);
 
-		this._sessionManager = SessionManager.open(sessionPath, currentSessionManager.getSessionDir(), this._cwd);
-		this._cwd = this._sessionManager.getCwd();
-		const result = await this._createSession(this._cwd, this._sessionManager, {
+		this._sessionManager = SessionManager.open(sessionPath, currentSessionManager.getSessionDir(), this._physicalCwd);
+		// switchSession only replaces the session manager; the context (and thus
+		// _physicalCwd/_logicalCwd/backend) is immutable for the session lifetime.
+		// A distro/cwd change requires stop + start (wsl_plan.md §4.8).
+		const result = await this._createSession(this._physicalCwd, this._sessionManager, {
 			type: "session_start",
 			reason: "resume",
 			previousSessionFile,
@@ -353,12 +440,12 @@ export class SessionBridge {
 			if (label) {
 				sessionManager.appendLabelChange(selectedEntry.id, label);
 			}
-			const newSessionManager = SessionManager.create(this._cwd, sessionDir);
+			const newSessionManager = SessionManager.create(this._physicalCwd, sessionDir);
 			newSessionManager.newSession({ parentSession: currentSessionFile });
 			await this._closeCurrentSession("fork");
 			this._sessionManager = newSessionManager;
 
-			const result = await this._createSession(this._cwd, this._sessionManager, {
+			const result = await this._createSession(this._physicalCwd, this._sessionManager, {
 				type: "session_start",
 				reason: "fork",
 				previousSessionFile,
@@ -379,7 +466,7 @@ export class SessionBridge {
 			this._sessionManager.appendLabelChange(targetLeafId, label);
 		}
 
-		const result = await this._createSession(this._cwd, this._sessionManager, {
+		const result = await this._createSession(this._physicalCwd, this._sessionManager, {
 			type: "session_start",
 			reason: "fork",
 			previousSessionFile,
@@ -993,8 +1080,11 @@ export class SessionBridge {
 
 		// Process file paths
 		if (filePaths && filePaths.length > 0) {
-			const processed = await processChatFiles(filePaths, this._cwd, {
+			const processed = await processChatFiles(filePaths, this._physicalCwd, {
 				autoResizeImages: session.settingsManager.getImageAutoResize(),
+				// WSL: translate physical attachment paths to logical so the model
+				// never sees UNC/drive letters; also skips macOS NFD probing.
+				displayPath: this._executionContext?.executionBackend?.paths.displayPath,
 			});
 			if (processed.text) parts.push(processed.text);
 			allImages.push(...processed.images);
@@ -1286,7 +1376,12 @@ export class SessionBridge {
 		sessionStartEvent: SessionStartEvent,
 	): Promise<CreateAgentSessionResult> {
 		const settingsManager = this._createSettingsManager(cwd);
-		const mcpAdapter = new McpAdapter();
+		const context = this._executionContext;
+		// WSL mode disables Windows-side stdio MCP (decided by context.isWsl, not
+		// by backend existence). HTTP/SSE remain configurable (wsl_plan.md §4.10).
+		const mcpAdapter = new McpAdapter({
+			allowStdio: context?.isWsl ? false : true,
+		});
 		this._mcpAdapter = mcpAdapter;
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,
@@ -1301,6 +1396,12 @@ export class SessionBridge {
 
 		const result = await createAgentSession({
 			cwd,
+			// bootstrap uses physical cwd (above); the Agent runtime uses the
+			// logical cwd via runtimeCwd. When no context is injected these are
+			// equal and Windows behavior is byte-identical (wsl_plan.md §4.1).
+			runtimeCwd: this._logicalCwd || cwd,
+			executionBackend: context?.executionBackend,
+			runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
 			sessionManager,
 			settingsManager,
 			resourceLoader,
@@ -1459,15 +1560,52 @@ export class SessionBridge {
 		}
 	}
 
-	private _assertProjectDirectory(projectDir: string): void {
-		if (!projectDir) {
+	/**
+	 * Accept either a ProjectLocation or a legacy Windows path string. String
+	 * inputs are treated as Windows projects (preserving existing callers in
+	 * ipc-handlers until S9 migrates them to ProjectLocation).
+	 */
+	private _coerceLocation(location: ProjectLocation | string): ProjectLocation {
+		if (typeof location === "string") {
+			return {
+				path: location,
+				physicalPath: location,
+				name: basename(location),
+				environment: { kind: "windows" },
+			};
+		}
+		return location;
+	}
+
+	/**
+	 * Translate a session's stored cwd into the model-visible logical cwd.
+	 * Stored cwd is physical; under WSL it is converted via the active backend's
+	 * displayPath, or falls back to the location's logical path when no backend
+	 * is active. Windows returns the path unchanged.
+	 */
+	private _toLogicalCwd(
+		storedCwd: string | undefined,
+		location: ProjectLocation,
+		displayPath?: (physical: string) => string,
+	): string {
+		const physical = storedCwd || location.physicalPath;
+		if (displayPath) return displayPath(physical);
+		if (location.environment.kind === "wsl") return location.path;
+		return physical;
+	}
+
+	private _assertProjectDirectory(location: ProjectLocation): void {
+		const physicalPath = location.physicalPath;
+		if (!physicalPath) {
 			throw new Error("Project directory is required.");
 		}
-		if (!existsSync(projectDir)) {
-			throw new Error(`Project directory does not exist: ${projectDir}`);
+		// Check the host-visible physical path, but report the model-visible
+		// logical path so WSL diagnostics never leak UNC/drive letters (§9.1).
+		if (!existsSync(physicalPath)) {
+			throw new Error(`Project directory does not exist: ${location.path}`);
 		}
-		if (!statSync(projectDir).isDirectory()) {
-			throw new Error(`Project path is not a directory: ${projectDir}`);
+		if (!statSync(physicalPath).isDirectory()) {
+			throw new Error(`Project path is not a directory: ${location.path}`);
 		}
 	}
 

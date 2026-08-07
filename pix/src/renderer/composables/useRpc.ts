@@ -3,6 +3,7 @@ import type {
   AgentSessionEvent,
   AuthStatusMap,
   ClipboardImage,
+  ExecutionEnvironmentInfo,
   GuiSettings,
   McpConfigInfo,
   McpResourceContent,
@@ -21,6 +22,7 @@ import type {
   UserMessageForForking,
 } from "@/types/rpc";
 import type { PixApi } from "../../main/preload";
+import type { ProjectLocation } from "@/types/session";
 
 type CommandResponse<T = unknown> = { success: boolean; data?: T; error?: string };
 type LifecycleExit = { code: number | null; signal: string | null; stderr: string };
@@ -28,7 +30,7 @@ type LifecycleExit = { code: number | null; signal: string | null; stderr: strin
 export interface RpcTransport {
   sendCommand: <T = unknown>(command: RpcCommand) => Promise<CommandResponse<T>>;
   sendCommandAsync: (command: RpcCommand) => Promise<{ success: boolean; error?: string }>;
-  startRuntime: (projectDir: string) => Promise<{ success: boolean; error?: string }>;
+  startRuntime: (location: ProjectLocation) => Promise<{ success: boolean; error?: string }>;
   stopRuntime: () => Promise<{ success: boolean }>;
   isRuntimeRunning: () => Promise<boolean>;
   onEvent: (callback: (event: AgentSessionEvent) => void) => () => void;
@@ -43,6 +45,8 @@ export interface RpcTransport {
   mcpListResources: (serverName?: string) => Promise<McpResourceInfo[]>;
   mcpReadResource: (serverName: string | undefined, uri: string) => Promise<McpResourceContent>;
   setGuiSettings: (settings: Partial<GuiSettings>) => Promise<{ success: boolean }>;
+  /** Execution environment of the active runtime (team leader preferred over single). */
+  getExecutionEnvironment: () => Promise<ExecutionEnvironmentInfo | null>;
 }
 
 function api(): PixApi {
@@ -56,7 +60,7 @@ function createSingleTransport(): RpcTransport {
   return {
     sendCommand: <T = unknown>(command: RpcCommand) => api().sendCommand<T>(command),
     sendCommandAsync: (command: RpcCommand) => api().sendCommandAsync(command),
-    startRuntime: (projectDir: string) => api().startPi(projectDir),
+    startRuntime: (location: ProjectLocation) => api().startPi(location),
     stopRuntime: () => api().stopPi(),
     isRuntimeRunning: () => api().isPiRunning(),
     onEvent: (callback) => api().onPiEvent(callback),
@@ -71,6 +75,7 @@ function createSingleTransport(): RpcTransport {
     mcpListResources: (serverName?: string) => api().mcpListResources(serverName),
     mcpReadResource: (serverName: string | undefined, uri: string) => api().mcpReadResource(serverName, uri),
     setGuiSettings: (settings) => api().setSettings(settings),
+    getExecutionEnvironment: () => api().getExecutionEnvironment(),
   };
 }
 
@@ -82,6 +87,8 @@ export function createRpcClient(transport: RpcTransport, label: string) {
   const sessionStats = ref<SessionStats | null>(null);
   const stderr = ref("");
   const lastError = ref<string | null>(null);
+  /** Execution environment of the active runtime (null while stopped). */
+  const executionEnvironment = ref<ExecutionEnvironmentInfo | null>(null);
   let eventUnsubscribers: Array<() => void> = [];
 
   function cleanupEventListeners(): void {
@@ -127,8 +134,22 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     }
   }
 
+  async function refreshExecutionEnvironment(): Promise<void> {
+    try {
+      executionEnvironment.value = await transport.getExecutionEnvironment();
+    } catch (err) {
+      console.error(`[${label}] Failed to get execution environment:`, err);
+    }
+  }
+
   async function refreshSessionData(): Promise<void> {
-    await Promise.all([refreshState(), refreshCommands(), refreshModels(), refreshSessionStats()]);
+    await Promise.all([
+      refreshState(),
+      refreshCommands(),
+      refreshModels(),
+      refreshSessionStats(),
+      refreshExecutionEnvironment(),
+    ]);
   }
 
   function setupEventListeners(): void {
@@ -144,6 +165,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
         piStatus.value = "stopped";
         stderr.value = data.stderr;
         sessionState.value = null;
+        executionEnvironment.value = null;
       }),
       transport.onError((err) => {
         piStatus.value = "error";
@@ -229,16 +251,17 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     }
   }
 
-  async function startRuntime(projectDir: string): Promise<boolean> {
+  async function startRuntime(location: ProjectLocation): Promise<boolean> {
     piStatus.value = "starting";
     lastError.value = null;
     setupEventListeners();
     try {
-      const result = await transport.startRuntime(projectDir);
+      const result = await transport.startRuntime(location);
       if (!result.success) {
         cleanupEventListeners();
         piStatus.value = "error";
         lastError.value = result.error || "启动运行环境失败";
+        executionEnvironment.value = null;
         return false;
       }
       piStatus.value = "running";
@@ -248,6 +271,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
       cleanupEventListeners();
       piStatus.value = "error";
       lastError.value = err instanceof Error ? err.message : "启动运行环境时发生未知错误";
+      executionEnvironment.value = null;
       return false;
     }
   }
@@ -273,6 +297,8 @@ export function createRpcClient(transport: RpcTransport, label: string) {
       piStatus.value = "stopped";
       sessionState.value = null;
       sessionStats.value = null;
+      // onExit is detached above before stopRuntime fires, so clear here too.
+      executionEnvironment.value = null;
     }
   }
 
@@ -436,7 +462,16 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     lastError: computed(() => lastError.value),
     isRunning: computed(() => piStatus.value === "running"),
     isStreaming: computed(() => sessionState.value?.isStreaming ?? false),
-    isConnected: computed(() => piStatus.value === "running"),
+    executionEnvironment: computed(() => executionEnvironment.value),
+    // Connection state consumes the execution environment: a WSL backend only
+    // reports ready after warm-up completes, so a running session whose
+    // environment is explicitly not ready is still connecting. Windows
+    // environments carry no ready flag and remain connected once running.
+    isConnected: computed(() => {
+      if (piStatus.value !== "running") return false;
+      const env = executionEnvironment.value;
+      return env?.kind !== "wsl" || env.ready !== false;
+    }),
     getBackgroundTasks: transport.getBackgroundTasks,
     stopBackgroundTask: transport.stopBackgroundTask,
     mcpGetServers: transport.mcpGetServers,

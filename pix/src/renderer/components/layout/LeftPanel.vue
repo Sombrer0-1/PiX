@@ -31,6 +31,12 @@ const showNewTeamDialog = ref(false);
 const isCreatingTeamSession = ref(false);
 
 const projectPath = computed(() => projectStore.currentProject?.path || "");
+const environmentLabel = computed(() => {
+  const env = projectStore.currentProject?.environment;
+  if (!env) return "";
+  if (env.kind === "wsl") return `WSL · ${env.distro}`;
+  return "Windows";
+});
 const deleteSessionTitle = computed(() => deriveSessionTitle(confirmDeleteSession.value));
 const currentSessionId = computed(() => {
   if (teamStore.teamMode) {
@@ -82,7 +88,7 @@ async function refreshCurrentTeamSession(): Promise<void> {
 
 async function newSession(): Promise<void> {
   if (teamStore.teamMode) {
-    const switched = await teamStore.toggleTeamMode(projectPath.value);
+    const switched = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
     if (!switched) return;
   }
   const result = await rpc.newSession();
@@ -93,7 +99,7 @@ async function newSession(): Promise<void> {
 
 async function newTeamSession(): Promise<void> {
   if (!teamStore.teamMode) {
-    const switched = await teamStore.toggleTeamMode(projectPath.value);
+    const switched = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
     if (!switched) {
       // TeamDashboard only mounts once teamMode is true, so while still in
       // solo mode teamStore.lastError is invisible. Surface the failure here
@@ -264,6 +270,7 @@ function goSettings(): void { void router.push("/settings"); }
           {{ projectStore.currentProject?.name || "未打开项目" }}
         </div>
         <span class="project-mode-label">{{ teamStore.teamMode ? "团队" : "单人" }}</span>
+        <span v-if="environmentLabel" class="project-env-label" :title="environmentLabel">{{ environmentLabel }}</span>
       </div>
       <div class="project-path" :title="projectPath">{{ projectPath }}</div>
     </div>
@@ -461,6 +468,24 @@ function goSettings(): void { void router.push("/settings"); }
 .team-mode .project-mode-label {
   background: #eaf6f1;
   color: #13795b;
+}
+
+.project-env-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 6px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-code);
+  color: var(--pix-text-secondary);
+  font-size: 9px;
+  font-weight: var(--pix-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 120px;
 }
 
 .team-mode .project-icon {

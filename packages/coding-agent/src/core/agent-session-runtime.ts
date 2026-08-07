@@ -8,6 +8,8 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { SessionManager } from "./session-manager.ts";
+import type { RuntimeEnvironmentContext } from "./system-prompt.ts";
+import type { ExecutionBackend } from "./tools/execution-backend.ts";
 
 /**
  * Result returned by runtime creation.
@@ -29,6 +31,12 @@ export interface CreateAgentSessionRuntimeResult extends CreateAgentSessionResul
  */
 export type CreateAgentSessionRuntimeFactory = (options: {
 	cwd: string;
+	/** Agent runtime cwd (logical path under the execution backend). */
+	runtimeCwd?: string;
+	/** Execution backend for built-in tools; preserved across session switches. */
+	executionBackend?: ExecutionBackend;
+	/** Explicit runtime environment override (no cwd field). */
+	runtimeEnvironmentOverride?: Partial<RuntimeEnvironmentContext>;
 	agentDir: string;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
@@ -200,6 +208,9 @@ export class AgentSessionRuntime {
 		this.apply(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
+				runtimeCwd: this.services.runtimeCwd,
+				executionBackend: this.services.executionBackend,
+				runtimeEnvironmentOverride: this.services.runtimeEnvironmentOverride,
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
@@ -230,6 +241,9 @@ export class AgentSessionRuntime {
 		this.apply(
 			await this.createRuntime({
 				cwd: this.cwd,
+				runtimeCwd: this.services.runtimeCwd,
+				executionBackend: this.services.executionBackend,
+				runtimeEnvironmentOverride: this.services.runtimeEnvironmentOverride,
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
@@ -284,6 +298,9 @@ export class AgentSessionRuntime {
 				this.apply(
 					await this.createRuntime({
 						cwd: this.cwd,
+						runtimeCwd: this.services.runtimeCwd,
+						executionBackend: this.services.executionBackend,
+						runtimeEnvironmentOverride: this.services.runtimeEnvironmentOverride,
 						agentDir: this.services.agentDir,
 						sessionManager,
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
@@ -302,6 +319,9 @@ export class AgentSessionRuntime {
 			this.apply(
 				await this.createRuntime({
 					cwd: sessionManager.getCwd(),
+					runtimeCwd: this.services.runtimeCwd,
+					executionBackend: this.services.executionBackend,
+					runtimeEnvironmentOverride: this.services.runtimeEnvironmentOverride,
 					agentDir: this.services.agentDir,
 					sessionManager,
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
@@ -321,6 +341,9 @@ export class AgentSessionRuntime {
 		this.apply(
 			await this.createRuntime({
 				cwd: this.cwd,
+				runtimeCwd: this.services.runtimeCwd,
+				executionBackend: this.services.executionBackend,
+				runtimeEnvironmentOverride: this.services.runtimeEnvironmentOverride,
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
@@ -365,6 +388,9 @@ export class AgentSessionRuntime {
 		this.apply(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
+				runtimeCwd: this.services.runtimeCwd,
+				executionBackend: this.services.executionBackend,
+				runtimeEnvironmentOverride: this.services.runtimeEnvironmentOverride,
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
@@ -394,6 +420,9 @@ export async function createAgentSessionRuntime(
 	createRuntime: CreateAgentSessionRuntimeFactory,
 	options: {
 		cwd: string;
+		runtimeCwd?: string;
+		executionBackend?: ExecutionBackend;
+		runtimeEnvironmentOverride?: Partial<RuntimeEnvironmentContext>;
 		agentDir: string;
 		sessionManager: SessionManager;
 		sessionStartEvent?: SessionStartEvent;

@@ -6,18 +6,26 @@ import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { sanitizeBinaryOutput } from "../../utils/shell.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 
-export function shortenPath(path: unknown): string {
+export function shortenPath(path: unknown, home?: string): string {
 	if (typeof path !== "string") return "";
-	const home = os.homedir();
-	if (path.startsWith(home)) {
-		return `~${path.slice(home.length)}`;
+	const homeDir = home ?? os.homedir();
+	if (path.startsWith(homeDir)) {
+		return `~${path.slice(homeDir.length)}`;
 	}
 	return path;
 }
 
-export function linkPath(styledText: string, rawPath: string, cwd: string): string {
+export function linkPath(styledText: string, rawPath: string, cwd: string, paths?: ToolPathContext): string {
 	if (!getCapabilities().hyperlinks) return styledText;
+	// Resolve in the runtime namespace (POSIX under WSL) and let the backend build
+	// a host-openable URL. The visible styledText is never rewritten here, so no
+	// UNC or drive letter leaks into model-visible tool text.
+	if (paths?.toFileUrl) {
+		const absolutePath = paths.resolvePath(rawPath, cwd);
+		return hyperlink(styledText, paths.toFileUrl(absolutePath));
+	}
 	const absolutePath = resolvePath(rawPath, cwd);
 	return hyperlink(styledText, pathToFileURL(absolutePath).href);
 }
@@ -76,10 +84,11 @@ export function renderToolPath(
 	rawPath: string | null,
 	theme: Theme,
 	cwd: string,
-	options?: { emptyFallback?: string },
+	options?: { emptyFallback?: string; pathContext?: ToolPathContext },
 ): string {
 	if (rawPath === null) return invalidArgText(theme);
 	const value = rawPath || options?.emptyFallback;
 	if (!value) return theme.fg("toolOutput", "...");
-	return linkPath(theme.fg("accent", shortenPath(value)), value, cwd);
+	const home = options?.pathContext?.homeDir;
+	return linkPath(theme.fg("accent", shortenPath(value, home)), value, cwd, options?.pathContext);
 }

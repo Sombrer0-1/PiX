@@ -8,6 +8,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ToolPathContext } from "./execution-backend.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -54,12 +55,18 @@ const defaultFindOperations: FindOperations = {
 export interface FindToolOptions {
 	/** Custom operations for find. Default: local filesystem plus fd */
 	operations?: FindOperations;
+	/** Path context for a remote execution backend (for example WSL). */
+	pathContext?: ToolPathContext;
 }
 
-function formatFindCall(args: { pattern: string; path?: string; limit?: number } | undefined, theme: Theme): string {
+function formatFindCall(
+	args: { pattern: string; path?: string; limit?: number } | undefined,
+	theme: Theme,
+	home?: string,
+): string {
 	const pattern = str(args?.pattern);
 	const rawPath = str(args?.path);
-	const path = rawPath !== null ? shortenPath(rawPath || ".") : null;
+	const path = rawPath !== null ? shortenPath(rawPath || ".", home) : null;
 	const limit = args?.limit;
 	const invalidArg = invalidArgText(theme);
 	let text =
@@ -111,6 +118,9 @@ export function createFindToolDefinition(
 	options?: FindToolOptions,
 ): ToolDefinition<typeof findSchema, FindToolDetails | undefined> {
 	const customOps = options?.operations;
+	const pathContext = options?.pathContext;
+	const pathStyle = pathContext?.pathStyle ?? "win32";
+	const pathApi = pathStyle === "posix" ? path.posix : path;
 	return {
 		name: "find",
 		label: "find",
@@ -147,7 +157,7 @@ export function createFindToolDefinition(
 
 				(async () => {
 					try {
-						const searchPath = resolveToCwd(searchDir || ".", cwd);
+						const searchPath = resolveToCwd(searchDir || ".", cwd, pathContext);
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 						const ops = customOps ?? defaultFindOperations;
 
@@ -180,9 +190,11 @@ export function createFindToolDefinition(
 							}
 
 							// Relativize paths against the search root for stable output.
+							// A backend glob may return Linux absolute paths; pathApi is
+							// path.posix under WSL so relative slicing/joining is correct.
 							const relativized = results.map((p) => {
 								if (p.startsWith(searchPath)) return toPosixPath(p.slice(searchPath.length + 1));
-								return toPosixPath(path.relative(searchPath, p));
+								return toPosixPath(pathApi.relative(searchPath, p));
 							});
 							const resultLimitReached = relativized.length >= effectiveLimit;
 							const rawOutput = relativized.join("\n");
@@ -306,7 +318,7 @@ export function createFindToolDefinition(
 								if (line.startsWith(searchPath)) {
 									relativePath = line.slice(searchPath.length + 1);
 								} else {
-									relativePath = path.relative(searchPath, line);
+									relativePath = pathApi.relative(searchPath, line);
 								}
 								if (hadTrailingSlash && !relativePath.endsWith("/")) relativePath += "/";
 								relativized.push(toPosixPath(relativePath));
@@ -351,7 +363,7 @@ export function createFindToolDefinition(
 		},
 		renderCall(args, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatFindCall(args, theme));
+			text.setText(formatFindCall(args, theme, pathContext?.homeDir));
 			return text;
 		},
 		renderResult(result, options, theme, context) {

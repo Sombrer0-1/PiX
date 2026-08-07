@@ -1,6 +1,7 @@
 import { createRpcClient, type RpcTransport } from "./useRpc";
 import type { PixApi } from "../../main/preload";
 import type { RpcCommand } from "@/types/rpc";
+import type { ProjectLocation } from "@/types/session";
 
 function api(): PixApi {
   if (!window.pixApi) {
@@ -12,7 +13,7 @@ function api(): PixApi {
 const teamLeaderTransport: RpcTransport = {
   sendCommand: <T = unknown>(command: RpcCommand) => api().sendTeamLeaderCommand<T>(command),
   sendCommandAsync: (command) => api().sendTeamLeaderCommandAsync(command),
-  startRuntime: (projectDir: string) => api().startTeamRuntime(projectDir),
+  startRuntime: (location: ProjectLocation) => api().startTeamRuntime(location),
   stopRuntime: () => api().stopTeamRuntime(),
   isRuntimeRunning: () => api().isTeamLeaderRunning(),
   onEvent: (callback) => api().onTeamLeaderEvent(callback),
@@ -27,6 +28,7 @@ const teamLeaderTransport: RpcTransport = {
   mcpListResources: (serverName?: string) => api().teamLeaderMcpListResources(serverName),
   mcpReadResource: (serverName: string | undefined, uri: string) => api().teamLeaderMcpReadResource(serverName, uri),
   setGuiSettings: (settings) => api().setSettings(settings),
+  getExecutionEnvironment: () => api().getExecutionEnvironment(),
 };
 
 const teamLeaderClient = createRpcClient(teamLeaderTransport, "useTeamLeaderRpc");

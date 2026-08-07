@@ -9,7 +9,14 @@ import { useProjectStore } from "../stores/project-store";
 import { useSessionStore, useTeamLeaderSessionStore } from "../stores/session-store";
 import { useRpc } from "../composables/useRpc";
 import { useTeamStore } from "../stores/team-store";
-import type { ProjectInfo } from "@/types/session";
+import ProjectOpenDialog from "../components/project/ProjectOpenDialog.vue";
+import { toPlain } from "../utils/plain";
+import type {
+  ProjectEnvironment,
+  ProjectInfo,
+  ProjectLocation,
+  ProjectLocationInput,
+} from "@/types/session";
 
 const router = useRouter();
 const settingsStore = useSettingsStore();
@@ -20,9 +27,14 @@ const teamStore = useTeamStore();
 const rpc = useRpc();
 
 const piDetection = ref<{ found: boolean; path: string; note?: string } | null>(null);
+const showOpenDialog = ref(false);
 
 onMounted(async () => {
   await projectStore.loadSettings();
+  await settingsStore.load();
+  // Probe WSL distros so the open-project dialog can offer them; failures land
+  // in wslDiagnostic and only disable the WSL option, never the Windows path.
+  void settingsStore.loadWslDistros();
   try {
     piDetection.value = await settingsStore.detectPi();
   } catch {
@@ -32,8 +44,24 @@ onMounted(async () => {
 
 const recentProjects = computed(() => projectStore.recentProjects);
 
-async function finishSoloStartup(dirPath: string): Promise<void> {
-  await projectStore.openProject(dirPath);
+// Global WSL defaults seed the dialog's initial environment/cwd. The persisted
+// per-project environment remains authoritative when reopening a recent project.
+const defaultEnvironment = computed<ProjectEnvironment>(() => {
+  const wsl = settingsStore.wslSettings;
+  if (
+    wsl.enabled &&
+    !!wsl.distro &&
+    settingsStore.wslDistros.some((d) => d.name === wsl.distro)
+  ) {
+    return { kind: "wsl", distro: wsl.distro };
+  }
+  return { kind: "windows" };
+});
+
+const defaultCwd = computed(() => settingsStore.wslSettings.defaultCwd || "/home");
+
+async function finishSoloStartup(location: ProjectLocation): Promise<void> {
+  await projectStore.openProject(location);
   const result = await rpc.newSession();
   if (!result || result.cancelled) {
     alert(`新建会话失败：${rpc.lastError.value || "未知错误"}`);
@@ -43,19 +71,23 @@ async function finishSoloStartup(dirPath: string): Promise<void> {
   await projectStore.listSessions();
   projectStore.syncCurrentSession(
     rpc.sessionState.value?.sessionFile,
-    rpc.sessionState.value?.sessionId
+    rpc.sessionState.value?.sessionId,
   );
   await router.push("/workspace");
 }
 
-async function startFreshWorkspace(dirPath: string): Promise<void> {
+async function startFreshWorkspace(location: ProjectLocation): Promise<void> {
+  // Store objects (recent projects, current project) are Vue reactive proxies;
+  // strip reactivity before they cross the contextBridge/IPC boundary.
+  const target = toPlain(location);
   // Determine the target mode from persisted state BEFORE touching runtimes,
   // so a fire-and-forget setWorkspaceMode from a prior toggle cannot leave a
-  // stale mode.json read here.
-  const hasTeamSnapshot = await window.pixApi.hasTeamSnapshot(dirPath);
-  const lastMode = await window.pixApi.getWorkspaceMode(dirPath);
+  // stale mode.json read here. Snapshot/mode keys use physicalPath on the main
+  // process side; here we only pass the full location object.
+  const hasTeamSnapshot = await window.pixApi.hasTeamSnapshot(target);
+  const lastMode = await window.pixApi.getWorkspaceMode(target);
   const targetTeam = lastMode === "team" && hasTeamSnapshot;
-  const sameProject = projectStore.currentProject?.path === dirPath;
+  const sameProject = projectStore.isCurrentProject(target);
 
   if (targetTeam) {
     // Only (re)start the team when we are not already in team mode for this
@@ -63,13 +95,13 @@ async function startFreshWorkspace(dirPath: string): Promise<void> {
     // reason. A different project still gets a fresh team via the toggle.
     const needsTeamStart = !teamStore.teamMode || !sameProject;
     if (needsTeamStart) {
-      const started = await teamStore.toggleTeamMode(dirPath);
+      const started = await teamStore.toggleTeamMode(target);
       if (!started) {
         alert(`Pi 启动失败：${teamStore.lastError || "未知错误"}`);
         return;
       }
     }
-    await projectStore.openProject(dirPath, { loadSessions: false });
+    await projectStore.openProject(target, { loadSessions: false });
     if (needsTeamStart) {
       teamLeaderSessionStore.clearSession();
     }
@@ -81,35 +113,49 @@ async function startFreshWorkspace(dirPath: string): Promise<void> {
   // runtime) and skip rpc.startPi below so the solo runtime is not started
   // twice on the same singleton.
   if (teamStore.teamMode) {
-    const switched = await teamStore.toggleTeamMode(dirPath);
+    const switched = await teamStore.toggleTeamMode(target);
     if (!switched) {
       alert(`Pi 启动失败：${teamStore.lastError || "未知错误"}`);
       return;
     }
-    await finishSoloStartup(dirPath);
+    await finishSoloStartup(target);
     return;
   }
 
   // Already solo: start the solo runtime directly, then open the project.
-  if (!(await rpc.startPi(dirPath))) {
+  if (!(await rpc.startPi(target))) {
     alert(`Pi 启动失败：${rpc.lastError.value || "未知错误"}`);
     return;
   }
-  await finishSoloStartup(dirPath);
+  await finishSoloStartup(target);
 }
 
-async function openProject(): Promise<void> {
-  const dirPath = await window.pixApi.selectProject();
-  if (!dirPath) return;
-  await startFreshWorkspace(dirPath);
+/** Open the project picker dialog (Windows folder browse or WSL distro + cwd). */
+function openProject(): void {
+  showOpenDialog.value = true;
+}
+
+/** Resolve the dialog's ProjectLocationInput via the main process and launch. */
+async function handleOpenLocation(input: ProjectLocationInput): Promise<void> {
+  const result = await window.pixApi.resolveProjectLocation(input);
+  if (!result.success) {
+    // Error text is produced by the main process and must not leak UNC/drive.
+    alert(`打开项目失败：${result.error || "无法解析项目路径"}`);
+    return;
+  }
+  await startFreshWorkspace(result.location);
 }
 
 async function openRecentProject(project: ProjectInfo): Promise<void> {
-  await startFreshWorkspace(project.path);
+  await startFreshWorkspace(project);
 }
 
 async function removeRecentProject(project: ProjectInfo): Promise<void> {
-  await projectStore.removeRecentProject(project.path);
+  await projectStore.removeRecentProject(project);
+}
+
+function envLabel(project: ProjectInfo): string {
+  return project.environment.kind === "wsl" ? `WSL2 · ${project.environment.distro}` : "Windows";
 }
 
 function formatDate(timestamp: number): string {
@@ -162,7 +208,7 @@ function formatDate(timestamp: number): string {
           <v-list density="default" bg-color="transparent">
             <v-list-item
               v-for="project in recentProjects"
-              :key="project.path"
+              :key="`${project.environment.kind}:${project.physicalPath}`"
               :title="project.name"
               :subtitle="formatDate(project.lastOpened)"
               @click="openRecentProject(project)"
@@ -170,6 +216,7 @@ function formatDate(timestamp: number): string {
             >
               <template #append>
                 <div class="project-list-actions">
+                  <span class="project-env" :class="{ 'env-wsl': project.environment.kind === 'wsl' }">{{ envLabel(project) }}</span>
                   <span class="project-path-mono">{{ project.path }}</span>
                   <button
                     class="project-delete-btn"
@@ -200,6 +247,16 @@ function formatDate(timestamp: number): string {
         </footer>
       </div>
     </div>
+
+    <ProjectOpenDialog
+      v-model="showOpenDialog"
+      :default-environment="defaultEnvironment"
+      :default-cwd="defaultCwd"
+      :distros="settingsStore.wslDistros"
+      :distros-loading="!settingsStore.wslDistrosLoaded"
+      :wsl-diagnostic="settingsStore.wslDiagnostic ?? undefined"
+      @open="handleOpenLocation"
+    />
   </div>
 </template>
 
@@ -377,6 +434,21 @@ function formatDate(timestamp: number): string {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 250px;
+}
+
+.project-env {
+  flex-shrink: 0;
+  font-size: var(--pix-text-xs);
+  font-family: var(--pix-font-mono);
+  color: var(--pix-text-muted);
+  padding: 1px 6px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-hover);
+}
+
+.project-env.env-wsl {
+  color: var(--pix-text-inverse);
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
 }
 
 .project-delete-btn {

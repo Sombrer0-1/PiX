@@ -3,6 +3,16 @@
  * These mirror the Pi RPC protocol types.
  */
 
+// Project location, WSL settings and GuiSettings live in project-location.ts
+// (a leaf module) and are re-exported here so existing `from "../shared/types"`
+// imports keep working. See project-location.ts for the rationale. Only the
+// types used by other declarations in this file are imported; the rest are
+// re-exported at the bottom.
+import type {
+  ExecutionEnvironmentInfo,
+  ThinkingLevel,
+} from "./project-location.js";
+
 // ============================================================================
 // RPC Command Types (commands sent to pi via stdin)
 // ============================================================================
@@ -78,8 +88,6 @@ export type RpcCommand =
   | { id?: string; type: "get_themes" }
   | { id?: string; type: "get_resource_status" };
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
 // ============================================================================
 // RPC Response Types (received from pi stdout)
 // ============================================================================
@@ -100,6 +108,12 @@ export interface RpcSessionState {
   pendingMessageCount: number;
   blockImages?: boolean;
   goal?: ThreadGoal;
+  /**
+   * Execution environment of the active session. Unrelated to `executionMode`
+   * (which is the approval mode). WSL sessions carry distro + logicalCwd; the
+   * renderer reads this to render the environment badge.
+   */
+  executionEnvironment?: ExecutionEnvironmentInfo;
 }
 
 export interface RpcSlashCommand {
@@ -156,12 +170,6 @@ export interface ModelInfo {
   reasoning?: boolean;
   thinkingLevels?: ThinkingLevel[];
   input?: ("text" | "image")[];
-}
-
-export interface TakeHerEyesSettings {
-  enabled: boolean;
-  provider?: string;
-  modelId?: string;
 }
 
 /**
@@ -277,12 +285,12 @@ export type DisplayBlock =
 // Project & Session Info Types
 // ============================================================================
 
-export interface ProjectInfo {
-  path: string;
-  name: string;
-  lastOpened: number;
-  sessionCount: number;
-}
+// ProjectInfo and the project-location surface are defined in project-location.ts
+// and re-exported at the bottom of this file. SessionInfo stays here: its field
+// types are unchanged (created/modified remain ISO strings) per the WSL plan's
+// "do not change fields" note; WSL mode translates `cwd` to logical at the
+// listSessions call site, and `path` is the physical JSONL path (not shown to
+// the model).
 
 export interface SessionInfo {
   path: string;
@@ -299,16 +307,10 @@ export interface SessionInfo {
 // GUI Settings Types
 // ============================================================================
 
-export interface GuiSettings {
-  /** @deprecated No longer needed with direct AgentSession integration */
-  piPath?: string;
-  theme: "light";
-  recentProjects: ProjectInfo[];
-  defaultProvider?: string;
-  defaultModel?: string;
-  defaultThinkingLevel?: ThinkingLevel;
-  takeHerEyes?: TakeHerEyesSettings;
-}
+// GuiSettings is defined in project-location.ts (it references ProjectInfo and
+// WslSettings, both co-located there) and re-exported at the bottom of this
+// file. The §4.3 additions (schemaVersion, wsl) are the only shape changes;
+// takeHerEyes/defaultThinkingLevel keep their existing rich field types.
 
 // ============================================================================
 // Model-initiated User Input
@@ -807,3 +809,27 @@ export type TeamCommand =
   | { type: "respond_permission"; requestId: string; approved: boolean; reason?: string }
   | { type: "respond_plan_approval"; approvalId: string; approved: boolean; feedback?: string }
   | { type: "restart_worker"; agentId: string };
+
+// ============================================================================
+// Re-exports from project-location.ts
+// ============================================================================
+//
+// These types are canonically defined in project-location.ts (a leaf module)
+// so GuiSettings can reference ProjectInfo/WslSettings without a circular
+// import. They are re-exported here to preserve the existing
+// `from "../shared/types"` import paths used across main, preload and renderer.
+
+export type {
+  GuiSettings,
+  ProjectEnvironment,
+  ProjectInfo,
+  ProjectLocation,
+  ProjectLocationInput,
+  WslSettings,
+  WslDistroInfo,
+  WslDistroListResult,
+  ResolveProjectLocationResult,
+  ExecutionEnvironmentInfo,
+  ThinkingLevel,
+  TakeHerEyesSettings,
+} from "./project-location.js";

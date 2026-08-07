@@ -10,6 +10,8 @@ import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type Resource
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import type { RuntimeEnvironmentContext } from "./system-prompt.ts";
+import type { ExecutionBackend } from "./tools/execution-backend.ts";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -32,6 +34,12 @@ export interface AgentSessionRuntimeDiagnostic {
  */
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
+	/** Agent runtime cwd (logical path under the execution backend). Default: cwd. */
+	runtimeCwd?: string;
+	/** Execution backend providing operations and path context for built-in tools. */
+	executionBackend?: ExecutionBackend;
+	/** Explicit override for the runtime environment shown to the model (no cwd field). */
+	runtimeEnvironmentOverride?: Partial<RuntimeEnvironmentContext>;
 	agentDir?: string;
 	authStorage?: AuthStorage;
 	settingsManager?: SettingsManager;
@@ -67,6 +75,12 @@ export interface CreateAgentSessionFromServicesOptions {
  */
 export interface AgentSessionServices {
 	cwd: string;
+	/** Agent runtime cwd (logical path); undefined means SDK defaults to cwd. */
+	runtimeCwd?: string;
+	/** Execution backend for built-in tools; undefined means local filesystem. */
+	executionBackend?: ExecutionBackend;
+	/** Explicit runtime environment override (no cwd field). */
+	runtimeEnvironmentOverride?: Partial<RuntimeEnvironmentContext>;
 	agentDir: string;
 	authStorage: AuthStorage;
 	settingsManager: SettingsManager;
@@ -162,6 +176,9 @@ export async function createAgentSessionServices(
 
 	return {
 		cwd,
+		runtimeCwd: options.runtimeCwd,
+		executionBackend: options.executionBackend,
+		runtimeEnvironmentOverride: options.runtimeEnvironmentOverride,
 		agentDir,
 		authStorage,
 		settingsManager,
@@ -183,6 +200,9 @@ export async function createAgentSessionFromServices(
 ): Promise<CreateAgentSessionResult> {
 	return createAgentSession({
 		cwd: options.services.cwd,
+		runtimeCwd: options.services.runtimeCwd,
+		executionBackend: options.services.executionBackend,
+		runtimeEnvironmentOverride: options.services.runtimeEnvironmentOverride,
 		agentDir: options.services.agentDir,
 		authStorage: options.services.authStorage,
 		settingsManager: options.services.settingsManager,

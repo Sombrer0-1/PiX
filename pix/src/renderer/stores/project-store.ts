@@ -8,7 +8,8 @@
 
 import { defineStore } from "pinia";
 import { ref } from "vue";
-import type { ProjectInfo, SessionInfo } from "@/types/session";
+import { toPlain } from "../utils/plain";
+import type { ProjectInfo, ProjectLocation, SessionInfo } from "@/types/session";
 import type { PixApi } from "../../main/preload";
 
 function api(): PixApi {
@@ -37,6 +38,8 @@ function api(): PixApi {
       onUserInputRequest: () => () => {},
       listSessions: async () => [],
       listTeamLeaderSessions: async () => [],
+      listWslDistros: async () => ({ distros: [], diagnostic: "pixApi 不可用" }),
+      resolveProjectLocation: async () => ({ success: false, error: "pixApi 不可用" }),
       windowMinimize: async () => {},
       windowMaximize: async () => {},
       windowClose: async () => {},
@@ -54,6 +57,19 @@ function api(): PixApi {
 
 function normalizePath(path: string | undefined): string {
   return (path || "").replace(/\\/g, "/").toLowerCase();
+}
+
+/**
+ * Stable identity key for a project. Windows paths are case-normalized
+ * (win32 is case-insensitive); WSL projects keep their POSIX logical path
+ * case-sensitive and are namespaced by distro. Uses `path` (logical) which
+ * equals `physicalPath` for Windows. See wsl_plan §4.3/§7.4.
+ */
+function projectKey(p: ProjectLocation): string {
+  if (p.environment.kind === "wsl") {
+    return `wsl:${p.environment.distro}:${p.path}`;
+  }
+  return `win:${p.path.toLowerCase()}`;
 }
 
 export const useProjectStore = defineStore("project", () => {
@@ -75,12 +91,10 @@ export const useProjectStore = defineStore("project", () => {
     }
   }
 
-  async function openProject(dirPath: string, options: { loadSessions?: boolean } = {}): Promise<void> {
-    const name = dirPath.split(/[/\\]/).pop() || dirPath;
-
+  async function openProject(location: ProjectLocation, options: { loadSessions?: boolean } = {}): Promise<void> {
+    const key = projectKey(location);
     currentProject.value = {
-      path: dirPath,
-      name,
+      ...location,
       lastOpened: Date.now(),
       sessionCount: 0,
     };
@@ -88,16 +102,16 @@ export const useProjectStore = defineStore("project", () => {
     // Save to recent projects
     try {
       const settings = await api().getSettings();
-      const existing = (settings.recentProjects || []).findIndex((p: ProjectInfo) => p.path === dirPath);
+      const existing = (settings.recentProjects || []).findIndex((p: ProjectInfo) => projectKey(p) === key);
       let updated: ProjectInfo[];
       if (existing !== -1) {
-        // Remove from old position and move to front
+        // Remove from old position and move to front; preserve known sessionCount.
         updated = [...settings.recentProjects];
         const [moved] = updated.splice(existing, 1);
-        updated.unshift({ ...moved, lastOpened: Date.now(), name });
+        updated.unshift({ ...location, lastOpened: Date.now(), sessionCount: moved.sessionCount ?? 0 });
       } else {
         updated = [
-          { path: dirPath, name, lastOpened: Date.now(), sessionCount: 0 },
+          { ...location, lastOpened: Date.now(), sessionCount: 0 },
           ...(settings.recentProjects || []),
         ].slice(0, 20);
       }
@@ -119,12 +133,18 @@ export const useProjectStore = defineStore("project", () => {
     await listSessions();
   }
 
-  async function removeRecentProject(path: string): Promise<void> {
-    const next = recentProjects.value.filter((project) => project.path !== path);
+  /** Whether `location` refers to the currently open project (by identity key). */
+  function isCurrentProject(location: ProjectLocation): boolean {
+    return currentProject.value ? projectKey(currentProject.value) === projectKey(location) : false;
+  }
+
+  async function removeRecentProject(project: ProjectLocation): Promise<void> {
+    const key = projectKey(project);
+    const next = recentProjects.value.filter((p) => projectKey(p) !== key);
     recentProjects.value = next;
     try {
       const settings = await api().getSettings();
-      const latest = (settings.recentProjects || []).filter((project: ProjectInfo) => project.path !== path);
+      const latest = (settings.recentProjects || []).filter((p: ProjectInfo) => projectKey(p) !== key);
       await api().setSettings({ recentProjects: latest });
       recentProjects.value = latest;
     } catch (err) {
@@ -137,11 +157,12 @@ export const useProjectStore = defineStore("project", () => {
     currentProject.value = project;
   }
 
-  async function syncRecentProjectSessionCount(projectPath: string, sessionCount: number): Promise<void> {
+  async function syncRecentProjectSessionCount(project: ProjectLocation, sessionCount: number): Promise<void> {
+    const key = projectKey(project);
     try {
       const settings = await api().getSettings();
       const projects = settings.recentProjects || [];
-      const existing = projects.findIndex((project: ProjectInfo) => project.path === projectPath);
+      const existing = projects.findIndex((p: ProjectInfo) => projectKey(p) === key);
       if (existing === -1 || projects[existing]?.sessionCount === sessionCount) {
         if (existing !== -1) recentProjects.value = projects;
         return;
@@ -160,12 +181,15 @@ export const useProjectStore = defineStore("project", () => {
     if (!project) return;
     isLoadingSessions.value = true;
     try {
-      const sessionInfos = await api().listSessions(project.path);
+      // currentProject is a Vue reactive proxy; strip reactivity before IPC.
+      const sessionInfos = await api().listSessions(toPlain(project));
       if (Array.isArray(sessionInfos)) {
-        if (currentProject.value?.path !== project.path) return;
+        if (currentProject.value && projectKey(currentProject.value) !== projectKey(project)) return;
         sessions.value = sessionInfos;
-        currentProject.value.sessionCount = sessionInfos.length;
-        await syncRecentProjectSessionCount(project.path, sessionInfos.length);
+        // `project` is the captured currentProject at call time and the
+        // identity guard above confirms it is still current.
+        project.sessionCount = sessionInfos.length;
+        await syncRecentProjectSessionCount(project, sessionInfos.length);
       }
     } catch (err) {
       console.error("[project-store] Failed to list sessions:", err);
@@ -179,9 +203,10 @@ export const useProjectStore = defineStore("project", () => {
     if (!project) return;
     isLoadingTeamSessions.value = true;
     try {
-      const sessionInfos = await api().listTeamLeaderSessions(project.path);
+      // currentProject is a Vue reactive proxy; strip reactivity before IPC.
+      const sessionInfos = await api().listTeamLeaderSessions(toPlain(project));
       if (Array.isArray(sessionInfos)) {
-        if (currentProject.value?.path !== project.path) return;
+        if (currentProject.value && projectKey(currentProject.value) !== projectKey(project)) return;
         teamSessions.value = sessionInfos;
       }
     } catch (err) {
@@ -244,6 +269,7 @@ export const useProjectStore = defineStore("project", () => {
     isLoadingTeamSessions,
     loadSettings,
     openProject,
+    isCurrentProject,
     setCurrentProject,
     listSessions,
     listTeamLeaderSessions,

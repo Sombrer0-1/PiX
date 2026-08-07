@@ -331,8 +331,15 @@ function loadSkillFromFile(
  *
  * Skills with disableModelInvocation=true are excluded from the prompt
  * (they can only be invoked explicitly via /skill:name commands).
+ *
+ * Pass `displayPath` to translate the physical skill load path into a
+ * model-visible logical path (for example under WSL). The real load path
+ * stored on the Skill is unchanged; only the <location> text is rewritten.
  */
-export function formatSkillsForPrompt(skills: Skill[]): string {
+export function formatSkillsForPrompt(
+	skills: Skill[],
+	displayPath?: (filePath: string) => string,
+): string {
 	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
 
 	if (visibleSkills.length === 0) {
@@ -348,10 +355,11 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 	];
 
 	for (const skill of visibleSkills) {
+		const location = displayPath ? displayPath(skill.filePath) : skill.filePath;
 		lines.push("  <skill>");
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		lines.push(`    <location>${escapeXml(location)}</location>`);
 		lines.push("  </skill>");
 	}
 

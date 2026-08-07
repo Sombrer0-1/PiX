@@ -12,6 +12,10 @@ import { join } from "path";
 import {
 	type AgentSession,
 	type ExtensionAPI,
+	type CreateAgentSessionOptions,
+	type CreateAgentSessionResult,
+	type ExecutionBackend,
+	type RuntimeEnvironmentContext,
 	createAgentSession,
 	SessionManager,
 	SettingsManager,
@@ -20,6 +24,7 @@ import {
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
+import type { ProjectExecutionContext } from "./execution-context.js";
 import type {
 	TeamState,
 	TeammateInfo,
@@ -96,8 +101,41 @@ import { WorkerRunner } from "./team-worker-runner.js";
 export class TeamManager {
   private _team: TeamData | null = null;
   private _eventCallbacks: TeamEventCallback[] = [];
-  private _cwd: string = "";
+  /**
+   * Host/bootstrap cwd and snapshot/hash key. Settings/Resource/Session managers
+   * and the debug logger read this; it is always the physical path, never the
+   * model-visible logical path (wsl_plan.md §4.8: snapshot/workspace hash input
+   * MUST be physicalCwd).
+   */
+  private _physicalCwd = "";
+  /**
+   * Runtime/logical cwd passed to createAgentSession as `runtimeCwd` for both
+   * leader and workers. Equals _physicalCwd on Windows; the POSIX path inside
+   * the distro under WSL.
+   */
+  private _logicalCwd = "";
+  /**
+   * Shared execution backend borrowed from the leader ProjectExecutionContext.
+   * Workers reuse this exact object (identity) and never dispose it; only the
+   * context owner (SessionBridge) releases the backend (wsl_plan.md §4.8).
+   */
+  private _executionBackend: ExecutionBackend | null = null;
+  /**
+   * Explicit WSL marker used to decide MCP allowStdio and worker wiring. It is
+   * taken from context.isWsl, NOT inferred from backend existence, so future
+   * non-WSL backends are not misclassified (wsl_plan.md §4.8/§4.10).
+   */
+  private _isWsl = false;
+  /** Runtime environment override forwarded to every worker createAgentSession. */
+  private _runtimeEnvironmentOverride: Partial<RuntimeEnvironmentContext> | undefined;
   private _authStorage: AuthStorage | null = null;
+  /**
+   * Session factory used by _launchWorkerInner. Defaults to the real
+   * createAgentSession; overridable for tests so the worker bootstrap path can
+   * be asserted without a live distro (wsl_plan.md §9.3.7: real
+   * createAgentSession object-identity is a distro-gated integration test).
+   */
+  private readonly _sessionFactory: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
   private _healthCheckInterval: ReturnType<typeof setInterval> | null = null;
   /** Timestamp of the last orchestration stall-recovery nudge (health-check throttle). */
   private _lastStallRecoveryAt = 0;
@@ -147,6 +185,15 @@ export class TeamManager {
   } = {};
 
   /**
+   * @param options.sessionFactory Override the AgentSession factory (tests only).
+   *   Production callers omit it; `new TeamManager()` uses the real
+   *   createAgentSession, preserving existing behavior.
+   */
+  constructor(options: { sessionFactory?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult> } = {}) {
+    this._sessionFactory = options.sessionFactory ?? createAgentSession;
+  }
+
+  /**
    * Set the Leader (main) AgentSession reference.
    * Called by SessionBridge after the main session is activated.
    * The Leader session is where team tools are registered and where worker
@@ -178,13 +225,28 @@ export class TeamManager {
     };
   }
 
-  /** Set the working directory and auth storage, called when the leader session starts. */
-  async initialize(cwd: string, authStorage: AuthStorage): Promise<void> {
-    this._cwd = cwd;
+  /**
+   * Store the leader ProjectExecutionContext and auth storage, called after the
+   * leader SessionBridge.start succeeds. The borrowed backend is shared with all
+   * workers; TeamManager never disposes it (the context owner does). On failure
+   * the IPC layer stops the leader (wsl_plan.md §4.8).
+   */
+  async initialize(context: ProjectExecutionContext, authStorage: AuthStorage): Promise<void> {
+    this._physicalCwd = context.physicalCwd;
+    this._logicalCwd = context.logicalCwd;
+    this._executionBackend = context.executionBackend ?? null;
+    this._isWsl = context.isWsl;
+    this._runtimeEnvironmentOverride = context.runtimeEnvironmentOverride;
     this._authStorage = authStorage;
     this._executionState = "paused";
     this._runtimeEpoch++;
-    this.logTeamDebug("manager.initialize", { cwd, hasAuthStorage: Boolean(authStorage) });
+    this.logTeamDebug("manager.initialize", {
+      physicalCwd: context.physicalCwd,
+      logicalCwd: context.logicalCwd,
+      isWsl: context.isWsl,
+      hasBackend: Boolean(context.executionBackend),
+      hasAuthStorage: Boolean(authStorage),
+    });
     await this._restorePersistedTeamIfPresent();
   }
 
@@ -232,7 +294,7 @@ export class TeamManager {
     if (this._team) {
       throw new Error("A team is already active. Stop the current team first.");
     }
-    if (!this._cwd) {
+    if (!this._physicalCwd) {
       throw new Error("TeamManager not initialized. Start a project session first.");
     }
 
@@ -265,7 +327,7 @@ export class TeamManager {
 
     this._team = team;
     this._lastLoggedContext = {};
-    this._debugLogger.start(this._cwd, name, "create_team");
+    this._debugLogger.start(this._physicalCwd, name, "create_team");
     this.logTeamDebug("team.create", {
       teamName: name,
       leadAgentId,
@@ -418,13 +480,13 @@ export class TeamManager {
     // "active" (isRestorableTeamSnapshot rejects "stopping"). This captures the
     // latest worker chat history/tasks/bus that the debounced timer may not have
     // written yet.
-    if (!deleteSnapshot && this._cwd) {
+    if (!deleteSnapshot && this._physicalCwd) {
       if (this._persistTimer) {
         clearTimeout(this._persistTimer);
         this._persistTimer = null;
       }
       try {
-        await persistTeamSnapshot(this._cwd, team);
+        await persistTeamSnapshot(this._physicalCwd, team);
       } catch (err) {
         console.warn("[TeamManager] Failed to flush team snapshot before stop:", err);
       }
@@ -764,12 +826,17 @@ export class TeamManager {
     // Create AgentSession (same pattern as SessionBridge._createSession)
     const agentDir = getAgentDir();
     const sessionDir = join(agentDir, "team-sessions", team.name, worker.info.name);
-    const sessionManager = SessionManager.create(this._cwd, sessionDir);
-    const settingsManager = SettingsManager.create(this._cwd);
-    const mcpAdapter = new McpAdapter();
+    // Bootstrap consumers (Session/Settings/Resource loaders) use the physical
+    // cwd; the Agent runtime uses the logical cwd via runtimeCwd below
+    // (wsl_plan.md §4.8: worker bootstrap uses physical cwd).
+    const sessionManager = SessionManager.create(this._physicalCwd, sessionDir);
+    const settingsManager = SettingsManager.create(this._physicalCwd);
+    // WSL mode disables Windows-side stdio MCP (decided by _isWsl, not by
+    // backend existence). HTTP/SSE remain configurable (wsl_plan.md §4.10).
+    const mcpAdapter = new McpAdapter({ allowStdio: this._isWsl ? false : true });
     const bus = team.bus;
     const resourceLoader = new DefaultResourceLoader({
-      cwd: this._cwd,
+      cwd: this._physicalCwd,
       agentDir,
       settingsManager,
       extensionFactories: [
@@ -791,8 +858,16 @@ export class TeamManager {
     // physically cannot call them (no need to rely on request_permission alone).
     const roleDenied = ROLE_PERMISSIONS[worker.info.role]?.deniedTools ?? [];
 
-    const result = await createAgentSession({
-      cwd: this._cwd,
+    // Workers reuse the leader's backend object identity and runtime cwd
+    // (logical). bootstrap cwd above is physical. When no backend is injected
+    // (Windows) runtimeCwd === physicalCwd and behavior is byte-identical to
+    // the previous single-cwd path (wsl_plan.md §4.1/§4.8). The worker never
+    // disposes the shared backend; only the context owner does.
+    const result = await this._sessionFactory({
+      cwd: this._physicalCwd,
+      runtimeCwd: this._logicalCwd,
+      executionBackend: this._executionBackend ?? undefined,
+      runtimeEnvironmentOverride: this._runtimeEnvironmentOverride,
       sessionManager,
       settingsManager,
       resourceLoader,
@@ -3349,7 +3424,7 @@ export class TeamManager {
   }
 
   private _schedulePersist(): void {
-    if (this._isRestoringTeam || !this._team || !this._cwd) return;
+    if (this._isRestoringTeam || !this._team || !this._physicalCwd) return;
     // Never persist during teardown: a "stopping" snapshot is non-restorable and
     // would clobber the final "active" snapshot flushed at the start of stopTeam.
     if (this._team.status === "stopping") return;
@@ -3363,8 +3438,8 @@ export class TeamManager {
   }
 
   private async _persistTeamSnapshot(): Promise<void> {
-    if (!this._team || !this._cwd || this._team.status === "stopping") return;
-    await persistTeamSnapshot(this._cwd, this._team);
+    if (!this._team || !this._physicalCwd || this._team.status === "stopping") return;
+    await persistTeamSnapshot(this._physicalCwd, this._team);
   }
 
   private async _deletePersistedSnapshot(): Promise<void> {
@@ -3372,15 +3447,15 @@ export class TeamManager {
       clearTimeout(this._persistTimer);
       this._persistTimer = null;
     }
-    if (!this._cwd) return;
-    await deletePersistedTeamSnapshot(this._cwd);
+    if (!this._physicalCwd) return;
+    await deletePersistedTeamSnapshot(this._physicalCwd);
   }
 
   private async _restorePersistedTeamIfPresent(): Promise<void> {
-    if (this._team || !this._cwd || !this._authStorage) return;
+    if (this._team || !this._physicalCwd || !this._authStorage) return;
 
-    const snapshot = await readPersistedTeamSnapshot(this._cwd);
-    if (!snapshot || !isRestorableTeamSnapshot(snapshot, this._cwd)) {
+    const snapshot = await readPersistedTeamSnapshot(this._physicalCwd);
+    if (!snapshot || !isRestorableTeamSnapshot(snapshot, this._physicalCwd)) {
       return;
     }
 
@@ -3391,7 +3466,7 @@ export class TeamManager {
       this._executionState = "paused";
       this._runtimeEpoch++;
       this._lastLoggedContext = {};
-      this._debugLogger.start(this._cwd, team.name, "restore_persisted_team");
+      this._debugLogger.start(this._physicalCwd, team.name, "restore_persisted_team");
       this.logTeamDebug("team.restore.start", {
         snapshotSavedAt: snapshot.savedAt,
         teamCreatedAt: snapshot.team.createdAt,

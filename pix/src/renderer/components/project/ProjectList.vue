@@ -2,9 +2,13 @@
 /**
  * ProjectList - Recent projects list
  *
- * Used on the home page and for project switching.
+ * Used on the home page and for project switching. Shows the project
+ * environment (Windows / WSL2 + distro) alongside the logical path; the
+ * `select` event carries the full ProjectInfo (a ProjectLocation) so callers
+ * never have to re-guess the environment from a string.
  */
-import type { ProjectInfo } from "@/types/session";
+import { computed } from "vue";
+import type { ProjectInfo, ProjectEnvironment } from "@/types/session";
 
 const props = defineProps<{
   projects: ProjectInfo[];
@@ -14,6 +18,24 @@ const emit = defineEmits<{
   select: [project: ProjectInfo];
   remove: [project: ProjectInfo];
 }>();
+
+const items = computed(() =>
+  props.projects.map((project) => ({
+    project,
+    key: projectKey(project),
+    envLabel: envLabel(project.environment),
+  })),
+);
+
+function envLabel(env: ProjectEnvironment): string {
+  return env.kind === "wsl" ? `WSL2 · ${env.distro}` : "Windows";
+}
+
+function projectKey(project: ProjectInfo): string {
+  return project.environment.kind === "wsl"
+    ? `wsl:${project.environment.distro}:${project.path}`
+    : `win:${project.path.toLowerCase()}`;
+}
 
 function formatDate(timestamp: number): string {
   const d = new Date(timestamp);
@@ -33,14 +55,17 @@ function formatDate(timestamp: number): string {
       <p class="empty-text">暂无最近项目</p>
     </div>
     <button
-      v-for="project in projects"
-      :key="project.path"
+      v-for="{ project, key, envLabel } in items"
+      :key="key"
       class="project-item"
       @click="emit('select', project)"
     >
       <div class="project-icon" aria-hidden="true"></div>
       <div class="project-info">
-        <div class="project-name">{{ project.name }}</div>
+        <div class="project-name-row">
+          <span class="project-name">{{ project.name }}</span>
+          <span class="project-env" :class="{ 'env-wsl': project.environment.kind === 'wsl' }">{{ envLabel }}</span>
+        </div>
         <div class="project-path">{{ project.path }}</div>
         <div class="project-meta">
           <span>{{ formatDate(project.lastOpened) }}</span>
@@ -114,10 +139,35 @@ function formatDate(timestamp: number): string {
   min-width: 0;
 }
 
+.project-name-row {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-xs);
+  min-width: 0;
+}
+
 .project-name {
   font-weight: 500;
   font-size: var(--pix-text-md);
   color: var(--pix-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-env {
+  flex-shrink: 0;
+  font-size: var(--pix-text-xs);
+  font-family: var(--pix-font-mono);
+  color: var(--pix-text-muted);
+  padding: 1px 6px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-hover);
+}
+
+.project-env.env-wsl {
+  color: var(--pix-text-inverse);
+  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
 }
 
 .project-path {

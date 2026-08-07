@@ -15,6 +15,23 @@ const projectStore = useProjectStore();
 
 const projectName = computed(() => projectStore.currentProject?.name || "");
 const sessionName = computed(() => rpc.sessionState.value?.sessionName || "");
+const environmentLabel = computed(() => {
+  const env = rpc.executionEnvironment.value;
+  if (!env) return "";
+  if (env.kind === "wsl") return `WSL · ${env.distro}`;
+  return "Windows";
+});
+const environmentTooltip = computed(() => {
+  const env = rpc.executionEnvironment.value;
+  if (!env) return "";
+  if (env.kind === "wsl") {
+    const parts = [`WSL2 · ${env.distro}`, env.logicalCwd];
+    if (env.ready === false) parts.push("未就绪");
+    if (env.diagnostic) parts.push(env.diagnostic);
+    return parts.join("\n");
+  }
+  return `Windows · ${env.logicalCwd}`;
+});
 </script>
 
 <template>
@@ -25,6 +42,7 @@ const sessionName = computed(() => rpc.sessionState.value?.sessionName || "");
         <span class="topbar-sep">&rsaquo;</span>
         <span class="topbar-project">{{ projectName }}</span>
       </template>
+      <span v-if="environmentLabel" class="topbar-env" :title="environmentTooltip">{{ environmentLabel }}</span>
       <template v-if="sessionName">
         <span class="topbar-sep">&rsaquo;</span>
         <span class="topbar-session">{{ sessionName }}</span>
@@ -84,6 +102,23 @@ const sessionName = computed(() => rpc.sessionState.value?.sessionName || "");
 .topbar-session {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar-env {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-muted);
+  font-size: 10px;
+  font-weight: var(--pix-weight-semibold);
+  letter-spacing: 0;
+  flex-shrink: 0;
+  max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

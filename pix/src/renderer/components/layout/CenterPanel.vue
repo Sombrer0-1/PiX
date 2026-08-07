@@ -94,6 +94,12 @@ interface ChatAttachment {
 const attachments = ref<ChatAttachment[]>([]);
 
 const projectName = computed(() => projectStore.currentProject?.name || "");
+const environmentLabel = computed(() => {
+  const env = rpc.executionEnvironment.value;
+  if (!env) return "";
+  if (env.kind === "wsl") return `WSL · ${env.distro}`;
+  return "Windows";
+});
 const sessionName = computed(() => {
   const explicitName = rpc.sessionState.value?.sessionName?.trim();
   if (explicitName) return explicitName;
@@ -218,7 +224,7 @@ watch(
 
 watch(canUseTeamMode, (available) => {
   if (!available && teamStore.teamMode) {
-    void teamStore.toggleTeamMode(projectStore.currentProject?.path);
+    void teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
   }
 });
 
@@ -282,7 +288,7 @@ async function setWorkspaceMode(mode: WorkspaceMode): Promise<void> {
     return;
   }
 
-  const ok = await teamStore.toggleTeamMode(projectStore.currentProject?.path);
+  const ok = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
   if (!ok) {
     // toggleTeamMode returns false on failure (it does not throw) and records
     // the cause in teamStore.lastError. TeamDashboard renders lastError, but
@@ -294,7 +300,7 @@ async function setWorkspaceMode(mode: WorkspaceMode): Promise<void> {
 
 async function confirmSwitchToSolo(): Promise<void> {
   showSwitchToSoloConfirmDialog.value = false;
-  const ok = await teamStore.toggleTeamMode(projectStore.currentProject?.path);
+  const ok = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
   if (!ok) {
     alert(`切换到单人模式失败：${teamStore.lastError || "未知错误"}`);
   }
@@ -649,6 +655,7 @@ function sendQuickStart(prompt: string): void {
           <span class="topbar-sep">&rsaquo;</span>
           <span class="topbar-path">{{ projectName }}</span>
         </template>
+        <span v-if="environmentLabel" class="topbar-env-badge" :title="environmentLabel">{{ environmentLabel }}</span>
         <template v-if="sessionName">
           <span class="topbar-sep">&rsaquo;</span>
           <span class="topbar-path">{{ sessionName }}</span>
@@ -1064,6 +1071,23 @@ function sendQuickStart(prompt: string): void {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-secondary);
   font-weight: var(--pix-weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar-env-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-code);
+  color: var(--pix-text-secondary);
+  font-size: 10px;
+  font-weight: var(--pix-weight-semibold);
+  letter-spacing: 0;
+  flex-shrink: 0;
+  max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

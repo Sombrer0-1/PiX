@@ -28,13 +28,21 @@ import {
 	createReadOnlyTools,
 	createReadTool,
 	createWriteTool,
+	type ExecutionBackend,
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
+import type { RuntimeEnvironmentContext } from "./system-prompt.ts";
 
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: process.cwd() */
 	cwd?: string;
+	/** Agent runtime cwd (logical path under the execution backend). Default: cwd. */
+	runtimeCwd?: string;
+	/** Execution backend providing operations and path context for built-in tools. */
+	executionBackend?: ExecutionBackend;
+	/** Explicit override for the runtime environment shown to the model (no cwd field). */
+	runtimeEnvironmentOverride?: Partial<RuntimeEnvironmentContext>;
 	/** Global config directory. Default: ~/.pi/agent */
 	agentDir?: string;
 
@@ -206,6 +214,7 @@ function getAttributionHeaders(
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
+	const runtimeCwd = options.runtimeCwd ?? options.executionBackend?.getCwd?.() ?? cwd;
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
@@ -417,6 +426,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager,
 		settingsManager,
 		cwd,
+		runtimeCwd,
+		executionBackend: options.executionBackend,
+		runtimeEnvironmentOverride: options.runtimeEnvironmentOverride,
 		scopedModels: options.scopedModels,
 		resourceLoader,
 		customTools: options.customTools,

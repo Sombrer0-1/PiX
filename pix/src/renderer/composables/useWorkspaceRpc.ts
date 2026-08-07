@@ -37,6 +37,7 @@ export function useWorkspaceRpc() {
     lastError: computed(() => activeRpc.value.lastError.value),
     isRunning: computed(() => activeRpc.value.isRunning.value),
     isStreaming: computed(() => activeRpc.value.isStreaming.value),
+    executionEnvironment: computed(() => activeRpc.value.executionEnvironment.value),
     isConnected: computed(() => activeRpc.value.isConnected.value),
     getBackgroundTasks: () => activeRpc.value.getBackgroundTasks(),
     stopBackgroundTask: (taskId: string) => activeRpc.value.stopBackgroundTask(taskId),

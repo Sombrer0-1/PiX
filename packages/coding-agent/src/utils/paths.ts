@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve as nodeResolvePath, relative, sep } from "node:path";
+import { isAbsolute, join, posix as posixPath, resolve as nodeResolvePath, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnProcessSync } from "./child-process.ts";
 
@@ -17,6 +17,13 @@ export interface PathInputOptions {
 	stripAtPrefix?: boolean;
 	/** Normalize unicode space variants to regular spaces. */
 	normalizeUnicodeSpaces?: boolean;
+	/**
+	 * Use POSIX path semantics (`path.posix`) for resolution and tilde expansion
+	 * instead of the platform default. Lets host code resolve Linux logical paths
+	 * (for example a WSL runtime cwd) without switching the whole process to POSIX.
+	 * Defaults to the platform default (win32 on Windows).
+	 */
+	posix?: boolean;
 }
 
 /**
@@ -24,8 +31,15 @@ export interface PathInputOptions {
  * Falls back to the raw path if resolution fails (e.g. the target does
  * not exist yet), so that callers never crash on missing filesystem
  * entries.
+ *
+ * Pass `{ posix: true }` to skip the host `realpathSync`, which cannot
+ * resolve Linux logical paths (for example a WSL runtime cwd). The caller
+ * is then responsible for canonicalization in the runtime namespace.
  */
-export function canonicalizePath(path: string): string {
+export function canonicalizePath(path: string, options?: PathInputOptions): string {
+	if (options?.posix) {
+		return path;
+	}
 	try {
 		return realpathSync(path);
 	} catch {
@@ -55,6 +69,7 @@ export function isLocalPath(value: string): boolean {
 }
 
 export function normalizePath(input: string, options: PathInputOptions = {}): string {
+	const pathApi = options.posix ? posixPath : { join, sep, isAbsolute };
 	let normalized = options.trim ? input.trim() : input;
 	if (options.normalizeUnicodeSpaces) {
 		normalized = normalized.replace(UNICODE_SPACES, " ");
@@ -66,8 +81,8 @@ export function normalizePath(input: string, options: PathInputOptions = {}): st
 	if (options.expandTilde ?? true) {
 		const home = options.homeDir ?? homedir();
 		if (normalized === "~") return home;
-		if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
-			return join(home, normalized.slice(2));
+		if (normalized.startsWith("~/") || (!options.posix && process.platform === "win32" && normalized.startsWith("~\\"))) {
+			return pathApi.join(home, normalized.slice(2));
 		}
 	}
 
@@ -79,9 +94,10 @@ export function normalizePath(input: string, options: PathInputOptions = {}): st
 }
 
 export function resolvePath(input: string, baseDir: string = process.cwd(), options: PathInputOptions = {}): string {
+	const pathApi = options.posix ? posixPath : { isAbsolute, resolve: nodeResolvePath };
 	const normalized = normalizePath(input, options);
-	const normalizedBaseDir = normalizePath(baseDir);
-	return isAbsolute(normalized) ? nodeResolvePath(normalized) : nodeResolvePath(normalizedBaseDir, normalized);
+	const normalizedBaseDir = normalizePath(baseDir, options);
+	return pathApi.isAbsolute(normalized) ? pathApi.resolve(normalized) : pathApi.resolve(normalizedBaseDir, normalized);
 }
 
 export function getCwdRelativePath(filePath: string, cwd: string): string | undefined {

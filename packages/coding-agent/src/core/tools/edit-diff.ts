@@ -6,6 +6,7 @@
 import * as Diff from "diff";
 import { constants } from "fs";
 import { access, readFile } from "fs/promises";
+import type { ToolPathContext } from "./execution-backend.ts";
 import { resolveToCwd } from "./path-utils.ts";
 
 export function detectLineEnding(content: string): "\r\n" | "\n" {
@@ -411,28 +412,59 @@ export interface EditDiffError {
 	error: string;
 }
 
+/** Operations used by computeEditsDiff to read the target file for preview. */
+export interface EditDiffReadOperations {
+	/** Check if file is readable (throw if not) */
+	access: (absolutePath: string) => Promise<void>;
+	/** Read file contents as a Buffer */
+	readFile: (absolutePath: string) => Promise<Buffer>;
+}
+
+export interface ComputeEditsDiffOptions {
+	/**
+	 * Backend file operations. When provided, preview reads go through them so a
+	 * remote backend (WSL) reads the physical file via its own operations instead
+	 * of the host filesystem. Defaults to local fs.access/fs.readFile.
+	 */
+	operations?: EditDiffReadOperations;
+	/**
+	 * Path context for the active execution backend. When provided, the preview
+	 * path is resolved in the runtime namespace (POSIX under WSL). Defaults to
+	 * local win32 resolution.
+	 */
+	paths?: ToolPathContext;
+}
+
 /**
  * Compute the diff for one or more edit operations without applying them.
  * Used for preview rendering in the TUI before the tool executes.
+ *
+ * The 3-arg form `computeEditsDiff(path, edits, cwd)` is unchanged for
+ * existing callers. Pass `options` to route resolution and reads through a
+ * remote execution backend (WSL) so the preview matches execution.
  */
 export async function computeEditsDiff(
 	path: string,
 	edits: Edit[],
 	cwd: string,
+	options?: ComputeEditsDiffOptions,
 ): Promise<EditDiffResult | EditDiffError> {
-	const absolutePath = resolveToCwd(path, cwd);
+	const absolutePath = resolveToCwd(path, cwd, options?.paths);
+	const accessFn = options?.operations?.access ?? ((p: string) => access(p, constants.R_OK));
+	const readFileFn = options?.operations?.readFile ?? ((p: string) => readFile(p));
 
 	try {
 		// Check if file exists and is readable
 		try {
-			await access(absolutePath, constants.R_OK);
+			await accessFn(absolutePath);
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
 			return { error: `Could not edit file: ${path}. ${errorMessage}.` };
 		}
 
 		// Read the file
-		const rawContent = await readFile(absolutePath, "utf-8");
+		const rawBuffer = await readFileFn(absolutePath);
+		const rawContent = rawBuffer.toString("utf-8");
 
 		// Strip BOM before matching (LLM won't include invisible BOM in oldText)
 		const { text: content } = stripBom(rawContent);
@@ -455,6 +487,7 @@ export async function computeEditDiff(
 	oldText: string,
 	newText: string,
 	cwd: string,
+	options?: ComputeEditsDiffOptions,
 ): Promise<EditDiffResult | EditDiffError> {
-	return computeEditsDiff(path, [{ oldText, newText }], cwd);
+	return computeEditsDiff(path, [{ oldText, newText }], cwd, options);
 }

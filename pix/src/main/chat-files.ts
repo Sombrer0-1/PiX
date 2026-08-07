@@ -17,6 +17,15 @@ export interface ProcessedChatFiles {
 
 export interface ProcessChatFileOptions {
 	autoResizeImages?: boolean;
+	/**
+	 * Translate a physical (host) absolute path into the model-visible runtime
+	 * path. WSL sessions pass the backend's displayPath so attachment `path`
+	 * fields and `<file name>` tags never leak UNC/drive letters. When omitted,
+	 * paths are used verbatim (existing Windows behavior). Its presence also
+	 * skips the macOS-only NFC/NFD/NFKC/NFKD + curly-quote existsSync probing,
+	 * which would otherwise cost 10+ 9P round-trips per file under WSL.
+	 */
+	displayPath?: (physical: string) => string;
 }
 
 export async function processChatFiles(
@@ -25,23 +34,29 @@ export async function processChatFiles(
 	options?: ProcessChatFileOptions,
 ): Promise<ProcessedChatFiles> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
+	const toDisplay = options?.displayPath ?? ((path: string) => path);
+	// displayPath is only injected under WSL; its presence also signals that the
+	// macOS-only normalization probing is unnecessary (and prohibitively slow
+	// over 9P). IO still uses the physical `cwd` and physical absolute paths.
+	const skipProbe = Boolean(options?.displayPath);
 	let text = "";
 	const images: ImageContent[] = [];
 	const attachments: ChatMessageAttachment[] = [];
 
 	for (const filePath of filePaths) {
-		const absolutePath = resolveReadPath(filePath, cwd);
+		const absolutePath = resolveReadPath(filePath, cwd, skipProbe);
+		const visiblePath = toDisplay(absolutePath);
 
 		try {
 			await access(absolutePath);
 		} catch {
-			throw new Error(`File not found: ${absolutePath}`);
+			throw new Error(`File not found: ${visiblePath}`);
 		}
 
 		const fileStats = await stat(absolutePath);
 		if (fileStats.size === 0) {
 			attachments.push({
-				path: absolutePath,
+				path: visiblePath,
 				name: basenameFromPath(absolutePath),
 				kind: "file",
 				size: fileStats.size,
@@ -53,7 +68,7 @@ export async function processChatFiles(
 		if (mimeType) {
 			const content = await readFile(absolutePath);
 			attachments.push({
-				path: absolutePath,
+				path: visiblePath,
 				name: basenameFromPath(absolutePath),
 				kind: "image",
 				size: fileStats.size,
@@ -64,7 +79,7 @@ export async function processChatFiles(
 			if (autoResizeImages) {
 				const resized = await resizeImage(content, mimeType);
 				if (!resized) {
-					text += `<file name="${absolutePath}">[Image omitted: could not be resized below the inline image size limit.]</file>\n`;
+					text += `<file name="${visiblePath}">[Image omitted: could not be resized below the inline image size limit.]</file>\n`;
 					continue;
 				}
 				dimensionNote = formatDimensionNote(resized);
@@ -83,22 +98,22 @@ export async function processChatFiles(
 
 			images.push(attachment);
 			text += dimensionNote
-				? `<file name="${absolutePath}">${dimensionNote}</file>\n`
-				: `<file name="${absolutePath}"></file>\n`;
+				? `<file name="${visiblePath}">${dimensionNote}</file>\n`
+				: `<file name="${visiblePath}"></file>\n`;
 		} else {
 			try {
 				const content = await readFile(absolutePath, "utf-8");
 				attachments.push({
-					path: absolutePath,
+					path: visiblePath,
 					name: basenameFromPath(absolutePath),
 					kind: "text",
 					size: fileStats.size,
 					content,
 				});
-				text += `<file name="${absolutePath}">\n${content}\n</file>\n`;
+				text += `<file name="${visiblePath}">\n${content}\n</file>\n`;
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
-				throw new Error(`Could not read file ${absolutePath}: ${message}`);
+				throw new Error(`Could not read file ${visiblePath}: ${message}`);
 			}
 		}
 	}
@@ -110,8 +125,11 @@ function basenameFromPath(filePath: string): string {
 	return filePath.split(/[/\\]/).pop() || filePath;
 }
 
-function resolveReadPath(filePath: string, cwd: string): string {
+function resolveReadPath(filePath: string, cwd: string, skipProbe = false): string {
 	const resolved = resolveToCwd(filePath, cwd);
+	if (skipProbe) {
+		return resolved;
+	}
 	const candidates = buildPathCandidates(resolved);
 
 	for (const candidate of candidates) {

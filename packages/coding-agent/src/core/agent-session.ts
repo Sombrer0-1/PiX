@@ -117,6 +117,7 @@ import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt, type RuntimeEnvironmentContext } from "./system-prompt.ts";
 import { inspectToolExecution } from "./tool-execution-policy.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import type { ExecutionBackend } from "./tools/execution-backend.ts";
 import { createAllToolDefinitions, createBackgroundToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import {
@@ -214,6 +215,12 @@ export interface AgentSessionConfig {
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
+	/** Agent runtime cwd (logical path under the execution backend). Default: cwd. */
+	runtimeCwd?: string;
+	/** Execution backend providing operations and path context for built-in tools. */
+	executionBackend?: ExecutionBackend;
+	/** Explicit override for the runtime environment shown to the model (no cwd field). */
+	runtimeEnvironmentOverride?: Partial<RuntimeEnvironmentContext>;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for skills, prompts, themes, context files, system prompt */
@@ -401,6 +408,9 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _runtimeCwd: string;
+	private _executionBackend?: ExecutionBackend;
+	private _runtimeEnvironmentOverride?: Partial<RuntimeEnvironmentContext>;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -446,6 +456,9 @@ export class AgentSession {
 					];
 		this._customTools = [...(config.customTools ?? []), ...builtInEnhancementTools];
 		this._cwd = config.cwd;
+		this._runtimeCwd = config.runtimeCwd ?? config.cwd;
+		this._executionBackend = config.executionBackend;
+		this._runtimeEnvironmentOverride = config.runtimeEnvironmentOverride;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -570,7 +583,7 @@ export class AgentSession {
 				mode: this.settingsManager.getExecutionMode(),
 				toolName: toolCall.name,
 				args,
-				cwd: this.sessionManager.getCwd(),
+				cwd: this._runtimeCwd,
 			});
 			if (!policyDecision.allowed) {
 				if (policyDecision.requiresApproval) {
@@ -1188,27 +1201,42 @@ export class AgentSession {
 
 	private _runtimeEnvironmentContext(): RuntimeEnvironmentContext {
 		const shellPath = this.settingsManager.getShellPath();
+		const executionMode = this.settingsManager.getExecutionMode();
+		const verificationGate = this.settingsManager.getVerificationGateEnabled();
+		let context: RuntimeEnvironmentContext;
 		try {
 			const shellConfig = getShellConfig(shellPath);
-			return {
+			context = {
 				platform: process.platform,
-				executionMode: this.settingsManager.getExecutionMode(),
-				verificationGate: this.settingsManager.getVerificationGateEnabled(),
+				executionMode,
+				verificationGate,
 				shell: {
 					path: shellConfig.shell,
 					args: shellConfig.args,
 				},
 			};
 		} catch (error) {
-			return {
+			context = {
 				platform: process.platform,
-				executionMode: this.settingsManager.getExecutionMode(),
-				verificationGate: this.settingsManager.getVerificationGateEnabled(),
+				executionMode,
+				verificationGate,
 				shell: {
 					error: error instanceof Error ? error.message : String(error),
 				},
 			};
 		}
+		// Shallow merge: local-probed < backend.runtimeEnvironment < explicit override.
+		// Backend must not override settings-provided executionMode/verificationGate.
+		// The shell field is replaced wholesale (backend provides a complete shell object).
+		if (this._executionBackend?.runtimeEnvironment) {
+			context = { ...context, ...this._executionBackend.runtimeEnvironment };
+			context.executionMode = executionMode;
+			context.verificationGate = verificationGate;
+		}
+		if (this._runtimeEnvironmentOverride) {
+			context = { ...context, ...this._runtimeEnvironmentOverride };
+		}
+		return context;
 	}
 
 	private _rebuildSystemPrompt(toolNames: string[]): string {
@@ -1235,7 +1263,7 @@ export class AgentSession {
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
 		this._baseSystemPromptOptions = {
-			cwd: this._cwd,
+			cwd: this._runtimeCwd,
 			runtimeEnvironment: this._runtimeEnvironmentContext(),
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
@@ -1244,6 +1272,10 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
+			// Translate the physical skill load path into a model-visible logical
+			// path (for example under WSL). Undefined without a backend, so Windows
+			// behavior (raw skill.filePath) is unchanged.
+			skillPathFormatter: this._executionBackend?.paths.displayPath,
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -3068,7 +3100,8 @@ export class AgentSession {
 						createToolDefinitionFromAgentTool(tool),
 					]),
 				)
-			: createAllToolDefinitions(this._cwd, {
+			: createAllToolDefinitions(this._runtimeCwd, {
+					executionBackend: this._executionBackend,
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
@@ -3266,8 +3299,8 @@ export class AgentSession {
 		try {
 			const result = await executeBashWithOperations(
 				resolvedCommand,
-				this.sessionManager.getCwd(),
-				options?.operations ?? createLocalBashOperations({ shellPath }),
+				this._runtimeCwd,
+				options?.operations ?? this._executionBackend?.bash ?? createLocalBashOperations({ shellPath }),
 				{
 					onChunk,
 					signal: this._bashAbortController.signal,
@@ -3696,7 +3729,7 @@ export class AgentSession {
 		const toolRenderer: ToolHtmlRenderer = createToolHtmlRenderer({
 			getToolDefinition: (name) => this.getToolDefinition(name),
 			theme,
-			cwd: this.sessionManager.getCwd(),
+			cwd: this._runtimeCwd,
 		});
 
 		return await exportSessionToHtml(this.sessionManager, this.state, {
@@ -3727,6 +3760,8 @@ export class AgentSession {
 			version: CURRENT_SESSION_VERSION,
 			id: this.sessionManager.getSessionId(),
 			timestamp: new Date().toISOString(),
+			// Store the physical (host) cwd in session metadata; the renderer
+			// translates it to the logical path when displaying to the model.
 			cwd: this.sessionManager.getCwd(),
 		};
 

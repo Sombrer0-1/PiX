@@ -8,6 +8,17 @@
  */
 
 import { randomUUID } from "crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, posix as pathPosix } from "node:path";
+import {
+  AuthStorage,
+  type AgentSession,
+  type CreateAgentSessionOptions,
+  type CreateAgentSessionResult,
+  type ExecutionBackend,
+  type RuntimeEnvironmentContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   buildWorkerUnavailableOrchestrationEvents,
   buildTeamOrchestrationPrompt,
@@ -29,8 +40,12 @@ import {
   createPersistedTeamSnapshot,
   hydratePersistedTeam,
   isRestorableTeamSnapshot,
+  teamSnapshotPath,
+  workspaceModePath,
 } from "../team-persistence.js";
 import { TeamProtocolManager } from "../team-protocol-manager.js";
+import { TeamManager } from "../team-manager.js";
+import type { ProjectExecutionContext } from "../execution-context.js";
 import type { TeamData } from "../team-runtime-types.js";
 import type { OrchestrationEvent } from "../team-orchestration.js";
 import type {
@@ -929,6 +944,204 @@ console.log("\n=== Spawn Helpers & Shutdown Protocol Tests ===\n");
 
   const missing = pm.respondShutdown("coder::t", true);
   assert(missing === null, "Responding after resolution reports no pending request");
+}
+
+console.log("\n=== TeamManager WSL Backend Consistency (S8) ===\n");
+
+/**
+ * Read-only view of TeamManager private fields used by the S8 regression
+ * assertions. The fields asserted here (_physicalCwd / _logicalCwd /
+ * _executionBackend / _isWsl / _runtimeEnvironmentOverride / _team) are the
+ * exact state the worker bootstrap path consumes, per wsl_plan.md §4.8. The
+ * real createAgentSession object-identity check is a distro-gated integration
+ * test (skipped without a distro); S8 asserts internal state primarily
+ * (wsl_plan.md §9.3.7).
+ */
+interface TeamManagerTestAccess {
+  _physicalCwd: string;
+  _logicalCwd: string;
+  _executionBackend: ExecutionBackend | null;
+  _isWsl: boolean;
+  _runtimeEnvironmentOverride: Partial<RuntimeEnvironmentContext> | undefined;
+  _team: TeamData | null;
+}
+
+/** Minimal AgentSession stub for the worker bootstrap path (no live model). */
+function createFakeWorkerSession(): AgentSession {
+  const session = {
+    subscribe: () => () => {},
+    modelRegistry: { find: () => undefined, getAvailable: () => [] },
+    setModel: async () => {},
+    isStreaming: false,
+    prompt: async () => {},
+    steer: async () => {},
+    getLastAssistantText: () => "",
+    abort: async () => {},
+    clearQueue: () => {},
+    dispose: async () => {},
+    agent: { waitForIdle: async () => undefined },
+  };
+  return session as unknown as AgentSession;
+}
+
+function buildWslContext(physicalCwd: string, backend: ExecutionBackend): ProjectExecutionContext {
+  return {
+    location: {
+      path: "/home/u/repo",
+      physicalPath: physicalCwd,
+      name: "repo",
+      environment: { kind: "wsl", distro: "Ubuntu-22.04" },
+    },
+    logicalCwd: "/home/u/repo",
+    physicalCwd,
+    executionBackend: backend,
+    runtimeEnvironmentOverride: { platform: "linux", osName: "WSL2 (Ubuntu-22.04)" },
+    isWsl: true,
+  };
+}
+
+// Test S8.1: initialize stores _executionBackend / _physicalCwd / _logicalCwd / _isWsl
+{
+  const fakeBackend: ExecutionBackend = {
+    paths: {
+      pathStyle: "posix",
+      homeDir: "/home/u",
+      resolvePath: (input, cwd) => pathPosix.resolve(cwd, input),
+    },
+    getCwd: () => "/home/u/repo",
+  };
+  const physicalCwd = "\\\\wsl.localhost\\Ubuntu-22.04\\home\\u\\repo";
+  const manager = new TeamManager();
+  await manager.initialize(buildWslContext(physicalCwd, fakeBackend), AuthStorage.inMemory());
+  const access = manager as unknown as TeamManagerTestAccess;
+  assertEqual(access._physicalCwd, physicalCwd, "WSL initialize stores physicalCwd (snapshot/hash key)");
+  assertEqual(access._logicalCwd, "/home/u/repo", "WSL initialize stores logicalCwd (worker runtime cwd)");
+  assert(
+    access._executionBackend === fakeBackend,
+    "WSL initialize stores the SAME backend object (leader/worker share identity)",
+  );
+  assertEqual(access._isWsl, true, "WSL initialize stores _isWsl=true");
+  assertEqual(access._runtimeEnvironmentOverride?.platform, "linux", "WSL initialize stores runtimeEnvironmentOverride");
+}
+
+// Test S8.2: Windows context stores no backend, isWsl=false, logical===physical
+{
+  const tmp = mkdtempSync(join(tmpdir(), "pix-team-win-"));
+  const winContext: ProjectExecutionContext = {
+    location: { path: tmp, physicalPath: tmp, name: "win", environment: { kind: "windows" } },
+    logicalCwd: tmp,
+    physicalCwd: tmp,
+    isWsl: false,
+  };
+  const manager = new TeamManager();
+  await manager.initialize(winContext, AuthStorage.inMemory());
+  const access = manager as unknown as TeamManagerTestAccess;
+  assertEqual(access._physicalCwd, tmp, "Windows initialize stores physicalCwd");
+  assertEqual(access._logicalCwd, tmp, "Windows logicalCwd equals physicalCwd (no-regression)");
+  assertEqual(access._executionBackend, null, "Windows initialize stores no backend");
+  assertEqual(access._isWsl, false, "Windows initialize stores _isWsl=false");
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+// Test S8.3: snapshot/workspace hash input is physicalCwd, never logical
+{
+  const physical: string = "\\\\wsl.localhost\\Ubuntu-22.04\\home\\u\\repo";
+  const logical: string = "/home/u/repo";
+  assert(physical !== logical, "physical and logical paths differ for the hash test");
+  assertEqual(
+    teamSnapshotPath(physical) === teamSnapshotPath(logical),
+    false,
+    "teamSnapshotPath differs for physical vs logical cwd (hash input is physical)",
+  );
+  assertEqual(
+    workspaceModePath(physical) === workspaceModePath(logical),
+    false,
+    "workspaceModePath differs for physical vs logical cwd (hash input is physical)",
+  );
+  // TeamManager stores _physicalCwd (S8.1) and feeds it to persist/restore/
+  // deletePersistedTeamSnapshot, so all three hash sites receive physicalCwd.
+}
+
+// Test S8.4 + S8.5: worker bootstrap passes the SAME backend + runtimeCwd=logical,
+//   and McpAdapter passes allowStdio=false (decided by _isWsl, not backend existence).
+//   Uses a sessionFactory injection so the path runs without a live distro; the real
+//   createAgentSession object-identity check is distro-gated (skip without distro).
+{
+  // Give the fakeBackend a dispose spy so the "worker dispose does not dispose
+  // the shared backend" assertion can actually FAIL if backend.dispose were
+  // ever called. Without the spy, backend.dispose?.() is a silent no-op and the
+  // _executionBackend === fakeBackend check passes tautologically (wsl_plan.md
+  // §4.8 / appendix item 11: only the context owner disposes the backend).
+  const backendDisposeCalls: number[] = [];
+  const fakeBackend: ExecutionBackend = {
+    paths: {
+      pathStyle: "posix",
+      homeDir: "/home/u",
+      resolvePath: (input, cwd) => pathPosix.resolve(cwd, input),
+    },
+    dispose: async () => {
+      backendDisposeCalls.push(1);
+    },
+  };
+  // Real temp dir on the host so bootstrap IO (Session/Settings/Resource loaders)
+  // works; logicalCwd stays a distinct POSIX path to prove runtimeCwd != cwd.
+  const physicalCwd = mkdtempSync(join(tmpdir(), "pix-team-wsl-"));
+  const logicalCwd = "/home/u/repo";
+  const captured: CreateAgentSessionOptions[] = [];
+  const fakeSessionFactory = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
+    captured.push(options);
+    return { session: createFakeWorkerSession() } as unknown as CreateAgentSessionResult;
+  };
+  const manager = new TeamManager({ sessionFactory: fakeSessionFactory });
+  await manager.initialize(buildWslContext(physicalCwd, fakeBackend), AuthStorage.inMemory());
+
+  const team = await manager.createTeam();
+  // createTeam fire-and-forget-launches the always-on coder; add an on-demand
+  // worker and activate it (awaited) so a createAgentSession call is captured
+  // deterministically regardless of the coder's background launch timing.
+  const planner = await manager.addWorker({ role: "planner", activateNow: false });
+  await manager.activateMember(planner.agentId);
+
+  assert(captured.length >= 1, "worker creation invoked createAgentSession at least once");
+  for (const args of captured) {
+    assert(
+      args.executionBackend === fakeBackend,
+      "worker createAgentSession receives the SAME backend object (identity)",
+    );
+    assertEqual(args.runtimeCwd, logicalCwd, "worker createAgentSession runtimeCwd is logical");
+    assertEqual(args.cwd, physicalCwd, "worker createAgentSession bootstrap cwd is physical");
+  }
+
+  // The planner's McpAdapter is constructed inside _launchWorkerInner; its
+  // allowStdio must be false because _isWsl is true (not because a backend
+  // exists) -- wsl_plan.md §4.10 / 附 item 11.
+  const access = manager as unknown as TeamManagerTestAccess;
+  const plannerWorker = access._team?.workers.get(planner.agentId);
+  assert(
+    plannerWorker?.mcpAdapter !== null && plannerWorker?.mcpAdapter !== undefined,
+    "worker has an McpAdapter after launch",
+  );
+  const mcpOptions = (plannerWorker?.mcpAdapter as unknown as { options: { allowStdio?: boolean } }).options;
+  assertEqual(mcpOptions?.allowStdio, false, "WSL worker McpAdapter passes allowStdio=false (by _isWsl)");
+
+  // Worker dispose must NOT dispose the shared backend; only the context owner
+  // does. stopTeam tears down worker sessions/MCP adapters but leaves the
+  // borrowed backend untouched. The dispose spy proves dispose was not invoked
+  // (without it, the identity check alone is tautological).
+  await manager.stopTeam({ deleteSnapshot: true });
+  assert(
+    access._executionBackend === fakeBackend,
+    "worker dispose/stopTeam does NOT dispose the shared backend (context owner owns it)",
+  );
+  assertEqual(
+    backendDisposeCalls.length,
+    0,
+    "worker dispose/stopTeam did NOT call backend.dispose (only context owner disposes)",
+  );
+  assert(access._team === null, "stopTeam clears the active team");
+
+  rmSync(physicalCwd, { recursive: true, force: true });
+  void team;
 }
 
 console.log("\n=== Summary ===\n");

@@ -60,6 +60,28 @@ const sessionName = computed(() => {
 });
 const messageCount = computed(() => rpc.sessionState.value?.messageCount || 0);
 const projectPath = computed(() => projectStore.currentProject?.path || "-");
+const logicalCwd = computed(() => {
+  const env = rpc.executionEnvironment.value;
+  if (env) return env.logicalCwd;
+  return projectPath.value;
+});
+const environmentLabel = computed(() => {
+  const env = rpc.executionEnvironment.value;
+  if (!env) return "";
+  if (env.kind === "wsl") return `WSL · ${env.distro}`;
+  return "Windows";
+});
+const environmentTooltip = computed(() => {
+  const env = rpc.executionEnvironment.value;
+  if (!env) return "";
+  if (env.kind === "wsl") {
+    const parts = [`WSL2 · ${env.distro}`, env.logicalCwd];
+    if (env.ready === false) parts.push("未就绪");
+    if (env.diagnostic) parts.push(env.diagnostic);
+    return parts.join("\n");
+  }
+  return `Windows · ${env.logicalCwd}`;
+});
 const goal = computed(() => {
   const currentGoal = rpc.sessionState.value?.goal;
   if (!currentGoal) return undefined;
@@ -263,8 +285,12 @@ watch(() => teamStore.teamMode, () => {
           <span class="info-value">{{ messageCount }}</span>
         </div>
         <div class="info-row">
-          <span class="info-label">项目</span>
-          <span class="info-value">{{ projectPath.split(/[/\\]/).pop() }}</span>
+          <span class="info-label">工作目录</span>
+          <span class="info-value mono" :title="logicalCwd">{{ logicalCwd }}</span>
+        </div>
+        <div v-if="environmentLabel" class="info-row">
+          <span class="info-label">环境</span>
+          <span class="info-value" :title="environmentTooltip">{{ environmentLabel }}</span>
         </div>
       </div>
     </div>
@@ -339,12 +365,16 @@ watch(() => teamStore.teamMode, () => {
         <div
           v-for="server in failedMcpServers"
           :key="server.name"
-          class="mcp-server-row failed"
-          :title="server.error || server.name"
+          class="mcp-server-block failed"
         >
-          <span class="mcp-server-dot"></span>
-          <span class="mcp-server-name">{{ server.name }}</span>
-          <span class="mcp-server-meta">失败</span>
+          <div class="mcp-server-row failed" :title="server.error || server.name">
+            <span class="mcp-server-dot"></span>
+            <span class="mcp-server-name">{{ server.name }}</span>
+            <span class="mcp-server-meta">失败</span>
+          </div>
+          <!-- The concrete error (e.g. the WSL stdio-disabled message) is shown
+               inline, not folded into a generic startup failure. -->
+          <div v-if="server.error" class="mcp-server-error">{{ server.error }}</div>
         </div>
         <div
           v-for="server in pendingMcpServers"
@@ -674,6 +704,23 @@ watch(() => teamStore.teamMode, () => {
 
 .mcp-server-row.failed .mcp-server-dot {
   background: var(--pix-error);
+}
+
+.mcp-server-block.failed {
+  border-left: 2px solid var(--pix-error-light);
+  padding-left: var(--pix-space-sm);
+}
+
+.mcp-server-error {
+  margin-top: 3px;
+  padding: var(--pix-space-xs) var(--pix-space-sm);
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-error-bg);
+  color: var(--pix-error);
+  font-size: 11px;
+  line-height: 1.45;
+  word-break: break-word;
+  white-space: pre-wrap;
 }
 
 .mcp-server-row.pending .mcp-server-dot {

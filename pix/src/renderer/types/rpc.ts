@@ -27,4 +27,6 @@ export type {
   McpResourceContent,
   McpResourceInfo,
   McpServerInfo,
+  WslDistroInfo,
+  ExecutionEnvironmentInfo,
 } from "../../shared/types";

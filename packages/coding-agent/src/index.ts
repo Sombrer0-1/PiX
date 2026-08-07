@@ -248,6 +248,8 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
+// Runtime environment context for execution backend overrides
+export type { RuntimeEnvironmentContext } from "./core/system-prompt.ts";
 export {
 	type AgentExecutionMode,
 	inspectToolExecution,
@@ -275,6 +277,7 @@ export {
 	type EditToolDetails,
 	type EditToolInput,
 	type EditToolOptions,
+	type ExecutionBackend,
 	type FindOperations,
 	type FindToolDetails,
 	type FindToolInput,
@@ -292,6 +295,9 @@ export {
 	type ReadToolDetails,
 	type ReadToolInput,
 	type ReadToolOptions,
+	type ToolMutationKeyResolver,
+	type ToolPathContext,
+	type ToolPathResolver,
 	type ToolsOptions,
 	type TruncationOptions,
 	type TruncationResult,

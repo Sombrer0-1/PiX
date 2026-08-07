@@ -1,4 +1,5 @@
 import { basename, resolve } from "node:path";
+import type { ToolPathContext } from "./tools/execution-backend.ts";
 import { getPathFromToolArgs, isPathInsideCwd } from "./file-change.ts";
 
 export type AgentExecutionMode = "approval" | "unattended" | "read-only";
@@ -24,6 +25,21 @@ function normalizeCommand(command: string): string {
 function isWindowsReservedDevicePath(path: string): boolean {
 	const leaf = basename(path).split(".")[0]?.toLowerCase();
 	return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(leaf ?? "");
+}
+
+/**
+ * Detect a Windows-style path: a drive letter (`C:\` / `C:/`) or a UNC share
+ * (`\\wsl.localhost\...`, `\\wsl$\...`, `\\server\share`).
+ *
+ * Under a POSIX (WSL) execution backend the model must address files with
+ * Linux paths (`/home/...`, `/mnt/c/...`); a drive/UNC input is rejected so
+ * the physical host namespace never leaks into file tools.
+ */
+function isWindowsStylePath(path: string): boolean {
+	const trimmed = path.trim();
+	if (/^[a-zA-Z]:[\\/]/.test(trimmed)) return true;
+	if (/^\\\\[^\\]/.test(trimmed) || trimmed.startsWith("\\\\")) return true;
+	return false;
 }
 
 function riskyCommandReason(command: string): string | undefined {
@@ -58,6 +74,8 @@ export function inspectToolExecution(options: {
 	toolName: string;
 	args: unknown;
 	cwd: string;
+	/** Path context for the active execution backend. When absent, win32 semantics apply. */
+	pathContext?: ToolPathContext;
 }): ToolPolicyDecision {
 	if (options.mode === "read-only" && !isReadOnlyTool(options.toolName)) {
 		return {
@@ -66,6 +84,7 @@ export function inspectToolExecution(options: {
 		};
 	}
 
+	const posix = options.pathContext?.pathStyle === "posix";
 	const path = getPathFromToolArgs(options.args);
 	if ((options.toolName === "write" || options.toolName === "edit") && path) {
 		if (isWindowsReservedDevicePath(path)) {
@@ -74,7 +93,16 @@ export function inspectToolExecution(options: {
 				reason: `Refusing to write Windows reserved device path "${path}". Use a normal filename instead.`,
 			};
 		}
-		if (options.mode === "approval" && !isPathInsideCwd(path, options.cwd)) {
+		// Under a POSIX (WSL) backend, reject Windows drive/UNC inputs so the
+		// physical host namespace never reaches file operations. The model must
+		// use Linux paths (/home/... or /mnt/<drive>/...).
+		if (posix && isWindowsStylePath(path)) {
+			return {
+				allowed: false,
+				reason: `Refusing Windows-style path "${path}" in WSL mode. Use a Linux path such as /home/<user>/... or /mnt/<drive>/... instead.`,
+			};
+		}
+		if (options.mode === "approval" && !isPathInsideCwd(path, options.cwd, { posix })) {
 			return {
 				allowed: false,
 				requiresApproval: true,

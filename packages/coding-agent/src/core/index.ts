@@ -76,3 +76,9 @@ export {
 } from "./extensions/index.ts";
 export type { CreateGoalOptions, ThreadGoal, ThreadGoalStatus, UpdateGoalOptions } from "./goal-runtime.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export {
+	type ExecutionBackend,
+	type ToolMutationKeyResolver,
+	type ToolPathContext,
+	type ToolPathResolver,
+} from "./tools/execution-backend.ts";
