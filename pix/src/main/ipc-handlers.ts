@@ -868,6 +868,10 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       return null;
     case "get_auth_status":
       return bridge.getAuthStatus();
+    case "get_custom_providers":
+      return bridge.getCustomProviders();
+    case "set_custom_providers":
+      return bridge.setCustomProviders(cmd.providers);
 
     // Settings (full pi settings)
     case "get_pi_settings":

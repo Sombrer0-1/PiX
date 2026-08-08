@@ -5,8 +5,9 @@
  * Renders display blocks as a flowing document.
  * Tool calls are aggregated into collapsible work-status blocks.
  */
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import type { DisplayBlock, ToolWorkItem } from "@/types/session";
+import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import MessageBlock from "./MessageBlock.vue";
 import ErrorBlock from "./ErrorBlock.vue";
 import { marked } from "marked";
@@ -259,6 +260,18 @@ const props = defineProps<{
 
 const emit = defineEmits<{ retry: [] }>();
 
+const rpc = useWorkspaceRpc();
+/** 实际发出的思考档位（thinkingLevelMap 映射后的值，如 max/high）；off 或无映射时为空。 */
+const thinkingEffortLabel = computed(() => {
+  const level = rpc.sessionState.value?.thinkingLevel;
+  if (!level || level === "off") return "";
+  const model = rpc.sessionState.value?.model;
+  if (!model) return "";
+  const info = rpc.availableModels.value.find((m) => m.provider === model.provider && m.id === model.id);
+  const mapped = info?.thinkingLevelMap?.[level];
+  return typeof mapped === "string" ? mapped : level;
+});
+
 const expandedWorkStatus = ref<Set<string>>(new Set());
 const expandedTools = ref<Set<string>>(new Set());
 
@@ -395,7 +408,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         class="thinking-block"
       >
         <span class="thinking-spinner" aria-hidden="true"></span>
-        <span>AI 正在思考...</span>
+        <span>AI 正在思考...<template v-if="thinkingEffortLabel"> · {{ thinkingEffortLabel }}</template></span>
       </div>
 
       <!-- Vision preprocessing indicator -->

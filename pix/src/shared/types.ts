@@ -12,6 +12,7 @@ import type {
   ExecutionEnvironmentInfo,
   ThinkingLevel,
 } from "./project-location.js";
+import type { CustomProviderConfig } from "./custom-providers.js";
 
 // ============================================================================
 // RPC Command Types (commands sent to pi via stdin)
@@ -79,6 +80,9 @@ export type RpcCommand =
   | { id?: string; type: "get_auth_status" }
   | { id?: string; type: "set_api_key"; provider: string; key: string }
   | { id?: string; type: "remove_auth"; provider: string }
+  // Custom providers (models.json management; reuses the RPC channel)
+  | { id?: string; type: "get_custom_providers" }
+  | { id?: string; type: "set_custom_providers"; providers: Record<string, CustomProviderConfig> }
   // Settings (full pi settings from SettingsManager)
   | { id?: string; type: "get_pi_settings" }
   | { id?: string; type: "set_pi_setting"; key: string; value: unknown }
@@ -170,6 +174,7 @@ export interface ModelInfo {
   reasoning?: boolean;
   thinkingLevels?: ThinkingLevel[];
   input?: ("text" | "image")[];
+  thinkingLevelMap?: Record<string, string | null>;
 }
 
 /**

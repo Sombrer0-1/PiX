@@ -23,6 +23,7 @@ import type {
 } from "@/types/rpc";
 import type { PixApi } from "../../main/preload";
 import type { ProjectLocation } from "@/types/session";
+import type { CustomProviderConfig } from "@shared/custom-providers";
 
 type CommandResponse<T = unknown> = { success: boolean; data?: T; error?: string };
 type LifecycleExit = { code: number | null; signal: string | null; stderr: string };
@@ -375,6 +376,17 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     await Promise.all([refreshModels(), refreshState()]);
   }
 
+  async function getCustomProviders(): Promise<{ providers: Record<string, CustomProviderConfig>; schemaError?: string } | null> {
+    return sendCommand<{ providers: Record<string, CustomProviderConfig>; schemaError?: string }>({ type: "get_custom_providers" });
+  }
+
+  async function setCustomProviders(providers: Record<string, CustomProviderConfig>): Promise<{ success: boolean; schemaError?: string; sessionActive: boolean; workersStale?: boolean; error?: string } | null> {
+    // Electron IPC 用 structured clone 序列化，无法克隆 Vue reactive Proxy；providers
+    // 来自 reactive drafts，嵌套属性仍是 Proxy，需深拷贝成 plain object 再发送。
+    const plain = JSON.parse(JSON.stringify(providers)) as Record<string, CustomProviderConfig>;
+    return sendCommand({ type: "set_custom_providers", providers: plain });
+  }
+
   async function removeAuth(provider: string): Promise<void> {
     await sendCommand({ type: "remove_auth", provider });
     await Promise.all([refreshModels(), refreshState()]);
@@ -502,6 +514,8 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     getScopedModels,
     getAuthStatus,
     setApiKey,
+    getCustomProviders,
+    setCustomProviders,
     removeAuth,
     getPiSettings,
     setPiSetting,

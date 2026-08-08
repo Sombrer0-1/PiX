@@ -12,6 +12,7 @@ import { useAuthStore } from "../stores/auth-store";
 import { useWorkspaceRpc } from "../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 import McpSettings from "../components/settings/McpSettings.vue";
+import CustomProviders from "../components/settings/CustomProviders.vue";
 
 const router = useRouter();
 const route = useRoute();
@@ -20,7 +21,7 @@ const authStore = useAuthStore();
 const rpc = useWorkspaceRpc();
 
 // ---- Navigation ----
-type SettingsSection = "general" | "model" | "shell" | "wsl" | "resources" | "mcp" | "auth" | "advanced";
+type SettingsSection = "general" | "model" | "shell" | "wsl" | "resources" | "mcp" | "custom" | "auth" | "advanced";
 const activeSection = ref<SettingsSection>("general");
 const sections: { key: SettingsSection; label: string; icon: string }[] = [
   { key: "general", label: "常规", icon: "mdi-cog-outline" },
@@ -29,6 +30,7 @@ const sections: { key: SettingsSection; label: string; icon: string }[] = [
   { key: "wsl", label: "WSL", icon: "mdi-linux" },
   { key: "resources", label: "资源", icon: "mdi-package-variant" },
   { key: "mcp", label: "MCP", icon: "mdi-puzzle-outline" },
+  { key: "custom", label: "自定义模型", icon: "mdi-transit-connection-variant" },
   { key: "auth", label: "认证", icon: "mdi-shield-key" },
   { key: "advanced", label: "高级", icon: "mdi-tune" },
 ];
@@ -90,8 +92,13 @@ const updateError = ref<string | null>(null);
 // ---- Auth editing state ----
 const editingProvider = ref<string | null>(null);
 const editingKeys = ref<Record<string, string>>({});
+// Provider names defined in ~/.pi/agent/models.json. Their API keys are managed
+// in the "自定义模型" section, so the auth section disables set/delete to avoid
+// auth.json silently overriding the models.json apiKey (double-source guard).
+const customProviderNames = ref<Set<string>>(new Set());
 
 function toggleEditProvider(provider: string): void {
+  if (customProviderNames.value.has(provider)) return;
   if (editingProvider.value === provider) {
     editingProvider.value = null;
   } else {
@@ -228,10 +235,25 @@ onMounted(async () => {
     } catch { /* use defaults */ }
     try { await rpc.refreshModels(); } catch { /* unavailable */ }
     try { await authStore.refreshStatus(); } catch { /* unavailable */ }
+    try {
+      const result = await rpc.getCustomProviders();
+      if (result) customProviderNames.value = new Set(Object.keys(result.providers));
+    } catch { /* unavailable */ }
   }
 });
 
 watch(() => route.query.section, syncSectionFromRoute);
+
+// Re-sync custom provider names when entering the auth section so the
+// double-source guard reflects any providers added/removed in "自定义模型"
+// since mount (CustomProviders.vue refreshes auth status on save but not this set).
+watch(activeSection, async (section) => {
+  if (section !== "auth" || !rpc.isConnected.value) return;
+  try {
+    const result = await rpc.getCustomProviders();
+    if (result) customProviderNames.value = new Set(Object.keys(result.providers));
+  } catch { /* unavailable */ }
+});
 
 function applyPiSettings(s: Record<string, unknown>): void {
   steeringMode.value = (s.steeringMode as "all" | "one-at-a-time") ?? "one-at-a-time";
@@ -552,6 +574,11 @@ async function downloadAndInstall(): Promise<void> {
           <McpSettings />
         </div>
 
+        <!-- ============ 自定义模型 ============ -->
+        <div v-show="activeSection === 'custom'" class="section-panel">
+          <CustomProviders />
+        </div>
+
         <!-- ============ 认证 ============ -->
         <div v-show="activeSection === 'auth'" class="section-panel">
           <h2 class="section-title">认证</h2>
@@ -564,19 +591,21 @@ async function downloadAndInstall(): Promise<void> {
                 <div class="auth-provider-info">
                   <span class="auth-provider-name">{{ provider }}</span>
                   <span v-if="status.label" class="auth-provider-label">{{ status.label }}</span>
+                  <span v-if="customProviderNames.has(provider)" class="auth-custom-hint">密钥在「自定义模型」分区管理</span>
                 </div>
                 <div class="auth-status-info">
                   <v-icon size="small" :color="status.configured ? 'success' : undefined" :icon="status.configured ? 'mdi-check-circle' : 'mdi-circle-outline'" />
                   <span class="auth-status-text">{{ status.configured ? '已配置' : '未配置' }}</span>
                   <span v-if="status.source" class="auth-source">来源 {{ status.source }}</span>
-                  <v-icon size="small" class="ml-2">{{ editingProvider === provider ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
+                  <v-icon v-if="customProviderNames.has(provider)" size="small" class="ml-2" icon="mdi-lock-outline" />
+                  <v-icon v-else size="small" class="ml-2">{{ editingProvider === provider ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
                 </div>
               </div>
               <div v-if="editingProvider === provider" class="auth-edit-row">
-                <v-text-field v-model="editingKeys[provider]" type="password" :placeholder="status.configured ? '输入新密钥以替换...' : '粘贴 API 密钥...'" hide-details density="comfortable" @keydown.enter="saveKey(provider)" class="mb-3" />
+                <v-text-field v-model="editingKeys[provider]" type="password" :disabled="customProviderNames.has(provider)" :placeholder="status.configured ? '输入新密钥以替换...' : '粘贴 API 密钥...'" hide-details density="comfortable" @keydown.enter="saveKey(provider)" class="mb-3" />
                 <div class="auth-btn-group">
-                  <v-btn size="small" color="primary" variant="tonal" :disabled="!editingKeys[provider]?.trim()" @click="saveKey(provider)">保存</v-btn>
-                  <v-btn v-if="status.configured" size="small" color="error" variant="text" @click="deleteKey(provider)">删除</v-btn>
+                  <v-btn size="small" color="primary" variant="tonal" :disabled="customProviderNames.has(provider) || !editingKeys[provider]?.trim()" @click="saveKey(provider)">保存</v-btn>
+                  <v-btn v-if="status.configured" size="small" color="error" variant="text" :disabled="customProviderNames.has(provider)" @click="deleteKey(provider)">删除</v-btn>
                 </div>
               </div>
             </v-card>
@@ -872,6 +901,11 @@ async function downloadAndInstall(): Promise<void> {
 .auth-provider-label {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-secondary);
+}
+
+.auth-custom-hint {
+  font-size: var(--pix-text-xs);
+  color: var(--pix-accent);
 }
 
 .auth-status-info {

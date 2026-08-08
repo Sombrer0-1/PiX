@@ -6,7 +6,7 @@
 
 <template>
   <div class="model-settings">
-    <p class="settings-note">模型设置通过 PiX 设置页面进行配置。您也可以在会话过程中使用底部栏的模型选择器切换模型。</p>
+    <p class="settings-note">模型设置通过 PiX 设置页面进行配置。您也可以在会话过程中使用底部栏的模型选择器切换模型。如需添加第三方 provider 或中转站，请在左侧「自定义模型」分区配置。</p>
   </div>
 </template>
 

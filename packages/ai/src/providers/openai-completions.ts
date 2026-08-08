@@ -414,9 +414,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
-			// Some providers via OpenRouter give additional information in this field.
-			const rawMetadata = (error as any)?.error?.metadata?.raw;
-			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
+			// Surface provider/relay error body for diagnosis (503/400 etc.). The OpenAI SDK
+			// exposes the parsed body as `error.error`; OpenRouter nests extra detail under
+			// `error.error.metadata.raw`. Append whichever is present so the user can see why
+			// a relay rejected the request (e.g. an unsupported reasoning_effort field).
+			const nested = (error as { error?: unknown }).error;
+			if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+				const raw = (nested as { metadata?: { raw?: unknown } }).metadata?.raw;
+				if (typeof raw === "string" && raw) {
+					output.errorMessage += `\n${raw}`;
+				} else {
+					const bodyStr = JSON.stringify(nested);
+					if (bodyStr && bodyStr !== "{}") output.errorMessage += `\n${bodyStr}`;
+				}
+			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

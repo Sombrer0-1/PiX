@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
-import { existsSync, statSync } from "fs";
+import { chmodSync, existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { basename, isAbsolute, join, relative, resolve } from "path";
+import { lockSync } from "proper-lockfile";
 import { shell } from "electron";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
@@ -58,6 +59,7 @@ import type {
 	ChatMessageAttachment,
 	SessionInfo,
 } from "../shared/types.js";
+import { type CustomProviderConfig, SENTINEL } from "../shared/custom-providers.js";
 import { processChatFiles } from "./chat-files.js";
 
 interface ExitPayload {
@@ -134,6 +136,66 @@ function createEmptyAuxiliaryUsage(): AuxiliaryUsageTotals {
 		cacheWrite: 0,
 		cost: 0,
 	};
+}
+
+/**
+ * Extract a validated `providers` map from a parsed models.json value.
+ * Returns an empty map when the value is missing, not an object, or has no
+ * usable `providers` field. Malformed provider entries are skipped.
+ */
+function readModelsProviders(value: unknown): Record<string, CustomProviderConfig> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const providers = (value as { providers?: unknown }).providers;
+	if (!providers || typeof providers !== "object" || Array.isArray(providers)) return {};
+	const result: Record<string, CustomProviderConfig> = {};
+	for (const [name, provider] of Object.entries(providers as Record<string, unknown>)) {
+		if (provider && typeof provider === "object" && !Array.isArray(provider)) {
+			result[name] = provider as CustomProviderConfig;
+		}
+	}
+	return result;
+}
+
+/**
+ * Mask plaintext header values for IPC. Any non-empty string value is replaced
+ * with SENTINEL (mirrors apiKey masking); empty values are left as-is. Header
+ * keys (e.g. "Authorization") are not secret and are preserved so the UI can
+ * show which headers exist.
+ */
+function maskHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+	if (!headers) return headers;
+	const masked: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		masked[key] = typeof value === "string" && value !== "" ? SENTINEL : value;
+	}
+	return masked;
+}
+
+/**
+ * Resolve header values on write, mirroring the apiKey contract: SENTINEL keeps
+ * the on-disk value for that key, null/empty drops the key, any other string
+ * becomes the new value. Returns undefined when no headers remain (so the field
+ * is dropped under the wholesale-replacement model).
+ */
+function resolveHeaders(
+	incoming: Record<string, string> | undefined,
+	disk: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+	if (!incoming) return undefined;
+	const resolved: Record<string, string> = {};
+	for (const [key, value] of Object.entries(incoming)) {
+		if (value === SENTINEL) {
+			const diskValue = disk?.[key];
+			if (typeof diskValue === "string" && diskValue !== "") {
+				resolved[key] = diskValue;
+			}
+			// No on-disk value to restore: drop the key.
+		} else if (typeof value === "string" && value !== "") {
+			resolved[key] = value;
+		}
+		// null or empty string: drop the key.
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
 }
 
 export class SessionBridge {
@@ -583,6 +645,7 @@ export class SessionBridge {
 			reasoning: m.model.reasoning,
 			thinkingLevels: getSupportedThinkingLevels(m.model) as ThinkingLevel[],
 			input: m.model.input,
+				thinkingLevelMap: m.model.thinkingLevelMap,
 		}));
 	}
 
@@ -615,6 +678,9 @@ export class SessionBridge {
 		if (!this._authStorage) {
 			throw new Error("Auth storage not initialized. Start a session first.");
 		}
+		if (this._readModelsProviderNames().has(provider)) {
+			throw new Error("该 provider 的凭证请在「自定义模型」分区管理");
+		}
 		this._authStorage.set(provider, { type: "api_key", key });
 		const session = this._getSession();
 		session.modelRegistry.refresh();
@@ -625,10 +691,274 @@ export class SessionBridge {
 		if (!this._authStorage) {
 			throw new Error("Auth storage not initialized. Start a session first.");
 		}
+		if (this._readModelsProviderNames().has(provider)) {
+			throw new Error("该 provider 的凭证请在「自定义模型」分区管理");
+		}
 		this._authStorage.remove(provider);
 		const session = this._getSession();
 		session.modelRegistry.refresh();
 		this._applyEnabledModelScope(session);
+	}
+
+	/**
+	 * Read models.json providers for the settings UI. Pure file read; does not
+	 * require an active session. Each provider's plaintext apiKey is replaced
+	 * with SENTINEL before crossing IPC (undefined when never set). Header
+	 * VALUES (provider- and model-level) are likewise masked: any non-empty
+	 * string becomes SENTINEL so plaintext tokens in headers like
+	 * Authorization/x-api-key never reach the renderer. When a session is
+	 * active, schemaError carries the registry's last load error. The disk read
+	 * is serialized under the models.json lock so a concurrent setCustomProviders
+	 * write cannot expose a half-written file.
+	 */
+	getCustomProviders(): { providers: Record<string, CustomProviderConfig>; schemaError?: string } {
+		let providers: Record<string, CustomProviderConfig> = {};
+		let schemaError: string | undefined;
+		try {
+			const src = this.withModelsLock(() => {
+				const modelsPath = join(getAgentDir(), "models.json");
+				if (!existsSync(modelsPath)) return {} as Record<string, CustomProviderConfig>;
+				const raw = readFileSync(modelsPath, "utf-8");
+				const parsed: unknown = JSON.parse(raw);
+				return readModelsProviders(parsed);
+			});
+			for (const [name, provider] of Object.entries(src)) {
+				const masked: CustomProviderConfig = { ...provider };
+				if (typeof masked.apiKey === "string" && masked.apiKey !== "") {
+					masked.apiKey = SENTINEL;
+				} else {
+					delete masked.apiKey;
+				}
+				masked.headers = maskHeaders(masked.headers);
+				if (masked.models) {
+					masked.models = masked.models.map((model) => ({
+						...model,
+						headers: maskHeaders(model.headers),
+					}));
+				}
+				providers[name] = masked;
+			}
+		} catch (err) {
+			providers = {};
+			schemaError = `models.json 解析失败: ${err instanceof Error ? err.message : String(err)}`;
+		}
+		if (schemaError === undefined && this._session) {
+			schemaError = this._session.modelRegistry.getError() ?? undefined;
+		}
+		return { providers, schemaError };
+	}
+
+	/**
+	 * Write models.json providers from the settings UI. `providers` is wholly
+	 * replaced by `incoming`; top-level non-providers fields are preserved.
+	 * apiKey resolution: SENTINEL keeps the on-disk value, null clears the
+	 * field, any other string becomes the new key. Header VALUES follow the
+	 * same contract (SENTINEL keeps the on-disk value for that key, null/empty
+	 * drops the key, other string is the new value), applied to provider-level
+	 * and each model's headers. The read-modify-write is serialized under the
+	 * models.json lock (mirrors auth-storage's acquireLockSyncWithRetry) so two
+	 * writers cannot interleave. The write is atomic (temp file + rename,
+	 * created mode 0600) and followed by chmod 0600. When a session is active
+	 * the leader registry is refreshed and its schema error returned. Team
+	 * workers hold independent registries that are NOT refreshed here, so
+	 * workersStale is set when team mode is active to let the UI prompt a
+	 * restart.
+	 */
+	setCustomProviders(incoming: Record<string, CustomProviderConfig>): {
+		success: boolean;
+		schemaError?: string;
+		sessionActive: boolean;
+		workersStale?: boolean;
+		error?: string;
+	} {
+		const teamActive = this._role === "team-leader" && (this._teamManager?.hasActiveTeam() ?? false);
+		try {
+			this.withModelsLock(() => {
+				const modelsPath = join(getAgentDir(), "models.json");
+				// Read current disk state; preserve top-level non-providers fields.
+				let diskData: Record<string, unknown> = {};
+				if (existsSync(modelsPath)) {
+					const raw = readFileSync(modelsPath, "utf-8");
+					const parsed: unknown = JSON.parse(raw);
+					if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+						diskData = parsed as Record<string, unknown>;
+					}
+				}
+				const diskProviders = readModelsProviders(diskData);
+
+				// providers are wholly replaced by incoming; resolve apiKey/headers per protocol.
+				const merged: Record<string, CustomProviderConfig> = {};
+				for (const [name, incomingProvider] of Object.entries(incoming)) {
+					const resolved: CustomProviderConfig = { ...incomingProvider };
+					// Normalize baseUrl: trim + strip trailing slashes (opencode trims only
+					// trailing slashes; we also trim whitespace). Double-safety with the UI.
+					if (typeof resolved.baseUrl === "string") {
+						resolved.baseUrl = resolved.baseUrl.trim().replace(/\/+$/, "");
+					}
+					const incomingApiKey = (incomingProvider as { apiKey?: string | null }).apiKey;
+					if (incomingApiKey === SENTINEL) {
+						const diskApiKey = diskProviders[name]?.apiKey;
+						if (typeof diskApiKey === "string" && diskApiKey !== "") {
+							resolved.apiKey = diskApiKey;
+						} else {
+							delete resolved.apiKey;
+						}
+					} else if (incomingApiKey === null) {
+						delete resolved.apiKey;
+					} else if (typeof incomingApiKey === "string") {
+						resolved.apiKey = incomingApiKey;
+					} else {
+						delete resolved.apiKey;
+					}
+					// Resolve provider-level headers (SENTINEL keeps on-disk, null/empty drops).
+					const diskProvider = diskProviders[name];
+					const resolvedHeaders = resolveHeaders(incomingProvider.headers, diskProvider?.headers);
+					if (resolvedHeaders) {
+						resolved.headers = resolvedHeaders;
+					} else {
+						delete resolved.headers;
+					}
+					// Resolve each model's headers against the matching on-disk model.
+					if (resolved.models) {
+						resolved.models = resolved.models.map((model) => {
+							const diskModel = diskProvider?.models?.find((m) => m.id === model.id);
+						const resolvedModel = { ...model };
+						// The UI does not expose model-level headers; when the incoming model
+						// carries none, preserve the on-disk headers instead of dropping them
+						// (don't destroy data the UI cannot represent).
+						const resolvedModelHeaders = model.headers
+							? resolveHeaders(model.headers, diskModel?.headers)
+							: diskModel?.headers;
+							if (resolvedModelHeaders) {
+								resolvedModel.headers = resolvedModelHeaders;
+							} else {
+								delete resolvedModel.headers;
+							}
+							return resolvedModel;
+						});
+					}
+					merged[name] = resolved;
+				}
+
+				// Atomic write: temp file (mode 0600) -> rename -> chmod 0600.
+				const output: Record<string, unknown> = { ...diskData, providers: merged };
+				const json = JSON.stringify(output, null, 2);
+				const tmpPath = `${modelsPath}.tmp`;
+				try {
+					writeFileSync(tmpPath, json, { encoding: "utf-8", mode: 0o600 });
+					renameSync(tmpPath, modelsPath);
+				} finally {
+					// Clean up a leftover temp file if the rename failed; a no-op on
+					// success (rename removes the source). Guard ENOENT for the race-free path.
+					try {
+						if (existsSync(tmpPath)) {
+							unlinkSync(tmpPath);
+						}
+					} catch {
+						// Best-effort cleanup; ignore if the file is already gone.
+					}
+				}
+				try {
+					chmodSync(modelsPath, 0o600);
+				} catch {
+					// chmod is best-effort (no-op on Windows; some filesystems reject it).
+				}
+			});
+
+			let schemaError: string | undefined;
+			let sessionActive: boolean;
+			if (this._session) {
+				this._session.modelRegistry.refresh();
+				schemaError = this._session.modelRegistry.getError() ?? undefined;
+				sessionActive = true;
+			} else {
+				sessionActive = false;
+			}
+			return { success: true, schemaError, sessionActive, workersStale: teamActive };
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+				sessionActive: this._session != null,
+				workersStale: false,
+			};
+		}
+	}
+
+	/**
+	 * Read the set of provider names defined in models.json. Used to block
+	 * setApiKey/removeAuth from touching providers whose credentials must be
+	 * managed in the custom-providers partition (prevents auth.json from
+	 * silently overriding models.json apiKey, which would leak real keys to a
+	 * proxy URL in the override-builtin-provider scenario). The read is taken
+	 * under the models.json lock so a mid-write read cannot fail open (a
+	 * half-written file would otherwise throw, the catch would return an empty
+	 * set, and the auth guard would let auth.json override a models.json key).
+	 */
+	private _readModelsProviderNames(): Set<string> {
+		try {
+			return this.withModelsLock(() => {
+				const modelsPath = join(getAgentDir(), "models.json");
+				if (!existsSync(modelsPath)) return new Set<string>();
+				const raw = readFileSync(modelsPath, "utf-8");
+				const parsed: unknown = JSON.parse(raw);
+				return new Set(Object.keys(readModelsProviders(parsed)));
+			});
+		} catch {
+			return new Set();
+		}
+	}
+
+	/**
+	 * Serialize a critical section against the models.json lockfile. Mirrors
+	 * auth-storage's acquireLockSyncWithRetry: lockSync with realpath:false,
+	 * retry on ELOCKED, release in finally. Stays synchronous because every
+	 * caller (getCustomProviders / setCustomProviders / _readModelsProviderNames)
+	 * is itself a synchronous IPC handler. lockSync on a missing file only
+	 * creates the .lock sidecar, so callers still own their existsSync branch.
+	 */
+	private withModelsLock<T>(fn: () => T): T {
+		const modelsPath = join(getAgentDir(), "models.json");
+		let release: (() => void) | undefined;
+		try {
+			release = this._acquireModelsLockSync(modelsPath);
+			return fn();
+		} finally {
+			if (release) {
+				try {
+					release();
+				} catch {
+					// Ignore unlock errors (lock may have been compromised).
+				}
+			}
+		}
+	}
+
+	private _acquireModelsLockSync(path: string): () => void {
+		const maxAttempts = 10;
+		const delayMs = 20;
+		let lastError: unknown;
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				return lockSync(path, { realpath: false });
+			} catch (error) {
+				const code =
+					typeof error === "object" && error !== null && "code" in error
+						? String((error as { code?: unknown }).code)
+						: undefined;
+				if (code !== "ELOCKED" || attempt === maxAttempts) {
+					throw error;
+				}
+				lastError = error;
+				const start = Date.now();
+				while (Date.now() - start < delayMs) {
+					// Sleep synchronously to avoid changing callers to async.
+				}
+			}
+		}
+
+		throw (lastError as Error) ?? new Error("Failed to acquire models.json lock");
 	}
 
 	// =========================================================================
@@ -819,6 +1149,7 @@ export class SessionBridge {
 				reasoning: model.reasoning,
 				thinkingLevels: getSupportedThinkingLevels(model) as ThinkingLevel[],
 				input: model.input,
+				thinkingLevelMap: model.thinkingLevelMap,
 			}));
 	}
 

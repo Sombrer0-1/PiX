@@ -111,6 +111,16 @@ const canSend = computed(() =>
   !isSending.value
 );
 const isStreaming = computed(() => rpc.isStreaming.value);
+/** 实际发出的思考档位（映射后值）；off 或无映射时为空。 */
+const streamingEffortLabel = computed(() => {
+  const level = rpc.sessionState.value?.thinkingLevel;
+  if (!level || level === "off") return "";
+  const model = rpc.sessionState.value?.model;
+  if (!model) return "";
+  const info = rpc.availableModels.value.find((m) => m.provider === model.provider && m.id === model.id);
+  const mapped = info?.thinkingLevelMap?.[level];
+  return typeof mapped === "string" ? mapped : level;
+});
 const canUseTeamMode = computed(() => Boolean(projectStore.currentProject && rpc.isConnected.value));
 
 const composerPlaceholder = computed(() => {
@@ -122,7 +132,7 @@ const composerPlaceholder = computed(() => {
 });
 
 const statusText = computed(() => {
-  if (rpc.isStreaming.value) return "运行中";
+  if (rpc.isStreaming.value) return streamingEffortLabel.value ? `运行中 · ${streamingEffortLabel.value}` : "运行中";
   if (rpc.sessionState.value?.isCompacting) return "压缩中";
   return "空闲";
 });

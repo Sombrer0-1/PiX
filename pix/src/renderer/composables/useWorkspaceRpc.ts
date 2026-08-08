@@ -20,6 +20,7 @@ import type {
   TreeEntry,
   UserMessageForForking,
 } from "@/types/rpc";
+import type { CustomProviderConfig } from "@shared/custom-providers";
 
 export function useWorkspaceRpc() {
   const teamStore = useTeamStore();
@@ -68,6 +69,8 @@ export function useWorkspaceRpc() {
     getScopedModels: (): Promise<ModelInfo[] | null> => activeRpc.value.getScopedModels(),
     getAuthStatus: (): Promise<AuthStatusMap | null> => activeRpc.value.getAuthStatus(),
     setApiKey: (provider: string, key: string): Promise<void> => activeRpc.value.setApiKey(provider, key),
+    getCustomProviders: () => activeRpc.value.getCustomProviders(),
+    setCustomProviders: (providers: Record<string, CustomProviderConfig>) => activeRpc.value.setCustomProviders(providers),
     removeAuth: (provider: string): Promise<void> => activeRpc.value.removeAuth(provider),
     getPiSettings: (): Promise<Record<string, unknown> | null> => activeRpc.value.getPiSettings(),
     setPiSetting: (key: string, value: unknown): Promise<void> => activeRpc.value.setPiSetting(key, value),
