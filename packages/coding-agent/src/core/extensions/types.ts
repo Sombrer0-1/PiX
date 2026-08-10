@@ -48,7 +48,7 @@ import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
-import type { ModelRegistry } from "../model-registry.ts";
+import type { ReadonlyModelRegistry } from "../model-registry.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -304,8 +304,8 @@ export interface ExtensionContext {
 	cwd: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
-	/** Model registry for API key resolution */
-	modelRegistry: ModelRegistry;
+	/** 只用于 model/auth 查询；provider mutation 必须使用 ExtensionAPI 上的正式方法。 */
+	modelRegistry: ReadonlyModelRegistry;
 	/** Current model (may be undefined) */
 	model: Model<any> | undefined;
 	/** Whether the agent is idle (not streaming) */

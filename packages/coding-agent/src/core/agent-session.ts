@@ -210,6 +210,18 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 // Types
 // ============================================================================
 
+/**
+ * Extension provider mutation policy.
+ *
+ * - "mutable" (default): pi.registerProvider/unregisterProvider behave exactly
+ *   as today, including current-model refresh after provider changes.
+ * - "read-only": extensions still load, bind and run and their
+ *   tools/commands/events still refresh, but pending registrations at load
+ *   flush and runtime register/unregister become side-effect-free no-ops that
+ *   never touch the shared registry and never refresh the current model.
+ */
+export type ExtensionProviderPolicy = "mutable" | "read-only";
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -250,6 +262,8 @@ export interface AgentSessionConfig {
 	requestUserInput?: RequestUserInputHandler;
 	/** Whether built-in enhancement tools such as goal and request_user_input should be registered. */
 	enableBuiltInEnhancementTools?: boolean;
+	/** 默认 mutable；nested session 必须传 read-only，保护借用的 ModelRegistry。 */
+	extensionProviderPolicy?: ExtensionProviderPolicy;
 }
 
 export interface ExtensionBindings {
@@ -427,6 +441,11 @@ export class AgentSession {
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
 
+	// Extension provider mutation policy, normalized to "mutable" at
+	// construction and held for the whole session lifetime. Applied to the
+	// initial runner and to every reload-created runner.
+	private _extensionProviderPolicy: ExtensionProviderPolicy;
+
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -460,6 +479,7 @@ export class AgentSession {
 		this._executionBackend = config.executionBackend;
 		this._runtimeEnvironmentOverride = config.runtimeEnvironmentOverride;
 		this._modelRegistry = config.modelRegistry;
+		this._extensionProviderPolicy = config.extensionProviderPolicy ?? "mutable";
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -986,24 +1006,97 @@ export class AgentSession {
 			reason?: SessionShutdownEvent["reason"];
 			targetSessionFile?: string;
 			emitSessionShutdown?: boolean;
+			/** 默认 true；nested session 必须传 false，避免清理其它同进程 session 的 detached children。 */
+			killTrackedDetachedChildren?: boolean;
+			/** 默认 undefined（沿用现有无超时行为）；nested session 固定传 NESTED_CLEANUP_TIMEOUT_MS。 */
+			extensionShutdownTimeoutMs?: number;
 		} = {},
 	): Promise<void> {
 		if (this._disposed) return;
 		this._disposed = true;
 
 		if (options.emitSessionShutdown !== false) {
-			try {
-				await emitSessionShutdownEvent(this._extensionRunner, {
-					type: "session_shutdown",
-					reason: options.reason ?? "quit",
-					targetSessionFile: options.targetSessionFile,
+			const shutdownEvent = {
+				type: "session_shutdown" as const,
+				reason: options.reason ?? ("quit" as const),
+				targetSessionFile: options.targetSessionFile,
+			};
+			const shutdownPromise = emitSessionShutdownEvent(this._extensionRunner, shutdownEvent);
+			const timeoutMs = options.extensionShutdownTimeoutMs;
+			// Never throws: a throwing error listener must not interrupt dispose
+			// or turn the observer promise into an unhandled rejection.
+			const reportShutdownError = (err: unknown): void => {
+				try {
+					this._extensionRunner.emitError({
+						extensionPath: "<runtime>",
+						event: "session_shutdown",
+						error: err instanceof Error ? err.message : String(err),
+					});
+				} catch {
+					// Error listeners must not be able to abort dispose.
+				}
+			};
+			// The timeout only bounds the session_shutdown handler aggregate. It
+			// never force-kills extension JavaScript: the original promise keeps
+			// running and always keeps resolve/reject observers so a late
+			// rejection can never become an unhandled rejection.
+			if (timeoutMs === undefined) {
+				try {
+					await shutdownPromise;
+				} catch (err) {
+					reportShutdownError(err);
+				}
+			} else if (timeoutMs === 0) {
+				// 0 means don't wait; observe the promise for a late settlement.
+				shutdownPromise.then(
+					() => {},
+					(err) => reportShutdownError(err),
+				);
+			} else if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+				let timedOut = false;
+				let shutdownError: unknown;
+				const timeoutPromise = sleep(timeoutMs).then(() => {
+					timedOut = true;
 				});
-			} catch (err) {
-				this._extensionRunner.emitError({
-					extensionPath: "<runtime>",
-					event: "session_shutdown",
-					error: err instanceof Error ? err.message : String(err),
-				});
+				try {
+					await Promise.race([shutdownPromise, timeoutPromise]);
+				} catch (err) {
+					// A rejecting shutdown aggregate (for example an error listener
+					// throwing during handler error reporting) must never escape
+					// dispose: record a bounded error and keep the local cleanup
+					// below running.
+					shutdownError = err;
+				}
+				if (timedOut) {
+					try {
+						this._extensionRunner.emitError({
+							extensionPath: "<runtime>",
+							event: "session_shutdown",
+							error: `session_shutdown extension handlers did not complete within ${timeoutMs}ms`,
+						});
+					} catch {
+						// Error listeners must not interrupt the timeout path.
+					}
+					shutdownPromise.then(
+						() => {},
+						(err) => reportShutdownError(err),
+					);
+				} else if (shutdownError !== undefined) {
+					reportShutdownError(shutdownError);
+				} else {
+					try {
+						await shutdownPromise;
+					} catch (err) {
+						reportShutdownError(err);
+					}
+				}
+			} else {
+				// Invalid timeout value: fall back to the default await behavior.
+				try {
+					await shutdownPromise;
+				} catch (err) {
+					reportShutdownError(err);
+				}
 			}
 		}
 
@@ -1014,7 +1107,9 @@ export class AgentSession {
 			this.abortBash();
 			this.agent.abort();
 			this._backgroundTaskRegistry.stopAll();
-			killTrackedDetachedChildren();
+			if (options.killTrackedDetachedChildren !== false) {
+				killTrackedDetachedChildren();
+			}
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
 		}
@@ -1261,12 +1356,15 @@ export class AgentSession {
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
+		// Only inject the agent catalog when the agent tool is active.
+		const loadedAgents = toolNames.includes("agent") ? this._resourceLoader.getAgents?.()?.agents : undefined;
 
 		this._baseSystemPromptOptions = {
 			cwd: this._runtimeCwd,
 			runtimeEnvironment: this._runtimeEnvironmentContext(),
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
+			agents: loadedAgents,
 			customPrompt: loaderSystemPrompt,
 			appendSystemPrompt,
 			selectedTools: validToolNames,
@@ -2979,16 +3077,26 @@ export class AgentSession {
 				},
 				getSystemPrompt: () => this.systemPrompt,
 			},
-			{
-				registerProvider: (name, config) => {
-					this._modelRegistry.registerProvider(name, config);
-					this._refreshCurrentModelFromRegistry();
-				},
-				unregisterProvider: (name) => {
-					this._modelRegistry.unregisterProvider(name);
-					this._refreshCurrentModelFromRegistry();
-				},
-			},
+			this._extensionProviderPolicy === "read-only"
+				? {
+						// read-only: load-phase pending registrations and runtime
+						// register/unregister become side-effect-free no-ops. They must
+						// not touch the shared registry, must not refresh the current
+						// model, and must not fall back to the raw registry through
+						// ExtensionRunner (the explicit actions always win).
+						registerProvider: () => {},
+						unregisterProvider: () => {},
+					}
+				: {
+						registerProvider: (name, config) => {
+							this._modelRegistry.registerProvider(name, config);
+							this._refreshCurrentModelFromRegistry();
+						},
+						unregisterProvider: (name) => {
+							this._modelRegistry.unregisterProvider(name);
+							this._refreshCurrentModelFromRegistry();
+						},
+					},
 		);
 	}
 

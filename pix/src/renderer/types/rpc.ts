@@ -19,6 +19,7 @@ export type {
   ThreadGoalStatus,
   RequestUserInputRequest,
   RequestUserInputResponse,
+  RequestUserInputDismissal,
   ThemeInfo,
   TreeEntry,
   UserMessageForForking,

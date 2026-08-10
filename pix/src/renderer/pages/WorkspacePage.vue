@@ -21,7 +21,7 @@ import LeftPanel from "../components/layout/LeftPanel.vue";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import RightPanel from "../components/layout/RightPanel.vue";
 import { toPlain } from "../utils/plain";
-import type { AgentMessage, RequestUserInputRequest } from "@/types/rpc";
+import type { AgentMessage, RequestUserInputDismissal, RequestUserInputRequest } from "@/types/rpc";
 import type { ProjectLocation } from "@/types/session";
 
 const router = useRouter();
@@ -34,9 +34,16 @@ const singleRpc = useRpc();
 const teamLeaderRpc = useTeamLeaderRpc();
 let unsubscribeEvent: (() => void) | null = null;
 let unsubscribeUserInput: (() => void) | null = null;
+let unsubscribeUserInputDismissed: (() => void) | null = null;
 let unsubscribeTeamLeaderEvent: (() => void) | null = null;
 let unsubscribeTeamLeaderUserInput: (() => void) | null = null;
+let unsubscribeTeamLeaderUserInputDismissed: (() => void) | null = null;
 let unsubscribeTeamEvent: (() => void) | null = null;
+/** Invalidated on mode switch, subscription cleanup and unmount; stale
+ *  snapshot resolutions must never open the clarification UI. */
+let userInputSubscriptionToken = 0;
+/** Incremented by every request/dismissal callback; guards async snapshots. */
+let userInputEventRevision = 0;
 const pendingUserInput = ref<RequestUserInputRequest | null>(null);
 const pendingUserInputMode = ref<"single" | "team">("single");
 const userInputAnswers = ref<Record<string, string>>({});
@@ -174,20 +181,55 @@ async function syncWorkspaceState(
 }
 
 function clearSessionSubscriptions(): void {
+  userInputSubscriptionToken++;
   unsubscribeEvent?.();
   unsubscribeEvent = null;
   unsubscribeUserInput?.();
   unsubscribeUserInput = null;
+  unsubscribeUserInputDismissed?.();
+  unsubscribeUserInputDismissed = null;
   unsubscribeTeamLeaderEvent?.();
   unsubscribeTeamLeaderEvent = null;
   unsubscribeTeamLeaderUserInput?.();
   unsubscribeTeamLeaderUserInput = null;
+  unsubscribeTeamLeaderUserInputDismissed?.();
+  unsubscribeTeamLeaderUserInputDismissed = null;
   unsubscribeTeamEvent?.();
   unsubscribeTeamEvent = null;
 }
 
 function subscribeToModeEvents(): void {
   clearSessionSubscriptions();
+  const token = ++userInputSubscriptionToken;
+  const mode = teamStore.teamMode ? "team" : "single";
+
+  // Any request/dismissal callback increments the local revision FIRST so an
+  // async snapshot result cannot overwrite a push that arrived meanwhile.
+  const onUserInputRequest = (request: RequestUserInputRequest, requestMode: "single" | "team"): void => {
+    userInputEventRevision++;
+    if (pendingUserInput.value && pendingUserInput.value.id === request.id) {
+      // Duplicate event with the same id: keep the filled answers.
+      return;
+    }
+    if (pendingUserInput.value) {
+      // Defensive replacement for a different id; main's correctness must not
+      // depend on it (the bridge FIFO owns ordering).
+      discardUserInput();
+    }
+    openUserInputRequest(request, requestMode);
+  };
+
+  const onUserInputDismissed = (event: RequestUserInputDismissal, dismissedMode: "single" | "team"): void => {
+    userInputEventRevision++;
+    if (
+      pendingUserInput.value &&
+      pendingUserInput.value.id === event.id &&
+      pendingUserInputMode.value === dismissedMode
+    ) {
+      // Main-initiated dismissal: local discard only, never a cancelled response.
+      discardUserInput();
+    }
+  };
 
   if (teamStore.teamMode) {
     unsubscribeTeamLeaderEvent = window.pixApi.onTeamLeaderEvent((event) => {
@@ -200,27 +242,50 @@ function subscribeToModeEvents(): void {
       if (shouldRefresh) void syncWorkspaceState();
     });
     unsubscribeTeamLeaderUserInput = window.pixApi.onTeamLeaderUserInputRequest((request) => {
-      if (pendingUserInput.value) void respondUserInput(true);
-      openUserInputRequest(request, "team");
+      onUserInputRequest(request, "team");
+    });
+    unsubscribeTeamLeaderUserInputDismissed = window.pixApi.onTeamLeaderUserInputDismissed((event) => {
+      onUserInputDismissed(event, "team");
     });
     unsubscribeTeamEvent = teamStore.subscribeToEvents();
-    return;
+  } else {
+    unsubscribeEvent = window.pixApi.onPiEvent((event) => {
+      singleSessionStore.addEvent(event);
+      const shouldRefreshSessions =
+        event.type === "agent_start" ||
+        event.type === "agent_end" ||
+        event.type === "session_info_changed" ||
+        (event.type === "message_end" && event.message.role === "user");
+      if (shouldRefreshSessions) void syncWorkspaceState();
+    });
+    unsubscribeUserInput = window.pixApi.onUserInputRequest((request) => {
+      onUserInputRequest(request, "single");
+    });
+    unsubscribeUserInputDismissed = window.pixApi.onUserInputDismissed((event) => {
+      onUserInputDismissed(event, "single");
+    });
   }
 
-  unsubscribeEvent = window.pixApi.onPiEvent((event) => {
-    singleSessionStore.addEvent(event);
-    const shouldRefreshSessions =
-      event.type === "agent_start" ||
-      event.type === "agent_end" ||
-      event.type === "session_info_changed" ||
-      (event.type === "message_end" && event.message.role === "user");
-    if (shouldRefreshSessions) void syncWorkspaceState();
-  });
-
-  unsubscribeUserInput = window.pixApi.onUserInputRequest((request) => {
-    if (pendingUserInput.value) void respondUserInput(true);
-    openUserInputRequest(request, "single");
-  });
+  // Remount catch-up: install this mode's request + dismissal listeners FIRST
+  // (done above), then record the local revision and query the active snapshot.
+  // The async result applies ONLY if subscription token, mode and revision are
+  // all unchanged, so a push arriving before/after the snapshot is never
+  // overwritten by a stale snapshot result. Snapshot query failure logs a
+  // bounded diagnostic only, without affecting session event subscriptions.
+  const snapshotRevision = userInputEventRevision;
+  const snapshotPromise = mode === "team"
+    ? window.pixApi.getTeamLeaderPendingUserInputRequest()
+    : window.pixApi.getPendingUserInputRequest();
+  snapshotPromise
+    .then((request) => {
+      if (userInputSubscriptionToken !== token) return;
+      if ((teamStore.teamMode ? "team" : "single") !== mode) return;
+      if (userInputEventRevision !== snapshotRevision) return;
+      if (request) onUserInputRequest(request, mode);
+    })
+    .catch((err: unknown) => {
+      console.error("[WorkspacePage] Failed to query pending user input request:", err);
+    });
 }
 
 async function attachTeamRuntimeIfNeeded(location: ProjectLocation): Promise<boolean> {

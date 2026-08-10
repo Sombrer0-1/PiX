@@ -765,10 +765,14 @@ export function createSessionStore(id: string, options: { teamLeader?: boolean }
           role: string; toolCallId: string; toolName: string;
           content: Array<{ type: string; text?: string }>;
           isError: boolean;
+          details?: unknown;
         };
         const tool = toolsById.get(tr.toolCallId);
         if (tool) {
-          tool.result = tr.content;
+          // The `agent` tool keeps the full { content, details } result shape
+          // on replay so SubagentToolView can rich-render from the persisted
+          // details; other tools keep the legacy content-only shape.
+          tool.result = tr.toolName === "agent" ? { content: tr.content, details: tr.details } : tr.content;
           tool.isError = tr.isError;
           if (!tool.toolName && tr.toolName) tool.toolName = tr.toolName;
         }

@@ -9,12 +9,35 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type ExtensionProviderPolicy,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";
+// Agent definitions catalog
+export {
+	type AgentDefinition,
+	type AgentDefinitionSource,
+	type AgentFrontmatter,
+	type AgentScope,
+	BUILTIN_AGENTS,
+	formatAgentsForPrompt,
+	type LoadAgentsDirectoryResult,
+	type LoadAgentsFromDirOptions,
+	type LoadAgentsOptions,
+	type LoadAgentsResult,
+	loadAgents,
+	loadAgentsFromDir,
+	MAX_AGENT_DEFINITION_BYTES,
+	MAX_AGENT_DESCRIPTION_LENGTH,
+	MAX_AGENT_NAME_LENGTH,
+	MAX_AGENT_TURNS,
+	MAX_AGENTS_PER_SOURCE,
+	MAX_AVAILABLE_AGENTS_PROMPT_BYTES,
+	resolveAgentsForScope,
+} from "./core/agents.ts";
 // Auth and model registry
 export {
 	type ApiKeyCredential,
@@ -158,7 +181,12 @@ export {
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { CreateGoalOptions, ThreadGoal, ThreadGoalStatus, UpdateGoalOptions } from "./core/goal-runtime.ts";
 export { convertToLlm } from "./core/messages.ts";
-export { ModelRegistry } from "./core/model-registry.ts";
+export {
+	createReadonlyModelRegistry,
+	ModelRegistry,
+	type ReadonlyModelRegistry,
+	type ResolvedRequestAuth,
+} from "./core/model-registry.ts";
 export type {
 	PackageManager,
 	PathMetadata,

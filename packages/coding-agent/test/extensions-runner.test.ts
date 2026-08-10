@@ -698,6 +698,118 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("readonly model registry facade", () => {
+		it("exposes only read-only capabilities without raw registry or authStorage", () => {
+			const runtime = createExtensionRuntime();
+			const runner = new ExtensionRunner([], runtime, tempDir, sessionManager, modelRegistry);
+
+			const facade = runner.createContext().modelRegistry;
+
+			expect(Object.keys(facade).sort()).toEqual(
+				[
+					"find",
+					"getAll",
+					"getApiKeyAndHeaders",
+					"getApiKeyForProvider",
+					"getAvailable",
+					"getError",
+					"getProviderAuthStatus",
+					"getProviderDisplayName",
+					"hasConfiguredAuth",
+					"isUsingOAuth",
+				].sort(),
+			);
+			expect(Object.isFrozen(facade)).toBe(true);
+			expect("authStorage" in facade).toBe(false);
+			expect("refresh" in facade).toBe(false);
+			expect("registerProvider" in facade).toBe(false);
+			expect("unregisterProvider" in facade).toBe(false);
+			expect("registry" in facade).toBe(false);
+		});
+
+		it("getAll/getAvailable/find return detached snapshots", () => {
+			const runtime = createExtensionRuntime();
+			runtime.registerProvider("facade-provider", providerModelConfig);
+			const runner = new ExtensionRunner([], runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			const facade = runner.createContext().modelRegistry;
+			const rawModel = modelRegistry.find("facade-provider", "instant-model")!;
+			expect(rawModel).toBeDefined();
+
+			const all = facade.getAll();
+			expect(all).not.toBe(facade.getAll());
+			const allModel = all.find((m) => m.provider === "facade-provider" && m.id === "instant-model")!;
+			expect(allModel).not.toBe(rawModel);
+
+			// Mutating nested values of the returned model must not touch the
+			// registry-owned model.
+			allModel.input.push("image");
+			allModel.cost.input = 9999;
+			allModel.headers = { "x-hacked": "1" };
+			allModel.compat = { supportsStore: true };
+			expect(rawModel.input).toEqual(["text"]);
+			expect(rawModel.cost.input).toBe(0);
+			expect(rawModel.headers).toBeUndefined();
+			expect(rawModel.compat).toBeUndefined();
+
+			// find returns a fresh model each call.
+			const found = facade.find("facade-provider", "instant-model")!;
+			expect(found).not.toBe(facade.find("facade-provider", "instant-model"));
+			found.cost.output = 12345;
+			expect(rawModel.cost.output).toBe(0);
+			expect(modelRegistry.find("facade-provider", "instant-model")?.cost.output).toBe(0);
+
+			// getAvailable also returns detached models.
+			const available = facade.getAvailable();
+			const availableModel = available.find((m) => m.provider === "facade-provider" && m.id === "instant-model");
+			expect(availableModel).toBeDefined();
+			availableModel!.cost.cacheRead = 777;
+			expect(rawModel.cost.cacheRead).toBe(0);
+		});
+
+		it("getApiKeyAndHeaders and getProviderAuthStatus return copied objects", async () => {
+			const runtime = createExtensionRuntime();
+			runtime.registerProvider("facade-provider", { ...providerModelConfig, headers: { "x-custom": "1" } });
+			const runner = new ExtensionRunner([], runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			const facade = runner.createContext().modelRegistry;
+			const model = facade.find("facade-provider", "instant-model")!;
+
+			const auth = await facade.getApiKeyAndHeaders(model);
+			expect(auth.ok).toBe(true);
+			if (auth.ok) {
+				expect(auth.headers?.["x-custom"]).toBe("1");
+				auth.headers = { "x-custom": "mutated" };
+			}
+
+			const status = facade.getProviderAuthStatus("facade-provider");
+			status.configured = false;
+
+			// Raw registry/auth state is unchanged by the mutations above.
+			const auth2 = await facade.getApiKeyAndHeaders(model);
+			expect(auth2.ok && auth2.headers?.["x-custom"]).toBe("1");
+			expect(facade.getProviderAuthStatus("facade-provider").configured).toBe(true);
+		});
+
+		it("primitive reads pass through and hasConfiguredAuth still works", async () => {
+			const runtime = createExtensionRuntime();
+			runtime.registerProvider("facade-provider", providerModelConfig);
+			const runner = new ExtensionRunner([], runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			const facade = runner.createContext().modelRegistry;
+			const model = facade.find("facade-provider", "instant-model")!;
+
+			expect(facade.getError()).toBeUndefined();
+			expect(facade.getProviderDisplayName("facade-provider")).toBe("facade-provider");
+			expect(await facade.getApiKeyForProvider("facade-provider")).toBe("provider-test-key");
+			expect(facade.isUsingOAuth(model)).toBe(false);
+			expect(facade.hasConfiguredAuth(model)).toBe(true);
+		});
+	});
+
 	describe("provider registration", () => {
 		it("bindCore ignores invalid queued registrations and reports extension error", () => {
 			const runtime = createExtensionRuntime();

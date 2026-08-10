@@ -344,6 +344,19 @@ export interface RequestUserInputResponse {
   cancelled?: boolean;
 }
 
+/** Why the main process revoked an already-displayed user input request. */
+export type RequestUserInputDismissalReason = "aborted" | "session_closed";
+
+/**
+ * Main-initiated revocation of a displayed user input request (design plan
+ * section 4.9). The renderer only discards its local clarification state when
+ * the id matches the pending request; it never replies to a dismissal.
+ */
+export interface RequestUserInputDismissal {
+  id: string;
+  reason: RequestUserInputDismissalReason;
+}
+
 // ============================================================================
 // Auth Types
 // ============================================================================

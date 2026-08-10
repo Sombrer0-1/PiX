@@ -3,6 +3,7 @@
  */
 
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
+import { formatAgentsForPrompt, type AgentDefinition } from "./agents.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
 export interface BuildSystemPromptOptions {
@@ -24,6 +25,8 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/** Available agent definitions catalog (rendered after skills, before environment context). */
+	agents?: AgentDefinition[];
 	/**
 	 * Optional formatter that translates a skill's physical load path into a
 	 * model-visible logical path (for example under WSL). When omitted, the raw
@@ -275,6 +278,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 		skillPathFormatter,
+		agents: providedAgents,
 	} = options;
 	const resolvedCwd = cwd;
 	const promptCwd = resolvedCwd.replace(/\\/g, "/");
@@ -300,6 +304,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
+	const agents = providedAgents ?? [];
 
 	if (customPrompt) {
 		let prompt = customPrompt;
@@ -317,6 +322,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		if (customPromptHasRead && skills.length > 0) {
 			prompt += formatSkillsForPrompt(skills, skillPathFormatter);
 		}
+
+		// Append available agents after skills, before environment context.
+		const agentsSection = formatAgentsForPrompt(agents);
+		if (agentsSection) prompt += `\n\n${agentsSection}`;
 
 		// Add runtime environment last so the model sees the live shell/cwd context.
 		prompt += `\n\n${renderEnvironmentContext(date, promptCwd, runtimeEnvironment)}`;
@@ -530,6 +539,10 @@ When project instructions are present, apply them to work in that project, but d
 	if (hasRead && skills.length > 0) {
 		prompt += formatSkillsForPrompt(skills, skillPathFormatter);
 	}
+
+	// Append available agents after skills, before environment context.
+	const agentsSection = formatAgentsForPrompt(agents);
+	if (agentsSection) prompt += `\n\n${agentsSection}`;
 
 	// Add runtime environment last so the model sees the live shell/cwd context.
 	prompt += `\n\n${renderEnvironmentContext(date, promptCwd, runtimeEnvironment)}`;

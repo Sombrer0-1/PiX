@@ -3,9 +3,11 @@ import { join, resolve, sep } from "node:path";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.ts";
+import { loadAgents, type LoadAgentsResult } from "./agents.ts";
 import type { ResourceDiagnostic } from "./diagnostics.ts";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
+export type { LoadAgentsResult } from "./agents.ts";
 
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
@@ -31,6 +33,8 @@ export interface ResourceLoader {
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
+	/** Cached agent definitions catalog snapshot from the last successful reload. Optional for backward compatibility with existing object-literal implementations. */
+	getAgents?(): LoadAgentsResult;
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
 	extendResources(paths: ResourceExtensionPaths): void;
@@ -145,6 +149,7 @@ export interface DefaultResourceLoaderOptions {
 	agentsFilesOverride?: (base: { agentsFiles: Array<{ path: string; content: string }> }) => {
 		agentsFiles: Array<{ path: string; content: string }>;
 	};
+	agentsOverride?: (base: LoadAgentsResult) => LoadAgentsResult;
 	systemPromptOverride?: (base: string | undefined) => string | undefined;
 	appendSystemPromptOverride?: (base: string[]) => string[];
 }
@@ -183,6 +188,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private agentsFilesOverride?: (base: { agentsFiles: Array<{ path: string; content: string }> }) => {
 		agentsFiles: Array<{ path: string; content: string }>;
 	};
+	private agentsOverride?: (base: LoadAgentsResult) => LoadAgentsResult;
 	private systemPromptOverride?: (base: string | undefined) => string | undefined;
 	private appendSystemPromptOverride?: (base: string[]) => string[];
 
@@ -194,6 +200,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private themes: Theme[];
 	private themeDiagnostics: ResourceDiagnostic[];
 	private agentsFiles: Array<{ path: string; content: string }>;
+	private agentsResult: LoadAgentsResult;
 	private systemPrompt?: string;
 	private appendSystemPrompt: string[];
 	private lastSkillPaths: string[];
@@ -230,6 +237,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.promptsOverride = options.promptsOverride;
 		this.themesOverride = options.themesOverride;
 		this.agentsFilesOverride = options.agentsFilesOverride;
+		this.agentsOverride = options.agentsOverride;
 		this.systemPromptOverride = options.systemPromptOverride;
 		this.appendSystemPromptOverride = options.appendSystemPromptOverride;
 
@@ -241,6 +249,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.themes = [];
 		this.themeDiagnostics = [];
 		this.agentsFiles = [];
+		this.agentsResult = this.loadAgentsInternal();
 		this.appendSystemPrompt = [];
 		this.lastSkillPaths = [];
 		this.extensionSkillSourceInfos = new Map();
@@ -268,6 +277,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
 		return { agentsFiles: this.agentsFiles };
+	}
+
+	/**
+	 * Return the cached agent definitions catalog snapshot from the last
+	 * successful reload. The subagent runner must consume the catalog only
+	 * through this getter; it never rescans disk as a second source of truth.
+	 */
+	getAgents(): LoadAgentsResult {
+		return this.agentsResult;
+	}
+
+	private loadAgentsInternal(): LoadAgentsResult {
+		const base = loadAgents({ cwd: this.cwd, agentDir: this.agentDir, includeBuiltIns: true });
+		return this.agentsOverride ? this.agentsOverride(base) : base;
 	}
 
 	getSystemPrompt(): string | undefined {
@@ -486,6 +509,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.appendSystemPrompt = this.appendSystemPromptOverride
 			? this.appendSystemPromptOverride(baseAppend)
 			: baseAppend;
+
+		// Refresh the agents catalog last: if reload() throws earlier, the
+		// getter keeps serving the previous successful snapshot.
+		this.agentsResult = this.loadAgentsInternal();
 	}
 
 	private normalizeExtensionPaths(

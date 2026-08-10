@@ -39,6 +39,8 @@ pix/release-bugfix/
 vuetify_guide/
 todo.md
 plans/
+pix-subagent-plan.md
+cc-subagent/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh

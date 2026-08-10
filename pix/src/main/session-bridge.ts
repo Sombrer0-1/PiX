@@ -12,6 +12,7 @@ import {
 	type ImageContent,
 	type Model,
 	type TextContent,
+	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
@@ -22,14 +23,20 @@ import {
 	type RequestUserInputResponse,
 	type SessionShutdownEvent,
 	type SessionStartEvent,
+	type ToolDefinition,
 	createAgentSession,
 	SessionManager,
 	SettingsManager,
 	AuthStorage,
 	DefaultResourceLoader,
+	ModelRegistry,
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
+import { aggregateSubagentUsage, isSubagentDetails } from "../shared/subagent-types.js";
+import type { SubagentExecutionContext, SubagentToolHost } from "./subagent/types.js";
+import { SubagentRunner } from "./subagent/subagent-runner.js";
+import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "./subagent/subagent-tool.js";
 import type { TeamManager } from "./team-manager.js";
 import {
 	createProjectExecutionContext,
@@ -47,6 +54,8 @@ import type {
 	McpServerInfo,
 	ModelInfo,
 	ProjectLocation,
+	RequestUserInputDismissal,
+	RequestUserInputDismissalReason,
 	RpcSessionState,
 	RpcSlashCommand,
 	SessionStats,
@@ -116,6 +125,43 @@ interface AuxiliaryUsageTotals {
 	cacheRead: number;
 	cacheWrite: number;
 	cost: number;
+}
+
+/**
+ * One queued/active/terminal user-input request in the bridge FIFO. Only the
+ * queue head becomes active and is ever visible to the renderer; queued items
+ * are invisible and never emit a dismissal.
+ */
+interface UserInputEntry {
+	request: RequestUserInputRequest;
+	/** Generation captured at enqueue; guards stale callbacks after replacement. */
+	generation: number;
+	signal: AbortSignal | undefined;
+	state: "queued" | "active" | "terminal";
+	resolve: (response: RequestUserInputResponse) => void;
+	reject: (error: Error) => void;
+	removeSignalListener: (() => void) | undefined;
+}
+
+/**
+ * Solo-only runtime candidate generation. Created before the parent session,
+ * owned by the bridge, never shared with extensions. `agentDir` is resolved
+ * exactly once per generation and used uniformly for auth storage, the model
+ * registry, the parent loader/session and the runner context; a replaced old
+ * generation never reads a new value (design plan section 4.9).
+ */
+interface RuntimeGeneration {
+	/** Non-reusable generation id; parent and runner closures both capture it. */
+	readonly genId: number;
+	readonly agentDir: string;
+	readonly authStorage: AuthStorage;
+	readonly modelRegistry: ModelRegistry;
+	/** Generation-bound auxiliary accumulator (history rebuild + live usage). */
+	readonly auxiliaryUsage: AuxiliaryUsageTotals;
+	/** Parent session of this generation; closed over by getParentRuntime. */
+	session: AgentSession | null;
+	readonly runner: SubagentRunner;
+	readonly mcpAdapter: McpAdapter;
 }
 
 function globPatternToRegExp(pattern: string): RegExp {
@@ -217,13 +263,14 @@ export class SessionBridge {
 
 	private _eventListeners: Array<(event: AgentSessionEvent) => void> = [];
 	private _userInputRequestListeners: UserInputRequestListener[] = [];
-	private _pendingUserInputRequests = new Map<
-		string,
-		{
-			resolve: (response: RequestUserInputResponse) => void;
-			reject: (error: Error) => void;
-		}
-	>();
+	private _userInputDismissedListeners: Array<(event: RequestUserInputDismissal) => void> = [];
+	private _userInputQueue: UserInputEntry[] = [];
+	private _activeUserInputEntry: UserInputEntry | null = null;
+	private _userInputQueueClosing = false;
+	/** Monotonic, non-reusable user-input generation counter. */
+	private _userInputGeneration = 0;
+	/** Solo runtime generation (registry/agentDir/runner/accumulator ownership). */
+	private _generation: RuntimeGeneration | null = null;
 	private _lifecycleListeners: {
 		[TEvent in LifecycleEvent]: Array<LifecycleListener<TEvent>>;
 	} = {
@@ -1331,13 +1378,57 @@ export class SessionBridge {
 		};
 	}
 
-	respondUserInput(response: RequestUserInputResponse): void {
-		const pending = this._pendingUserInputRequests.get(response.id);
-		if (!pending) {
-			throw new Error(`No pending user input request: ${response.id}`);
+	onUserInputDismissed(listener: (event: RequestUserInputDismissal) => void): () => void {
+		this._userInputDismissedListeners.push(listener);
+		return () => {
+			const idx = this._userInputDismissedListeners.indexOf(listener);
+			if (idx !== -1) this._userInputDismissedListeners.splice(idx, 1);
+		};
+	}
+
+	/**
+	 * Return the active request as a plain defensive snapshot; null when no
+	 * request is active. Queued items are never visible to the renderer.
+	 */
+	getActiveUserInputRequest(): RequestUserInputRequest | null {
+		const active = this._activeUserInputEntry;
+		if (!active || active.state !== "active" || active.generation !== this._userInputGeneration) {
+			return null;
 		}
-		this._pendingUserInputRequests.delete(response.id);
-		pending.resolve(response);
+		return {
+			id: active.request.id,
+			questions: active.request.questions.map((question) => ({
+				id: question.id,
+				header: question.header,
+				question: question.question,
+				options: question.options?.map((option) => ({ ...option })),
+			})),
+		};
+	}
+
+	/**
+	 * Settle the current generation's active request. Returns true when the id
+	 * matches the active request, removing the signal listener, resolving the
+	 * promise and then pumping the queue. A response never emits a dismissal.
+	 * Late/unknown ids return false as a normal race outcome - never an error.
+	 */
+	respondUserInput(response: RequestUserInputResponse): boolean {
+		const active = this._activeUserInputEntry;
+		if (
+			!active ||
+			active.state !== "active" ||
+			active.request.id !== response.id ||
+			active.generation !== this._userInputGeneration
+		) {
+			return false;
+		}
+		active.state = "terminal";
+		active.removeSignalListener?.();
+		active.removeSignalListener = undefined;
+		this._activeUserInputEntry = null;
+		active.resolve(response);
+		this._pumpUserInputQueue();
+		return true;
 	}
 
 	private _getSession(): AgentSession {
@@ -1347,50 +1438,188 @@ export class SessionBridge {
 		return this._session;
 	}
 
-	private _requestUserInput(
+	/**
+	 * Enqueue a user-input request into the bridge FIFO (parent, project trust
+	 * and nested tool approval all share this queue). The generation captured
+	 * at enqueue time guards stale callbacks: a provider calling back after the
+	 * generation was replaced is rejected without any request/dismissal emit.
+	 * The same immediate rejection applies while the queue is closing, when the
+	 * signal is already aborted, or when the id duplicates an active/queued
+	 * item.
+	 */
+	private _requestUserInputForGeneration(
+		generation: number,
 		request: RequestUserInputRequest,
 		signal?: AbortSignal,
 	): Promise<RequestUserInputResponse> {
-		if (signal?.aborted) {
-			return Promise.reject(new Error("request_user_input was aborted."));
-		}
-
 		return new Promise((resolve, reject) => {
-			const cleanup = () => {
-				signal?.removeEventListener("abort", onAbort);
-				this._pendingUserInputRequests.delete(request.id);
-			};
-			const onAbort = () => {
-				cleanup();
+			if (generation !== this._userInputGeneration) {
 				reject(new Error("request_user_input was aborted."));
-			};
-			signal?.addEventListener("abort", onAbort, { once: true });
-			this._pendingUserInputRequests.set(request.id, {
-				resolve: (response) => {
-					cleanup();
-					resolve(response);
-				},
-				reject: (error) => {
-					cleanup();
-					reject(error);
-				},
-			});
-
-			for (const listener of this._userInputRequestListeners) {
-				try {
-					listener(request);
-				} catch (err) {
-					console.error("[SessionBridge] User input request listener error:", err);
-				}
+				return;
 			}
+			if (this._userInputQueueClosing) {
+				reject(new Error("Session closed before user input was provided."));
+				return;
+			}
+			if (signal?.aborted) {
+				reject(new Error("request_user_input was aborted."));
+				return;
+			}
+			if (this._hasUserInputId(request.id)) {
+				reject(new Error(`Duplicate user input request id: ${request.id}`));
+				return;
+			}
+
+			const entry: UserInputEntry = {
+				request,
+				generation,
+				signal,
+				state: "queued",
+				resolve,
+				reject,
+				removeSignalListener: undefined,
+			};
+			// Observe the signal from enqueue time: a queued abort removes and
+			// rejects only itself (never displayed, so no dismissal); an active
+			// abort dismisses exactly once and pumps the next request.
+			if (signal && !signal.aborted) {
+				const onAbort = () => {
+					if (entry.state === "queued") {
+						this._removeQueuedUserInput(entry);
+						entry.state = "terminal";
+						entry.reject(new Error("request_user_input was aborted."));
+					} else if (entry.state === "active") {
+						this._abortActiveUserInput(this._userInputQueueClosing ? "session_closed" : "aborted");
+					}
+				};
+				signal.addEventListener("abort", onAbort, { once: true });
+				entry.removeSignalListener = () => signal.removeEventListener("abort", onAbort);
+			}
+			this._userInputQueue.push(entry);
+			this._pumpUserInputQueue();
 		});
 	}
 
-	private _rejectPendingUserInputRequests(error: Error): void {
-		const requests = Array.from(this._pendingUserInputRequests.values());
-		this._pendingUserInputRequests.clear();
-		for (const pending of requests) {
-			pending.reject(error);
+	private _hasUserInputId(id: string): boolean {
+		if (this._activeUserInputEntry?.request.id === id) {
+			return true;
+		}
+		return this._userInputQueue.some((entry) => entry.request.id === id);
+	}
+
+	private _removeQueuedUserInput(entry: UserInputEntry): void {
+		const index = this._userInputQueue.indexOf(entry);
+		if (index !== -1) {
+			this._userInputQueue.splice(index, 1);
+		}
+	}
+
+	/** Promote the queue head to active and emit its request (never queued items). */
+	private _pumpUserInputQueue(): void {
+		if (this._userInputQueueClosing || this._activeUserInputEntry) {
+			return;
+		}
+		const entry = this._userInputQueue.shift();
+		if (!entry) {
+			return;
+		}
+		if (entry.state !== "queued" || entry.generation !== this._userInputGeneration) {
+			// Defensive: an entry aborted while queued or belonging to a stale
+			// generation must never reach the renderer; it gets no dismissal.
+			if (entry.state === "queued") {
+				entry.state = "terminal";
+				entry.removeSignalListener?.();
+				entry.removeSignalListener = undefined;
+				entry.reject(new Error("request_user_input was aborted."));
+			}
+			this._pumpUserInputQueue();
+			return;
+		}
+		entry.state = "active";
+		this._activeUserInputEntry = entry;
+		for (const listener of this._userInputRequestListeners) {
+			try {
+				listener(entry.request);
+			} catch (err) {
+				console.error("[SessionBridge] User input request listener error:", err);
+			}
+		}
+	}
+
+	/**
+	 * Active signal abort: mark terminal, emit the dismissal exactly once,
+	 * reject, then pump the next request. After the queue is marked closing the
+	 * dismissal is "session_closed" so a close-driven abort is never misjudged
+	 * as a user denial.
+	 */
+	private _abortActiveUserInput(reason: RequestUserInputDismissalReason): void {
+		const active = this._activeUserInputEntry;
+		if (!active || active.state !== "active") {
+			return;
+		}
+		this._settleUserInputTerminal(active, reason, new Error("request_user_input was aborted."));
+		this._pumpUserInputQueue();
+	}
+
+	/** Terminal settle of a displayed request: exactly-once dismissal + reject. */
+	private _settleUserInputTerminal(
+		entry: UserInputEntry,
+		reason: RequestUserInputDismissalReason,
+		error: Error,
+	): void {
+		if (entry.state === "terminal") {
+			return;
+		}
+		entry.state = "terminal";
+		entry.removeSignalListener?.();
+		entry.removeSignalListener = undefined;
+		if (this._activeUserInputEntry === entry) {
+			this._activeUserInputEntry = null;
+		}
+		this._emitUserInputDismissal(entry.request.id, reason);
+		entry.reject(error);
+	}
+
+	/** Mark the queue closing and invalidate the current generation. */
+	private _markUserInputQueueClosing(): void {
+		this._userInputQueueClosing = true;
+		this._userInputGeneration++;
+	}
+
+	/**
+	 * Settle every pending entry after the queue is marked closing: the
+	 * displayed request gets an exactly-once "session_closed" dismissal, queued
+	 * requests are rejected without a dismissal (they were never displayed).
+	 * Never pumps afterwards; only a new generation reopens the queue.
+	 */
+	private _settleClosedUserInputQueue(): void {
+		const active = this._activeUserInputEntry;
+		if (active && active.state === "active") {
+			this._settleUserInputTerminal(
+				active,
+				"session_closed",
+				new Error("Session closed before user input was provided."),
+			);
+		}
+		const queued = this._userInputQueue.splice(0);
+		for (const entry of queued) {
+			if (entry.state === "queued") {
+				entry.state = "terminal";
+				entry.removeSignalListener?.();
+				entry.removeSignalListener = undefined;
+				entry.reject(new Error("Session closed before user input was provided."));
+			}
+		}
+	}
+
+	private _emitUserInputDismissal(id: string, reason: RequestUserInputDismissalReason): void {
+		const event: RequestUserInputDismissal = { id, reason };
+		for (const listener of this._userInputDismissedListeners) {
+			try {
+				listener(event);
+			} catch (err) {
+				console.error("[SessionBridge] User input dismissal listener error:", err);
+			}
 		}
 	}
 
@@ -1708,52 +1937,266 @@ export class SessionBridge {
 	): Promise<CreateAgentSessionResult> {
 		const settingsManager = this._createSettingsManager(cwd);
 		const context = this._executionContext;
+		const isSolo = this._role === "single";
+		// Resolved exactly once per candidate generation and used uniformly for
+		// auth storage, model registry, loader, parent session and runner
+		// context; a replaced old generation never reads a new value (4.9).
+		const agentDir = getAgentDir();
 		// WSL mode disables Windows-side stdio MCP (decided by context.isWsl, not
 		// by backend existence). HTTP/SSE remain configurable (wsl_plan.md §4.10).
 		const mcpAdapter = new McpAdapter({
 			allowStdio: context?.isWsl ? false : true,
 		});
 		this._mcpAdapter = mcpAdapter;
-		const resourceLoader = new DefaultResourceLoader({
-			cwd,
-			agentDir: getAgentDir(),
-			settingsManager,
-			extensionFactories: [
-				(pi) => { mcpAdapter.register(pi); },
-				(pi) => { this._teamManager?.registerLeaderTools(pi); },
-			],
-		});
-		await resourceLoader.reload();
 
-		const result = await createAgentSession({
-			cwd,
-			// bootstrap uses physical cwd (above); the Agent runtime uses the
-			// logical cwd via runtimeCwd. When no context is injected these are
-			// equal and Windows behavior is byte-identical (wsl_plan.md §4.1).
-			runtimeCwd: this._logicalCwd || cwd,
-			executionBackend: context?.executionBackend,
-			runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
-			sessionManager,
-			settingsManager,
-			resourceLoader,
-			authStorage: this._authStorage ?? undefined,
-			sessionStartEvent,
-			requestUserInput: (request, signal) => this._requestUserInput(request, signal),
-		});
-		this._applyEnabledModelScope(result.session);
-		return result;
+		// Each candidate parent session gets a non-reusable generation. Both the
+		// parent createAgentSession requestUserInput closure and the runner's
+		// closure capture this value; a stale provider callback after a
+		// replacement is rejected by the generation guard. The new generation
+		// reopens the queue.
+		const genId = ++this._userInputGeneration;
+		this._userInputQueueClosing = false;
+
+		let parentSessionRef: AgentSession | null = null;
+		try {
+			if (isSolo) {
+				// Solo runtime: the generation owns its auth storage and model
+				// registry; the SAME registry identity is later handed to the
+				// parent createAgentSession and the runner (the parent must
+				// never get an SDK-created second registry).
+				const generationAuthStorage = AuthStorage.create(join(agentDir, "auth.json"));
+				this._authStorage = generationAuthStorage;
+				const generationModelRegistry = ModelRegistry.create(generationAuthStorage, join(agentDir, "models.json"));
+
+				const resourceLoader = new DefaultResourceLoader({
+					cwd,
+					agentDir,
+					settingsManager,
+					extensionFactories: [
+						(pi) => { mcpAdapter.register(pi); },
+						(pi) => { this._teamManager?.registerLeaderTools(pi); },
+					],
+				});
+				await resourceLoader.reload();
+
+				// Construct the runner/host BEFORE creating the parent session;
+				// the SDK custom tool is mounted as one entry of customTools.
+				// SDK custom tools are written after extension tools in
+				// AgentSession._refreshToolRegistry(), so the effective parent
+				// agent is deterministically <sdk:agent> (design plan 4.8).
+				const auxiliaryAccumulator = createEmptyAuxiliaryUsage();
+				const runnerContext: SubagentExecutionContext = {
+					physicalCwd: cwd,
+					logicalCwd: this._logicalCwd || cwd,
+					agentDir,
+					executionBackend: context?.executionBackend,
+					runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
+					authStorage: generationAuthStorage,
+					modelRegistry: generationModelRegistry,
+					isWsl: context?.isWsl ?? false,
+					getLoadedAgents: () => resourceLoader.getAgents?.(),
+					getParentRuntime: () => {
+						// Closes over this candidate generation's own parent
+						// session; a stale runner's late calls must never
+						// inherit a replacement session's state.
+						const parent = parentSessionRef;
+						return {
+							model: parent?.model,
+							thinkingLevel: parent?.thinkingLevel ?? "off",
+							executionMode: parent?.settingsManager.getExecutionMode() ?? "approval",
+							verificationGate: parent?.settingsManager.getVerificationGateEnabled() ?? false,
+						};
+					},
+					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+					recordAuxiliaryUsage: (usage) => {
+						// Generation-bound accumulator: old generations never
+						// write usage into a replacement session through the
+						// replaceable _auxiliaryUsage field.
+						auxiliaryAccumulator.input += usage.input;
+						auxiliaryAccumulator.output += usage.output;
+						auxiliaryAccumulator.cacheRead += usage.cacheRead;
+						auxiliaryAccumulator.cacheWrite += usage.cacheWrite;
+						auxiliaryAccumulator.cost += usage.cost;
+					},
+				};
+				const runner = new SubagentRunner(runnerContext);
+				const host: SubagentToolHost = { getRunner: () => runner };
+				const generation: RuntimeGeneration = {
+					genId,
+					agentDir,
+					authStorage: generationAuthStorage,
+					modelRegistry: generationModelRegistry,
+					auxiliaryUsage: auxiliaryAccumulator,
+					session: null,
+					runner,
+					mcpAdapter,
+				};
+				this._generation = generation;
+
+				const result = await createAgentSession({
+					cwd,
+					// bootstrap uses physical cwd (above); the Agent runtime uses the
+					// logical cwd via runtimeCwd. When no context is injected these are
+					// equal and Windows behavior is byte-identical (wsl_plan.md §4.1).
+					runtimeCwd: this._logicalCwd || cwd,
+					agentDir,
+					executionBackend: context?.executionBackend,
+					runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
+					sessionManager,
+					settingsManager,
+					resourceLoader,
+					authStorage: generationAuthStorage,
+					modelRegistry: generationModelRegistry,
+					// The typed cast only widens the generic parameters; the tool
+					// definition itself is a full ToolDefinition.
+					customTools: [createSubagentToolDefinition(host) as ToolDefinition],
+					sessionStartEvent,
+					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+				});
+				parentSessionRef = result.session;
+				generation.session = result.session;
+				this._applyEnabledModelScope(result.session);
+				return result;
+			}
+
+			// Team-leader: no subagent ModelRegistry/runner/custom tool; the
+			// existing path stays unchanged (only the user-input closure now
+			// binds the generation for the shared FIFO/dismissal lifecycle).
+			const resourceLoader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager,
+				extensionFactories: [
+					(pi) => { mcpAdapter.register(pi); },
+					(pi) => { this._teamManager?.registerLeaderTools(pi); },
+				],
+			});
+			await resourceLoader.reload();
+
+			const result = await createAgentSession({
+				cwd,
+				runtimeCwd: this._logicalCwd || cwd,
+				executionBackend: context?.executionBackend,
+				runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
+				sessionManager,
+				settingsManager,
+				resourceLoader,
+				authStorage: this._authStorage ?? undefined,
+				sessionStartEvent,
+				requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+			});
+			// Team-leader keeps no generation record; retain the created session
+			// in the candidate ref so a later bind/activate failure still
+			// disposes it (design plan 4.9).
+			parentSessionRef = result.session;
+			this._applyEnabledModelScope(result.session);
+			return result;
+		} catch (err) {
+			// Candidate create failure: dispose the created runner/session/MCP,
+			// close this generation's input queue and clear bridge fields -
+			// not just null the references (design plan 4.9).
+			await this._disposeCandidateRuntime(parentSessionRef);
+			throw err;
+		}
+	}
+
+	/**
+	 * Dispose the candidate runtime after a create/bind/activate failure: close
+	 * this generation's input queue first (marks closing + invalidates the
+	 * generation), then dispose runner, session and MCP, and clear the bridge
+	 * fields. candidateSession is the team-leader candidate, which keeps no
+	 * generation record; it is skipped when identical to the generation's own
+	 * session so solo behavior is unchanged.
+	 */
+	private async _disposeCandidateRuntime(candidateSession?: AgentSession | null): Promise<void> {
+		const generation = this._generation;
+		this._generation = null;
+		this._markUserInputQueueClosing();
+		this._settleClosedUserInputQueue();
+		if (generation) {
+			try {
+				await generation.runner.dispose();
+			} catch (err) {
+				console.error("[SessionBridge] Error during subagent runner dispose:", err);
+			}
+			if (generation.session) {
+				try {
+					await generation.session.dispose();
+				} catch (err) {
+					console.error("[SessionBridge] Error during candidate session dispose:", err);
+				}
+			}
+		}
+		if (candidateSession && candidateSession !== generation?.session) {
+			try {
+				await candidateSession.dispose();
+			} catch (err) {
+				console.error("[SessionBridge] Error during candidate session dispose:", err);
+			}
+		}
+		const mcpAdapter = generation?.mcpAdapter ?? this._mcpAdapter;
+		if (mcpAdapter) {
+			try {
+				await mcpAdapter.dispose();
+			} catch (err) {
+				console.error("[SessionBridge] Error during candidate MCP adapter dispose:", err);
+			}
+		}
+		this._mcpAdapter = null;
+		this._authStorage = null;
 	}
 
 	private async _activateSession(session: AgentSession): Promise<void> {
 		this._session = session;
-		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
 		this._setupEventSubscription(session);
-		await this._bindExtensions();
+		try {
+			await this._bindExtensions();
+		} catch (err) {
+			// Activation (bind) failure: dispose the created runner/session/MCP,
+			// close this generation's input queue and clear bridge fields.
+			this._session = null;
+			this._unsubscribe?.();
+			this._unsubscribe = null;
+			await this._disposeCandidateRuntime(session);
+			throw err;
+		}
 		// Wire the Leader session to TeamManager so worker summaries can be injected
 		if (this._teamManager) {
 			this._teamManager.setLeaderSession(session);
 		}
+		// The stats reference points at this generation's accumulator so history
+		// rebuild and live usage of the same generation write the same object.
+		this._auxiliaryUsage = this._generation?.auxiliaryUsage ?? createEmptyAuxiliaryUsage();
+		this._rebuildAuxiliaryUsageFromHistory(session);
 		this._emitLifecycle("ready");
+	}
+
+	/**
+	 * Rebuild subagent usage for a resumed parent session by scanning persisted
+	 * agent tool result messages. Only messages that pass the shared type guard
+	 * are aggregated; live terminal tasks keep reporting through the runner.
+	 * Both write the same generation-bound accumulator.
+	 */
+	private _rebuildAuxiliaryUsageFromHistory(session: AgentSession): void {
+		const accumulator = this._generation?.auxiliaryUsage;
+		if (!accumulator) {
+			return;
+		}
+		for (const message of session.messages) {
+			if (message.role !== "toolResult") {
+				continue;
+			}
+			const toolMessage = message as ToolResultMessage;
+			if (toolMessage.toolName !== SUBAGENT_TOOL_NAME || !isSubagentDetails(toolMessage.details)) {
+				continue;
+			}
+			const usage = aggregateSubagentUsage(toolMessage.details);
+			accumulator.input += usage.input;
+			accumulator.output += usage.output;
+			accumulator.cacheRead += usage.cacheRead;
+			accumulator.cacheWrite += usage.cacheWrite;
+			accumulator.cost += usage.cost;
+		}
 	}
 
 	private async _closeCurrentSession(
@@ -1762,6 +2205,8 @@ export class SessionBridge {
 	): Promise<boolean> {
 		const session = this._session;
 		const mcpAdapter = this._mcpAdapter;
+		const generation = this._generation;
+		this._generation = null;
 		this._unsubscribe?.();
 		this._unsubscribe = null;
 		this._teamManager?.setLeaderSession(null);
@@ -1770,12 +2215,44 @@ export class SessionBridge {
 		this._isCompacting = false;
 		this._pendingMessageCount = 0;
 		this._mcpAdapter = null;
-		this._rejectPendingUserInputRequests(new Error("Session closed before user input was provided."));
+		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
+
+		// Mark the input queue closing and invalidate the generation FIRST.
+		// Bridge-level request/dismissal listeners must stay so IPC can still
+		// receive the close events (design plan section 4.9).
+		this._markUserInputQueueClosing();
+		// Call but do not await runner.dispose(): its synchronous prefix writes
+		// host_disposed and aborts queued/active tasks. Any abort it triggers on
+		// the displayed request now emits "session_closed" exactly once, never
+		// "aborted" - a close-driven approval rejection is never misjudged as a
+		// user denial.
+		const runnerPromise = generation ? generation.runner.dispose() : undefined;
+		// The bridge then dismisses the displayed request and rejects the
+		// remaining user-input; queued items were never displayed so they get
+		// no dismissal. Never pump afterwards.
+		this._settleClosedUserInputQueue();
 
 		if (!session) {
+			if (runnerPromise) {
+				try {
+					await runnerPromise;
+				} catch (err) {
+					console.error("[SessionBridge] Error during subagent runner dispose:", err);
+				}
+			}
 			return false;
 		}
 
+		// Finally await the runner cleanup, then dispose the parent session and
+		// the parent MCP IN THAT ORDER. The UI never waits up to 5s for the
+		// runner to settle before the session closes.
+		if (runnerPromise) {
+			try {
+				await runnerPromise;
+			} catch (err) {
+				console.error("[SessionBridge] Error during subagent runner dispose:", err);
+			}
+		}
 		try {
 			await session.dispose({ reason, targetSessionFile });
 		} catch (err) {

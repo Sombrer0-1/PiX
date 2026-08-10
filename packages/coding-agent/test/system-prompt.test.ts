@@ -1,4 +1,17 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
+import type { AgentDefinition } from "../src/core/agents.ts";
+import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { ToolDefinition } from "../src/core/extensions/types.ts";
+import type { ResourceLoader } from "../src/core/resource-loader.ts";
+import { createAgentSession } from "../src/core/sdk.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
+import type { Skill } from "../src/core/skills.ts";
 import {
 	buildSystemPrompt,
 	definePromptFragment,
@@ -6,6 +19,8 @@ import {
 	matchesPromptFragment,
 	renderPromptFragment,
 } from "../src/core/system-prompt.ts";
+import { fauxModel } from "./test-harness.ts";
+import { createTestResourceLoader } from "./utilities.ts";
 
 describe("buildSystemPrompt", () => {
 	describe("empty tools", () => {
@@ -169,6 +184,173 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
+		});
+	});
+
+	describe("available agents", () => {
+		const testAgent: AgentDefinition = {
+			name: "scout",
+			description: "Scout agent",
+			systemPrompt: "Scout body",
+			source: "user",
+			tools: ["read", "grep"],
+		};
+		const testSkill: Skill = {
+			name: "test-skill",
+			description: "Test skill",
+			filePath: "/tmp/skill.md",
+			baseDir: "/tmp",
+			sourceInfo: createSyntheticSourceInfo("/tmp/skill.md", { source: "custom" }),
+			disableModelInvocation: false,
+		};
+
+		test("appends available agents after skills and before environment context in the default branch", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [testSkill],
+				agents: [testAgent],
+				cwd: process.cwd(),
+			});
+
+			const agentsIndex = prompt.indexOf("<available_agents>");
+			const skillsIndex = prompt.indexOf("<available_skills>");
+			const environmentIndex = prompt.indexOf('<environment_context role="developer" source="runtime"');
+
+			expect(agentsIndex).toBeGreaterThan(-1);
+			expect(skillsIndex).toBeGreaterThan(-1);
+			expect(environmentIndex).toBeGreaterThan(-1);
+			expect(agentsIndex).toBeGreaterThan(skillsIndex);
+			expect(environmentIndex).toBeGreaterThan(agentsIndex);
+			expect(prompt).toContain('name="scout"');
+		});
+
+		test("appends available agents after skills and before environment context in the custom branch", () => {
+			const prompt = buildSystemPrompt({
+				customPrompt: "You are a custom assistant.",
+				contextFiles: [],
+				skills: [testSkill],
+				agents: [testAgent],
+				cwd: process.cwd(),
+			});
+
+			const agentsIndex = prompt.indexOf("<available_agents>");
+			const skillsIndex = prompt.indexOf("<available_skills>");
+			const environmentIndex = prompt.indexOf('<environment_context role="developer" source="runtime"');
+
+			expect(agentsIndex).toBeGreaterThan(-1);
+			expect(skillsIndex).toBeGreaterThan(-1);
+			expect(environmentIndex).toBeGreaterThan(-1);
+			expect(agentsIndex).toBeGreaterThan(skillsIndex);
+			expect(environmentIndex).toBeGreaterThan(agentsIndex);
+		});
+
+		test("renders no agents section when no agents are provided", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).not.toContain("<available_agents>");
+		});
+
+		test("XML-escapes agent descriptions in both branches", () => {
+			const agents: AgentDefinition[] = [
+				{
+					...testAgent,
+					description: 'Scout "quoted" & <tagged> agent',
+				},
+			];
+
+			const customPrompt = buildSystemPrompt({
+				customPrompt: "You are a custom assistant.",
+				contextFiles: [],
+				skills: [],
+				agents,
+				cwd: process.cwd(),
+			});
+			expect(customPrompt).toContain("Scout &quot;quoted&quot; &amp; &lt;tagged&gt; agent");
+			expect(customPrompt).not.toContain("Scout \"quoted\" & <tagged> agent");
+
+			const defaultPrompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				agents,
+				cwd: process.cwd(),
+			});
+			expect(defaultPrompt).toContain("Scout &quot;quoted&quot; &amp; &lt;tagged&gt; agent");
+		});
+
+		test("does not render the systemPrompt or filePath of agents", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [],
+				skills: [],
+				agents: [testAgent],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).not.toContain("Scout body");
+			expect(prompt).not.toContain("filePath");
+		});
+	});
+
+	describe("session-level agent injection", () => {
+		test("injects the catalog only when the agent tool is active", async () => {
+			const tempDir = mkdtempSync(join(tmpdir(), "pi-prompt-agents-test-"));
+			try {
+				const agents: AgentDefinition[] = [
+					{
+						name: "scout",
+						description: "Scout agent",
+						systemPrompt: "Scout body",
+						source: "user",
+					},
+				];
+				const loader: ResourceLoader = {
+					...createTestResourceLoader(),
+					getAgents: () => ({ agents, diagnostics: [], projectAgentsDir: null }),
+				};
+				const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+				authStorage.setRuntimeApiKey(fauxModel.provider, "faux-key");
+				const settingsManager = SettingsManager.create(tempDir, tempDir);
+				const agentTool: ToolDefinition = {
+					name: "agent",
+					label: "agent",
+					description: "Delegate a self-contained task",
+					parameters: Type.Object({}),
+					execute: async () => ({ result: "ok" }),
+				};
+
+				const { session: withAgentTool } = await createAgentSession({
+					cwd: tempDir,
+					agentDir: tempDir,
+					model: fauxModel,
+					authStorage,
+					settingsManager,
+					resourceLoader: loader,
+					tools: ["agent"],
+					customTools: [agentTool],
+					sessionManager: SessionManager.inMemory(),
+				});
+				expect(withAgentTool.systemPrompt).toContain("<available_agents>");
+				expect(withAgentTool.systemPrompt).toContain('name="scout"');
+				await withAgentTool.dispose();
+
+				const { session: withoutAgentTool } = await createAgentSession({
+					cwd: tempDir,
+					agentDir: tempDir,
+					model: fauxModel,
+					authStorage,
+					settingsManager,
+					resourceLoader: loader,
+					tools: ["read"],
+					sessionManager: SessionManager.inMemory(),
+				});
+				expect(withoutAgentTool.systemPrompt).not.toContain("<available_agents>");
+				await withoutAgentTool.dispose();
+			} finally {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
 		});
 	});
 

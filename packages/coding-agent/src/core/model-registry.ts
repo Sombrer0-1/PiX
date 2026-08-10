@@ -318,6 +318,64 @@ export type ResolvedRequestAuth =
 			error: string;
 	  };
 
+/**
+ * Read-only model registry facade exposed to extensions.
+ *
+ * Only model/auth query capabilities are available; provider mutation must go
+ * through the official ExtensionAPI registerProvider/unregisterProvider. The
+ * facade never exposes the raw registry, its authStorage, or mutating methods,
+ * and every compound return value is a defensive snapshot that shares no
+ * references with the underlying registry.
+ */
+export interface ReadonlyModelRegistry {
+	getError(): string | undefined;
+	getAll(): Model<Api>[];
+	getAvailable(): Model<Api>[];
+	find(provider: string, modelId: string): Model<Api> | undefined;
+	hasConfiguredAuth(model: Model<Api>): boolean;
+	getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth>;
+	getProviderAuthStatus(provider: string): AuthStatus;
+	getProviderDisplayName(provider: string): string;
+	getApiKeyForProvider(provider: string): Promise<string | undefined>;
+	isUsingOAuth(model: Model<Api>): boolean;
+}
+
+/**
+ * Deep-copy a model so that all nested arrays/records (input, cost, headers,
+ * thinkingLevelMap, compat) are detached from the registry-owned object.
+ * Model values are plain data, so structuredClone covers the full shape.
+ */
+function cloneModel(model: Model<Api>): Model<Api> {
+	return structuredClone(model);
+}
+
+/**
+ * Create a frozen read-only facade over a ModelRegistry.
+ *
+ * The returned capability object has no back reference to the raw registry and
+ * cannot be reflected to reach it. getAll/getAvailable return fresh arrays and
+ * find returns a fresh model on every call; object results of
+ * getApiKeyAndHeaders/getProviderAuthStatus are copied as well. Primitive
+ * return values pass through unchanged.
+ */
+export function createReadonlyModelRegistry(registry: ModelRegistry): ReadonlyModelRegistry {
+	return Object.freeze({
+		getError: () => registry.getError(),
+		getAll: () => registry.getAll().map(cloneModel),
+		getAvailable: () => registry.getAvailable().map(cloneModel),
+		find: (provider: string, modelId: string) => {
+			const model = registry.find(provider, modelId);
+			return model ? cloneModel(model) : undefined;
+		},
+		hasConfiguredAuth: (model: Model<Api>) => registry.hasConfiguredAuth(model),
+		getApiKeyAndHeaders: async (model: Model<Api>) => structuredClone(await registry.getApiKeyAndHeaders(model)),
+		getProviderAuthStatus: (provider: string) => structuredClone(registry.getProviderAuthStatus(provider)),
+		getProviderDisplayName: (provider: string) => registry.getProviderDisplayName(provider),
+		getApiKeyForProvider: (provider: string) => registry.getApiKeyForProvider(provider),
+		isUsingOAuth: (model: Model<Api>) => registry.isUsingOAuth(model),
+	});
+}
+
 /** Result of loading custom models from models.json */
 interface CustomModelsResult {
 	models: Model<Api>[];

@@ -15,6 +15,7 @@ import type {
   McpServerInfo,
   ProjectLocation,
   ProjectLocationInput,
+  RequestUserInputDismissal,
   RequestUserInputRequest,
   ResolveProjectLocationResult,
   RpcCommand,
@@ -71,11 +72,15 @@ export interface PixApi {
   onPiError: (callback: (err: { message: string }) => void) => () => void;
   onPiReady: (callback: () => void) => () => void;
   onUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => () => void;
+  onUserInputDismissed: (callback: (event: RequestUserInputDismissal) => void) => () => void;
+  getPendingUserInputRequest: () => Promise<RequestUserInputRequest | null>;
+  getTeamLeaderPendingUserInputRequest: () => Promise<RequestUserInputRequest | null>;
   onTeamLeaderEvent: (callback: (event: AgentSessionEvent) => void) => () => void;
   onTeamLeaderExit: (callback: (data: { code: number | null; signal: string | null; stderr: string }) => void) => () => void;
   onTeamLeaderError: (callback: (err: { message: string }) => void) => () => void;
   onTeamLeaderReady: (callback: () => void) => () => void;
   onTeamLeaderUserInputRequest: (callback: (request: RequestUserInputRequest) => void) => () => void;
+  onTeamLeaderUserInputDismissed: (callback: (event: RequestUserInputDismissal) => void) => () => void;
 
   // Session management
   listSessions: (location: ProjectLocation) => Promise<SessionInfo[]>;
@@ -190,6 +195,13 @@ const api: PixApi = {
     ipcRenderer.on("user-input-request", handler);
     return () => ipcRenderer.removeListener("user-input-request", handler);
   },
+  onUserInputDismissed: (callback: (event: RequestUserInputDismissal) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: RequestUserInputDismissal) => callback(data);
+    ipcRenderer.on("user-input-dismissed", handler);
+    return () => ipcRenderer.removeListener("user-input-dismissed", handler);
+  },
+  getPendingUserInputRequest: () => ipcRenderer.invoke("get-pending-user-input-request"),
+  getTeamLeaderPendingUserInputRequest: () => ipcRenderer.invoke("get-team-leader-pending-user-input-request"),
   onTeamLeaderEvent: (callback: (event: AgentSessionEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: AgentSessionEvent) => callback(data);
     ipcRenderer.on("team-leader-event", handler);
@@ -213,6 +225,11 @@ const api: PixApi = {
     const handler = (_event: Electron.IpcRendererEvent, data: RequestUserInputRequest) => callback(data);
     ipcRenderer.on("team-leader-user-input-request", handler);
     return () => ipcRenderer.removeListener("team-leader-user-input-request", handler);
+  },
+  onTeamLeaderUserInputDismissed: (callback: (event: RequestUserInputDismissal) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: RequestUserInputDismissal) => callback(data);
+    ipcRenderer.on("team-leader-user-input-dismissed", handler);
+    return () => ipcRenderer.removeListener("team-leader-user-input-dismissed", handler);
   },
 
   listSessions: (location: ProjectLocation) => ipcRenderer.invoke("list-sessions", location),

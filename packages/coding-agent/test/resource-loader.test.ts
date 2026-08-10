@@ -491,6 +491,112 @@ Content`,
 		});
 	});
 
+	describe("agents catalog", () => {
+		it("initializes the agents cache in the constructor and exposes it via getAgents", () => {
+			const agentsDir = join(agentDir, "agents");
+			mkdirSync(agentsDir, { recursive: true });
+			writeFileSync(
+				join(agentsDir, "scout.md"),
+				`---
+name: scout
+description: Scout agent
+---
+Scout body`,
+			);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+
+			const result = loader.getAgents();
+			expect(result.agents.some((agent) => agent.name === "scout")).toBe(true);
+			expect(result.agents.some((agent) => agent.name === "general-purpose")).toBe(true);
+			expect(result.projectAgentsDir).toBe(join(cwd, ".pi", "agents"));
+		});
+
+		it("refreshes the agents cache on reload", async () => {
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			expect(loader.getAgents().agents.some((agent) => agent.name === "scout")).toBe(false);
+
+			const agentsDir = join(agentDir, "agents");
+			mkdirSync(agentsDir, { recursive: true });
+			writeFileSync(
+				join(agentsDir, "scout.md"),
+				`---
+name: scout
+description: Scout agent
+---
+Scout body`,
+			);
+
+			await loader.reload();
+
+			expect(loader.getAgents().agents.some((agent) => agent.name === "scout")).toBe(true);
+		});
+
+		it("serves the cached snapshot without rescanning the disk until reload", async () => {
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			const firstSnapshot = loader.getAgents();
+
+			const agentsDir = join(agentDir, "agents");
+			mkdirSync(agentsDir, { recursive: true });
+			writeFileSync(
+				join(agentsDir, "scout.md"),
+				`---
+name: scout
+description: Scout agent
+---
+Scout body`,
+			);
+
+			// Disk changed but the cache must not move without a reload.
+			expect(loader.getAgents()).toBe(firstSnapshot);
+			expect(loader.getAgents().agents.some((agent) => agent.name === "scout")).toBe(false);
+
+			await loader.reload();
+			expect(loader.getAgents().agents.some((agent) => agent.name === "scout")).toBe(true);
+		});
+
+		it("applies agentsOverride on constructor load and every reload", async () => {
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				agentsOverride: (base) => ({
+					...base,
+					agents: [
+						...base.agents,
+						{
+							name: "injected",
+							description: "Injected agent",
+							systemPrompt: "Injected body",
+							source: "user",
+						},
+					],
+				}),
+			});
+
+			expect(loader.getAgents().agents.some((agent) => agent.name === "injected")).toBe(true);
+
+			await loader.reload();
+			expect(loader.getAgents().agents.some((agent) => agent.name === "injected")).toBe(true);
+			expect(loader.getAgents().agents.some((agent) => agent.name === "general-purpose")).toBe(true);
+		});
+
+		it("existing custom ResourceLoader object literals without getAgents remain valid", () => {
+			const customLoader: import("../src/core/resource-loader.ts").ResourceLoader = {
+				getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+				getSkills: () => ({ skills: [], diagnostics: [] }),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => undefined,
+				getAppendSystemPrompt: () => [],
+				extendResources: () => {},
+				reload: async () => {},
+			};
+
+			expect(customLoader.getAgents).toBeUndefined();
+		});
+	});
+
 	describe("override functions", () => {
 		it("should apply skillsOverride", async () => {
 			const injectedSkill: Skill = {

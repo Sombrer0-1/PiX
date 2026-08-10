@@ -516,6 +516,18 @@ export function registerIpcHandlers(
   });
 
   // =========================================================================
+  // Active user-input snapshot (remount catch-up)
+  // =========================================================================
+
+  ipcMain.handle("get-pending-user-input-request", () => {
+    return singleSessionBridge.getActiveUserInputRequest();
+  });
+
+  ipcMain.handle("get-team-leader-pending-user-input-request", () => {
+    return teamLeaderSessionBridge.getActiveUserInputRequest();
+  });
+
+  // =========================================================================
   // Session listing
   // =========================================================================
 
@@ -941,6 +953,16 @@ export function setupEventForwarding(
     }
   }));
 
+  // Dismissals forward on their own channels, preserving the bridge's event
+  // order (a dismissal always precedes the following request). ipc-handlers
+  // never generates dismissals and never maintains UI state.
+  eventForwardingUnsubscribes.push(singleSessionBridge.onUserInputDismissed((event) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("user-input-dismissed", event);
+    }
+  }));
+
   // Lifecycle: ready
   eventForwardingUnsubscribes.push(singleSessionBridge.onLifecycle("ready", () => {
     const win = getWin();
@@ -977,6 +999,13 @@ export function setupEventForwarding(
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("team-leader-user-input-request", request);
+    }
+  }));
+
+  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onUserInputDismissed((event) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("team-leader-user-input-dismissed", event);
     }
   }));
 

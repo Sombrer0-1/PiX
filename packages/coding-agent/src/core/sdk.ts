@@ -3,7 +3,7 @@ import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, type ExtensionProviderPolicy } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -91,6 +91,8 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** 默认 mutable；nested session 必须传 read-only，保护借用的 ModelRegistry。 */
+	extensionProviderPolicy?: ExtensionProviderPolicy;
 }
 
 /** Result from createAgentSession */
@@ -440,6 +442,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		enableBuiltInEnhancementTools,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		extensionProviderPolicy: options.extensionProviderPolicy,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

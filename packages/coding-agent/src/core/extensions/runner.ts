@@ -8,7 +8,7 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
-import type { ModelRegistry } from "../model-registry.ts";
+import { createReadonlyModelRegistry, type ModelRegistry, type ReadonlyModelRegistry } from "../model-registry.ts";
 import type { SessionManager } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
@@ -228,6 +228,7 @@ export class ExtensionRunner {
 	private cwd: string;
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
+	private readonlyModelRegistry: ReadonlyModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private isIdleFn: () => boolean = () => true;
@@ -261,6 +262,11 @@ export class ExtensionRunner {
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+		// Construct and hold one readonly facade for the lifetime of the runner.
+		// createContext() never returns the raw registry under any policy; the
+		// raw registry stays private and is only used by bindCore() when the
+		// owning session does not inject provider actions.
+		this.readonlyModelRegistry = createReadonlyModelRegistry(modelRegistry);
 	}
 
 	bindCore(
@@ -592,7 +598,7 @@ export class ExtensionRunner {
 			},
 			get modelRegistry() {
 				runner.assertActive();
-				return runner.modelRegistry;
+				return runner.readonlyModelRegistry;
 			},
 			get model() {
 				runner.assertActive();
