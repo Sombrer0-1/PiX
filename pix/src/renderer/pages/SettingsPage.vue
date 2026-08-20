@@ -21,11 +21,12 @@ const authStore = useAuthStore();
 const rpc = useWorkspaceRpc();
 
 // ---- Navigation ----
-type SettingsSection = "general" | "model" | "shell" | "wsl" | "resources" | "mcp" | "custom" | "auth" | "advanced";
+type SettingsSection = "general" | "model" | "plan" | "shell" | "wsl" | "resources" | "mcp" | "custom" | "auth" | "advanced";
 const activeSection = ref<SettingsSection>("general");
 const sections: { key: SettingsSection; label: string; icon: string }[] = [
   { key: "general", label: "常规", icon: "mdi-cog-outline" },
   { key: "model", label: "模型", icon: "mdi-cube-outline" },
+  { key: "plan", label: "规划", icon: "mdi-clipboard-list-outline" },
   { key: "shell", label: "Shell", icon: "mdi-bash" },
   { key: "wsl", label: "WSL", icon: "mdi-linux" },
   { key: "resources", label: "资源", icon: "mdi-package-variant" },
@@ -55,6 +56,16 @@ const imageAutoResize = ref(true);
 const blockImages = ref(false);
 const takeHerEyesEnabled = ref(false);
 const takeHerEyesModel = ref("");
+
+// Plan-mode settings (1.4.0). Empty planModelKey/planThinkingLevel mean
+// "inherit the current session model" and persist as undefined.
+const planModelKey = ref("");
+const planThinkingLevel = ref<ThinkingLevel | "">("");
+const enableProductAnalytics = ref(false);
+
+// 1.4.1: auto-background threshold for foreground agent tasks (ms);
+// 0 = off. Hydrated from the store on mount, which defaults absent to 120000.
+const autoBackgroundMs = ref(120_000);
 
 const shellPath = ref("");
 const shellCommandPrefix = ref("");
@@ -169,6 +180,35 @@ const visionModelItems = computed(() =>
     }))
 );
 
+// Plan-mode model choices; the first entry (empty value) means "inherit the
+// current session model" and is never persisted as a planModel.
+const planModelItems = computed(() => {
+  const inherit = [{ title: "继承当前会话模型", value: "" }];
+  const models = rpc.availableModels.value
+    .filter((model: ModelInfo) => authStore.authStatus[model.provider]?.configured)
+    .map((model: ModelInfo) => ({
+      title: `${model.provider}/${model.id}`,
+      value: modelKey(model),
+      props: {
+        subtitle: model.contextWindow ? `${formatContextWindow(model.contextWindow)} 上下文` : undefined,
+      },
+    }));
+  return [...inherit, ...models];
+});
+
+const planThinkingLevelItems: Array<{ title: string; value: ThinkingLevel | "" }> = [
+  { title: "继承会话默认", value: "" },
+  ...thinkingLevelItems,
+];
+
+// 1.4.1: auto-background threshold choices; 0 = off (never auto-background).
+const autoBackgroundMsItems: Array<{ title: string; value: number }> = [
+  { title: "1 分钟", value: 60_000 },
+  { title: "2 分钟", value: 120_000 },
+  { title: "5 分钟", value: 300_000 },
+  { title: "关闭", value: 0 },
+];
+
 const wslDistroItems = computed(() =>
   settingsStore.wslDistros.map((d) => ({
     title: d.name,
@@ -220,6 +260,13 @@ onMounted(async () => {
     settingsStore.settings.takeHerEyes?.provider && settingsStore.settings.takeHerEyes?.modelId
       ? `${settingsStore.settings.takeHerEyes.provider}/${settingsStore.settings.takeHerEyes.modelId}`
       : "";
+  planModelKey.value =
+    settingsStore.settings.planModel?.provider && settingsStore.settings.planModel?.modelId
+      ? `${settingsStore.settings.planModel.provider}/${settingsStore.settings.planModel.modelId}`
+      : "";
+  planThinkingLevel.value = settingsStore.settings.planThinkingLevel ?? "";
+  enableProductAnalytics.value = settingsStore.settings.enableProductAnalytics ?? false;
+  autoBackgroundMs.value = settingsStore.autoBackgroundMs;
   wslEnabled.value = settingsStore.settings.wsl?.enabled ?? false;
   wslDistro.value = settingsStore.settings.wsl?.distro ?? "";
   wslDefaultCwd.value = settingsStore.settings.wsl?.defaultCwd || "/home";
@@ -299,6 +346,7 @@ async function saveSettings(): Promise<void> {
   saved.value = false;
   try {
     const selectedEyeModel = parseModelKey(takeHerEyesModel.value);
+    const selectedPlanModel = parseModelKey(planModelKey.value);
     await settingsStore.save({
       defaultModel: defaultModel.value || undefined,
       defaultProvider: defaultProvider.value || undefined,
@@ -308,6 +356,13 @@ async function saveSettings(): Promise<void> {
         provider: selectedEyeModel?.provider,
         modelId: selectedEyeModel?.modelId,
       },
+      // 1.4.0 plan-mode settings; empty selection persists as undefined
+      // ("inherit the session model").
+      planModel: selectedPlanModel,
+      planThinkingLevel: planThinkingLevel.value || undefined,
+      enableProductAnalytics: enableProductAnalytics.value,
+      // 1.4.1: auto-background threshold; 0 = off.
+      autoBackgroundMs: autoBackgroundMs.value,
       wsl: {
         enabled: wslEnabled.value,
         distro: wslDistro.value,
@@ -478,6 +533,57 @@ async function downloadAndInstall(): Promise<void> {
                 已开启“阻止图片”，takeHerEyes 会保持关闭效果，不会把图片发送给任何模型。
               </div>
             </div>
+          </div>
+        </div>
+
+        <!-- ============ 规划 ============ -->
+        <div v-show="activeSection === 'plan'" class="section-panel">
+          <h2 class="section-title">规划</h2>
+          <p class="section-desc">规划模式的模型、匿名使用数据与自动后台设置。</p>
+          <div class="form-fields">
+            <v-select
+              v-model="planModelKey"
+              data-test="plan-model-select"
+              label="规划模型"
+              :items="planModelItems"
+              item-title="title"
+              item-value="value"
+              hint="规划模式使用的模型；「继承当前会话模型」时跟随当前会话。"
+              persistent-hint
+              class="mb-4"
+            />
+            <v-select
+              v-model="planThinkingLevel"
+              data-test="plan-thinking-select"
+              label="规划思考级别"
+              :items="planThinkingLevelItems"
+              item-title="title"
+              item-value="value"
+              hint="规划模式使用的思考级别；「继承会话默认」时跟随当前会话。"
+              persistent-hint
+              class="mb-4"
+            />
+            <v-divider class="my-4" />
+            <v-switch
+              v-model="enableProductAnalytics"
+              data-test="analytics-switch"
+              label="匿名使用数据"
+              hint="收集匿名产品使用数据以改进 PiX。默认关闭，与安装遥测相互独立。"
+              persistent-hint
+              class="mb-4"
+            />
+            <v-divider class="my-4" />
+            <v-select
+              v-model="autoBackgroundMs"
+              data-test="auto-background-select"
+              label="自动后台化阈值"
+              :items="autoBackgroundMsItems"
+              item-title="title"
+              item-value="value"
+              hint="前台子代理运行超过该时长后自动转入后台继续执行；选择「关闭」则始终等待前台完成。"
+              persistent-hint
+              class="mb-4"
+            />
           </div>
         </div>
 

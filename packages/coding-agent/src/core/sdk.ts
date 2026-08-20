@@ -4,6 +4,7 @@ import { clampThinkingLevel, type Message, type Model, streamSimple } from "@ear
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, type ExtensionProviderPolicy } from "./agent-session.ts";
+import type { HostToolPolicyOverride } from "./tool-execution-policy.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -93,6 +94,13 @@ export interface CreateAgentSessionOptions {
 	sessionStartEvent?: SessionStartEvent;
 	/** 默认 mutable；nested session 必须传 read-only，保护借用的 ModelRegistry。 */
 	extensionProviderPolicy?: ExtensionProviderPolicy;
+	/**
+	 * Host-injected synchronous tool policy override, authoritative for the
+	 * whole session lifetime. Consulted before the built-in execution-mode
+	 * policy; returning undefined falls back to it. Not replaced by extension
+	 * reloads. A throwing override fails closed instead of falling back.
+	 */
+	hostToolPolicyOverride?: HostToolPolicyOverride;
 }
 
 /** Result from createAgentSession */
@@ -443,6 +451,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 		extensionProviderPolicy: options.extensionProviderPolicy,
+		hostToolPolicyOverride: options.hostToolPolicyOverride,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

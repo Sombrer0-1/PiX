@@ -12,7 +12,7 @@ import type {
   ProjectInfo,
 } from "../shared/types.js";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 const DEFAULT_WSL_SETTINGS: NonNullable<GuiSettings["wsl"]> = {
   enabled: false,
   distro: "",
@@ -82,27 +82,54 @@ export class SettingsStore {
   }
 
   /**
-   * One-time migration to schemaVersion=2. Idempotent.
+   * Per-version, idempotent migration to schemaVersion=4 (1.4.1). Steps run in
+   * order so any older store is advanced one version at a time; a store already
+   * at the current version is untouched. Migrations never write the optional
+   * 1.4.1 field: an absent autoBackgroundMs means the consumer default
+   * (DEFAULT_AUTO_BACKGROUND_MS = 120000).
    *
-   * 1. Old entries without physicalPath/environment become Windows projects
-   *    (physicalPath = path, environment = windows, path = physicalPath).
-   * 2. Missing wsl defaults are written.
-   * 3. schemaVersion is stamped to 2.
+   * 0/1 -> 2 (legacy):
+   *   1. Old entries without physicalPath/environment become Windows projects
+   *      (physicalPath = path, environment = windows, path = physicalPath).
+   *   2. Missing wsl defaults are written.
+   * 2 -> 3 (1.4.0):
+   *   3. enableProductAnalytics defaults to false; planModel/planThinkingLevel
+   *      stay absent (undefined = inherit).
+   * 3 -> 4 (1.4.1):
+   *   4. No field writes: autoBackgroundMs stays absent (undefined = consumer
+   *      default 120000); the schemaVersion stamp below advances the version.
+   * 5. schemaVersion is stamped to 4.
    */
   private migrate(): void {
-    if (this.store.get("schemaVersion") === SCHEMA_VERSION) return;
+    const version = this.store.get("schemaVersion");
+    if (version === SCHEMA_VERSION) return;
 
-    const rawProjects = this.store.get("recentProjects") ?? [];
-    const migrated: ProjectInfo[] = [];
-    for (const entry of rawProjects) {
-      const info = migrateProjectInfo(entry);
-      if (info) migrated.push(info);
-    }
-    this.store.set("recentProjects", migrated);
+    if (version === undefined || version < 2) {
+      const rawProjects = this.store.get("recentProjects") ?? [];
+      const migrated: ProjectInfo[] = [];
+      for (const entry of rawProjects) {
+        const info = migrateProjectInfo(entry);
+        if (info) migrated.push(info);
+      }
+      this.store.set("recentProjects", migrated);
 
-    if (!this.store.get("wsl")) {
-      this.store.set("wsl", DEFAULT_WSL_SETTINGS);
+      if (!this.store.get("wsl")) {
+        this.store.set("wsl", DEFAULT_WSL_SETTINGS);
+      }
     }
+
+    if (version === undefined || version < 3) {
+      if (this.store.get("enableProductAnalytics") === undefined) {
+        this.store.set("enableProductAnalytics", false);
+      }
+    }
+
+    if (version === undefined || version < 4) {
+      // 3 -> 4 (1.4.1): nothing to write. autoBackgroundMs is optional; when
+      // absent, consumers fall back to DEFAULT_AUTO_BACKGROUND_MS (120000),
+      // so the migration only advances the version via the stamp below.
+    }
+
     this.store.set("schemaVersion", SCHEMA_VERSION);
   }
 
@@ -162,6 +189,34 @@ export class SettingsStore {
         this.store.delete("wsl");
       } else {
         this.store.set("wsl", settings.wsl);
+      }
+    }
+    if (Object.hasOwn(settings, "planModel")) {
+      if (settings.planModel === undefined) {
+        this.store.delete("planModel");
+      } else {
+        this.store.set("planModel", settings.planModel);
+      }
+    }
+    if (Object.hasOwn(settings, "planThinkingLevel")) {
+      if (settings.planThinkingLevel === undefined) {
+        this.store.delete("planThinkingLevel");
+      } else {
+        this.store.set("planThinkingLevel", settings.planThinkingLevel);
+      }
+    }
+    if (Object.hasOwn(settings, "enableProductAnalytics")) {
+      if (settings.enableProductAnalytics === undefined) {
+        this.store.delete("enableProductAnalytics");
+      } else {
+        this.store.set("enableProductAnalytics", settings.enableProductAnalytics);
+      }
+    }
+    if (Object.hasOwn(settings, "autoBackgroundMs")) {
+      if (settings.autoBackgroundMs === undefined) {
+        this.store.delete("autoBackgroundMs");
+      } else {
+        this.store.set("autoBackgroundMs", settings.autoBackgroundMs);
       }
     }
   }

@@ -384,7 +384,17 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     // Electron IPC 用 structured clone 序列化，无法克隆 Vue reactive Proxy；providers
     // 来自 reactive drafts，嵌套属性仍是 Proxy，需深拷贝成 plain object 再发送。
     const plain = JSON.parse(JSON.stringify(providers)) as Record<string, CustomProviderConfig>;
-    return sendCommand({ type: "set_custom_providers", providers: plain });
+    const result = await sendCommand<{
+      success: boolean;
+      schemaError?: string;
+      sessionActive: boolean;
+      workersStale?: boolean;
+      error?: string;
+    }>({ type: "set_custom_providers", providers: plain });
+    if (result?.success && result.sessionActive) {
+      await Promise.all([refreshModels(), refreshState()]);
+    }
+    return result;
   }
 
   async function removeAuth(provider: string): Promise<void> {

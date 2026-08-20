@@ -7,6 +7,7 @@
 
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
+import { DEFAULT_AUTO_BACKGROUND_MS } from "@shared/agent-task-types.js";
 import type { GuiSettings, WslDistroInfo, WslSettings } from "@/types/session";
 import type { PixApi } from "../../main/preload";
 
@@ -134,6 +135,13 @@ export const useSettingsStore = defineStore("settings", () => {
     theme: computed(() => settings.value.theme),
     recentProjects: computed(() => settings.value.recentProjects),
     wslSettings: computed<WslSettings>(() => settings.value.wsl ?? DEFAULT_WSL_SETTINGS),
+    // 1.4.0: plan-mode settings; undefined means "inherit the session model".
+    planModel: computed<GuiSettings["planModel"]>(() => settings.value.planModel),
+    planThinkingLevel: computed<GuiSettings["planThinkingLevel"]>(() => settings.value.planThinkingLevel),
+    enableProductAnalytics: computed<boolean>(() => settings.value.enableProductAnalytics ?? false),
+    // 1.4.1: auto-background threshold for foreground agent tasks;
+    // 0 = off, absent = consumer default (120000).
+    autoBackgroundMs: computed<number>(() => settings.value.autoBackgroundMs ?? DEFAULT_AUTO_BACKGROUND_MS),
     wslDistros,
     wslDiagnostic,
     wslDistrosLoaded,

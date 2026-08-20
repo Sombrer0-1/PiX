@@ -14,6 +14,11 @@
  * close order, create/bind failure cleanup and resume usage rebuild.
  *
  * Run with: npx tsx src/main/__tests__/session-bridge-subagent.test.ts
+ *
+ * 1.4.1: the runner is a service facade, so the bridge FIFO tests inject a
+ * real app-level AgentTaskService (faux runtime hooks never needed; every run
+ * here is terminal before any task enqueues) and the project-trust approval
+ * requests flow back through the bridge FIFO closure.
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -36,12 +41,20 @@ import {
   type RequestUserInputRequest,
   type RequestUserInputResponse,
 } from "@earendil-works/pi-coding-agent";
+import type { CustomProviderConfig } from "../../shared/custom-providers.js";
 import type { SubagentDetails } from "../../shared/subagent-types.js";
+import type { ProjectLocation, RequestUserInputDismissal } from "../../shared/types.js";
 import { McpAdapter } from "pi-mcp-adapter";
+import { AgentTaskStore } from "../agent-task/agent-task-store.js";
+import { AgentTaskService, __setAgentTaskServiceHooksForTests } from "../agent-task/agent-task-service.js";
+import type { AgentTaskRuntime } from "../agent-task/agent-task-runtime.js";
+import type { ProductEventCollector } from "../product-event-collector.js";
+import { SettingsStore } from "../settings-store.js";
 import type { SubagentExecutionContext } from "../subagent/types.js";
 import type { SubagentRunner } from "../subagent/subagent-runner.js";
+import type { PlanController, PlanDisposeReason } from "../plan/plan-controller.js";
+import type { PlanRuntimeSnapshot } from "../../shared/plan-types.js";
 import { SessionBridge } from "../session-bridge.js";
-import type { ProjectLocation, RequestUserInputDismissal } from "../../shared/types.js";
 
 // ============================================================================
 // Test harness (matches subagent-runner.test.ts / execution-context.test.ts
@@ -105,6 +118,15 @@ process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 const AGENTS_DIR = join(AGENT_DIR, "agents");
 mkdirSync(AGENTS_DIR, { recursive: true });
 const PROJECT_CWD = mkdtempSync(join(tmpdir(), "pix-bridge-project-"));
+/**
+ * Dedicated project cwd for the resume test: the persisted session namespace
+ * is keyed by the physical cwd, and SessionManager.continueRecent restores
+ * the most-recently-written session file. Earlier tests leave their session
+ * in PROJECT_CWD's namespace, and equal millisecond mtimes can make the
+ * restore pick the wrong file; an empty namespace makes the resume restore
+ * deterministic.
+ */
+const RESUME_CWD = mkdtempSync(join(tmpdir(), "pix-bridge-resume-project-"));
 
 const MODELS_JSON = {
   providers: {
@@ -152,11 +174,11 @@ function clearProjectAgents(): void {
   rmSync(join(PROJECT_CWD, ".pi"), { recursive: true, force: true });
 }
 
-function makeLocation(): ProjectLocation {
+function makeLocation(cwd: string = PROJECT_CWD): ProjectLocation {
   return {
-    path: PROJECT_CWD,
-    physicalPath: PROJECT_CWD,
-    name: basename(PROJECT_CWD),
+    path: cwd,
+    physicalPath: cwd,
+    name: basename(cwd),
     environment: { kind: "windows" },
   };
 }
@@ -188,6 +210,7 @@ interface GenerationAccess {
   auxiliaryUsage: AuxiliaryTotals;
   session: AgentSession | null;
   runner: SubagentRunner;
+  planController: PlanController;
   mcpAdapter: { dispose: () => Promise<void> };
 }
 
@@ -290,6 +313,76 @@ process.on("unhandledRejection", (reason: unknown) => {
 function assertNoUnhandledRejections(): void {
   assertEqual(unhandledRejections.length, 0, "no unhandled rejections observed");
   unhandledRejections.length = 0;
+}
+
+// ============================================================================
+// Faux app-level AgentTaskService (1.4.1 facade path)
+// ============================================================================
+
+/**
+ * Fresh app-level task service for the bridge FIFO tests: the runner facade
+ * delegates project-trust preflight to this service, whose approval requests
+ * flow back through the bridge FIFO closure (the same FIFO the parent session
+ * uses). Every run in these tests becomes terminal before any task enqueues
+ * (denied approval / approval-race cancelled), so no runtime factory is needed
+ * and the auto-background timer never starts.
+ */
+function makeTaskService(): AgentTaskService {
+  const cwd = mkdtempSync(join(tmpdir(), "pix-bridge-task-service-"));
+  const settings = new SettingsStore({ cwd });
+  const events = { record: () => {} } as unknown as ProductEventCollector;
+  // 1.4.2 (R2): the service requires a real store + frozen runId.
+  const store = new AgentTaskStore({
+    rootDir: mkdtempSync(join(tmpdir(), "pix-bridge-task-store-")),
+    maxTaskBytes: 25 * 1024 * 1024,
+    maxWorkspaceBytes: 500 * 1024 * 1024,
+  });
+  return new AgentTaskService({ settings, events, store, runId: "bridge-run" });
+}
+
+/**
+ * Never-settling runtime for the session-switch / delivery tests: the task
+ * starts and stays running until the test ends it, so a foreground group keeps
+ * its delegation in flight (auto-background is disabled via the hooks).
+ */
+class NeverSettlingRuntime {
+  static instances: NeverSettlingRuntime[] = [];
+  readonly spec: unknown;
+  abortCalls = 0;
+
+  constructor(spec: unknown) {
+    this.spec = spec;
+    NeverSettlingRuntime.instances.push(this);
+  }
+
+  run(): Promise<never> {
+    return new Promise(() => {});
+  }
+
+  abort(): void {
+    this.abortCalls++;
+  }
+
+  dispose(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  resolveInput(): boolean {
+    return true;
+  }
+
+  cancelInput(): boolean {
+    return true;
+  }
+}
+
+/** Shared hooks: no auto-background timer, never-settling fake runtime. */
+function installNeverSettlingRuntimeHooks(): () => void {
+  NeverSettlingRuntime.instances.length = 0;
+  return __setAgentTaskServiceHooksForTests({
+    autoBackgroundMsOverride: 0,
+    runtimeFactory: (spec) => new NeverSettlingRuntime(spec) as unknown as AgentTaskRuntime,
+  });
 }
 
 // ============================================================================
@@ -429,7 +522,7 @@ await run("stale runner closures never read or write a replacement parent/genera
 await run("project trust and concurrent requests: one active at a time through the bridge FIFO", async () => {
   writeProjectAgent("scout.md", "name: scout\ndescription: scout agent");
   try {
-    const bridge = new SessionBridge();
+    const bridge = new SessionBridge({ agentTaskService: makeTaskService() });
     await bridge.start(makeLocation());
     const b = accessBridge(bridge);
     const runner = b._generation!.runner;
@@ -532,7 +625,7 @@ await run("project trust and concurrent requests: one active at a time through t
 await run("active abort dismisses then pumps; queued abort never dismisses", async () => {
   writeProjectAgent("scout.md", "name: scout\ndescription: scout agent");
   try {
-    const bridge = new SessionBridge();
+    const bridge = new SessionBridge({ agentTaskService: makeTaskService() });
     await bridge.start(makeLocation());
     const runner = accessBridge(bridge)._generation!.runner;
     await bridge.setModel("faux", "faux-model");
@@ -617,7 +710,7 @@ await run("active abort dismisses then pumps; queued abort never dismisses", asy
 await run("close dismisses only the displayed item and rejects the whole queue", async () => {
   writeProjectAgent("scout.md", "name: scout\ndescription: scout agent");
   try {
-    const bridge = new SessionBridge();
+    const bridge = new SessionBridge({ agentTaskService: makeTaskService() });
     await bridge.start(makeLocation());
     const runner = accessBridge(bridge)._generation!.runner;
     await bridge.setModel("faux", "faux-model");
@@ -852,7 +945,9 @@ await run("parent request_user_input approval flows through the same bridge FIFO
 });
 
 await run("resume usage rebuilds from persisted agent tool result details", async () => {
-  const sessionManager = SessionManager.create(PROJECT_CWD);
+  // Dedicated cwd: an empty session namespace guarantees continueRecent
+  // restores exactly the session appended below (mtime-tie safe).
+  const sessionManager = SessionManager.create(RESUME_CWD);
   sessionManager.appendModelChange("faux", "faux-model");
   sessionManager.appendThinkingLevelChange("off");
   sessionManager.appendMessage({ role: "user", content: "do it", timestamp: Date.now() });
@@ -918,7 +1013,7 @@ await run("resume usage rebuilds from persisted agent tool result details", asyn
   } as unknown as ToolResultMessage);
 
   const bridge = new SessionBridge();
-  await bridge.start(makeLocation());
+  await bridge.start(makeLocation(RESUME_CWD));
   const b = accessBridge(bridge);
   try {
     const session = b._session!;
@@ -940,6 +1035,249 @@ await run("resume usage rebuilds from persisted agent tool result details", asyn
     );
   } finally {
     await bridge.dispose();
+  }
+  assertNoUnhandledRejections();
+});
+
+await run("custom provider save hot-reloads the active model metadata", async () => {
+  const bridge = new SessionBridge();
+  await bridge.start(makeLocation());
+  let sessionFile: string | undefined;
+  try {
+    await bridge.setModel("faux", "faux-model");
+    const session = accessBridge(bridge)._session!;
+    sessionFile = session.sessionFile;
+    const previousModel = session.model!;
+    const providers = structuredClone(MODELS_JSON.providers) as unknown as Record<string, CustomProviderConfig>;
+    providers.faux!.models![0]!.name = "Renamed Faux Model";
+    providers.faux!.models![0]!.thinkingLevelMap = { off: null, low: "low", high: "max" };
+
+    const result = bridge.setCustomProviders(providers);
+
+    assertEqual(result.success, true, "custom provider save succeeds");
+    assert(session.model !== previousModel, "active model is rebound to the refreshed registry instance");
+    assertEqual(session.model?.name, "Renamed Faux Model", "active model name updates immediately");
+    assertEqual(session.model?.thinkingLevelMap?.high, "max", "active model thinking map updates immediately");
+    assertEqual(
+      bridge.getAvailableModels().find((model) => model.provider === "faux" && model.id === "faux-model")
+        ?.thinkingLevelMap?.high,
+      "max",
+      "available model metadata updates immediately",
+    );
+  } finally {
+    await bridge.dispose();
+    if (sessionFile) rmSync(sessionFile, { force: true });
+    writeModelsJson();
+  }
+  assertNoUnhandledRejections();
+});
+
+await run("quit close maps to session_close unless the app shutdown flag is set", async () => {
+  // User-initiated stop (stop-pi) / project switch (start) / team-mode switch
+  // all close with "quit" while the app and the app-level task service keep
+  // running: the plan dispose reason must be session_close so task-linked
+  // waiting steps survive as waiting_input+paused (1.4.2 R4).
+  const bridge = new SessionBridge();
+  await bridge.start(makeLocation());
+  const b = accessBridge(bridge);
+  const controller = b._generation!.planController;
+  const ctrl = controller as unknown as { dispose: (reason: PlanDisposeReason) => Promise<void> };
+  const captured: PlanDisposeReason[] = [];
+  const origDispose = ctrl.dispose;
+  ctrl.dispose = (reason: PlanDisposeReason): Promise<void> => {
+    captured.push(reason);
+    return origDispose.call(controller, reason);
+  };
+  try {
+    await bridge.dispose();
+    assertEqual(captured.length, 1, "plan dispose called exactly once on bridge dispose");
+    assertEqual(captured[0], "session_close", "user stop maps to session_close, never app_shutdown");
+  } finally {
+    ctrl.dispose = origDispose;
+  }
+
+  // Whole-app shutdown (index.ts cleanup): markAppShuttingDown flips the
+  // mapping to app_shutdown, which writes task-linked waiting steps as
+  // "interrupted" keeping the link facts (1.4.2 R4).
+  const bridge2 = new SessionBridge();
+  await bridge2.start(makeLocation());
+  const b2 = accessBridge(bridge2);
+  const controller2 = b2._generation!.planController;
+  const ctrl2 = controller2 as unknown as { dispose: (reason: PlanDisposeReason) => Promise<void> };
+  const captured2: PlanDisposeReason[] = [];
+  const origDispose2 = ctrl2.dispose;
+  ctrl2.dispose = (reason: PlanDisposeReason): Promise<void> => {
+    captured2.push(reason);
+    return origDispose2.call(controller2, reason);
+  };
+  try {
+    bridge2.markAppShuttingDown();
+    await bridge2.dispose();
+    assertEqual(captured2.length, 1, "plan dispose called exactly once on flagged dispose");
+    assertEqual(captured2[0], "app_shutdown", "app cleanup maps to app_shutdown");
+  } finally {
+    ctrl2.dispose = origDispose2;
+  }
+  assertNoUnhandledRejections();
+});
+
+await run("foreground plan delegation during a session switch persists waiting_input(agent_task)+paused, never failed", async () => {
+  const restoreHooks = installNeverSettlingRuntimeHooks();
+  try {
+    const bridge = new SessionBridge({ agentTaskService: makeTaskService() });
+    await bridge.start(makeLocation());
+    const b = accessBridge(bridge);
+    const session = b._session!;
+    const controller = b._generation!.planController;
+    const registry = b._generation!.modelRegistry;
+    registry.registerProvider("faux", { api: "faux-api", streamSimple: fauxStream });
+    await bridge.setModel("faux", "faux-model");
+
+    // Scripted planning turn: the model submits a single subagent_foreground
+    // step. The generationId is a randomUUID created inside enterPlanning, so
+    // the scripted args resolve it lazily when the loop validates the tool
+    // call (during the turn, after the generation exists).
+    let capturedGenerationId = "";
+    const planDraftArgs: Record<string, unknown> = {
+      get generationId(): string {
+        if (capturedGenerationId === "") {
+          capturedGenerationId = controller.getSnapshot().generation?.generationId ?? "";
+        }
+        return capturedGenerationId;
+      },
+      title: "Delegate one step",
+      summary: "Run a single subagent step.",
+      steps: [
+        {
+          stepKey: "s0",
+          title: "Run the subagent step",
+          description: "Delegate the step to a subagent.",
+          files: [],
+          expectedCommands: [],
+          executionTarget: "subagent_foreground",
+          risk: "low",
+          riskReason: "Read-only inspection.",
+          effort: "small",
+          verification: "Inspect the reported output.",
+          dependsOn: [],
+        },
+      ],
+    };
+    providerScripts.length = 0;
+    providerScripts.push({
+      kind: "message",
+      stopReason: "stop",
+      toolCall: { name: "submit_user_plan", id: "call_plan_1", args: planDraftArgs },
+    });
+    providerScripts.push({ kind: "message", text: "plan submitted", stopReason: "stop" });
+
+    const entered = await controller.enterPlanning({ text: "Make a plan for one subagent step." });
+    assertEqual(entered.ok, true, "planning generation started");
+    const snapshot = controller.getSnapshot();
+    assertEqual(snapshot.phase, "awaiting_approval", "scripted submission reaches awaiting_approval");
+    assert(capturedGenerationId !== "", "generationId resolved lazily from the live generation");
+
+    const planId = snapshot.planId!;
+    const version = snapshot.plan!.version;
+    const approved = await controller.approve(planId, version);
+    assertEqual(approved.ok, true, "plan approved");
+    // Do NOT await: the foreground delegation blocks on the service awaitGroup
+    // until the session switch detaches it.
+    const executing = controller.startExecution(planId, version);
+    await waitFor(() => NeverSettlingRuntime.instances.length >= 1, 20000, "delegated task running in the app service");
+
+    // Capture plan_state and switch the session while the delegation is in
+    // flight: the close must first persist waiting_input(agent_task)+paused
+    // (the detach -> macrotask -> dispose ordering), never fail the step.
+    const states: PlanRuntimeSnapshot[] = [];
+    const off = controller.onEvent((event) => {
+      if (event.type === "plan_state") {
+        states.push(event.snapshot);
+      }
+    });
+    await bridge.newSession();
+    off();
+    await executing;
+
+    const last = states[states.length - 1];
+    assert(last !== undefined, "plan_state events were captured");
+    assertEqual(last!.phase, "paused", "top-level plan is paused after the session switch");
+    const step = last!.plan!.steps[0];
+    assertEqual(step.status, "waiting_input", "delegated step persisted as waiting_input, never failed");
+    assertEqual(step.waitingReason, "agent_task", "waiting reason is agent_task");
+    assert(
+      typeof step.waitingTaskGroupId === "string" && step.waitingTaskGroupId !== "",
+      "waitingTaskGroupId recorded for two-phase consumption",
+    );
+    assert(
+      states.every((s) => s.plan === null || s.plan!.steps.every((candidate) => candidate.status !== "failed")),
+      "no plan_state ever shows the delegated step as failed",
+    );
+    assertEqual(NeverSettlingRuntime.instances[0]!.abortCalls, 0, "the backgrounded task was never cancelled by the switch");
+    assertEqual(
+      accessBridge(bridge)._session !== null,
+      true,
+      "the bridge reopened a fresh session after the switch",
+    );
+    void session;
+  } finally {
+    restoreHooks();
+  }
+  assertNoUnhandledRejections();
+});
+
+await run("session delivery sink: registered on activate, injects with triggerTurn:false, unregistered on close", async () => {
+  const restoreHooks = installNeverSettlingRuntimeHooks();
+  try {
+    const service = makeTaskService();
+    const bridge = new SessionBridge({ agentTaskService: service });
+    await bridge.start(makeLocation());
+    const b = accessBridge(bridge);
+    const session = b._session!;
+
+    // A task of the same project/workspace, still running in the service.
+    const context = b._generation!.runner.assembleSubmissionContext("delivery-test");
+    const handle = await service.createTaskGroup(
+      {
+        mode: "single",
+        agentScope: "user",
+        tasks: [
+          { subagent_type: "general-purpose", prompt: "Do the thing", description: "Delivery task" },
+        ],
+        runInBackground: false,
+      },
+      context,
+      "foreground",
+    );
+    await waitFor(() => NeverSettlingRuntime.instances.length >= 1, 20000, "task running in the fake runtime");
+    const taskId = handle.tasks[0].taskId;
+    const generation = handle.tasks[0].generation;
+
+    // The active Solo session was registered as the sink: delivery succeeds
+    // and the structured result is injected as a custom message (no turn).
+    const delivered = await service.sendResultToSession(taskId, generation, session.sessionId);
+    assertEqual(delivered.ok, true, "send_to_session delivers to the open Solo session");
+    const custom = session.messages.find(
+      (message) => message.role === "custom" && message.customType === "pix-agent-task-result",
+    );
+    assert(custom !== undefined, "delivery message injected into the session state");
+    assert(
+      typeof custom!.content === "string" && custom!.content.includes(taskId),
+      "delivery message carries the task id",
+    );
+
+    // A different (unopened) session id is still rejected by the service.
+    const otherSession = await service.sendResultToSession(taskId, generation, "some-other-session");
+    assertEqual(otherSession.ok, false, "unknown target session rejected");
+    assertEqual(otherSession.reason, "target_session_not_open", "unknown target reason is target_session_not_open");
+
+    // Close unregisters the sink: results stay in the panel (design plan §5.4).
+    await bridge.dispose();
+    const afterClose = await service.sendResultToSession(taskId, generation, session.sessionId);
+    assertEqual(afterClose.ok, false, "closed session rejects delivery");
+    assertEqual(afterClose.reason, "target_session_not_open", "reason is target_session_not_open after close");
+  } finally {
+    restoreHooks();
   }
   assertNoUnhandledRejections();
 });

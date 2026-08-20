@@ -35,8 +35,26 @@ import {
 import { McpAdapter } from "pi-mcp-adapter";
 import { aggregateSubagentUsage, isSubagentDetails } from "../shared/subagent-types.js";
 import type { SubagentExecutionContext, SubagentToolHost } from "./subagent/types.js";
-import { SubagentRunner } from "./subagent/subagent-runner.js";
+import { SHELL_BACKGROUND_TOOLS, SubagentRunner } from "./subagent/subagent-runner.js";
 import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "./subagent/subagent-tool.js";
+import { PlanController } from "./plan/plan-controller.js";
+import type {
+  PlanControllerContext,
+  PlanDisposeReason,
+  PlanLinkedTaskFileChangeEvent,
+  PlanStepExecutionLink,
+  PlanTaskLinkHydration,
+  PlanUserRequest,
+  StepDelegateResult,
+} from "./plan/plan-controller.js";
+import { detectFileDeviation, type PlanPathContext } from "./plan/plan-deviation.js";
+import { createSubmitUserPlanTool, createUpdatePlanStepTool } from "./plan/plan-tools.js";
+import type { AgentTaskDeliveryContent, AgentTaskService, AgentTaskSubmissionContext } from "./agent-task/agent-task-service.js";
+import { workspaceIdOf } from "./agent-task/agent-task-identity.js";
+import type { AgentTaskPlanLink } from "../shared/agent-task-types.js";
+import type { PlanDeviation, PlanStep } from "../shared/plan-types.js";
+import type { ProductEvent } from "../shared/product-events.js";
+import type { ProductEventCollector } from "./product-event-collector.js";
 import type { TeamManager } from "./team-manager.js";
 import {
 	createProjectExecutionContext,
@@ -108,6 +126,10 @@ export type SessionBridgeRole = "single" | "team-leader";
 export interface SessionBridgeOptions {
 	role?: SessionBridgeRole;
 	teamManager?: TeamManager;
+	/** App-level anonymous product-event collector (1.4.0); injected by index.ts. */
+	productEventCollector?: ProductEventCollector;
+	/** App-level agent task service (1.4.1); injected by index.ts. */
+	agentTaskService?: AgentTaskService;
 }
 
 const TAKE_HER_EYES_TIMEOUT_MS = 45_000;
@@ -162,6 +184,8 @@ interface RuntimeGeneration {
 	session: AgentSession | null;
 	readonly runner: SubagentRunner;
 	readonly mcpAdapter: McpAdapter;
+	/** Solo Plan state machine of this generation (PiX 1.4.0). */
+	readonly planController: PlanController;
 }
 
 function globPatternToRegExp(pattern: string): RegExp {
@@ -246,6 +270,11 @@ function resolveHeaders(
 
 export class SessionBridge {
 	private readonly _role: SessionBridgeRole;
+	private _productEventCollector: ProductEventCollector | undefined;
+	/** App-level agent task service (1.4.1); owned by index.ts, borrowed. */
+	private _agentTaskService: AgentTaskService | undefined;
+	/** First activate in this process is app_restart; later session switches are session_reopen. */
+	private _planTaskLinkHydration: PlanTaskLinkHydration = "app_restart";
 	private _session: AgentSession | null = null;
 	private _sessionManager: SessionManager | null = null;
 	private _authStorage: AuthStorage | null = null;
@@ -281,10 +310,24 @@ export class SessionBridge {
 
 	private _isCompacting = false;
 	private _pendingMessageCount = 0;
+	/** Per-session once-flag for the collector's valid-Solo-session baseline. */
+	private _validSoloSessionRecorded = false;
+	/**
+	 * 1.4.2 (R4): whole-app shutdown flag set by index.ts cleanup only. A
+	 * "quit" close is an app_shutdown ONLY when this is set; stop-pi / project
+	 * switch (start) / team-mode switch keep session_close semantics so
+	 * task-linked waiting steps survive as waiting_input+paused while the app
+	 * level task service keeps running them.
+	 */
+	private _appShuttingDown = false;
+	/** Unsubscribe of the active Solo session's delivery sink (1.4.2). */
+	private _deliverySinkUnsubscribe: (() => void) | null = null;
 
 	constructor(options: SessionBridgeOptions = {}) {
 		this._role = options.role ?? "single";
 		this._teamManager = this._role === "team-leader" ? options.teamManager ?? null : null;
+		this._productEventCollector = options.productEventCollector;
+		this._agentTaskService = options.agentTaskService;
 	}
 
 	async start(location: ProjectLocation | string, guiSettings?: GuiSettings): Promise<void> {
@@ -350,6 +393,21 @@ export class SessionBridge {
 	/** Alias for dispose() to match the §4.8 SessionBridge contract. */
 	async stop(): Promise<void> {
 		await this.dispose();
+	}
+
+	/**
+	 * 1.4.2 (R4): mark the bridge for whole-app shutdown (index.ts cleanup).
+	 * Only this path maps a "quit" close to PlanDisposeReason app_shutdown;
+	 * user-initiated stops (stop-pi / project switch / team-mode switch) stay
+	 * session_close so task-linked waiting steps keep waiting_input+paused.
+	 */
+	markAppShuttingDown(): void {
+		this._appShuttingDown = true;
+	}
+
+	/** Solo Plan controller of the current generation (null for team-leader). */
+	getPlanController(): PlanController | null {
+		return this._generation?.planController ?? null;
 	}
 
 	/** Get the current working directory (empty if no session started). */
@@ -423,6 +481,9 @@ export class SessionBridge {
 	async prompt(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
 		if (this._role === "team-leader") {
 			this._teamManager?.resumeRuntime("leader_prompt");
+		}
+		if (typeof text === "string" && text.trim() !== "") {
+			this._recordValidSoloSessionOnce();
 		}
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().prompt(prepared.text, {
@@ -798,6 +859,7 @@ export class SessionBridge {
 	/**
 	 * Write models.json providers from the settings UI. `providers` is wholly
 	 * replaced by `incoming`; top-level non-providers fields are preserved.
+	 * replaced by `incoming`; top-level non-providers fields are preserved.
 	 * apiKey resolution: SENTINEL keeps the on-disk value, null clears the
 	 * field, any other string becomes the new key. Header VALUES follow the
 	 * same contract (SENTINEL keeps the on-disk value for that key, null/empty
@@ -915,8 +977,17 @@ export class SessionBridge {
 			let schemaError: string | undefined;
 			let sessionActive: boolean;
 			if (this._session) {
-				this._session.modelRegistry.refresh();
-				schemaError = this._session.modelRegistry.getError() ?? undefined;
+				const session = this._session;
+				session.modelRegistry.refresh();
+				const currentModel = session.model;
+				if (currentModel) {
+					const refreshedModel = session.modelRegistry.find(currentModel.provider, currentModel.id);
+					if (refreshedModel) {
+						session.agent.state.model = refreshedModel;
+					}
+				}
+				this._applyEnabledModelScope(session);
+				schemaError = session.modelRegistry.getError() ?? undefined;
 				sessionActive = true;
 			} else {
 				sessionActive = false;
@@ -2018,9 +2089,92 @@ export class SessionBridge {
 						auxiliaryAccumulator.cacheWrite += usage.cacheWrite;
 						auxiliaryAccumulator.cost += usage.cost;
 					},
+					// 1.4.1 service facade surface: the app-level service and the
+					// synchronous submission-context pieces (lazy session id so a
+					// stale runner's late calls never read a replacement parent).
+					getTaskService: () => this._agentTaskService,
+					getSessionId: () => parentSessionRef?.sessionId ?? "",
+					getProjectLocation: () => this._planExecutionContext().location,
 				};
 				const runner = new SubagentRunner(runnerContext);
-				const host: SubagentToolHost = { getRunner: () => runner };
+				const host: SubagentToolHost = {
+					getRunner: () => runner,
+					getTaskService: () => this._agentTaskService!,
+					getSubmissionContext: (toolCallId: string) => runner.assembleSubmissionContext(toolCallId),
+				};
+
+				// Solo Plan state machine (PiX 1.4.0). Created before the parent
+				// session so its tools can be mounted; the session reference is
+				// resolved lazily via parentSessionRef (set right after
+				// createAgentSession). The planning-model resolution reads the
+				// configured planModel setting and falls back to the current
+				// session model; useSessionModelAndRetry uses the controller's
+				// frozen first-enter snapshot instead.
+				const planController = new PlanController({
+					getSession: () => parentSessionRef!,
+					getSessionManager: () => this._sessionManager!,
+					getProjectLocation: () => this._planExecutionContext().location,
+					getExecutionContext: () => this._planExecutionContext(),
+					getExecutionMode: () => parentSessionRef?.settingsManager.getExecutionMode() ?? "approval",
+					resolvePlanningModel: () => {
+						const cfg = this._guiSettings?.planModel;
+						const session = parentSessionRef;
+						if (cfg) {
+							if (!session) return { error: "no active session" };
+							const model = session.modelRegistry.find(cfg.provider, cfg.modelId);
+							if (!model) {
+								return { error: `plan model not found: ${cfg.provider}/${cfg.modelId}` };
+							}
+							if (!session.modelRegistry.hasConfiguredAuth(model)) {
+								return { error: `no configured credentials for ${cfg.provider}/${cfg.modelId}` };
+							}
+							return { model, thinkingLevel: this._guiSettings?.planThinkingLevel ?? session.thinkingLevel };
+						}
+						if (!session) return { error: "no active session" };
+						const model = session.model;
+						if (!model) return { error: "the session has no active model" };
+						return { model, thinkingLevel: session.thinkingLevel };
+					},
+					promptPlanningRequest: async (request: PlanUserRequest) => {
+						this._recordValidSoloSessionOnce();
+						const prepared = await this._preparePromptInput(request.text, request.filePaths, request.images);
+						const session = parentSessionRef;
+						if (!session) throw new Error("No active session.");
+						await session.prompt(prepared.text, {
+							images: prepared.images,
+							displayText: prepared.displayText,
+							attachments: prepared.attachments,
+						});
+					},
+					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+					recordProductEvent: (e: ProductEvent) => {
+						this._productEventCollector?.record(e);
+					},
+					delegateSubagentStep: (step, link, presentation) => this._delegatePlanStep(step, link, presentation),
+					// 1.4.1 Plan-linked background task surface (SessionBridge adapter).
+					subscribePlanLinkedTaskEvents: (listener) => this._subscribePlanLinkedTaskEvents(listener),
+					getPlanTaskGroupResult: async (groupId, link) => {
+						const service = this._agentTaskService;
+						if (!service) {
+							return { ok: false, reason: "task_service_unavailable" };
+						}
+						return service.getPlanTaskGroupResult(groupId, link);
+					},
+					confirmPlanTaskGroupConsumed: async (groupId, link) => {
+						const service = this._agentTaskService;
+						if (!service) {
+							return;
+						}
+						await service.confirmPlanTaskGroupConsumed(groupId, link);
+					},
+					releasePlanTaskGroup: async (groupId, link, reason) => {
+						const service = this._agentTaskService;
+						if (!service) {
+							return;
+						}
+						await service.releasePlanTaskGroup(groupId, link, reason);
+					},
+				});
 				const generation: RuntimeGeneration = {
 					genId,
 					agentDir,
@@ -2030,6 +2184,7 @@ export class SessionBridge {
 					session: null,
 					runner,
 					mcpAdapter,
+					planController,
 				};
 				this._generation = generation;
 
@@ -2047,9 +2202,21 @@ export class SessionBridge {
 					resourceLoader,
 					authStorage: generationAuthStorage,
 					modelRegistry: generationModelRegistry,
+					// 1.4.1 WSL Shell tool isolation: the parent SessionBridge
+					// denylists run_background/read_output/stop_process under WSL
+					// (Windows keeps them available); WSL AgentTaskRuntime nested
+					// sessions apply the same denylist.
+					excludeTools: context?.isWsl === true ? [...SHELL_BACKGROUND_TOOLS] : undefined,
 					// The typed cast only widens the generic parameters; the tool
 					// definition itself is a full ToolDefinition.
-					customTools: [createSubagentToolDefinition(host) as ToolDefinition],
+					customTools: [
+						createSubagentToolDefinition(host) as ToolDefinition,
+						createSubmitUserPlanTool({ controller: planController }) as ToolDefinition,
+						createUpdatePlanStepTool({ controller: planController }) as ToolDefinition,
+					],
+					// Authoritative host tool policy during planning/revising;
+					// survives extension reloads (PiX 1.4.0 F1).
+					hostToolPolicyOverride: (input) => planController.decideToolPolicy(input),
 					sessionStartEvent,
 					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
 				});
@@ -2082,6 +2249,8 @@ export class SessionBridge {
 				settingsManager,
 				resourceLoader,
 				authStorage: this._authStorage ?? undefined,
+				// 1.4.1 WSL Shell tool isolation applies to the leader session too.
+				excludeTools: context?.isWsl === true ? [...SHELL_BACKGROUND_TOOLS] : undefined,
 				sessionStartEvent,
 				requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
 			});
@@ -2114,6 +2283,11 @@ export class SessionBridge {
 		this._markUserInputQueueClosing();
 		this._settleClosedUserInputQueue();
 		if (generation) {
+			try {
+				await generation.planController.dispose("host_disposed");
+			} catch (err) {
+				console.error("[SessionBridge] Error during plan controller dispose:", err);
+			}
 			try {
 				await generation.runner.dispose();
 			} catch (err) {
@@ -2149,6 +2323,9 @@ export class SessionBridge {
 	private async _activateSession(session: AgentSession): Promise<void> {
 		this._session = session;
 		this._setupEventSubscription(session);
+		// 1.4.2 (R4): the active Solo session becomes the delivery sink for
+		// send_to_session (design plan §4.5); closed on _closeCurrentSession.
+		this._registerDeliverySink(session);
 		try {
 			await this._bindExtensions();
 		} catch (err) {
@@ -2168,7 +2345,253 @@ export class SessionBridge {
 		// rebuild and live usage of the same generation write the same object.
 		this._auxiliaryUsage = this._generation?.auxiliaryUsage ?? createEmptyAuxiliaryUsage();
 		this._rebuildAuxiliaryUsageFromHistory(session);
+		// Plan rebuild: the controller hydrates the persisted snapshot of the
+		// current branch (dormant planning/revising + A8 executing normalization
+		// + 1.4.1 task-link intent replay/confirm).
+		if (this._generation) {
+			await this._generation.planController.restoreFromHistory(session.sessionManager.getEntries(), {
+				taskLinkHydration: this._planTaskLinkHydration,
+			});
+			this._planTaskLinkHydration = "session_reopen";
+		}
 		this._emitLifecycle("ready");
+	}
+
+	/**
+	 * Plan delegation adapter (PiX 1.4.1): the subagent step's self-contained
+	 * prompt is built from the step contract and submitted to the app-level
+	 * AgentTaskService with the explicit PlanStepExecutionLink (never a guessed
+	 * project agent, never a second model call, never inferred from the
+	 * prompt). The adapter forces runInBackground from the controller's
+	 * executionTarget; the parent model never assembles the parameter itself.
+	 * Observable nested file changes run through detectFileDeviation bound to
+	 * the current link; deviations travel with the StepDelegateResult back to
+	 * the controller.
+	 */
+	private async _delegatePlanStep(
+		step: PlanStep,
+		link: PlanStepExecutionLink,
+		presentation: "foreground" | "background",
+	): Promise<StepDelegateResult> {
+		const service = this._agentTaskService;
+		const generation = this._generation;
+		if (!service || !generation) {
+			return {
+				stepId: step.stepId,
+				status: "failed",
+				summary: "The agent task service is not available; the step cannot be delegated.",
+			};
+		}
+		const execution = this._planExecutionContext();
+		const pathContext: PlanPathContext = {
+			logicalCwd: execution.logicalCwd,
+			isWsl: execution.isWsl,
+			executionBackend: execution.executionBackend,
+		};
+		const planLink: AgentTaskPlanLink = { planId: link.planId, version: link.version, stepId: link.stepId };
+		const prompt = this._buildPlanStepPrompt(step, link);
+		const context = generation.runner.assembleSubmissionContext(`plan-step-${link.planId}-${link.stepId}`);
+		const group = await service.createTaskGroup(
+			{
+				mode: "single",
+				agentScope: "user",
+				tasks: [{ subagent_type: "general-purpose", prompt, description: step.title }],
+				runInBackground: presentation === "background",
+				planLink,
+			},
+			context,
+			presentation,
+			undefined,
+		);
+		if (presentation === "background") {
+			// Minimal link only: the Plan layer never depends on AgentTask UI types.
+			return {
+				stepId: step.stepId,
+				status: "backgrounded",
+				groupId: group.groupId,
+				taskIds: group.tasks.map((task) => task.taskId),
+			};
+		}
+		const deviations: PlanDeviation[] = [];
+		const detectionPromises: Array<Promise<void>> = [];
+		const taskIds = new Set(group.tasks.map((task) => task.taskId));
+		const unsubscribe = service.onEvent((event) => {
+			if (event.type !== "task_file_change" || !taskIds.has(event.taskId)) {
+				return;
+			}
+			detectionPromises.push(
+				detectFileDeviation(event.change, step, pathContext)
+					.then((deviation) => {
+						if (deviation) {
+							deviations.push(deviation);
+						}
+					})
+					.catch(() => {
+						// Deviation detection is best-effort; a failed probe never
+						// fails the delegation.
+					}),
+			);
+		});
+		try {
+			const awaited = await service.awaitGroup(group.groupId);
+			if (awaited.kind === "backgrounded") {
+				// The foreground group detached while awaiting (manual/auto
+				// background): surface the group handle to the controller.
+				return {
+					stepId: step.stepId,
+					status: "backgrounded",
+					groupId: awaited.handle.groupId,
+					taskIds: awaited.handle.tasks.map((task) => task.taskId),
+				};
+			}
+			await Promise.allSettled(detectionPromises);
+			const result = awaited.details.results[0];
+			if (result?.status === "completed") {
+				return {
+					stepId: step.stepId,
+					status: "result",
+					summary: result.finalOutput !== "" ? result.finalOutput : "The subagent completed without producing text.",
+					deviations,
+					groupId: group.groupId,
+				};
+			}
+			return {
+				stepId: step.stepId,
+				status: "failed",
+				summary: result?.errorMessage ?? result?.finalOutput ?? "The subagent failed.",
+				deviations,
+				groupId: group.groupId,
+			};
+		} finally {
+			unsubscribe();
+		}
+	}
+
+	/**
+	 * 1.4.1 Plan-linked task file-change subscription adapter: forwards the
+	 * service's main-only task_file_change events carrying a planLink to the
+	 * PlanController for background-step deviation detection.
+	 */
+	private _subscribePlanLinkedTaskEvents(listener: (event: PlanLinkedTaskFileChangeEvent) => void): () => void {
+		const service = this._agentTaskService;
+		if (!service) {
+			return () => {};
+		}
+		return service.onEvent((event) => {
+			if (event.type !== "task_file_change" || !event.planLink) {
+				return;
+			}
+			listener({
+				taskId: event.taskId,
+				planId: event.planLink.planId,
+				version: event.planLink.version,
+				stepId: event.planLink.stepId,
+				change: event.change,
+				aggregate: event.aggregate,
+			});
+		});
+	}
+
+	/**
+	 * 1.4.2 (R4): register the active Solo session as the result delivery sink
+	 * (design plan §4.5: "当前打开的 Solo SessionBridge 按 sessionId+workspaceId
+	 * 注册 sink"). The sink injects the structured result as a custom message
+	 * with triggerTurn:false; the target must still be this open session AND
+	 * idle - it never steers/follows-up/triggers a model turn. A busy or
+	 * vanished session surfaces target_session_busy / target_session_not_open
+	 * through the sendResultToSession envelope.
+	 */
+	private _registerDeliverySink(session: AgentSession): void {
+		const service = this._agentTaskService;
+		if (!service || this._role !== "single") {
+			return;
+		}
+		this._deliverySinkUnsubscribe?.();
+		this._deliverySinkUnsubscribe = null;
+		const sessionId = session.sessionId;
+		const workspaceId = workspaceIdOf(this._planExecutionContext().location.physicalPath);
+		this._deliverySinkUnsubscribe = service.registerSessionDeliverySink(
+			sessionId,
+			workspaceId,
+			async (content) => {
+				const current = this._session;
+				if (!current || current.sessionId !== sessionId) {
+					throw new Error("target_session_not_open");
+				}
+				if (current.isStreaming) {
+					throw new Error("target_session_busy");
+				}
+				await current.sendCustomMessage(
+					{
+						customType: "pix-agent-task-result",
+						content: this._formatDeliveryContent(content),
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
+			},
+		);
+	}
+
+	/** Human-readable chat text for one delivered task result. */
+	private _formatDeliveryContent(content: AgentTaskDeliveryContent): string {
+		const lines: string[] = [];
+		lines.push(`Agent task ${content.taskId} finished.`);
+		if (content.planLink) {
+			lines.push(`Plan step ${content.planLink.stepId} (plan ${content.planLink.planId}, version ${content.planLink.version}).`);
+		}
+		if (content.summary !== "") {
+			lines.push(content.summary);
+		}
+		if (content.finalOutput !== "") {
+			lines.push(content.finalOutput);
+		}
+		return lines.join("\n");
+	}
+
+	/** Self-contained single-task prompt for a delegated plan step. */
+	private _buildPlanStepPrompt(step: PlanStep, link: PlanStepExecutionLink): string {
+		const lines: string[] = [];
+		lines.push(`<plan_step_execution plan_id="${link.planId}" version="${link.version}" step_id="${link.stepId}">`);
+		lines.push(`Title: ${step.title}`);
+		lines.push(`Description: ${step.description}`);
+		if (step.scopeNote) {
+			lines.push(`Scope note: ${step.scopeNote}`);
+		}
+		if (step.files.length > 0) {
+			lines.push(
+				`Declared files (workspace-relative; work only inside this scope): ${step.files
+					.map((file) => `${file.path} (${file.operation})`)
+					.join(", ")}`,
+			);
+		}
+		if (step.expectedCommands && step.expectedCommands.length > 0) {
+			lines.push(`Expected commands: ${step.expectedCommands.join(" | ")}`);
+		}
+		lines.push(`Verification required: ${step.verification}`);
+		lines.push(`Risk: ${step.risk} - ${step.riskReason}`);
+		lines.push("Work only within the declared scope. Report what you changed and how it was verified.");
+		lines.push("</plan_step_execution>");
+		return lines.join("\n");
+	}
+
+	/** Execution context with a defensive fallback for the Plan validation surface. */
+	private _planExecutionContext(): ProjectExecutionContext {
+		return this._executionContext ?? {
+			location: this._coerceLocation(this._physicalCwd),
+			logicalCwd: this._logicalCwd || this._physicalCwd,
+			physicalCwd: this._physicalCwd,
+			isWsl: false,
+		};
+	}
+
+	/** Count each Solo session once for the valid-sessions baseline (content never recorded). */
+	private _recordValidSoloSessionOnce(): void {
+		if (this._validSoloSessionRecorded) {
+			return;
+		}
+		this._validSoloSessionRecorded = true;
+		this._productEventCollector?.recordValidSoloSession();
 	}
 
 	/**
@@ -2207,6 +2630,42 @@ export class SessionBridge {
 		const mcpAdapter = this._mcpAdapter;
 		const generation = this._generation;
 		this._generation = null;
+		// 1.4.2 (R4): unregister the delivery sink FIRST so an in-flight
+		// send_to_session never injects into a closing session; the result
+		// stays in the panel (design plan §5.4).
+		this._deliverySinkUnsubscribe?.();
+		this._deliverySinkUnsubscribe = null;
+		// 1.4.1 session switch/close: detach this session's still-foreground
+		// groups FIRST (they continue in the app service as backgrounded and
+		// the facade's parent-signal listeners are removed), so the parent
+		// signal below never misclassifies a session switch as user_cancel.
+		if (this._agentTaskService && session) {
+			try {
+				this._agentTaskService.detachForegroundGroupsForSession(session.sessionId);
+			} catch (err) {
+				console.warn("[SessionBridge] Error during foreground group detach:", err);
+			}
+		}
+		// 1.4.2 (R4): yield one macrotask after the detach and BEFORE the plan
+		// dispose so the awaitGroup continuations (delegation adapter ->
+		// controller _delegateStep) flush first. A foreground Plan delegation
+		// then persists waiting_input(agent_task) + Plan paused before the
+		// session_close dispose, instead of being caught mid-delegation and
+		// written failed; the detached facade also removes its parent-signal
+		// listener in that same continuation, so the dispose abort never fires
+		// onAbort -> cancelGroup against a just-backgrounded group.
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		// Plan close matrix: session/app semantics map to PlanDisposeReason;
+		// dispose runs BEFORE the session manager is nulled so the final
+		// snapshot can still be persisted. Never auto-approves/executes.
+		// 1.4.2 (R4): "quit" alone is not an app shutdown - stop-pi, project
+		// switch (start) and team-mode switch all close with "quit" while the
+		// app and the app-level task service keep running; only index.ts
+		// cleanup marks _appShuttingDown.
+		const planDisposeReason: PlanDisposeReason = this._appShuttingDown ? "app_shutdown" : "session_close";
+		const planDisposePromise = generation?.planController
+			? generation.planController.dispose(planDisposeReason)
+			: undefined;
 		this._unsubscribe?.();
 		this._unsubscribe = null;
 		this._teamManager?.setLeaderSession(null);
@@ -2232,7 +2691,14 @@ export class SessionBridge {
 		// no dismissal. Never pump afterwards.
 		this._settleClosedUserInputQueue();
 
-		if (!session) {
+		const awaitCleanups = async (): Promise<void> => {
+			if (planDisposePromise) {
+				try {
+					await planDisposePromise;
+				} catch (err) {
+					console.error("[SessionBridge] Error during plan controller dispose:", err);
+				}
+			}
 			if (runnerPromise) {
 				try {
 					await runnerPromise;
@@ -2240,19 +2706,17 @@ export class SessionBridge {
 					console.error("[SessionBridge] Error during subagent runner dispose:", err);
 				}
 			}
+		};
+
+		if (!session) {
+			await awaitCleanups();
 			return false;
 		}
 
-		// Finally await the runner cleanup, then dispose the parent session and
-		// the parent MCP IN THAT ORDER. The UI never waits up to 5s for the
-		// runner to settle before the session closes.
-		if (runnerPromise) {
-			try {
-				await runnerPromise;
-			} catch (err) {
-				console.error("[SessionBridge] Error during subagent runner dispose:", err);
-			}
-		}
+		// Finally await the plan/runner cleanup, then dispose the parent
+		// session and the parent MCP IN THAT ORDER. The UI never waits up to
+		// 5s for the runner to settle before the session closes.
+		await awaitCleanups();
 		try {
 			await session.dispose({ reason, targetSessionFile });
 		} catch (err) {

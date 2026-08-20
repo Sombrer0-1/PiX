@@ -7,12 +7,20 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
   AgentSessionEvent,
+  AgentTaskCommandDataV142,
+  AgentTaskCommandV142,
+  AgentTaskEvent,
+  AgentTaskInputRequest,
   ExecutionEnvironmentInfo,
   GuiSettings,
   McpConfigInfo,
   McpResourceContent,
   McpResourceInfo,
   McpServerInfo,
+  PixCommandResult,
+  PlanCommand,
+  PlanEvent,
+  PlanRuntimeSnapshot,
   ProjectLocation,
   ProjectLocationInput,
   RequestUserInputDismissal,
@@ -122,6 +130,18 @@ export interface PixApi {
   // Team commands
   sendTeamCommand: <T = unknown>(command: TeamCommand) => Promise<{ success: boolean; data?: T; error?: string; code?: string }>;
   sendTeamLeaderCommand: <T = unknown>(command: RpcCommand) => Promise<{ success: boolean; data?: T; error?: string }>;
+
+  // Plan commands (PiX 1.4.0)
+  sendPlanCommand: (command: PlanCommand) => Promise<PixCommandResult<PlanRuntimeSnapshot | undefined>>;
+  onPlanEvent: (callback: (event: PlanEvent) => void) => () => void;
+
+  // Agent task commands (PiX 1.4.1 + 1.4.2 R2/R3; the data shape is narrowed
+  // per command type - get_all returns the AgentTaskListSnapshot since R2,
+  // recovery commands arrive with R3)
+  sendAgentTaskCommand<C extends AgentTaskCommandV142>(command: C): Promise<PixCommandResult<AgentTaskCommandDataV142<C>>>;
+  onAgentTaskEvent: (callback: (event: AgentTaskEvent) => void) => () => void;
+  onAgentTaskInputRequest: (callback: (request: AgentTaskInputRequest) => void) => () => void;
+  getPendingAgentTaskInputRequests: () => Promise<AgentTaskInputRequest[]>;
   sendTeamLeaderCommandAsync: (command: RpcCommand) => Promise<{ success: boolean; error?: string }>;
   onTeamEvent: (callback: (event: TeamEvent) => void) => () => void;
 
@@ -279,6 +299,30 @@ const api: PixApi = {
     ipcRenderer.invoke("team-leader-command", command) as Promise<{ success: boolean; data?: T; error?: string }>,
   sendTeamLeaderCommandAsync: (command: RpcCommand) =>
     ipcRenderer.invoke("team-leader-command-async", command) as Promise<{ success: boolean; error?: string }>,
+
+  // Plan commands
+  sendPlanCommand: (command: PlanCommand) =>
+    ipcRenderer.invoke("plan-command", command) as Promise<PixCommandResult<PlanRuntimeSnapshot | undefined>>,
+  onPlanEvent: (callback: (event: PlanEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: PlanEvent) => callback(data);
+    ipcRenderer.on("plan-event", handler);
+    return () => ipcRenderer.removeListener("plan-event", handler);
+  },
+
+  // Agent task commands
+  sendAgentTaskCommand: <C extends AgentTaskCommandV142>(command: C) =>
+    ipcRenderer.invoke("agent-task-command", command) as Promise<PixCommandResult<AgentTaskCommandDataV142<C>>>,
+  onAgentTaskEvent: (callback: (event: AgentTaskEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: AgentTaskEvent) => callback(data);
+    ipcRenderer.on("agent-task-event", handler);
+    return () => ipcRenderer.removeListener("agent-task-event", handler);
+  },
+  onAgentTaskInputRequest: (callback: (request: AgentTaskInputRequest) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: AgentTaskInputRequest) => callback(data);
+    ipcRenderer.on("agent-task-input-request", handler);
+    return () => ipcRenderer.removeListener("agent-task-input-request", handler);
+  },
+  getPendingAgentTaskInputRequests: () => ipcRenderer.invoke("get-pending-agent-task-input-requests"),
   getTeamLeaderBackgroundTasks: () =>
     ipcRenderer.invoke("get-team-leader-background-tasks") as Promise<Array<{ taskId: string; command: string; pid?: number; startedAt: number; status: string }>>,
   stopTeamLeaderBackgroundTask: (taskId: string) =>

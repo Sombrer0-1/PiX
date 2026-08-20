@@ -10,6 +10,27 @@ export interface ToolPolicyDecision {
 	requiresApproval?: boolean;
 }
 
+/** Input for a host-injected tool policy override. */
+export interface HostToolPolicyInput {
+	mode: AgentExecutionMode;
+	toolName: string;
+	args: unknown;
+	cwd: string;
+	/** Path context for the active execution backend. When absent, win32 semantics apply. */
+	pathContext?: ToolPathContext;
+}
+
+/**
+ * Host-injected synchronous tool policy override.
+ *
+ * Returning a decision makes it authoritative; returning `undefined` falls back
+ * to the built-in `inspectToolExecution` policy. The callback is owned by the
+ * host (AgentSessionConfig) and is not replaced by extension reloads. It must
+ * be synchronous; a throwing override fails closed (allowed:false) instead of
+ * falling back to the default policy.
+ */
+export type HostToolPolicyOverride = (input: HostToolPolicyInput) => ToolPolicyDecision | undefined;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }

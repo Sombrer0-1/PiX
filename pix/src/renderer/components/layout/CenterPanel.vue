@@ -22,6 +22,10 @@ import { useSettingsStore } from "../../stores/settings-store";
 import { useTeamStore } from "../../stores/team-store";
 import TeamDashboard from "../team/TeamDashboard.vue";
 import WorkerStatusBar from "../team/WorkerStatusBar.vue";
+import PlanModeToggle from "../plan/PlanModeToggle.vue";
+import PlanPanel from "../plan/PlanPanel.vue";
+import { usePlanStore } from "../../stores/plan-store";
+import type { PlanStatus } from "@shared/types.js";
 import type { RequestUserInputRequest, RequestUserInputQuestion } from "@/types/rpc";
 
 const sessionStore = useWorkspaceSessionStore();
@@ -29,6 +33,7 @@ const rpc = useWorkspaceRpc();
 const projectStore = useProjectStore();
 const settingsStore = useSettingsStore();
 const teamStore = useTeamStore();
+const planStore = usePlanStore();
 
 // Clarification props are driven by WorkspacePage request_user_input handling.
 const props = defineProps<{
@@ -131,13 +136,79 @@ const composerPlaceholder = computed(() => {
   return "输入任务，或按 / 使用命令...";
 });
 
+// Plan mode (PiX 1.4.0): the toggle only arms the current Solo composer; no
+// IPC fires on toggle, and enter_planning is sent once on the next non-empty
+// submit (§5.1). The status pill + toggle + PlanPanel form the three explicit
+// plan indicators.
+const PLAN_PHASE_PILL_TEXT: Partial<Record<PlanStatus, string>> = {
+  planning: "规划中",
+  planning_failed: "规划失败",
+  awaiting_approval: "待批准",
+  revising: "修订中",
+  approved: "已批准",
+  executing: "执行中",
+  paused: "已暂停",
+};
+const PLAN_PHASE_PILL_CLASS: Partial<Record<PlanStatus, string>> = {
+  planning: "status-running",
+  revising: "status-running",
+  executing: "status-running",
+};
+
+const planArmed = ref(false);
+
+/** Solo 会话的当前 plan phase（团队模式无 Plan）。 */
+const soloPlanPhase = computed(() => (teamStore.teamMode ? null : planStore.planPhase));
+
+/** Solo 会话的当前 plan（团队模式无 Plan）；从未进入规划时为 null。 */
+const soloPlan = computed(() => (teamStore.teamMode ? null : planStore.currentPlan));
+
+/** 计划处于活跃中间态（终态后允许再次进入规划）。 */
+const planEntryBlocked = computed(() => {
+  const phase = soloPlanPhase.value;
+  if (phase == null) return false;
+  return phase !== "completed" && phase !== "cancelled" && phase !== "failed";
+});
+
+/** 仅空闲且 armed 的 Solo composer 提交才走 enter_planning（一次）。 */
+const shouldEnterPlanning = computed(
+  () => planArmed.value && !teamStore.teamMode && !isStreaming.value && !planEntryBlocked.value,
+);
+
+const planToggleDisabled = computed(
+  () => teamStore.teamMode || isStreaming.value || planEntryBlocked.value || !rpc.isConnected.value,
+);
+
+const planToggleDisableReason = computed(() => {
+  if (teamStore.teamMode) return "团队模式不支持规划";
+  if (isStreaming.value) return "运行中不可切换规划";
+  if (soloPlanPhase.value === "planning_failed") return "规划失败，请先重试或放弃";
+  if (planEntryBlocked.value) return "计划进行中，请先批准或放弃";
+  if (!rpc.isConnected.value) return "未连接会话";
+  return null;
+});
+
+const planPillText = computed(() => {
+  const phase = soloPlanPhase.value;
+  return phase ? (PLAN_PHASE_PILL_TEXT[phase] ?? "") : "";
+});
+
+const planPillClass = computed(() => {
+  const phase = soloPlanPhase.value;
+  return phase ? (PLAN_PHASE_PILL_CLASS[phase] ?? "") : "";
+});
+
 const statusText = computed(() => {
+  const planStatus = planPillText.value;
+  if (planStatus) return planStatus;
   if (rpc.isStreaming.value) return streamingEffortLabel.value ? `运行中 · ${streamingEffortLabel.value}` : "运行中";
   if (rpc.sessionState.value?.isCompacting) return "压缩中";
   return "空闲";
 });
 
 const statusClass = computed(() => {
+  const planClass = planPillClass.value;
+  if (planClass) return planClass;
   if (rpc.isStreaming.value) return "status-running";
   if (rpc.sessionState.value?.isCompacting) return "status-compacting";
   return "status-idle";
@@ -240,6 +311,9 @@ watch(canUseTeamMode, (available) => {
 
 // Scroll to bottom on mount when there are existing blocks (e.g. navigating back from settings)
 onMounted(async () => {
+  // Plan event mirror: subscribe once here so PlanPanel (v-if'ed on the plan
+  // phase) never misses pushes; a remount replaces the subscription (§5.1).
+  planStore.subscribeToEvents();
   if (sessionStore.displayBlocks.value.length > 0) {
     await nextTick();
     scrollContentToBottom();
@@ -588,11 +662,31 @@ async function sendMessage(): Promise<void> {
   let optimisticBlockId: string | null = null;
   try {
     optimisticBlockId = sessionStore.appendOptimisticUserMessage(text, allFilePaths);
-    const commandType = isStreaming.value ? "steer" : "prompt";
-    void rpc.sendCommandAsync({ type: commandType, message: text, filePaths: allFilePaths, images: allImages }).catch((error) => {
-      sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
-    });
+    // Armed solo submit with an empty requestText (attachment-only) must NOT
+    // enter planning: the controller rejects empty_request, so it falls back
+    // to the ordinary prompt path (§4.9: first armed submit requires
+    // non-empty requestText). `text` is the pre-clear trimmed input.
+    if (shouldEnterPlanning.value && text !== "") {
+      // Armed solo submit: one enter_planning carrying text + attachments;
+      // main writes the single user message for the planning turn (§5.1).
+      const result = await planStore.enterPlanning({
+        requestText: text,
+        filePaths: allFilePaths,
+        images: allImages,
+        source: "configured",
+      });
+      if (!result.success) {
+        throw new Error(result.error || "进入规划失败");
+      }
+    } else {
+      const commandType = isStreaming.value ? "steer" : "prompt";
+      void rpc.sendCommandAsync({ type: commandType, message: text, filePaths: allFilePaths, images: allImages }).catch((error) => {
+        sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
+      });
+    }
   } catch (error) {
+    // enter_planning failed: restore the composer and keep armed; the
+    // optimistic block is marked failed so no duplicate user message forms.
     sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
     inputText.value = originalText;
     attachments.value = originalAttachments;
@@ -829,6 +923,15 @@ function sendQuickStart(prompt: string): void {
     </div>
     </template>
 
+    <!-- PlanPanel sits between the message area and the composer (solo only).
+         The controller's initial snapshot uses phase "cancelled" with no plan
+         as the never-entered sentinel; only hide the panel in that case, a
+         genuinely cancelled plan still renders. -->
+    <PlanPanel
+      v-if="soloPlanPhase != null && !(soloPlanPhase === 'cancelled' && soloPlan == null)"
+      class="center-plan-panel"
+    />
+
     <!-- Composer remains visible; in team mode it sends to the Leader. -->
     <div class="center-composer">
       <div
@@ -921,6 +1024,14 @@ function sendQuickStart(prompt: string): void {
 
         <div v-if="!pendingUserInput" class="composer-controls">
           <div class="composer-left">
+            <PlanModeToggle
+              v-if="!pendingUserInput && !teamStore.teamMode"
+              class="plan-toggle-in-composer"
+              :armed="planArmed"
+              :disabled="planToggleDisabled"
+              :disable-reason="planToggleDisableReason"
+              @update:armed="planArmed = $event"
+            />
             <button
               class="composer-icon-btn"
               @click="pickFiles"

@@ -160,8 +160,10 @@ function isSubagentActivity(value: unknown): value is SubagentActivity {
   if (!isFiniteNonNegative(sequence)) return false;
   if (typeof toolCallId !== "string" || typeof toolName !== "string") return false;
   if (!isOneOf(status, SUBAGENT_ACTIVITY_STATUSES)) return false;
-  if (summary !== undefined && typeof summary !== "string") return false;
-  if (summary !== undefined && summary.length > SUBAGENT_MAX_ACTIVITY_SUMMARY_CHARS) return false;
+  if (summary !== undefined) {
+    if (typeof summary !== "string") return false;
+    if (summary.length > SUBAGENT_MAX_ACTIVITY_SUMMARY_CHARS) return false;
+  }
   if (!isFiniteNonNegative(startedAt)) return false;
   if (endedAt !== undefined && !isFiniteNonNegative(endedAt)) return false;
   // running activities have no endedAt; completed/failed must have endedAt.

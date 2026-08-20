@@ -115,7 +115,11 @@ import { BackgroundTaskRegistry } from "./background-task-registry.ts";
 import { BUILTIN_SLASH_COMMANDS, type SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt, type RuntimeEnvironmentContext } from "./system-prompt.ts";
-import { inspectToolExecution } from "./tool-execution-policy.ts";
+import {
+	type HostToolPolicyOverride,
+	inspectToolExecution,
+	type ToolPolicyDecision,
+} from "./tool-execution-policy.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import type { ExecutionBackend } from "./tools/execution-backend.ts";
 import { createAllToolDefinitions, createBackgroundToolDefinitions } from "./tools/index.ts";
@@ -264,6 +268,13 @@ export interface AgentSessionConfig {
 	enableBuiltInEnhancementTools?: boolean;
 	/** 默认 mutable；nested session 必须传 read-only，保护借用的 ModelRegistry。 */
 	extensionProviderPolicy?: ExtensionProviderPolicy;
+	/**
+	 * Host-injected synchronous tool policy override, authoritative for the
+	 * whole session lifetime. Consulted before the built-in execution-mode
+	 * policy; returning undefined falls back to it. Not replaced by extension
+	 * reloads. A throwing override fails closed instead of falling back.
+	 */
+	hostToolPolicyOverride?: HostToolPolicyOverride;
 }
 
 export interface ExtensionBindings {
@@ -446,6 +457,10 @@ export class AgentSession {
 	// initial runner and to every reload-created runner.
 	private _extensionProviderPolicy: ExtensionProviderPolicy;
 
+	// Host-injected tool policy override, held for the whole session lifetime
+	// (never replaced by extension reloads).
+	private _hostToolPolicyOverride?: HostToolPolicyOverride;
+
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -480,6 +495,7 @@ export class AgentSession {
 		this._runtimeEnvironmentOverride = config.runtimeEnvironmentOverride;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionProviderPolicy = config.extensionProviderPolicy ?? "mutable";
+		this._hostToolPolicyOverride = config.hostToolPolicyOverride;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -599,12 +615,30 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
-			const policyDecision = inspectToolExecution({
+			// Host override first, then the built-in execution-mode policy. The
+			// input carries the runtime cwd and the active backend path context.
+			// A throwing override fails closed: it must never fall back to allow.
+			const policyInput = {
 				mode: this.settingsManager.getExecutionMode(),
 				toolName: toolCall.name,
 				args,
 				cwd: this._runtimeCwd,
-			});
+				pathContext: this._executionBackend?.paths,
+			};
+			let policyDecision: ToolPolicyDecision;
+			if (this._hostToolPolicyOverride) {
+				try {
+					policyDecision = this._hostToolPolicyOverride(policyInput) ?? inspectToolExecution(policyInput);
+				} catch (err) {
+					console.warn("[AgentSession] host tool policy override threw; failing closed:", err);
+					policyDecision = {
+						allowed: false,
+						reason: "host_policy_error: host tool policy override failed, blocking execution.",
+					};
+				}
+			} else {
+				policyDecision = inspectToolExecution(policyInput);
+			}
 			if (!policyDecision.allowed) {
 				if (policyDecision.requiresApproval) {
 					const approved = await this._requestToolApproval(toolCall.name, args, policyDecision.reason);

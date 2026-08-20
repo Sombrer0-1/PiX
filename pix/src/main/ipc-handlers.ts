@@ -9,7 +9,7 @@
 
 import { existsSync, rmSync } from "fs";
 import { isAbsolute, join, relative, resolve } from "path";
-import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
+import { BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from "electron";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import electronUpdater from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
@@ -26,6 +26,20 @@ import type {
   ThinkingLevel,
   WslSettings,
 } from "../shared/types.js";
+import type { AgentTaskService } from "./agent-task/agent-task-service.js";
+// Plan/agent-task command registration and dispatch live in pure modules that
+// do not import electron at the top level, so plan-ipc.test.ts and
+// agent-task-ipc.test.ts exercise the REAL handlers with a fake adapter
+// (design plan §3 IPC harness rule). These are re-exported at the bottom.
+import {
+  registerAgentTaskIpcHandlers,
+  subscribeAgentTaskEventForwarding,
+} from "./ipc-agent-task-adapters.js";
+import {
+  registerPlanIpcHandlers,
+  resyncPlanEventForwarding,
+  subscribePlanEventForwarding,
+} from "./ipc-plan-adapters.js";
 import type { TeamManager } from "./team-manager.js";
 import { readWorkspaceMode, teamSnapshotPath, writeWorkspaceMode } from "./team-persistence.js";
 import { WslDistroResolver } from "./wsl/wsl-distro.js";
@@ -47,7 +61,13 @@ const SETTING_KEYS = new Set([
   "defaultThinkingLevel",
   "takeHerEyes",
   "wsl",
+  "planModel",
+  "planThinkingLevel",
+  "enableProductAnalytics",
+  "autoBackgroundMs",
 ]);
+
+const AUTO_BACKGROUND_MS_VALUES = new Set<number>([0, 60_000, 120_000, 300_000]);
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
@@ -190,6 +210,37 @@ function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSetting
       if (cleaned) sanitized.wsl = cleaned;
     }
   }
+  if (Object.hasOwn(settings, "planModel")) {
+    const value = settings.planModel;
+    if (value === undefined) {
+      sanitized.planModel = undefined;
+    } else if (value && typeof value === "object") {
+      const raw = value as Record<string, unknown>;
+      if (typeof raw.provider === "string" && raw.provider.trim() && typeof raw.modelId === "string" && raw.modelId.trim()) {
+        sanitized.planModel = { provider: raw.provider, modelId: raw.modelId };
+      }
+    }
+  }
+  if (Object.hasOwn(settings, "planThinkingLevel")) {
+    const value = settings.planThinkingLevel;
+    if (value === undefined || isThinkingLevel(value)) {
+      sanitized.planThinkingLevel = value;
+    }
+  }
+  if (Object.hasOwn(settings, "enableProductAnalytics")) {
+    const value = settings.enableProductAnalytics;
+    if (value === undefined || typeof value === "boolean") {
+      sanitized.enableProductAnalytics = value;
+    }
+  }
+  if (Object.hasOwn(settings, "autoBackgroundMs")) {
+    const value = settings.autoBackgroundMs;
+    if (value === undefined) {
+      sanitized.autoBackgroundMs = undefined;
+    } else if (typeof value === "number" && AUTO_BACKGROUND_MS_VALUES.has(value)) {
+      sanitized.autoBackgroundMs = value;
+    }
+  }
 
   return sanitized;
 }
@@ -245,6 +296,7 @@ export function registerIpcHandlers(
   teamLeaderSessionBridge: SessionBridge,
   settingsStore: SettingsStore,
   teamManager: TeamManager,
+  agentTaskService: AgentTaskService,
 ): void {
   setCurrentWindow(win);
 
@@ -312,6 +364,10 @@ export function registerIpcHandlers(
       // snapshot so it can be restored when Team mode is entered again.
       await disposeTeamRuntime(true);
       await singleSessionBridge.start(location, settingsStore.getAll());
+      // start() created a fresh PlanController; re-attach the plan-event
+      // forwarding so the mirror converges without waiting for the next
+      // plan command.
+      resyncPlanEventForwarding();
       return { success: true };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -324,6 +380,7 @@ export function registerIpcHandlers(
     } catch (err) {
       console.error("[ipc] Error during single session dispose:", err);
     }
+    resyncPlanEventForwarding();
     return { success: true };
   });
 
@@ -336,6 +393,7 @@ export function registerIpcHandlers(
       // stop the single runtime before bringing up the independent leader.
       await disposeTeamRuntime(true);
       await singleSessionBridge.dispose();
+      resyncPlanEventForwarding();
       await teamLeaderSessionBridge.start(location, settingsStore.getAll());
       // TeamManager.initialize takes the borrowed leader context (S8); the
       // leader SessionBridge owns the backend and TeamManager never disposes it
@@ -476,6 +534,19 @@ export function registerIpcHandlers(
   });
 
   // =========================================================================
+  // Plan Commands (PiX 1.4.0; always routed through the singleSessionBridge
+  // PlanController, design plan §3)
+  // =========================================================================
+
+  registerPlanIpcHandlers(ipcMain, () => singleSessionBridge.getPlanController());
+
+  // =========================================================================
+  // Agent Task Commands (PiX 1.4.1; app-level AgentTaskService, design plan §3)
+  // =========================================================================
+
+  registerAgentTaskIpcHandlers(ipcMain, agentTaskService);
+
+  // =========================================================================
   // Team Commands
   // =========================================================================
 
@@ -562,8 +633,11 @@ export function registerIpcHandlers(
     return settingsStore.getAll();
   });
 
-  ipcMain.handle("set-settings", (_event, settings: Record<string, unknown>) => {
-    settingsStore.setMany(sanitizeSettings(settings));
+  ipcMain.handle("set-settings", (_event, settings: unknown) => {
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      return { success: false, error: "invalid_settings" };
+    }
+    settingsStore.setMany(sanitizeSettings(settings as Record<string, unknown>));
     const nextSettings = settingsStore.getAll();
     singleSessionBridge.updateGuiSettings(nextSettings);
     teamLeaderSessionBridge.updateGuiSettings(nextSettings);
@@ -687,7 +761,6 @@ export function registerIpcHandlers(
 
   ipcMain.handle("open-external", async (_event, url: string) => {
     try {
-      const { shell } = await import("electron");
       const parsed = new URL(url);
       if (parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:") {
         await shell.openExternal(url);
@@ -824,19 +897,34 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
     // Session
     case "get_session_stats":
       return bridge.getSessionStats();
-    case "switch_session":
-      return bridge.switchSession(cmd.sessionPath);
-    case "fork":
-      return bridge.fork(cmd.entryId, cmd.position ?? "before", cmd.label);
-    case "navigate_tree":
-      return bridge.navigateTree(cmd.targetId, {
+    case "switch_session": {
+      const result = await bridge.switchSession(cmd.sessionPath);
+      // The switch replaced the PlanController instance; re-sync the
+      // plan-event forwarding so the renderer mirror converges to the new
+      // session's plan (the re-sync pushes a fresh snapshot on change).
+      resyncPlanEventForwarding();
+      return result;
+    }
+    case "fork": {
+      const result = await bridge.fork(cmd.entryId, cmd.position ?? "before", cmd.label);
+      resyncPlanEventForwarding();
+      return result;
+    }
+    case "navigate_tree": {
+      const result = await bridge.navigateTree(cmd.targetId, {
         summarize: cmd.summarize,
         customInstructions: cmd.customInstructions,
         replaceInstructions: cmd.replaceInstructions,
         label: cmd.label,
       });
-    case "clone":
-      return bridge.clone();
+      resyncPlanEventForwarding();
+      return result;
+    }
+    case "clone": {
+      const result = await bridge.clone();
+      resyncPlanEventForwarding();
+      return result;
+    }
     case "get_last_assistant_text":
       return bridge.getLastAssistantText();
     case "set_session_name":
@@ -862,8 +950,13 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       return { commands: await bridge.getCommands() };
 
     // Session management (new)
-    case "new_session":
-      return bridge.newSession(cmd.parentSession);
+    case "new_session": {
+      const result = await bridge.newSession(cmd.parentSession);
+      // Like switch_session/fork/clone: the new session owns a fresh
+      // PlanController, so re-sync plan-event forwarding to it.
+      resyncPlanEventForwarding();
+      return result;
+    }
 
     // Export
     case "export_html":
@@ -925,6 +1018,7 @@ export function setupEventForwarding(
   singleSessionBridge: SessionBridge,
   teamLeaderSessionBridge: SessionBridge,
   teamManager: TeamManager,
+  agentTaskService: AgentTaskService,
 ): void {
   if (eventForwardingSetup) return;
   eventForwardingSetup = true;
@@ -986,6 +1080,33 @@ export function setupEventForwarding(
       win.webContents.send("pi-error", { message: err.message ?? String(err) });
     }
   }));
+
+  // Forward PlanController events (PiX 1.4.0) on the dedicated plan-event
+  // channel. The controller instance is re-resolved per event because each
+  // solo runtime generation owns its own PlanController.
+  eventForwardingUnsubscribes.push(
+    subscribePlanEventForwarding(
+      () => {
+        const win = getWin();
+        return win && !win.isDestroyed() ? win.webContents : null;
+      },
+      () => singleSessionBridge.getPlanController(),
+    ),
+  );
+
+  // Forward AgentTaskService events (PiX 1.4.1) on the dedicated agent-task
+  // channels. The service is app-level and stable for the process lifetime, so
+  // one subscription at setup time is enough (unlike the per-session
+  // PlanController, which needs the command-time re-sync hook).
+  eventForwardingUnsubscribes.push(
+    subscribeAgentTaskEventForwarding(
+      () => {
+        const win = getWin();
+        return win && !win.isDestroyed() ? win.webContents : null;
+      },
+      agentTaskService,
+    ),
+  );
 
   // Forward Team leader AgentSession events on dedicated channels.
   eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onEvent((event) => {
@@ -1146,3 +1267,24 @@ async function executeTeamCommand(teamManager: TeamManager, cmd: TeamCommand): P
       throw new Error(`Unknown team command type: ${(cmd as { type: string }).type}`);
   }
 }
+
+// Re-export the pure plan/agent-task IPC adapters (see ipc-plan-adapters.ts /
+// ipc-agent-task-adapters.ts) so callers that import the registration
+// functions, event-forwarding subscriptions or adapter types from
+// ipc-handlers keep working.
+export {
+  executePlanCommand,
+  isPlanCommand,
+  registerPlanIpcHandlers,
+  resyncPlanEventForwarding,
+  subscribePlanEventForwarding,
+  type IpcMainLike,
+  type WebContentsLike,
+} from "./ipc-plan-adapters.js";
+
+export {
+  executeAgentTaskCommand,
+  isAgentTaskCommand,
+  registerAgentTaskIpcHandlers,
+  subscribeAgentTaskEventForwarding,
+} from "./ipc-agent-task-adapters.js";

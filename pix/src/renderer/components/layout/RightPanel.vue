@@ -7,6 +7,8 @@ import { useRouter } from "vue-router";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useProjectStore } from "../../stores/project-store";
 import { useTeamStore } from "../../stores/team-store";
+import AgentTaskPanel from "../agent-task/AgentTaskPanel.vue";
+import AgentTaskNotificationCenter from "../agent-task/AgentTaskNotificationCenter.vue";
 import TokenStats from "../status/TokenStats.vue";
 import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
 import { deriveSessionTitle } from "@/utils/session-title";
@@ -15,6 +17,18 @@ import type { McpServerInfo } from "../../../shared/types";
 const rpc = useWorkspaceRpc();
 const projectStore = useProjectStore();
 const teamStore = useTeamStore();
+
+// ---- Agent tasks ----
+/** WSL 项目隐藏 Shell 后台任务卡片；AgentTask 入口保留（1.4.1 §5.4）。 */
+const isWsl = computed(() => rpc.executionEnvironment.value?.kind === "wsl");
+const currentSessionId = computed(() => rpc.sessionState.value?.sessionId ?? null);
+const agentTaskSessionNames = computed(() => {
+  const names: Record<string, string> = {};
+  for (const session of projectStore.sessions) {
+    if (session.name) names[session.id] = session.name;
+  }
+  return names;
+});
 
 // Compaction state
 const isCompacting = computed(() => rpc.sessionState.value?.isCompacting ?? false);
@@ -389,8 +403,22 @@ watch(() => teamStore.teamMode, () => {
       </div>
     </div>
 
-    <!-- Background tasks card -->
-    <div v-if="backgroundTasks.length > 0" class="info-card">
+    <!-- Agent tasks card (app-level tasks; above the Shell background card).
+         WSL projects hide the Shell background card below but keep this entry. -->
+    <div class="info-card">
+      <div class="card-title-row">
+        <span class="card-title">Agent 任务</span>
+      </div>
+      <AgentTaskNotificationCenter />
+      <AgentTaskPanel
+        :current-session-id="currentSessionId"
+        :current-project-physical-path="projectStore.currentProject?.physicalPath ?? null"
+        :session-names="agentTaskSessionNames"
+      />
+    </div>
+
+    <!-- Background tasks card (hidden on WSL projects; the agent task entry above stays) -->
+    <div v-if="backgroundTasks.length > 0 && !isWsl" class="info-card">
       <div class="card-title-row">
         <span class="card-title">后台任务</span>
         <button

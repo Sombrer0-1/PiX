@@ -17,8 +17,11 @@
  * `boolean` sketched in the plan's prose), because out-of-scope callers
  * (SettingsPage.vue, session-bridge.ts) read `takeHerEyes.provider` /
  * `takeHerEyes.modelId` and assign `defaultThinkingLevel` to a `ThinkingLevel`
- * ref. The §4.3 additions (`schemaVersion`, `wsl`) are the only GuiSettings
- * shape changes.
+ * ref. GuiSettings shape changes so far: the §4.3 additions (`schemaVersion`,
+ * `wsl`), the 1.4.0 additions (`planModel`, `planThinkingLevel`,
+ * `enableProductAnalytics`) and the 1.4.1 addition (`autoBackgroundMs`).
+ * Migrations are per-version and never write the optional fields: an absent
+ * `autoBackgroundMs` means the consumer default (120000 ms).
  */
 
 // ============================================================================
@@ -105,8 +108,23 @@ export interface GuiSettings {
   defaultModel?: string;
   defaultThinkingLevel?: ThinkingLevel;
   takeHerEyes?: TakeHerEyesSettings;
-  /** Settings schema version; migrated to 2 on first load. */
+  /** Settings schema version; migrated to 4 on first load (1.4.1). */
   schemaVersion?: number;
   /** Global WSL defaults; only seed new-project dialog defaults. */
   wsl?: WslSettings;
+  /** 1.4.0: plan-mode model; undefined = inherit the session model. */
+  planModel?: { provider: string; modelId: string };
+  /** 1.4.0: plan-mode thinking level; undefined = inherit. */
+  planThinkingLevel?: ThinkingLevel;
+  /**
+   * 1.4.0: anonymous product-analytics switch; defaults to false and is
+   * independent of enableInstallTelemetry.
+   */
+  enableProductAnalytics?: boolean;
+  /**
+   * 1.4.1: auto-background threshold in ms for foreground agent tasks;
+   * 60000 | 120000 | 300000 | 0 (off), default 120000. Absent = consumer
+   * default (DEFAULT_AUTO_BACKGROUND_MS); 0 = never auto-background.
+   */
+  autoBackgroundMs?: number;
 }

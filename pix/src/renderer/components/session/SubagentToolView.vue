@@ -4,11 +4,13 @@
  *
  * Replaces the generic tool item in the work-status list when the tool is the
  * solo-mode `agent` tool. Result parsing order is fixed by the renderer
- * contract (pix-subagent-plan.md 4.10):
+ * contract (pix-subagent-plan.md 4.10, extended by PiX-1.4-PLAN §3 for 1.4.1):
  * 1. result is { details } and isSubagentDetails(details) -> rich render
- * 2. details missing/unknown schemaVersion -> extract text from result.content
+ * 2. result is { details } and isAgentTaskGroupHandle(details) -> backgrounded
+ *    group: 已转后台 + 任务数/摘要 + 逐任务跳转入口 (no SubagentDetails)
+ * 3. details missing/unknown schemaVersion -> extract text from result.content
  *    or the replay content array and show a compatible fallback
- * 3. result === null -> queued/starting placeholder derived from args, never
+ * 4. result === null -> queued/starting placeholder derived from args, never
  *    raw JSON
  *
  * Not a nested card: the root is the work-status item itself and body sections
@@ -18,6 +20,8 @@
  */
 import { computed, ref, watch } from "vue";
 import { aggregateSubagentUsage, isSubagentDetails } from "@shared/subagent-types.js";
+import { isAgentTaskGroupHandle } from "@shared/agent-task-types.js";
+import type { AgentTaskGroupHandle } from "@shared/agent-task-types.js";
 import type {
   SubagentActivity,
   SubagentDetails,
@@ -25,6 +29,7 @@ import type {
   SubagentSingleResult,
   SubagentStatus,
 } from "@shared/subagent-types.js";
+import { useAgentTaskStore } from "../../stores/agent-task-store";
 import { renderMarkdown } from "@/utils/markdown";
 
 const props = defineProps<{
@@ -32,6 +37,8 @@ const props = defineProps<{
   args: unknown;
   isError: boolean;
 }>();
+
+const taskStore = useAgentTaskStore();
 
 const expanded = ref(false);
 
@@ -59,6 +66,42 @@ const details = computed<SubagentDetails | null>(() => {
   }
   return null;
 });
+
+/** Case 4: backgrounded agent_task_group handle (1.4.1 §3). */
+const groupHandle = computed<AgentTaskGroupHandle | null>(() => {
+  if (isRecord(props.result) && isAgentTaskGroupHandle(props.result.details)) {
+    return props.result.details;
+  }
+  return null;
+});
+
+const AGENT_TASK_STATUS_LABELS: Record<string, string> = {
+  queued: "排队中",
+  running: "运行中",
+  waiting_input: "等待输入",
+  interrupted: "已中断",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+function agentTaskStatusLabel(status: string): string {
+  return AGENT_TASK_STATUS_LABELS[status] ?? status;
+}
+
+function groupModeLabel(mode: AgentTaskGroupHandle["mode"]): string {
+  const labels: Record<AgentTaskGroupHandle["mode"], string> = {
+    single: "单任务",
+    parallel: "并行",
+    chain: "链式",
+  };
+  return labels[mode] ?? mode;
+}
+
+/** 逐任务跳转：选中任务，让右侧任务面板展开并定位到该任务。 */
+function jumpToTask(taskId: string): void {
+  taskStore.selectTask(taskId);
+}
 
 /** Case 2 fallback: text from result.content, then the result value itself. */
 const fallbackText = computed<string>(() => {
@@ -412,6 +455,42 @@ function toggleBody(): void {
             <span>Tokens {{ formatTokens(aggregate.totalTokens) }} · 费用 {{ formatCost(aggregate.cost) }} · {{ aggregate.turns }} 轮</span>
           </div>
         </template>
+      </div>
+    </template>
+
+    <!-- Case 4: backgrounded group handle -> 已转后台 + 任务数/摘要 + 逐任务跳转 -->
+    <template v-else-if="groupHandle">
+      <div class="subagent-backgrounded" data-test="agent-task-group-handle">
+        <div class="subagent-backgrounded-header">
+          <span class="subagent-icon" aria-hidden="true">
+            <v-icon icon="mdi-arrow-up-bold-circle-outline" size="14" />
+          </span>
+          <span class="subagent-title">已转后台</span>
+          <span class="subagent-source">{{ groupModeLabel(groupHandle.mode) }}</span>
+          <span class="subagent-status backgrounded">{{ groupHandle.tasks.length }} 个任务</span>
+          <span class="subagent-summary">任务已转为后台执行，可在右侧任务面板查看进度与结果</span>
+        </div>
+        <div class="subagent-group-tasks">
+          <div
+            v-for="task in groupHandle.tasks"
+            :key="task.taskId"
+            class="subagent-group-task"
+            :data-test="`agent-task-jump-${task.taskId}`"
+          >
+            <span class="subagent-status" :class="task.status">{{ agentTaskStatusLabel(task.status) }}</span>
+            <span class="subagent-group-task-desc" :title="task.description">{{ truncate(task.description, 60) || "—" }}</span>
+            <span class="subagent-group-task-presentation">{{ task.presentation === "background" ? "后台" : "前台" }}</span>
+            <button
+              type="button"
+              class="subagent-jump-btn"
+              data-test="agent-task-jump-btn"
+              :title="`跳转到任务 ${task.taskId}`"
+              @click="jumpToTask(task.taskId)"
+            >
+              跳转到任务
+            </button>
+          </div>
+        </div>
       </div>
     </template>
 
@@ -936,6 +1015,92 @@ function toggleBody(): void {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-muted);
   padding: var(--pix-space-sm) 0;
+}
+
+/* ── Backgrounded group (case 4) ── */
+.subagent-backgrounded {
+  border-top: 1px solid var(--pix-border-light);
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  background: rgba(255, 255, 255, 0.86);
+  min-width: 0;
+}
+
+.subagent-backgrounded-header {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-sm);
+  min-width: 0;
+  margin-bottom: var(--pix-space-sm);
+}
+
+.subagent-status.backgrounded {
+  color: var(--pix-warning);
+  background: var(--pix-warning-light);
+}
+
+.subagent-group-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-xs);
+}
+
+.subagent-group-task {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: var(--pix-space-xs) var(--pix-space-sm);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-sm);
+  min-width: 0;
+}
+
+.subagent-group-task .subagent-status.failed {
+  color: var(--pix-error);
+  background: var(--pix-error-light);
+}
+
+.subagent-group-task .subagent-status.completed {
+  color: var(--pix-success);
+  background: var(--pix-success-light);
+}
+
+.subagent-group-task .subagent-status.waiting_input {
+  color: var(--pix-warning);
+  background: var(--pix-warning-light);
+}
+
+.subagent-group-task-desc {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-group-task-presentation {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--pix-text-muted);
+}
+
+.subagent-jump-btn {
+  flex-shrink: 0;
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  padding: 2px 8px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-primary);
+  border: 1px solid var(--pix-border-light);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.subagent-jump-btn:hover {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
 }
 
 /* ── Fallback (case 2) ── */

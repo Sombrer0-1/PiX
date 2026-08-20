@@ -5,13 +5,22 @@
  * No more subprocess spawning; the coding agent runs in-process.
  */
 
+import { randomUUID } from "crypto";
 import { BrowserWindow, Menu, app, shell } from "electron";
 import { dirname, join } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { registerIpcHandlers, setupEventForwarding, teardownEventForwarding } from "./ipc-handlers.js";
 import { SessionBridge } from "./session-bridge.js";
 import { SettingsStore } from "./settings-store.js";
 import { TeamManager } from "./team-manager.js";
+import { ProductEventCollector } from "./product-event-collector.js";
+import {
+  AGENT_TASK_DEFAULT_MAX_TASK_BYTES,
+  AGENT_TASK_DEFAULT_MAX_WORKSPACE_BYTES,
+  AgentTaskStore,
+} from "./agent-task/agent-task-store.js";
+import { AgentTaskService } from "./agent-task/agent-task-service.js";
 
 // ESM doesn't have __dirname; derive it from import.meta.url.
 const __filename = fileURLToPath(import.meta.url);
@@ -24,6 +33,11 @@ let singleSessionBridge: SessionBridge | null = null;
 let teamLeaderSessionBridge: SessionBridge | null = null;
 let settingsStore: SettingsStore;
 let teamManager: TeamManager | null = null;
+let productEventCollector: ProductEventCollector | null = null;
+let agentTaskStore: AgentTaskStore | null = null;
+let agentTaskService: AgentTaskService | null = null;
+/** Frozen at service construction; prepareShutdown writes matching close markers with it. */
+let agentTaskRunId = "";
 
 function isSafeExternalUrl(url: string): boolean {
   try {
@@ -108,6 +122,23 @@ function createWindow(): void {
 async function cleanup(): Promise<void> {
   teardownEventForwarding();
 
+  // AgentTask shutdown runs before the bridges dispose, so the parent signals
+  // of the bridge dispose path never misclassify an app shutdown as
+  // user_cancel; product events flush last (PiX 1.4.2). prepareShutdown first
+  // freezes pre-status, bounded-aborts and writes matching runId close
+  // markers; the idempotent dispose afterwards only releases service resources.
+  if (agentTaskService) {
+    try {
+      await agentTaskService.prepareShutdown();
+    } catch (err) {
+      console.error("[main] Error during agent task prepareShutdown:", err);
+    }
+    try {
+      await agentTaskService.dispose("app_shutdown");
+    } catch (err) {
+      console.error("[main] Error during agent task service cleanup:", err);
+    }
+  }
   if (teamManager) {
     try {
       await teamManager.dispose();
@@ -117,6 +148,9 @@ async function cleanup(): Promise<void> {
   }
   if (teamLeaderSessionBridge) {
     try {
+      // 1.4.2 (R4): only the app cleanup marks the bridges as app-shutting-down;
+      // stop-pi / project switch / team-mode switch keep session_close semantics.
+      teamLeaderSessionBridge.markAppShuttingDown();
       await teamLeaderSessionBridge.dispose();
     } catch (err) {
       console.error("[main] Error during team leader session cleanup:", err);
@@ -124,14 +158,23 @@ async function cleanup(): Promise<void> {
   }
   if (singleSessionBridge) {
     try {
+      singleSessionBridge.markAppShuttingDown();
       await singleSessionBridge.dispose();
     } catch (err) {
       console.error("[main] Error during single session cleanup:", err);
     }
   }
+  // Flush the local baseline log last so no product event is lost (PiX 1.4.0).
+  if (productEventCollector) {
+    try {
+      await productEventCollector.flushLog();
+    } catch (err) {
+      console.error("[main] Error during product event flush:", err);
+    }
+  }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Remove default Electron menu bar (File, Edit, View, Window, Help)
   Menu.setApplicationMenu(null);
 
@@ -142,8 +185,46 @@ app.whenReady().then(() => {
     throw err;
   }
 
+  // App-level singleton product collector; gated by enableProductAnalytics.
   try {
-    singleSessionBridge = new SessionBridge({ role: "single" });
+    productEventCollector = new ProductEventCollector({
+      settings: settingsStore,
+      agentDir: getAgentDir(),
+    });
+  } catch (err) {
+    console.error("[main] ProductEventCollector FAILED:", err);
+    throw err;
+  }
+
+  // App-level agent task store (1.4.2) + service. The runId is frozen at
+  // construction; index writes never bypass the store. restoreAll() runs
+  // before createWindow/accepting tasks so the renderer's first get_all sees
+  // the fully hydrated task set (design plan §3, §5.5).
+  try {
+    agentTaskStore = new AgentTaskStore({
+      rootDir: join(getAgentDir(), "agent-tasks"),
+      maxTaskBytes: AGENT_TASK_DEFAULT_MAX_TASK_BYTES,
+      maxWorkspaceBytes: AGENT_TASK_DEFAULT_MAX_WORKSPACE_BYTES,
+    });
+    agentTaskRunId = randomUUID();
+    agentTaskService = new AgentTaskService({
+      settings: settingsStore,
+      events: productEventCollector!,
+      store: agentTaskStore,
+      runId: agentTaskRunId,
+    });
+    await agentTaskService.restoreAll();
+  } catch (err) {
+    console.error("[main] AgentTaskService FAILED:", err);
+    throw err;
+  }
+
+  try {
+    singleSessionBridge = new SessionBridge({
+      role: "single",
+      productEventCollector: productEventCollector ?? undefined,
+      agentTaskService: agentTaskService ?? undefined,
+    });
   } catch (err) {
     console.error("[main] Single SessionBridge FAILED:", err);
     throw err;
@@ -167,18 +248,18 @@ app.whenReady().then(() => {
   createWindow();
   activeWin = mainWindow;
 
-  if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager) {
-    registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager);
-    setupEventForwarding(() => activeWin, singleSessionBridge, teamLeaderSessionBridge, teamManager);
+  if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager && agentTaskService) {
+    registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager, agentTaskService);
+    setupEventForwarding(() => activeWin, singleSessionBridge, teamLeaderSessionBridge, teamManager, agentTaskService);
   }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
       activeWin = mainWindow;
-      if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager) {
+      if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager && agentTaskService) {
         // Re-register IPC handlers for the new window (handler guard prevents duplicates)
-        registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager);
+        registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager, agentTaskService);
         // Event forwarding is already set up with a getter; updating activeWin is enough.
       }
     }

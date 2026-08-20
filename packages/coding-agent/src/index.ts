@@ -175,6 +175,7 @@ export {
 	type DiffStat,
 	extractFileChangeFromToolResult,
 	type FileChangeSummary,
+	isPathInsideCwd,
 	type TurnDiffSummary,
 } from "./core/file-change.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
@@ -280,6 +281,8 @@ export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export type { RuntimeEnvironmentContext } from "./core/system-prompt.ts";
 export {
 	type AgentExecutionMode,
+	type HostToolPolicyInput,
+	type HostToolPolicyOverride,
 	inspectToolExecution,
 	type ToolPolicyDecision,
 } from "./core/tool-execution-policy.ts";

@@ -25,6 +25,7 @@ import {
   type SubagentMode,
   type SubagentSingleResult,
 } from "../../shared/subagent-types.js";
+import type { AgentTaskGroupHandle } from "../../shared/agent-task-types.js";
 import type { SubagentToolHost, SubagentTaskItem } from "./types.js";
 import { MAX_TOOL_CONTENT_BYTES } from "./subagent-runner.js";
 
@@ -92,6 +93,12 @@ const SubagentParams = Type.Object({
       description: "Which agent definitions may be selected (user, project, both); defaults to user. Project agents require explicit user approval.",
     }),
   ),
+  run_in_background: Type.Optional(
+    Type.Boolean({
+      default: false,
+      description: "Start the delegated task(s) directly in the background and return a group handle immediately instead of waiting. Defaults to false: only set this when the USER explicitly asked for the work to run in the background; never set it merely because the task might take a while.",
+    }),
+  ),
 });
 
 type SubagentParamsStatic = Static<typeof SubagentParams>;
@@ -100,6 +107,7 @@ interface NormalizedRun {
   mode: SubagentMode;
   agentScope: SubagentAgentScope;
   tasks: SubagentTaskItem[];
+  runInBackground: boolean;
 }
 
 const TOOL_DESCRIPTION = [
@@ -110,6 +118,7 @@ const TOOL_DESCRIPTION = [
   "- chain: sequential steps; the first step replaces {previous} with an empty string, later steps replace every {previous} with the previous step's output.",
   "subagent_type defaults to general-purpose when omitted.",
   "agentScope defaults to user; project or both may select project-defined agents, which require explicit user approval.",
+  "run_in_background defaults to false and waits for the result. Only set run_in_background=true when the USER explicitly requested background execution; never infer it from how long the task might take - long tasks are backgrounded automatically.",
 ].join(" ");
 
 /**
@@ -143,25 +152,28 @@ function normalizeParams(params: SubagentParamsStatic): NormalizedRun | { invali
   }
 
   const agentScope: SubagentAgentScope = params.agentScope ?? "user";
+  const runInBackground = params.run_in_background === true;
   if (hasPrompt) {
     const task: SubagentTaskItem = {
       subagent_type: params.subagent_type,
       prompt: params.prompt!,
       description: params.description,
     };
-    return { mode: "single", agentScope, tasks: [task] };
+    return { mode: "single", agentScope, tasks: [task], runInBackground };
   }
   if (hasTasks) {
     return {
       mode: "parallel",
       agentScope,
       tasks: params.tasks!.map((item) => ({ ...item })),
+      runInBackground,
     };
   }
   return {
     mode: "chain",
     agentScope,
     tasks: params.chain!.map((item) => ({ ...item })),
+    runInBackground,
   };
 }
 
@@ -354,11 +366,28 @@ function progressStatusLine(details: SubagentDetails): string {
 }
 
 /**
- * Create the `agent` ToolDefinition bound to the shared runner of the host
- * session. Business failures return ordinary AgentToolResult values; nothing
- * here throws for a business failure.
+ * One bounded status line for a backgrounded group handle (1.4.1): the group
+ * id, the task count and each task's id/status. Never rendered as
+ * SubagentDetails.
  */
-export function createSubagentToolDefinition(host: SubagentToolHost): ToolDefinition<typeof SubagentParams, SubagentDetails> {
+function formatHandleContent(handle: AgentTaskGroupHandle): string {
+  const lines = [
+    `The delegated task${handle.tasks.length === 1 ? "" : "s"} started in the background (${handle.tasks.length} task${handle.tasks.length === 1 ? "" : "s"}).`,
+    `Group ID: ${handle.groupId}`,
+    `Tasks: ${handle.tasks.map((task) => `${task.taskId} [${task.status}]`).join(", ")}`,
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * Create the `agent` ToolDefinition bound to the runner facade of the host
+ * session (PiX 1.4.1): execute routes to createTaskGroup/awaitGroup through
+ * the facade, foreground resolves to the existing SubagentDetails and a
+ * backgrounded group (direct/manual/auto) resolves to an AgentTaskGroupHandle.
+ * Business failures return ordinary AgentToolResult values; nothing here
+ * throws for a business failure.
+ */
+export function createSubagentToolDefinition(host: SubagentToolHost): ToolDefinition<typeof SubagentParams, SubagentDetails | AgentTaskGroupHandle> {
   return {
     name: SUBAGENT_TOOL_NAME,
     label: "Agent",
@@ -368,11 +397,11 @@ export function createSubagentToolDefinition(host: SubagentToolHost): ToolDefini
       "Each delegated task must be fully self-contained; the subagent has its own context window and cannot see the parent conversation.",
       "Parallel task items must be independent of each other; ordering is not guaranteed.",
       "Chain steps may reference the previous step output with the {previous} placeholder.",
+      "run_in_background defaults to false. Only set it to true when the user explicitly asked for the work to run in the background; never set it merely because the task might take a while - long-running tasks are backgrounded automatically.",
     ],
     parameters: SubagentParams,
     executionMode: "parallel",
     async execute(toolCallId, params, signal, onUpdate) {
-      void toolCallId;
       const normalized = normalizeParams(params);
       if ("invalid" in normalized) {
         const task: SubagentTaskItem = {
@@ -388,14 +417,24 @@ export function createSubagentToolDefinition(host: SubagentToolHost): ToolDefini
 
       try {
         const runner = host.getRunner();
-        const details = await runner.run(
+        const result = await runner.run(
           { mode: normalized.mode, agentScope: normalized.agentScope, tasks: normalized.tasks },
           signal,
           (event) => {
             onUpdate?.({ content: [textContent(progressStatusLine(event.details))], details: event.details });
           },
+          undefined,
+          { parentToolCallId: toolCallId, runInBackground: normalized.runInBackground },
         );
 
+        // Backgrounded outcome (direct/manual/auto): the single parent tool
+        // await resolves with the group handle, never with SubagentDetails.
+        if ("kind" in result) {
+          const contentText = formatHandleContent(result);
+          return { content: [textContent(truncateContent(contentText))], details: result };
+        }
+
+        const details = result;
         let contentText: string;
         if (details.mode === "single") {
           contentText = formatSingleContent(details.results[0]);
@@ -406,11 +445,11 @@ export function createSubagentToolDefinition(host: SubagentToolHost): ToolDefini
         }
         return { content: [textContent(truncateContent(contentText))], details };
       } catch (error) {
-        // Unexpected internal failure (host getter, runner preflight clone,
-        // progress callback or content formatting): return a bounded structured
-        // failed result, never throw. onUpdate is intentionally NOT called on
-        // this path: if the failure source was the progress callback itself,
-        // that would repeat its side effects.
+        // Unexpected internal failure (host getter, submission context,
+        // progress callback or content formatting): return a bounded
+        // structured failed result, never throw. onUpdate is intentionally NOT
+        // called on this path: if the failure source was the progress callback
+        // itself, that would repeat its side effects.
         const errorMessage = boundedErrorMessage(error instanceof Error ? error.message : String(error));
         const details = internalErrorDetails(normalized.mode, normalized.agentScope, normalized.tasks, errorMessage);
         const content = textContent(`The subagent tool failed internally: ${errorMessage}`);

@@ -13,6 +13,24 @@ import type {
   ThinkingLevel,
 } from "./project-location.js";
 import type { CustomProviderConfig } from "./custom-providers.js";
+import type {
+  PlanCancelRef,
+  PlanDeviation,
+  PlanRuntimeSnapshot,
+  PlanStep,
+} from "./plan-types.js";
+import type {
+  AgentTaskActivity,
+  AgentTaskClearAllResult,
+  AgentTaskDiagnosticExport,
+  AgentTaskInfo,
+  AgentTaskInputRequest,
+  AgentTaskListSnapshot,
+  AgentTaskRecoveryIssue,
+  AgentTaskResumeSummary,
+  AgentTaskStorageStatus,
+  ResumeDecision,
+} from "./agent-task-types.js";
 
 // ============================================================================
 // RPC Command Types (commands sent to pi via stdin)
@@ -829,6 +847,122 @@ export type TeamCommand =
   | { type: "restart_worker"; agentId: string };
 
 // ============================================================================
+// Plan IPC Types (PiX 1.4.0, design plan §4.9)
+// ============================================================================
+//
+// Renderer <-> main contract for the Plan feature. PlanRuntimeSnapshot /
+// PlanStep / PlanDeviation / PlanCancelRef come from the leaf module
+// plan-types.ts; shared/types.ts never references main/plan/plan-controller.ts.
+// The envelope (PixCommandResult) is the existing PixApi envelope, no second
+// protocol.
+
+export type PlanCommand =
+  | {
+      type: "enter_planning";
+      requestText?: string;
+      filePaths?: string[];
+      images?: ClipboardImage[];
+      source?: "configured" | "session";
+    } // 首次 armed 提交 requestText 必填非空；仅 dormant retry 可省略，且此时不得带附件
+  | { type: "retry_generation"; generationId: string }
+  | { type: "use_session_model_and_retry"; generationId: string }
+  | { type: "regenerate_plan"; generationId: string; concise: boolean }
+  | { type: "request_revision"; planId: string; version: number; feedback: string; stepKey?: string }
+  | { type: "return_previous_version"; planId: string; baseVersion: number }
+  | { type: "approve"; planId: string; version: number }
+  | { type: "start_execution"; planId: string; version: number }
+  | ({ type: "cancel" } & PlanCancelRef)
+  | { type: "retry_step"; planId: string; version: number; stepId: string }
+  | { type: "skip_step"; planId: string; version: number; stepId: string }
+  | { type: "continue_plan"; planId: string; version: number }
+  | { type: "get_snapshot" };
+
+export type PlanEvent =
+  | { type: "plan_state"; snapshot: PlanRuntimeSnapshot }
+  | { type: "plan_step"; planId: string; version: number; step: PlanStep }
+  | { type: "plan_deviation"; deviation: PlanDeviation };
+
+/**
+ * Existing PixApi result envelope, reused for plan-command. Data-bearing
+ * commands must carry `data` on success; data-less commands may omit it.
+ */
+export type PixCommandResult<T = undefined> =
+  | { success: true; data?: T }
+  | { success: false; error: string; code?: string };
+
+// ============================================================================
+// Agent Task IPC Types (PiX 1.4.1, design plan §4.9)
+// ============================================================================
+//
+// Renderer <-> main contract for the app-level agent task feature.
+// AgentTaskInfo / AgentTaskActivity / AgentTaskInputRequest come from the leaf
+// module agent-task-types.ts; shared/types.ts never references main-only
+// service types. The envelope (PixCommandResult) is the existing PixApi
+// envelope, no second protocol. AgentTaskCommandData must extend in lockstep
+// with the command union per release stage: 1.4.1 get_all data is
+// AgentTaskInfo[] (AgentTaskListSnapshot arrives with the 1.4.2 R2 switch),
+// and AgentTaskGroupHandle belongs to the agent tool result, never to an IPC
+// command's data.
+
+export type AgentTaskCommandV141 =
+  | { type: "cancel"; taskId: string; generation: number }
+  | { type: "background"; taskId: string; generation: number }
+  | { type: "foreground"; taskId: string; generation: number }
+  | { type: "continue_foreground_wait"; taskId: string; generation: number }
+  | { type: "respond_input"; taskId: string; requestId: string; generation: number; response: RequestUserInputResponse }
+  | { type: "cancel_input"; taskId: string; requestId: string; generation: number }
+  | { type: "send_to_session"; taskId: string; generation: number; targetSessionId: string; confirmDuplicate?: boolean }
+  | { type: "clear"; taskId: string; generation: number; confirmDataLoss: boolean }
+  | { type: "get_all" }
+  | { type: "get_active_input_requests" };   // 支撑 preload getPendingAgentTaskInputRequests
+// 1.4.2 (R3): recovery commands join the union; the alias switches to V142.
+export type AgentTaskRecoveryCommandV142 =
+  | { type: "clear_all_terminal"; workspaceId?: string; confirm: boolean }
+  | { type: "export_diagnostics"; taskId: string }
+  | { type: "resume"; taskId: string; generation: number; decision: ResumeDecision }
+  | { type: "mark_failed"; taskId: string; generation: number }
+  | { type: "get_resume_summary"; taskId: string; generation: number };
+export type AgentTaskCommandV142 = AgentTaskCommandV141 | AgentTaskRecoveryCommandV142;
+export type AgentTaskCommand = AgentTaskCommandV142; // 1.4.2 (R3) switch
+
+export type AgentTaskEventV141 =
+  | { type: "task_state"; task: AgentTaskInfo }
+  | { type: "task_input_dismissed"; taskId: string; requestId: string; generation: number; reason: string }
+  | { type: "task_activities"; taskId: string; activities: AgentTaskActivity[] }
+  | { type: "task_output"; taskId: string; output: string; truncated: boolean };
+// 1.4.2 (R2): storage_status / recovery_issue join the renderable event union.
+export type AgentTaskEventV142 = AgentTaskEventV141
+  | { type: "storage_status"; status: AgentTaskStorageStatus }
+  | { type: "recovery_issue"; issue: AgentTaskRecoveryIssue };
+export type AgentTaskEvent = AgentTaskEventV142; // 1.4.2 (R2) switch
+// 输入请求只走专用通道 agent-task-input-request；普通 AgentTaskEvent 不重复发送。
+// main-only 的 AgentTaskServiceEvent.task_file_change 不属于本联合，只由 main
+// 内 Plan adapter 消费，不得直接跨 IPC。
+
+export interface AgentTaskCommandDataMapV141 {
+  cancel: undefined; background: undefined; foreground: undefined; continue_foreground_wait: undefined;
+  respond_input: undefined; cancel_input: undefined; send_to_session: undefined; clear: undefined;
+  get_all: AgentTaskInfo[];
+  get_active_input_requests: AgentTaskInputRequest[];
+}
+export type AgentTaskCommandDataV141<C extends AgentTaskCommandV141> = AgentTaskCommandDataMapV141[C["type"]];
+
+// 1.4.2 (R2): get_all atomically switches to AgentTaskListSnapshot in shared /
+// service / event forwarding at the same stage, so there is never an
+// intermediate state where the service returns the new type while IPC still
+// declares the old one. (R3) adds the recovery commands and their data shapes;
+// AgentTaskCommandData must extend in lockstep with the command union.
+export type AgentTaskCommandDataMapV142 = Omit<AgentTaskCommandDataMapV141, "get_all"> & {
+  get_all: AgentTaskListSnapshot;
+  clear_all_terminal: AgentTaskClearAllResult;
+  export_diagnostics: AgentTaskDiagnosticExport;
+  resume: undefined;
+  mark_failed: undefined;
+  get_resume_summary: AgentTaskResumeSummary;
+};
+export type AgentTaskCommandDataV142<C extends AgentTaskCommandV142> = AgentTaskCommandDataMapV142[C["type"]];
+
+// ============================================================================
 // Re-exports from project-location.ts
 // ============================================================================
 //
@@ -851,3 +985,46 @@ export type {
   ThinkingLevel,
   TakeHerEyesSettings,
 } from "./project-location.js";
+
+// Plan plain-data types are canonically defined in plan-types.ts (leaf module,
+// guards included). Re-exported here so preload/renderer keep the single
+// `from "../shared/types"` import path used across the codebase.
+export type {
+  Plan,
+  PlanCancelRef,
+  PlanDeviation,
+  PlanGenerationFailure,
+  PlanGenerationKind,
+  PlanGenerationState,
+  PlanPlanningModel,
+  PlanRevisionState,
+  PlanRuntimeSnapshot,
+  PlanStatus,
+  PlanStep,
+  PlanStepFile,
+  PlanStepStatus,
+  PlanVerificationResult,
+  PlanVerificationStatus,
+} from "./plan-types.js";
+
+// AgentTask plain-data types are canonically defined in agent-task-types.ts
+// (leaf module, guards included). Re-exported here so preload/renderer keep the
+// single `from "../shared/types"` import path used across the codebase.
+export type {
+  AgentTaskActivity,
+  AgentTaskClearAllResult,
+  AgentTaskDiagnosticExport,
+  AgentTaskExecutionMode,
+  AgentTaskFailureReason,
+  AgentTaskInfo,
+  AgentTaskInputRequest,
+  AgentTaskListSnapshot,
+  AgentTaskPresentation,
+  AgentTaskRecoveryIssue,
+  AgentTaskRecoveryIssueCode,
+  AgentTaskResumeSummary,
+  AgentTaskStatus,
+  AgentTaskStorageStatus,
+  AgentTaskUsage,
+  ResumeDecision,
+} from "./agent-task-types.js";
