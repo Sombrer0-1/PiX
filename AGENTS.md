@@ -4,6 +4,7 @@
 
 提交代码时必须确保：
 - **只提交源码文件**（.ts, .vue, .json, .md 等）
+- `packages/ai/src/models.generated.ts` 和 `image-models.generated.ts` **是源码，不是构建产物**。它们是 PiX 安装包内的模型目录（id、定价、上下文窗口）。发版/打包前若有改动必须提交并推送，否则干净 clone 打出的包仍是上一份过期模型表。
 - **不提交依赖包**（node_modules/）
 - **不提交构建产物**（dist/, release/, release-bugfix/, *.exe, *.blockmap 等）
 - **不提交编译中间产物**（*.tsbuildinfo, *.log 等）
@@ -14,6 +15,7 @@
 1. 运行 `git status` 确认没有意外文件
 2. 使用 `git add <具体文件路径>` 暂存，绝不使用 `git add .` 或 `git add -A`
 3. 确认 .gitignore 已覆盖所有产物目录
+4. 发版或打包前确认 `models.generated.ts` / `image-models.generated.ts` 的改动已提交
 
 # 开发规范
 

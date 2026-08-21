@@ -86,6 +86,8 @@ npm run package
 npm run package
 ```
 
+打包前确认 `packages/ai/src/models.generated.ts`（以及 `image-models.generated.ts`）的改动已提交并推送。这两份文件是 `@earendil-works/pi-ai` 的模型目录源码，不是 `dist/` 产物；未进仓库则安装包里的模型列表、定价和上下文窗口仍是上一份已提交内容。
+
 打包产物位于 `release/` 目录，包含：
 - Windows: `PiX Setup x.x.x.exe`
 - macOS: `PiX-x.x.x.dmg`
