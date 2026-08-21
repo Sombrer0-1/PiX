@@ -11,6 +11,7 @@ import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import MessageBlock from "./MessageBlock.vue";
 import ErrorBlock from "./ErrorBlock.vue";
 import SubagentToolView from "./SubagentToolView.vue";
+import WorkflowRunPanel from "./WorkflowRunPanel.vue";
 import { codeCheckIcon, codeCopyIcon, renderMarkdown } from "@/utils/markdown";
 
 function formatTime(ts: number): string {
@@ -391,13 +392,22 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 
         <div v-if="expandedWorkStatus.has(block.id) && block.tools.length > 0" class="ws-body">
           <template v-for="tool in block.tools" :key="tool.toolCallId">
-            <!-- The `agent` tool gets its own rich renderer; all other tools
-                 keep the generic item below. -->
+            <!-- The `agent` tool gets its own rich renderer; `workflow` / `ralph`
+                 get the workflow run panel (toolName-based so old-version
+                 results still mount it and fall back to store/args); all other
+                 tools keep the generic item below. -->
             <SubagentToolView
               v-if="tool.toolName === 'agent'"
               :result="tool.result"
               :args="tool.args"
               :is-error="tool.isError"
+            />
+            <WorkflowRunPanel
+              v-else-if="tool.toolName === 'workflow' || tool.toolName === 'ralph'"
+              :result="tool.result"
+              :args="tool.args"
+              :is-error="tool.isError"
+              :tool-call-id="tool.toolCallId"
             />
             <div v-else class="ws-tool-item" :class="{ error: tool.isError }">
               <button class="ws-tool-header" @click="toggleTool(block.id, tool.toolCallId)">

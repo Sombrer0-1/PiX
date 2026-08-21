@@ -25,6 +25,7 @@ import { basename, join } from "node:path";
 import {
   PRODUCT_EVENT_ERROR_CATEGORIES,
   PRODUCT_EVENT_NAMES_V140,
+  PRODUCT_EVENT_NAMES_V143,
   PRODUCT_EVENT_SCHEMA_VERSION,
   isProductEvent,
   sanitizeProductEventPayload,
@@ -215,6 +216,9 @@ await run("isProductEvent: accepts valid events and rejects malformed ones", asy
   );
 
   assert(isProductEvent(makeEvent("agent_task_started")), "agent_task_started accepted (1.4.1 events)");
+  for (const name of PRODUCT_EVENT_NAMES_V143) {
+    assert(isProductEvent(makeEvent(name)), `${name} accepted (1.4.3 events)`);
+  }
   assert(!isProductEvent(makeEvent("plan_bogus")), "unknown name rejected");
   assert(!isProductEvent({ schemaVersion: 2, name: "plan_approved", payload: {} }), "wrong schemaVersion rejected");
   assert(!isProductEvent({ schemaVersion: 1, name: "plan_approved" }), "missing payload rejected");

@@ -21,7 +21,7 @@
  * `wsl`), the 1.4.0 additions (`planModel`, `planThinkingLevel`,
  * `enableProductAnalytics`) and the 1.4.1 addition (`autoBackgroundMs`).
  * Migrations are per-version and never write the optional fields: an absent
- * `autoBackgroundMs` means the consumer default (120000 ms).
+ * `autoBackgroundMs` means the consumer default (0 = off).
  */
 
 // ============================================================================
@@ -123,8 +123,9 @@ export interface GuiSettings {
   enableProductAnalytics?: boolean;
   /**
    * 1.4.1: auto-background threshold in ms for foreground agent tasks;
-   * 60000 | 120000 | 300000 | 0 (off), default 120000. Absent = consumer
-   * default (DEFAULT_AUTO_BACKGROUND_MS); 0 = never auto-background.
+   * 60000 | 120000 | 300000 | 0 (off). Absent = consumer default
+   * (DEFAULT_AUTO_BACKGROUND_MS, 0 = off). When set, expiry only flips
+   * panel presentation; it does not release the parent tool await.
    */
   autoBackgroundMs?: number;
 }

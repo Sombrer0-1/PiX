@@ -769,10 +769,15 @@ export function createSessionStore(id: string, options: { teamLeader?: boolean }
         };
         const tool = toolsById.get(tr.toolCallId);
         if (tool) {
-          // The `agent` tool keeps the full { content, details } result shape
-          // on replay so SubagentToolView can rich-render from the persisted
-          // details; other tools keep the legacy content-only shape.
-          tool.result = tr.toolName === "agent" ? { content: tr.content, details: tr.details } : tr.content;
+          // The `agent` / `workflow` / `ralph` tools keep the full
+          // { content, details } result shape on replay so their rich renderers
+          // (SubagentToolView / WorkflowRunPanel) can draw from the persisted
+          // details; other tools keep the legacy content-only shape to avoid
+          // replay bloat.
+          tool.result =
+            tr.toolName === "agent" || tr.toolName === "workflow" || tr.toolName === "ralph"
+              ? { content: tr.content, details: tr.details }
+              : tr.content;
           tool.isError = tr.isError;
           if (!tool.toolName && tr.toolName) tool.toolName = tr.toolName;
         }

@@ -64,8 +64,8 @@ const planThinkingLevel = ref<ThinkingLevel | "">("");
 const enableProductAnalytics = ref(false);
 
 // 1.4.1: auto-background threshold for foreground agent tasks (ms);
-// 0 = off. Hydrated from the store on mount, which defaults absent to 120000.
-const autoBackgroundMs = ref(120_000);
+// 0 = off. Hydrated from the store on mount, which defaults absent to 0.
+const autoBackgroundMs = ref(0);
 
 const shellPath = ref("");
 const shellCommandPrefix = ref("");
@@ -203,10 +203,10 @@ const planThinkingLevelItems: Array<{ title: string; value: ThinkingLevel | "" }
 
 // 1.4.1: auto-background threshold choices; 0 = off (never auto-background).
 const autoBackgroundMsItems: Array<{ title: string; value: number }> = [
+  { title: "关闭", value: 0 },
   { title: "1 分钟", value: 60_000 },
   { title: "2 分钟", value: 120_000 },
   { title: "5 分钟", value: 300_000 },
-  { title: "关闭", value: 0 },
 ];
 
 const wslDistroItems = computed(() =>
@@ -580,7 +580,7 @@ async function downloadAndInstall(): Promise<void> {
               :items="autoBackgroundMsItems"
               item-title="title"
               item-value="value"
-              hint="前台子代理运行超过该时长后自动转入后台继续执行；选择「关闭」则始终等待前台完成。"
+              hint="超过该时长后，任务在面板中显示为后台，但父会话仍等待结果。选择「关闭」则始终以前台展示。真正转后台（立即返回、完成后自动回传）仅在明确设置 run_in_background 或在任务面板手动转后台时发生。"
               persistent-hint
               class="mb-4"
             />

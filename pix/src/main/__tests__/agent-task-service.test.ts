@@ -51,6 +51,7 @@ import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
 import {
   AgentTaskService,
   __setAgentTaskServiceHooksForTests,
+  type AgentTaskDeliveryContent,
   type AgentTaskServiceEvent,
   type AgentTaskServiceTestHooks,
   type AgentTaskSubmissionContext,
@@ -963,7 +964,7 @@ async function testAutoBackgroundTimer(): Promise<void> {
   assertEqual(findTask(harness, taskId).presentation, "foreground", "group stays foreground after continue");
   assertEqual(harness.service.continueForegroundWait(taskId, 0).ok, false, "second continue has no timer to cancel");
 
-  // A second group auto-backgrounds at the deadline: detach, no restart.
+  // A second group hits the deadline: panel presentation flips, parent await stays.
   const harness2 = makeHarness({
     now: fakeTimers.now,
     setTimer: fakeTimers.setTimer,
@@ -975,13 +976,17 @@ async function testAutoBackgroundTimer(): Promise<void> {
   const result = await Promise.race([awaitPromise, drain().then(() => "pending" as const)]);
   assertEqual(result, "pending", "foreground await still pending before the deadline");
   fakeTimers.fireMs(AUTO_MS);
-  const awaited = await awaitPromise;
-  assertEqual(awaited.kind, "backgrounded", "deadline auto-backgrounds the group");
+  const stillPending = await Promise.race([awaitPromise, drain().then(() => "pending" as const)]);
+  assertEqual(stillPending, "pending", "deadline does not release the parent await");
   const after = harness2.service.getAll().tasks.filter((info) => info.groupId === handle2.groupId);
   assert(after.every((info) => info.presentation === "background"), "auto-background flips every child to background");
   assert(after.every((info) => info.autoBackground === undefined), "auto-background clears the mirrored fields");
   assert(FakeRuntime.instances.every((fake) => fake.abortCalls === 0), "auto-background never restarts tasks");
   assertEqual(FakeRuntime.instances.length, 2, "no runtime recreated on auto-background");
+  FakeRuntime.instances[0].complete();
+  FakeRuntime.instances[1].complete();
+  const awaited = await awaitPromise;
+  assertEqual(awaited.kind, "completed", "parent await still receives SubagentDetails after UI-only auto-background");
 }
 
 async function testForegroundAwaitRebuild(): Promise<void> {
@@ -1174,6 +1179,84 @@ async function testDeliverySink(): Promise<void> {
   // Clear after delivery without confirmation works (data was delivered).
   const clear = await harness.service.clearTask(taskId, 0, false);
   assertEqual(clear.ok, true, "delivered terminal task clears without confirmation");
+}
+
+async function testAutoDeliverOnDetachedComplete(): Promise<void> {
+  const harness = makeHarness();
+  const context = makeContext(harness);
+  const delivered: AgentTaskDeliveryContent[] = [];
+  const handle = await harness.service.createTaskGroup(makeParams("single", [makeTask(0)]), context, "foreground");
+  const taskId = handle.tasks[0].taskId;
+  const workspaceId = findTask(harness, taskId).workspaceId;
+  harness.service.registerSessionDeliverySink("session-1", workspaceId, async (content) => {
+    delivered.push(content);
+  });
+
+  const awaitPromise = harness.service.awaitGroup(handle.groupId);
+  harness.service.background(taskId, 0);
+  const detached = await awaitPromise;
+  assertEqual(detached.kind, "backgrounded", "manual background releases the parent await");
+
+  FakeRuntime.instances[0].complete();
+  await waitForStatus(harness, taskId, "completed");
+  await waitFor(() => delivered.length === 1, 20000, "detached completion auto-delivers to the parent session");
+  assertEqual(delivered[0].taskId, taskId, "auto-delivery carries the task id");
+  assertEqual(delivered[0].status, "completed", "auto-delivery carries the terminal status");
+  assert(findTask(harness, taskId).deliveredSessionIds.includes("session-1"), "parent session recorded as delivered");
+
+  // Foreground completion still returns details and does not auto-deliver.
+  const harness2 = makeHarness();
+  const context2 = makeContext(harness2);
+  const foregroundDelivered: AgentTaskDeliveryContent[] = [];
+  const handle2 = await harness2.service.createTaskGroup(makeParams("single", [makeTask(0)]), context2, "foreground");
+  const taskId2 = handle2.tasks[0].taskId;
+  harness2.service.registerSessionDeliverySink("session-1", findTask(harness2, taskId2).workspaceId, async (content) => {
+    foregroundDelivered.push(content);
+  });
+  const await2 = harness2.service.awaitGroup(handle2.groupId);
+  FakeRuntime.instances[0].complete();
+  const result2 = await await2;
+  assertEqual(result2.kind, "completed", "foreground await still returns details");
+  await drain();
+  assertEqual(foregroundDelivered.length, 0, "foreground completion does not auto-deliver");
+
+  // Plan-linked detached tasks keep the Plan consumption path; no chat inject.
+  const harness3 = makeHarness();
+  const context3 = makeContext(harness3);
+  const planDelivered: AgentTaskDeliveryContent[] = [];
+  const link: AgentTaskPlanLink = { planId: "plan-1", version: 1, stepId: "step-1" };
+  const handle3 = await harness3.service.createTaskGroup(
+    makeParams("single", [makeTask(0)], { planLink: link }),
+    context3,
+    "foreground",
+  );
+  const taskId3 = handle3.tasks[0].taskId;
+  harness3.service.registerSessionDeliverySink("session-1", findTask(harness3, taskId3).workspaceId, async (content) => {
+    planDelivered.push(content);
+  });
+  harness3.service.background(taskId3, 0);
+  FakeRuntime.instances[0].complete();
+  await waitForStatus(harness3, taskId3, "completed");
+  await drain();
+  assertEqual(planDelivered.length, 0, "plan-linked tasks skip auto-delivery");
+
+  // Direct run_in_background also auto-delivers on completion.
+  const harness4 = makeHarness();
+  const context4 = makeContext(harness4);
+  const directDelivered: AgentTaskDeliveryContent[] = [];
+  const handle4 = await harness4.service.createTaskGroup(
+    makeParams("single", [makeTask(0)], { runInBackground: true }),
+    context4,
+    "foreground",
+  );
+  const taskId4 = handle4.tasks[0].taskId;
+  harness4.service.registerSessionDeliverySink("session-1", findTask(harness4, taskId4).workspaceId, async (content) => {
+    directDelivered.push(content);
+  });
+  FakeRuntime.instances[0].complete();
+  await waitForStatus(harness4, taskId4, "completed");
+  await waitFor(() => directDelivered.length === 1, 20000, "direct background completion auto-delivers");
+  assertEqual(directDelivered[0].taskId, taskId4, "direct background delivery carries the task id");
 }
 
 async function testDisposeAndStopReasons(): Promise<void> {
@@ -1472,6 +1555,7 @@ async function main(): Promise<void> {
   await run("foreground await: SubagentDetails rebuild + cancelled aborted semantics", testForegroundAwaitRebuild);
   await run("Plan group consumption + clear semantics", testPlanGroupConsumptionAndClear);
   await run("result delivery sink", testDeliverySink);
+  await run("detached completion auto-delivers to the parent session", testAutoDeliverOnDetachedComplete);
   await run("dispose: bounded shutdown + stop reasons", testDisposeAndStopReasons);
   await run("shutdown input settle never rewrites the frozen preShutdownStatus", testShutdownInputSettleFreeze);
   await run("concurrent input requests: last settle returns the task to running", testConcurrentInputRequests);

@@ -17,9 +17,12 @@
  *
  * Foreground contract: the caller (facade) awaits `awaitGroup`, which resolves
  * once every child is terminal (rebuilding the legacy SubagentDetails in the
- * original mode/order) or once the group detaches (auto/manual background),
- * whichever comes first. Detaching never restarts a task; it only flips
- * presentation and resolves the single parent tool await with a group handle.
+ * original mode/order) or once the group detaches (direct/manual background or
+ * session switch), whichever comes first. Auto-background (when enabled) only
+ * flips panel presentation and never releases the parent await. Detaching
+ * never restarts a task; it flips presentation, resolves the parent tool
+ * await with a group handle, and auto-delivers each terminal result to the
+ * parent session.
  *
  * 1.4.2 (R2) version surface: constructor opts REQUIRE {settings, events,
  * store, runId}; getAll returns AgentTaskListSnapshot; every task is persisted
@@ -139,12 +142,27 @@ export interface AgentTaskSubmissionContext {
   hostDisposed: Promise<"host_disposed">; // 与 requestUserInput/父 signal 竞速，保留关闭分类
 }
 
+/**
+ * Per-task workflow extras (design plan §4.6): parallel to `tasks` by index.
+ * The agent tool never passes the field; only the workflow child spawner does.
+ */
+export interface WorkflowTaskExtra {
+  /** Takes precedence over the agent definition's model (including "inherit"). */
+  modelOverride?: string;
+  /** Must already be a subset-legal ObjectJsonSchema; the service does no subset gate. */
+  outputSchema?: unknown;
+  /** Nested-session turn cap; when set, overrides the agent definition default. */
+  maxTurns?: number;
+}
+
 export interface CreateTaskParams {
   mode: "single" | "parallel" | "chain"; // 保留现有模式
   agentScope: SubagentAgentScope;
   tasks: SubagentTaskItem[];
   runInBackground: boolean;
   planLink?: AgentTaskPlanLink;
+  /** workflow children only; length MUST equal tasks.length (the spawner guarantees it). */
+  workflowExtras?: WorkflowTaskExtra[];
 }
 
 export type AgentTaskAwaitResult =
@@ -170,8 +188,10 @@ export interface AgentTaskDelivery {
   taskId: string;
   groupId: string;
   planLink?: AgentTaskPlanLink;
+  status: AgentTaskStatus;
   summary: string;
   finalOutput: string;
+  errorMessage?: string;
   usage: AgentTaskUsage;
 }
 export type AgentTaskDeliveryContent = AgentTaskDelivery;
@@ -239,6 +259,10 @@ interface PreflightItem {
   description: string;
   modelSnapshot: Model<Api> | undefined;
   modelLabel: string | undefined;
+  /** workflow schema children only: the frozen extra's outputSchema (host-defense checked). */
+  outputSchema: unknown | undefined;
+  /** workflow children: optional per-item maxTurns override from extras. */
+  maxTurnsOverride: number | undefined;
   projectAgent: boolean;
   failure: { reason: AgentTaskFailureReason; message: string } | undefined;
 }
@@ -253,6 +277,8 @@ interface GroupEntry {
   taskIds: string[];
   createdAt: number;
   detached: boolean;
+  /** workflow children only (design plan §4.6): manual/auto backgrounding is forbidden for these groups. Internal field, never persisted. */
+  workflowOwned: boolean;
   autoBackgroundTimer: AutoBackgroundTimer | undefined;
   awaiters: Array<{ resolve: (result: AgentTaskAwaitResult) => void }>;
   terminalSnapshot: AgentTaskInfo[] | undefined;
@@ -444,6 +470,10 @@ export class AgentTaskService {
   ): Promise<AgentTaskGroupHandle> {
     const now = this._now();
     const effectivePresentation: AgentTaskPresentation = params.runInBackground ? "background" : presentation;
+    // Workflow extras are the spawner's per-index parallel array; they only
+    // take effect when they cover every task (the spawner guarantees it). A
+    // mismatched array is ignored like an absent one.
+    const workflowOwned = params.workflowExtras != null && params.workflowExtras.length === params.tasks.length;
     const items = this._preflight(params, parent);
     const approval = await this._resolveProjectApproval(items, parent, signal);
 
@@ -457,7 +487,9 @@ export class AgentTaskService {
       planLink: params.planLink ? { ...params.planLink } : undefined,
       taskIds: [],
       createdAt: now,
-      detached: false,
+      // Direct background releases the parent await immediately (lane B).
+      detached: effectivePresentation === "background",
+      workflowOwned,
       autoBackgroundTimer: undefined,
       awaiters: [],
       terminalSnapshot: undefined,
@@ -513,14 +545,15 @@ export class AgentTaskService {
       }
     }
 
-    // 3. Start the group-level auto-background timer (foreground only, never
-    //    for already-terminal groups). Children mirror the shared deadline;
-    //    the final state emission below carries it.
+    // 3. Start the group-level auto-background timer (still-attached
+    //    foreground only). Expiry only flips panel presentation; it never
+    //    detaches or resolves the parent await. Workflow-owned groups are
+    //    exempt (design plan §4.6).
     const hasNonTerminal = group.taskIds.some((taskId) => {
       const entry = this._tasks.get(taskId);
       return entry !== undefined && !isTerminalStatus(entry.info.status);
     });
-    if (effectivePresentation === "foreground" && hasNonTerminal) {
+    if (effectivePresentation === "foreground" && hasNonTerminal && !workflowOwned) {
       this._startAutoBackgroundTimer(group);
     }
 
@@ -535,17 +568,17 @@ export class AgentTaskService {
   }
 
   /**
-   * Wait for the group: a foreground group resolves when every child is
+   * Wait for the group: a still-attached group resolves when every child is
    * terminal (details rebuilt in original mode/order) or when it detaches
-   * (auto/manual background), whichever comes first; a background group
-   * resolves immediately with its handle.
+   * (direct/manual background or session switch), whichever comes first; a
+   * detached group resolves immediately with its handle.
    */
   async awaitGroup(groupId: string): Promise<AgentTaskAwaitResult> {
     const group = this._groups.get(groupId);
     if (!group) {
       throw new Error(`Unknown agent task group "${groupId}".`);
     }
-    if (group.detached || group.presentation === "background") {
+    if (group.detached) {
       return { kind: "backgrounded", handle: this._buildGroupHandle(group) };
     }
     if (group.terminalSnapshot) {
@@ -618,7 +651,11 @@ export class AgentTaskService {
     if (entry.info.generation !== generation) return { ok: false, reason: "stale_generation" };
     const group = this._groups.get(entry.info.groupId);
     if (!group) return { ok: false, reason: "group_not_found" };
-    if (group.detached || group.presentation === "background" || group.terminalSnapshot) {
+    // Workflow children must never background (design plan §4.6): cancelGroup
+    // on a detached group is a no-op, so a backgrounded workflow child would
+    // outlive its dead parent run. The UI/IPC must not background such groups.
+    if (group.workflowOwned) return { ok: false, reason: "workflow_owned" };
+    if (group.detached || group.terminalSnapshot) {
       return { ok: true };
     }
     this._detachGroup(group);
@@ -644,16 +681,11 @@ export class AgentTaskService {
     return { ok: true };
   }
 
-  /** Detach every foreground group of the given parent session (session switch/close path). */
+  /** Detach every still-attached group of the given parent session (session switch/close path). */
   detachForegroundGroupsForSession(parentSessionId: string): AgentTaskGroupHandle[] {
     const handles: AgentTaskGroupHandle[] = [];
     for (const group of this._groups.values()) {
-      if (
-        group.parentSessionId === parentSessionId &&
-        group.presentation === "foreground" &&
-        !group.detached &&
-        !group.terminalSnapshot
-      ) {
+      if (group.parentSessionId === parentSessionId && !group.detached && !group.terminalSnapshot) {
         this._detachGroup(group);
         handles.push(this._buildGroupHandle(group));
       }
@@ -694,9 +726,9 @@ export class AgentTaskService {
 
   /**
    * Deliver the structured task result to a Solo session sink registered for
-   * the same workspace. The sink decides idleness; a rejection surfaces its
-   * reason (target_session_busy etc.). Default: once per task per target
-   * session; a repeat requires confirmDuplicate.
+   * the same workspace. The sink injects into a streaming parent via followUp
+   * and starts a turn when idle. Default: once per task per target session;
+   * a repeat requires confirmDuplicate.
    */
   async sendResultToSession(
     taskId: string,
@@ -717,8 +749,10 @@ export class AgentTaskService {
       taskId: entry.info.taskId,
       groupId: entry.info.groupId,
       planLink: entry.info.planLink,
+      status: entry.info.status,
       summary: this._resultSummary(entry.info),
       finalOutput: entry.info.finalOutput,
+      errorMessage: entry.info.errorMessage,
       usage: { ...entry.info.usage },
     };
     try {
@@ -1293,18 +1327,32 @@ export class AgentTaskService {
 
   private _preflight(params: CreateTaskParams, parent: AgentTaskSubmissionContext): PreflightItem[] {
     const definitions = resolveAgentsForScope(parent.loadedAgents?.agents ?? [...BUILTIN_AGENTS], params.agentScope);
+    // Workflow extras are the spawner's per-index parallel array; they only
+    // take effect when they cover every task (the spawner guarantees it).
+    const workflowOwned = params.workflowExtras != null && params.workflowExtras.length === params.tasks.length;
     const items: PreflightItem[] = [];
     for (const [index, task] of params.tasks.entries()) {
       const requested = typeof task.subagent_type === "string" ? task.subagent_type.trim() : undefined;
       const name = requested && requested !== "" ? requested : "general-purpose";
       const definition = definitions.find((candidate) => candidate.name === name);
+      const extra = workflowOwned ? params.workflowExtras![index] : undefined;
+      const outputSchema = extra?.outputSchema;
+      const maxTurnsOverride =
+        extra?.maxTurns !== undefined && Number.isSafeInteger(extra.maxTurns) && extra.maxTurns >= 1
+          ? extra.maxTurns
+          : undefined;
 
       let failure: { reason: AgentTaskFailureReason; message: string } | undefined;
       let modelSnapshot: Model<Api> | undefined;
       let modelLabel: string | undefined;
 
       if (!definition) {
-        failure = { reason: "unknown_agent", message: `Unknown agent "${name}".` };
+        const known = definitions.map((candidate) => candidate.name).filter((name) => name.length > 0);
+        const knownList = known.length > 0 ? known.slice(0, 20).join(", ") : "(none)";
+        failure = {
+          reason: "unknown_agent",
+          message: `Unknown agent "${name}". Known user-scope agents: ${knownList}. provider is an agent definition name, not an LLM vendor; omit it to use the run default.`,
+        };
       } else if (typeof task.prompt !== "string" || task.prompt.trim() === "") {
         failure = { reason: "prompt_too_large", message: "The delegated prompt must not be empty." };
       } else if (utf8ByteLength(task.prompt) > MAX_DELEGATED_PROMPT_BYTES) {
@@ -1312,8 +1360,19 @@ export class AgentTaskService {
           reason: "prompt_too_large",
           message: `The delegated prompt exceeds ${MAX_DELEGATED_PROMPT_BYTES} bytes.`,
         };
+      } else if (
+        // Host defense (design plan §4.6): the worker's subset gate already
+        // ran, so only the plain-object shape is re-checked here; a violation
+        // rejects the item (child-failed), never a "model retry".
+        outputSchema !== undefined &&
+        (typeof outputSchema !== "object" || outputSchema === null || Array.isArray(outputSchema))
+      ) {
+        failure = { reason: "invalid_parameters", message: "The workflow outputSchema must be a plain object." };
       } else {
-        const resolved = this._resolveModel(definition, parent.parentRuntime, parent.modelRegistry);
+        // Resolution key (locked): the per-item modelOverride takes precedence
+        // over the definition's model (including "inherit" / default-inherit).
+        const modelSpec = extra?.modelOverride ?? definition.model;
+        const resolved = this._resolveModel(definition, parent.parentRuntime, parent.modelRegistry, modelSpec);
         if (resolved.failure) {
           failure = resolved.failure;
         } else {
@@ -1330,6 +1389,8 @@ export class AgentTaskService {
         description: describeTask(task),
         modelSnapshot,
         modelLabel,
+        outputSchema,
+        maxTurnsOverride,
         projectAgent: definition?.source === "project",
         failure,
       });
@@ -1343,17 +1404,22 @@ export class AgentTaskService {
     return items;
   }
 
-  /** Model resolution via the borrowed ReadonlyModelRegistry; nothing is retained. */
+  /**
+   * Model resolution via the borrowed ReadonlyModelRegistry; nothing is
+   * retained. The resolution key is the caller-chosen spec: the workflow
+   * modelOverride when present, otherwise the definition's model (including
+   * "inherit" / default-inherit).
+   */
   private _resolveModel(
     definition: AgentDefinition,
     snapshot: SubagentParentRuntimeSnapshot,
     registry: ReadonlyModelRegistry,
+    spec: string | undefined,
   ): {
     model: Model<Api> | undefined;
     label: string | undefined;
     failure: { reason: AgentTaskFailureReason; message: string } | undefined;
   } {
-    const spec = definition.model;
     const isInherit = spec === undefined || spec === "inherit";
     if (isInherit) {
       const parentModel = snapshot.model;
@@ -1594,6 +1660,9 @@ export class AgentTaskService {
       };
     }
     const definition = item.definition!;
+    // The frozen item model IS the resolved modelOverride (resolution already
+    // applied in preflight); the optional outputSchema is written only when a
+    // workflow schema child requested it, so the baseline shape is unchanged.
     return {
       resolution: "ready",
       index: item.index,
@@ -1601,7 +1670,8 @@ export class AgentTaskService {
       description: item.description,
       agent: this._snapshotAgentDefinition(definition),
       model: { provider: item.modelSnapshot!.provider, modelId: item.modelSnapshot!.id },
-      maxTurns: definition.maxTurns ?? DEFAULT_MAX_TURNS,
+      maxTurns: item.maxTurnsOverride ?? definition.maxTurns ?? DEFAULT_MAX_TURNS,
+      ...(item.outputSchema !== undefined ? { outputSchema: item.outputSchema } : {}),
     };
   }
 
@@ -1964,6 +2034,7 @@ export class AgentTaskService {
     this._releaseSlot(entry);
     this._releaseResumeReservation(entry);
     this._checkGroupTerminal(entry.info.groupId);
+    this._maybeAutoDeliver(entry);
   }
 
   /** Frees a held slot exactly once; terminal/aborted runs always release it. */
@@ -2647,6 +2718,9 @@ export class AgentTaskService {
       taskIds: entries.map((entry) => entry.info.taskId),
       createdAt: Math.min(...entries.map((entry) => entry.info.createdAt)),
       detached: true,
+      // workflowOwned is an internal in-memory flag (never persisted): a
+      // restored group can no longer own workflow semantics, so it is false.
+      workflowOwned: false,
       autoBackgroundTimer: undefined,
       awaiters: [],
       terminalSnapshot: undefined,
@@ -2804,21 +2878,26 @@ export class AgentTaskService {
     }
     group.detached = true;
     this._cancelAutoBackgroundTimer(group);
-    for (const taskId of group.taskIds) {
-      const entry = this._tasks.get(taskId);
-      if (entry && !isTerminalStatus(entry.info.status)) {
-        entry.info.presentation = "background";
-        entry.info.updatedAt = this._now();
-        entry.persist.pendingEvents.push({ type: "presentation", presentation: "background" });
-        this._schedulePersist(taskId);
-        this._emitTaskState(taskId);
-      }
-    }
+    this._flipGroupPresentation(group, "background");
     this._recordProductEvent("agent_task_backgrounded", {
       status: "background",
       counts: { tasks: group.taskIds.length },
     });
     this._resolveGroupAwaiters(group, { kind: "backgrounded", handle: this._buildGroupHandle(group) });
+  }
+
+  /** Display-only presentation switch for still-attached children. */
+  private _flipGroupPresentation(group: GroupEntry, presentation: AgentTaskPresentation): void {
+    for (const taskId of group.taskIds) {
+      const entry = this._tasks.get(taskId);
+      if (entry && !isTerminalStatus(entry.info.status)) {
+        entry.info.presentation = presentation;
+        entry.info.updatedAt = this._now();
+        entry.persist.pendingEvents.push({ type: "presentation", presentation });
+        this._schedulePersist(taskId);
+        this._emitTaskState(taskId);
+      }
+    }
   }
 
   /** Foreground-only, group-level; every child mirrors the same deadline. */
@@ -2864,12 +2943,17 @@ export class AgentTaskService {
     }
   }
 
+  /**
+   * UI-only auto-background: flip panel presentation, keep the parent await.
+   * Manual background() / session detach still take the lane-B path.
+   */
   private _autoBackgroundNow(group: GroupEntry): void {
     if (group.detached || group.terminalSnapshot) {
       this._cancelAutoBackgroundTimer(group);
       return;
     }
-    this._detachGroup(group);
+    this._flipGroupPresentation(group, "background");
+    this._cancelAutoBackgroundTimer(group);
   }
 
   /** Cancels the group timer and clears the mirrored autoBackground fields. */
@@ -3106,6 +3190,34 @@ export class AgentTaskService {
       .map((result) => `${result.agentName} [${result.status}${result.failureReason ? ` (${result.failureReason})` : ""}]`)
       .join("; ");
     return statuses !== "" ? statuses : info.status;
+  }
+
+  /**
+   * Lane B: after the parent await was released with a handle, inject each
+   * terminal result into the parent session. Foreground awaits (including
+   * UI-only auto-background) already return SubagentDetails. Plan-linked and
+   * workflow-owned groups have their own consumers.
+   */
+  private _maybeAutoDeliver(entry: TaskEntry): void {
+    const group = this._groups.get(entry.info.groupId);
+    if (!group || !group.detached || group.workflowOwned) {
+      return;
+    }
+    if (entry.info.planLink) {
+      return;
+    }
+    const parentSessionId = entry.info.parentSessionId;
+    if (parentSessionId === "") {
+      return;
+    }
+    if (entry.info.deliveredSessionIds.includes(parentSessionId)) {
+      return;
+    }
+    void this.sendResultToSession(entry.info.taskId, entry.info.generation, parentSessionId).then((result) => {
+      if (!result.ok && result.reason !== "target_session_not_open" && result.reason !== "duplicate_delivery") {
+        console.warn("[AgentTaskService] auto-delivery failed:", result.reason);
+      }
+    });
   }
 
   private _removeTask(entry: TaskEntry): void {

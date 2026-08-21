@@ -1028,3 +1028,12 @@ export type {
   AgentTaskUsage,
   ResumeDecision,
 } from "./agent-task-types.js";
+
+// Workflow plain-data types are canonically defined in workflow-types.ts
+// (leaf module, guards included). Re-exported here so preload/renderer keep
+// the single `from "../shared/types"` import path used across the codebase.
+export type {
+  WorkflowCommand,
+  WorkflowEvent,
+  WorkflowViewState,
+} from "./workflow-types.js";

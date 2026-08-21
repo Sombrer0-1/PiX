@@ -86,7 +86,7 @@ export class SettingsStore {
    * order so any older store is advanced one version at a time; a store already
    * at the current version is untouched. Migrations never write the optional
    * 1.4.1 field: an absent autoBackgroundMs means the consumer default
-   * (DEFAULT_AUTO_BACKGROUND_MS = 120000).
+   * (DEFAULT_AUTO_BACKGROUND_MS = 0, off).
    *
    * 0/1 -> 2 (legacy):
    *   1. Old entries without physicalPath/environment become Windows projects
@@ -97,7 +97,7 @@ export class SettingsStore {
    *      stay absent (undefined = inherit).
    * 3 -> 4 (1.4.1):
    *   4. No field writes: autoBackgroundMs stays absent (undefined = consumer
-   *      default 120000); the schemaVersion stamp below advances the version.
+   *      default 0 / off); the schemaVersion stamp below advances the version.
    * 5. schemaVersion is stamped to 4.
    */
   private migrate(): void {
@@ -126,7 +126,7 @@ export class SettingsStore {
 
     if (version === undefined || version < 4) {
       // 3 -> 4 (1.4.1): nothing to write. autoBackgroundMs is optional; when
-      // absent, consumers fall back to DEFAULT_AUTO_BACKGROUND_MS (120000),
+      // absent, consumers fall back to DEFAULT_AUTO_BACKGROUND_MS (0 = off),
       // so the migration only advances the version via the stamp below.
     }
 

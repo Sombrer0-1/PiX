@@ -482,6 +482,48 @@ await run("isSubagentDetails: enforces status invariants", async () => {
   assert(!isSubagentDetails(activityFailedNoEnded), "failed activity without endedAt rejected");
 });
 
+await run("isSubagentDetails: workflow structured field (absent legal; present JSON-clonable)", async () => {
+  assert(
+    isSubagentDetails(makeDetailsInput({ results: [makeResultInput()] })),
+    "result without structured accepted (absent is legal)",
+  );
+  assert(
+    isSubagentDetails(
+      makeDetailsInput({ results: [makeResultInput({ structured: { answer: 42, nested: { list: [1, 2, 3] } } })] }),
+    ),
+    "plain-object structured value accepted",
+  );
+  assert(
+    isSubagentDetails(makeDetailsInput({ results: [makeResultInput({ structured: null })] })),
+    "null structured value accepted",
+  );
+  assert(
+    isSubagentDetails(makeDetailsInput({ results: [makeResultInput({ structured: [1, "a", true] })] })),
+    "array structured value accepted",
+  );
+  assert(
+    isSubagentDetails(makeDetailsInput({ results: [makeResultInput({ structured: undefined })] })),
+    "explicit undefined structured treated as absent",
+  );
+  assert(
+    !isSubagentDetails(makeDetailsInput({ results: [makeResultInput({ structured: (() => 1) as unknown })] })),
+    "function structured value rejected (not JSON-clonable)",
+  );
+  assert(
+    !isSubagentDetails(makeDetailsInput({ results: [makeResultInput({ structured: Symbol("x") as unknown })] })),
+    "symbol structured value rejected (not JSON-clonable)",
+  );
+  // The structured field is plain data: it survives a JSON round-trip.
+  const withStructured = makeDetailsInput({ results: [makeResultInput({ structured: { answer: 42 } })] });
+  const roundTripped = JSON.parse(JSON.stringify(withStructured)) as unknown;
+  assert(isSubagentDetails(roundTripped), "structured survives JSON round-trip");
+  assertEqual(
+    JSON.stringify(roundTripped),
+    JSON.stringify(withStructured),
+    "round-trip preserves the exact structured shape",
+  );
+});
+
 await run("isSubagentDetails: never throws on arbitrary input", async () => {
   const inputs: unknown[] = [
     null,

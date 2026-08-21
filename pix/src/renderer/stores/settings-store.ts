@@ -140,7 +140,7 @@ export const useSettingsStore = defineStore("settings", () => {
     planThinkingLevel: computed<GuiSettings["planThinkingLevel"]>(() => settings.value.planThinkingLevel),
     enableProductAnalytics: computed<boolean>(() => settings.value.enableProductAnalytics ?? false),
     // 1.4.1: auto-background threshold for foreground agent tasks;
-    // 0 = off, absent = consumer default (120000).
+    // 0 = off (default), absent = consumer default (0).
     autoBackgroundMs: computed<number>(() => settings.value.autoBackgroundMs ?? DEFAULT_AUTO_BACKGROUND_MS),
     wslDistros,
     wslDiagnostic,

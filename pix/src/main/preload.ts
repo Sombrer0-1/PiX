@@ -31,6 +31,9 @@ import type {
   TeamCommand,
   TeamEvent,
   TeamState,
+  WorkflowCommand,
+  WorkflowEvent,
+  WorkflowViewState,
   WslDistroListResult,
 } from "../shared/types.js";
 
@@ -134,6 +137,10 @@ export interface PixApi {
   // Plan commands (PiX 1.4.0)
   sendPlanCommand: (command: PlanCommand) => Promise<PixCommandResult<PlanRuntimeSnapshot | undefined>>;
   onPlanEvent: (callback: (event: PlanEvent) => void) => () => void;
+
+  // Workflow commands (PiX 1.4.3)
+  sendWorkflowCommand: (command: WorkflowCommand) => Promise<PixCommandResult<WorkflowViewState[]>>;
+  onWorkflowEvent: (callback: (event: WorkflowEvent) => void) => () => void;
 
   // Agent task commands (PiX 1.4.1 + 1.4.2 R2/R3; the data shape is narrowed
   // per command type - get_all returns the AgentTaskListSnapshot since R2,
@@ -307,6 +314,15 @@ const api: PixApi = {
     const handler = (_event: Electron.IpcRendererEvent, data: PlanEvent) => callback(data);
     ipcRenderer.on("plan-event", handler);
     return () => ipcRenderer.removeListener("plan-event", handler);
+  },
+
+  // Workflow commands
+  sendWorkflowCommand: (command: WorkflowCommand) =>
+    ipcRenderer.invoke("workflow-command", command) as Promise<PixCommandResult<WorkflowViewState[]>>,
+  onWorkflowEvent: (callback: (event: WorkflowEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: WorkflowEvent) => callback(data);
+    ipcRenderer.on("workflow-event", handler);
+    return () => ipcRenderer.removeListener("workflow-event", handler);
   },
 
   // Agent task commands

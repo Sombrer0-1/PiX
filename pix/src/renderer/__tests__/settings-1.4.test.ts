@@ -5,8 +5,8 @@
  * anonymous-analytics settings; the settings store mirrors and saves them;
  * the analytics switch stays strictly independent of install telemetry.
  * 1.4.1 (B8): autoBackgroundMs is added to GuiSettings - the settings store
- * mirrors and saves it (default 120000), the SettingsPage offers
- * 60/120/300/off thresholds, and the main SettingsStore migrates the
+ * mirrors and saves it (default 0 / off), the SettingsPage offers
+ * off/60/120/300 thresholds, and the main SettingsStore migrates the
  * persisted schema 3 -> 4 idempotently without writing the optional field.
  * The 1.4.0 assertions must not regress.
  */
@@ -356,13 +356,13 @@ describe("settings store (1.4.1 autoBackgroundMs)", () => {
     expect(store.autoBackgroundMs).toBe(60_000);
   });
 
-  it("defaults autoBackgroundMs to 120000 when absent", async () => {
+  it("defaults autoBackgroundMs to 0 when absent", async () => {
     const store = useSettingsStore();
     getSettingsMock.mockResolvedValue({ theme: "light", recentProjects: [] });
 
     await store.load();
 
-    expect(store.autoBackgroundMs).toBe(120_000);
+    expect(store.autoBackgroundMs).toBe(0);
   });
 
   it("persists autoBackgroundMs through save() and updates the mirror", async () => {
@@ -388,22 +388,22 @@ async function pickAutoBackground(page: ReturnType<typeof mount>, value: number)
 }
 
 describe("SettingsPage auto background (1.4.1)", () => {
-  it("offers 60/120/300/off thresholds and defaults to 2 分钟 when absent", async () => {
+  it("offers off/60/120/300 thresholds and defaults to 关闭 when absent", async () => {
     const page = mountPage();
     await flushPromises();
     await openPlanSection(page);
 
     const select = page.get('[data-test="auto-background-select"]');
     expect(select.isVisible()).toBe(true);
-    expect(select.text()).toContain("2 分钟");
+    expect(select.text()).toContain("关闭");
 
     const items = (
       page.getComponent('[data-test="auto-background-select"]') as VueWrapper<{
         $props: { items: Array<{ title: string; value: number }> };
       }>
     ).props("items");
-    expect(items.map((item) => item.value)).toEqual([60_000, 120_000, 300_000, 0]);
-    expect(items.map((item) => item.title)).toEqual(["1 分钟", "2 分钟", "5 分钟", "关闭"]);
+    expect(items.map((item) => item.value)).toEqual([0, 60_000, 120_000, 300_000]);
+    expect(items.map((item) => item.title)).toEqual(["关闭", "1 分钟", "2 分钟", "5 分钟"]);
   });
 
   it("hydrates a persisted threshold on mount", async () => {

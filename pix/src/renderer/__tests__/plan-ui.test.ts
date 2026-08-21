@@ -243,6 +243,8 @@ const vuetify = createVuetify({
 
 let sendPlanCommand: ReturnType<typeof vi.fn>;
 let onPlanEvent: ReturnType<typeof vi.fn>;
+let sendWorkflowCommand: ReturnType<typeof vi.fn>;
+let onWorkflowEvent: ReturnType<typeof vi.fn>;
 let selectChatFiles: ReturnType<typeof vi.fn>;
 let planEventCallback: ((event: PlanEvent) => void) | null;
 let wrapper: ReturnType<typeof mount> | undefined;
@@ -254,8 +256,16 @@ function installPixApiMock(): void {
     planEventCallback = callback;
     return () => {};
   });
+  sendWorkflowCommand = vi.fn().mockResolvedValue({ success: true, data: [] });
+  onWorkflowEvent = vi.fn(() => () => {});
   selectChatFiles = vi.fn().mockResolvedValue([]);
-  window.pixApi = { sendPlanCommand, onPlanEvent, selectChatFiles } as unknown as PixApi;
+  window.pixApi = {
+    sendPlanCommand,
+    onPlanEvent,
+    sendWorkflowCommand,
+    onWorkflowEvent,
+    selectChatFiles,
+  } as unknown as PixApi;
 }
 
 /** Deliver a PlanEvent through the currently registered onPlanEvent callback. */

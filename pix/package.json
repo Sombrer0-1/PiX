@@ -1,6 +1,6 @@
 {
   "name": "pix",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "PiX - Desktop GUI for Pi AI coding agent",
   "type": "module",
   "main": "dist/main/main/index.js",
@@ -14,7 +14,7 @@
     "build": "npm run build:pi && node scripts/sync-nested-deps.mjs && npm run build:main && npm run build:renderer",
     "start": "electron .",
     "test:renderer": "vitest run",
-    "package": "npm run build && electron-builder"
+    "package": "npm run build && node scripts/materialize-workspace-deps.mjs && node scripts/stop-unpacked-app.mjs && electron-builder"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "file:../packages/agent",
@@ -50,17 +50,22 @@
   "build": {
     "appId": "com.pix.app",
     "productName": "PiX",
-    "publish": [{
-      "provider": "github",
-      "owner": "Sombrer0-1",
-      "repo": "PiX"
-    }],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Sombrer0-1",
+        "repo": "PiX"
+      }
+    ],
     "directories": {
       "output": "release"
     },
     "files": [
       "dist/**/*",
       "index.html"
+    ],
+    "asarUnpack": [
+      "dist/main/main/workflow/engine/**/*"
     ],
     "nsis": {
       "oneClick": false,

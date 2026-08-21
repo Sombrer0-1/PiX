@@ -78,11 +78,22 @@ import {
   type AgentSessionEvent,
   type ExecutionBackend,
   type FileChangeSummary,
+  type ToolDefinition,
   type TurnDiffSummary,
 } from "@earendil-works/pi-coding-agent";
 import { createProjectExecutionContext, disposeProjectExecutionContext, type ProjectExecutionContext } from "../execution-context.js";
 import type { ProjectLocation } from "../../shared/project-location.js";
 import { SHELL_BACKGROUND_TOOLS } from "../subagent/subagent-runner.js";
+import type { ObjectJsonSchema } from "../workflow/engine/schema.js";
+import {
+  createStructuredOutputTool,
+  salvageStructuredFromText,
+  schemaChildCompletionPrompt,
+  SCHEMA_CHILD_EARLY_STOP_NUDGE,
+  SCHEMA_CHILD_LAST_TURN_NUDGE,
+  SCHEMA_CHILD_SUBMIT_RECOVERIES,
+  STRUCTURED_OUTPUT_TOOL_NAME,
+} from "../workflow/structured-output-tool.js";
 import type { AgentTaskInputRouter } from "./agent-task-input.js";
 import type {
   AgentTaskActivity,
@@ -173,7 +184,7 @@ function runExecFile(command: string, args: string[], timeoutMs: number): Promis
 }
 
 /** External termination causes; the first one wins and is never overwritten. */
-type TerminationCause = "signal" | "abort" | "disposed" | "max_turns";
+type TerminationCause = "signal" | "abort" | "disposed" | "max_turns" | "structured_complete";
 
 /** Per-task termination coordinator (first cause wins). */
 interface TaskControl {
@@ -211,10 +222,22 @@ interface ItemCounters {
   lastPromptError: string | undefined;
   usage: SubagentUsage;
   activities: SubagentActivity[];
+  schemaNudgeSent: boolean;
 }
 
 function emptyUsage(): SubagentUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
+}
+
+/** Schema children append the capture-tool completion contract after the agent system prompt. */
+function nestedSystemPromptOverride(item: AgentTaskItemSpec & { resolution: "ready" }): (base: string[]) => string[] {
+  return (base) => {
+    const parts = [...base, item.agent.systemPrompt];
+    if (item.outputSchema !== undefined) {
+      parts.push(schemaChildCompletionPrompt(item.outputSchema as ObjectJsonSchema));
+    }
+    return parts;
+  };
 }
 
 function createTaskControl(): TaskControl {
@@ -595,7 +618,7 @@ export class AgentTaskRuntime {
       cwd: this._context.physicalCwd,
       agentDir: this._spec.agentDir,
       settingsManager,
-      appendSystemPromptOverride: (base) => [...base, item.agent.systemPrompt],
+      appendSystemPromptOverride: nestedSystemPromptOverride(item),
       extensionFactories: [
         (pi) => {
           mcpAdapter.register(pi);
@@ -611,6 +634,16 @@ export class AgentTaskRuntime {
         },
       });
       const isWsl = this._spec.project.environment.kind === "wsl";
+      // Workflow schema children (design plan §4.6): the capture tool is
+      // injected alongside the session, workflow/ralph are excluded like
+      // agent, and a tools allowlist must merge submit_workflow_result into
+      // itself or the allowlist would hide the custom tool. The item's
+      // outputSchema is already subset-gated by the worker, so the cast is
+      // the frozen contract.
+      const schemaChild = item.outputSchema !== undefined;
+      const tools = schemaChild && item.agent.tools !== undefined
+        ? [...new Set([...item.agent.tools, STRUCTURED_OUTPUT_TOOL_NAME])]
+        : item.agent.tools;
       const created = await createAgentSession({
         cwd: this._context.physicalCwd,
         runtimeCwd: this._context.logicalCwd,
@@ -627,10 +660,17 @@ export class AgentTaskRuntime {
         extensionProviderPolicy: "read-only",
         excludeTools: [
           "agent",
+          // Plan §7: workflow/ralph are excluded from WORKFLOW children only;
+          // ordinary agent-tool children keep today's baseline (an extension
+          // may legitimately register tools with those names).
+          ...(schemaChild ? ["workflow", "ralph"] : []),
           ...(item.agent.disallowedTools ?? []),
           ...(isWsl ? [...SHELL_BACKGROUND_TOOLS] : []),
         ],
-        tools: item.agent.tools,
+        tools,
+        customTools: schemaChild
+          ? [createStructuredOutputTool(item.outputSchema as ObjectJsonSchema) as ToolDefinition]
+          : undefined,
         requestUserInput: (request, signal) => this._requestUserInput(request, signal),
       });
       this._preparedSession = created.session;
@@ -883,6 +923,7 @@ export class AgentTaskRuntime {
       lastPromptError: undefined,
       usage: emptyUsage(),
       activities: [],
+      schemaNudgeSent: false,
     };
     const maxTurns = item.maxTurns ?? DEFAULT_MAX_TURNS;
 
@@ -940,7 +981,7 @@ export class AgentTaskRuntime {
             cwd: this._context.physicalCwd,
             agentDir: this._spec.agentDir,
             settingsManager,
-            appendSystemPromptOverride: (base) => [...base, item.agent.systemPrompt],
+            appendSystemPromptOverride: nestedSystemPromptOverride(item),
             extensionFactories: [
               (pi) => {
                 mcpAdapterRef.current!.register(pi);
@@ -960,6 +1001,15 @@ export class AgentTaskRuntime {
                 verificationGate: this._spec.verificationGate,
               },
             });
+            // Workflow schema children (design plan §4.6): the capture tool is
+            // injected alongside the session, workflow/ralph are excluded
+            // like agent, and a tools allowlist must merge
+            // submit_workflow_result into itself or the allowlist would hide
+            // the custom tool.
+            const schemaChild = item.outputSchema !== undefined;
+            const tools = schemaChild && item.agent.tools !== undefined
+              ? [...new Set([...item.agent.tools, STRUCTURED_OUTPUT_TOOL_NAME])]
+              : item.agent.tools;
             const created = await createAgentSession({
               cwd: this._context.physicalCwd,
               runtimeCwd: this._context.logicalCwd,
@@ -976,10 +1026,16 @@ export class AgentTaskRuntime {
               extensionProviderPolicy: "read-only",
               excludeTools: [
                 "agent",
+                // Plan §7: workflow/ralph are excluded from WORKFLOW children
+                // only; ordinary agent-tool children keep today's baseline.
+                ...(schemaChild ? ["workflow", "ralph"] : []),
                 ...(item.agent.disallowedTools ?? []),
                 ...(isWsl ? [...SHELL_BACKGROUND_TOOLS] : []),
               ],
-              tools: item.agent.tools,
+              tools,
+              customTools: schemaChild
+                ? [createStructuredOutputTool(item.outputSchema as ObjectJsonSchema) as ToolDefinition]
+                : undefined,
               requestUserInput: (request, signal) => this._requestUserInput(request, signal),
             });
             if (deadline.fired || control.cause) {
@@ -1062,35 +1118,55 @@ export class AgentTaskRuntime {
 
       // Event subscription.
       unsubscribeRef.current = nestedRef.current!.subscribe((event) => {
-        this._onNestedEvent(event, state, control, counters, maxTurns, result);
+        this._onNestedEvent(
+          event,
+          state,
+          control,
+          counters,
+          maxTurns,
+          result,
+          nestedRef.current,
+          item.outputSchema !== undefined,
+        );
       });
 
       // The full run promise; never start an unassociated waitForIdle race.
       // 1.4.2 (R3): the resume turn uses the fixed message with template
       // expansion disabled; the recovery note and the original item prompt are
       // already part of the transcript and are never re-injected.
-      const promptPromise = nestedRef.current!.prompt(promptText, resumePath ? { expandPromptTemplates: false } : undefined);
-      const settle = promptPromise.then(
-        () => true,
-        (error: unknown) => {
-          counters.lastPromptError = error instanceof Error ? error.message : String(error);
-          return false;
-        },
+      await this._awaitNestedPrompt(
+        nestedRef.current!,
+        promptText,
+        control,
+        counters,
+        resumePath ? { expandPromptTemplates: false } : undefined,
       );
-      const firstOutcome = await Promise.race([settle, control.promise]);
-      if (firstOutcome !== true) {
-        // A cause fired; the synchronous abort already happened via control.
-        const abortDeadline = createDeadline(ABORT_TIMEOUT_MS);
-        const outcome = await Promise.race([settle, abortDeadline.promise]);
-        abortDeadline.cancel();
-        if (outcome !== true) {
-          // Enter cleanup; the original prompt promise keeps its observers.
-          promptPromise.catch(() => {});
+
+      const outputSchema = item.outputSchema as ObjectJsonSchema | undefined;
+      if (outputSchema !== undefined && nestedRef.current !== undefined) {
+        this._trySalvageStructured(outputSchema, result, control, counters);
+        let recoveries = 0;
+        while (
+          result.structured === undefined &&
+          control.cause === undefined &&
+          counters.lastPromptError === undefined &&
+          counters.turnCount < maxTurns &&
+          recoveries < SCHEMA_CHILD_SUBMIT_RECOVERIES
+        ) {
+          recoveries++;
+          await this._awaitNestedPrompt(
+            nestedRef.current,
+            SCHEMA_CHILD_EARLY_STOP_NUDGE,
+            control,
+            counters,
+            { expandPromptTemplates: false },
+          );
+          this._trySalvageStructured(outputSchema, result, control, counters);
         }
       }
 
       // Terminal classification.
-      this._classifyTerminal(result, control, counters, maxTurns);
+      this._classifyTerminal(result, control, counters, maxTurns, item.outputSchema !== undefined);
       // Final output event (forced): the service's finalOutput must reflect the
       // terminal text, which may differ from the last streamed update.
       state.onEvent({
@@ -1145,7 +1221,7 @@ export class AgentTaskRuntime {
       const aborted =
         this._disposed ||
         itemStatus === "aborted" ||
-        (control.cause !== undefined && control.cause !== "max_turns");
+        (control.cause !== undefined && control.cause !== "max_turns" && control.cause !== "structured_complete");
       if (aborted) {
         return;
       }
@@ -1309,6 +1385,8 @@ export class AgentTaskRuntime {
     counters: ItemCounters,
     maxTurns: number,
     result: SubagentSingleResult,
+    nested: AgentSession | undefined,
+    schemaChild: boolean,
   ): void {
     switch (event.type) {
       case "message_update": {
@@ -1367,6 +1445,24 @@ export class AgentTaskRuntime {
           activity.endedAt = Date.now();
           state.onEvent({ type: "activity", activity });
         }
+        // Workflow schema children (design plan §4.6): a successful
+        // submit_workflow_result carries the capture-validated object in its
+        // details; _classifyTerminal decides completion on its presence. The
+        // no-schema path never injects the tool, so the field never appears
+        // there.
+        if (event.toolName === STRUCTURED_OUTPUT_TOOL_NAME && !event.isError) {
+          const details = (event.result as { details?: unknown } | undefined)?.details;
+          result.structured =
+            typeof details === "object" && details !== null && !Array.isArray(details)
+              ? (details as Record<string, unknown>).structured
+              : undefined;
+          // terminate:true only stops the loop when EVERY tool in the batch
+          // terminates. Abort the nested session here so a mixed batch cannot
+          // keep running until max_turns and mask a successful capture.
+          if (result.structured !== undefined) {
+            control.fire("structured_complete");
+          }
+        }
         // 1.4.2: a complete tool result is a checkpoint safety point.
         if (this._sessionManager) {
           this._openToolCalls.delete(event.toolCallId);
@@ -1380,6 +1476,22 @@ export class AgentTaskRuntime {
           // Only arm the limit here; abort happens on a NEW turn_start proving
           // the loop really intends another turn.
           counters.limitArmed = true;
+        }
+        if (
+          schemaChild &&
+          result.structured === undefined &&
+          control.cause === undefined &&
+          !counters.schemaNudgeSent &&
+          maxTurns >= 2 &&
+          counters.turnCount === maxTurns - 1 &&
+          nested !== undefined
+        ) {
+          counters.schemaNudgeSent = true;
+          nested.agent.followUp({
+            role: "user",
+            content: [{ type: "text", text: SCHEMA_CHILD_LAST_TURN_NUDGE }],
+            timestamp: Date.now(),
+          });
         }
         break;
       }
@@ -1708,11 +1820,67 @@ export class AgentTaskRuntime {
   // Terminal classification (extracted from SubagentRunner)
   // =========================================================================
 
+  /**
+   * Await one nested `prompt()` against the item abort control. A fired cause
+   * aborts the session; if the prompt still has not settled by ABORT_TIMEOUT_MS
+   * the original promise keeps a rejection consumer so it cannot surface later.
+   */
+  private async _awaitNestedPrompt(
+    nested: AgentSession,
+    text: string,
+    control: TaskControl,
+    counters: ItemCounters,
+    options?: { expandPromptTemplates?: boolean },
+  ): Promise<void> {
+    if (control.cause !== undefined) return;
+    const promptPromise = nested.prompt(text, options);
+    const settle = promptPromise.then(
+      () => true,
+      (error: unknown) => {
+        counters.lastPromptError = error instanceof Error ? error.message : String(error);
+        return false;
+      },
+    );
+    const firstOutcome = await Promise.race([settle, control.promise]);
+    if (firstOutcome !== true) {
+      const abortDeadline = createDeadline(ABORT_TIMEOUT_MS);
+      const outcome = await Promise.race([settle, abortDeadline.promise]);
+      abortDeadline.cancel();
+      if (outcome !== true) {
+        promptPromise.catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Accept a schema-valid JSON object from the child's text when it never
+   * called submit_workflow_result. Skipped on user cancel so an abort cannot
+   * be rewritten as a successful capture.
+   */
+  private _trySalvageStructured(
+    schema: ObjectJsonSchema,
+    result: SubagentSingleResult,
+    control: TaskControl,
+    counters: ItemCounters,
+  ): void {
+    if (result.structured !== undefined) return;
+    if (control.cause === "signal" || control.cause === "abort" || control.cause === "disposed") return;
+    const text =
+      counters.lastNonEmptyFinalizedText !== ""
+        ? counters.lastNonEmptyFinalizedText
+        : assistantText(counters.lastAssistantMessage);
+    const salvaged = salvageStructuredFromText(schema, text);
+    if (salvaged !== undefined) {
+      result.structured = salvaged;
+    }
+  }
+
   private _classifyTerminal(
     result: SubagentSingleResult,
     control: TaskControl,
     counters: ItemCounters,
     maxTurns: number,
+    structuredRequired: boolean,
   ): void {
     const now = Date.now();
     const cause = control.cause;
@@ -1732,11 +1900,41 @@ export class AgentTaskRuntime {
       finalText = "";
     }
 
-    if (cause !== undefined) {
+    const capturedStructured = structuredRequired ? result.structured : undefined;
+    const userCancelled = cause === "signal" || cause === "abort" || cause === "disposed";
+    if (capturedStructured !== undefined && !userCancelled) {
+      // A successful capture is the completion criterion. max_turns and the
+      // host abort after submit must not mask it (mixed tool batches do not
+      // honor terminate:true unless every call in the batch terminates).
+      let serialized: string | undefined;
+      try {
+        serialized = JSON.stringify(capturedStructured);
+      } catch {
+        serialized = undefined;
+      }
+      if (serialized === undefined) {
+        result.status = "failed";
+        result.failureReason = "invalid_parameters";
+        result.errorMessage = boundedErrorMessage("The submitted structured result is not JSON-serializable.");
+      } else {
+        result.status = "completed";
+        result.failureReason = undefined;
+        result.errorMessage = undefined;
+        finalText = serialized;
+      }
+    } else if (cause !== undefined) {
       if (cause === "max_turns") {
         result.status = "failed";
         result.failureReason = "max_turns";
         result.errorMessage = boundedErrorMessage(`The agent exceeded its turn limit (${maxTurns}).`);
+      } else if (cause === "structured_complete") {
+        // Capture recorded no structured value (should not happen); treat as
+        // a missing submit rather than a user abort.
+        result.status = "failed";
+        result.failureReason = "invalid_parameters";
+        result.errorMessage = boundedErrorMessage(
+          "The workflow child did not submit the structured result (missing submit_workflow_result tool call).",
+        );
       } else {
         result.status = "aborted";
         result.failureReason = "aborted";
@@ -1754,6 +1952,12 @@ export class AgentTaskRuntime {
       result.status = "aborted";
       result.failureReason = "aborted";
       result.errorMessage = boundedErrorMessage("The nested agent was aborted.");
+    } else if (structuredRequired) {
+      result.status = "failed";
+      result.failureReason = "invalid_parameters";
+      result.errorMessage = boundedErrorMessage(
+        "The workflow child did not submit the structured result (missing submit_workflow_result tool call).",
+      );
     } else {
       result.status = "completed";
     }
@@ -1792,6 +1996,8 @@ export class AgentTaskRuntime {
         return "The agent task runtime was disposed.";
       case "max_turns":
         return "The agent exceeded its turn limit.";
+      case "structured_complete":
+        return "The workflow child submitted its structured result.";
     }
   }
 

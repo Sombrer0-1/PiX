@@ -864,7 +864,7 @@ await run("run_in_background=true returns the group handle without awaiting", as
   assertEqual(h.usageSink.length, 0, "background runs never write usage into the parent accumulator");
 });
 
-await run("auto-background under an injectable short clock resolves the handle without restarting", async () => {
+await run("auto-background under an injectable short clock flips presentation without releasing the await", async () => {
   clearAgents();
   const baseNow = Date.now();
   const timers = makeFakeTimers(baseNow);
@@ -875,13 +875,15 @@ await run("auto-background under an injectable short clock resolves the handle w
   await waitFor(() => FakeRuntime.instances.length === 1, 20000, "runtime created");
   assertEqual(FakeRuntime.instances[0].abortCalls, 0, "no restart before the deadline");
   timers.fireMs(60_000);
-  const result = await runPromise;
-  assert("kind" in result, "auto-background resolves with the handle");
-  assertEqual(result.kind, "agent_task_group", "handle kind");
+  const pending = await Promise.race([runPromise.then(() => "resolved" as const), drain().then(() => "pending" as const)]);
+  assertEqual(pending, "pending", "auto-background does not resolve the parent await");
   assertEqual(FakeRuntime.instances[0].abortCalls, 0, "auto-background never restarts the task");
   assertEqual(FakeRuntime.instances[0].settled, false, "the task keeps running in the service");
-  const info = h.service.getAll().tasks.find((task) => task.taskId === result.tasks[0].taskId);
-  assertEqual(info?.presentation, "background", "detached child presentation flipped to background");
+  const info = h.service.getAll().tasks.find((task) => task.taskId === FakeRuntime.instances[0].spec.taskId);
+  assertEqual(info?.presentation, "background", "child presentation flipped to background");
+  FakeRuntime.instances[0].complete();
+  const result = await runPromise;
+  assert(isSubagentDetails(result), "foreground await still returns SubagentDetails");
 });
 
 await run("manual background detaches the group and resolves the single tool await", async () => {

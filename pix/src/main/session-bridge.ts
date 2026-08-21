@@ -23,6 +23,7 @@ import {
 	type RequestUserInputResponse,
 	type SessionShutdownEvent,
 	type SessionStartEvent,
+	type SessionEntry,
 	type ToolDefinition,
 	createAgentSession,
 	SessionManager,
@@ -49,11 +50,22 @@ import type {
 } from "./plan/plan-controller.js";
 import { detectFileDeviation, type PlanPathContext } from "./plan/plan-deviation.js";
 import { createSubmitUserPlanTool, createUpdatePlanStepTool } from "./plan/plan-tools.js";
+import { createAgentTaskChildSpawner } from "./workflow/child-spawner.js";
+import { WorkerThreadWorkflowEngine } from "./workflow/engine/index.js";
+import {
+	createWorkflowRecorder,
+	type WorkflowLifecycleEvent,
+	type WorkflowLifecyclePayload,
+	type WorkflowRecorder,
+} from "./workflow/recorder.js";
+import { createRalphToolDefinition } from "./workflow/tool-ralph.js";
+import { createWorkflowToolDefinition, type WorkflowToolHost } from "./workflow/tool-workflow.js";
 import type { AgentTaskDeliveryContent, AgentTaskService, AgentTaskSubmissionContext } from "./agent-task/agent-task-service.js";
 import { workspaceIdOf } from "./agent-task/agent-task-identity.js";
 import type { AgentTaskPlanLink } from "../shared/agent-task-types.js";
 import type { PlanDeviation, PlanStep } from "../shared/plan-types.js";
-import type { ProductEvent } from "../shared/product-events.js";
+import { PRODUCT_EVENT_SCHEMA_VERSION, type ProductEvent, type ProductEventName } from "../shared/product-events.js";
+import { WORKFLOW_RECORD_CUSTOM_TYPE } from "../shared/workflow-types.js";
 import type { ProductEventCollector } from "./product-event-collector.js";
 import type { TeamManager } from "./team-manager.js";
 import {
@@ -150,6 +162,21 @@ interface AuxiliaryUsageTotals {
 }
 
 /**
+ * 1.4.3 (S8) workflow lifecycle product events (V143). S12 lands the shared
+ * PRODUCT_EVENT_NAMES_V143 union in product-events.ts with these EXACT names;
+ * until that lands, the collector's name union does not include them, so this
+ * binding projects the literal into ProductEventName at the call site and the
+ * collector guard drops the event (silent no-op) instead of failing. record()
+ * is called ONLY from the recorder's onLifecycle binding.
+ */
+const WORKFLOW_PRODUCT_EVENT_NAMES = {
+	started: "workflow_started",
+	completed: "workflow_completed",
+	failed: "workflow_failed",
+	cancelled: "workflow_cancelled",
+} as const;
+
+/**
  * One queued/active/terminal user-input request in the bridge FIFO. Only the
  * queue head becomes active and is ever visible to the renderer; queued items
  * are invisible and never emit a dismissal.
@@ -186,6 +213,10 @@ interface RuntimeGeneration {
 	readonly mcpAdapter: McpAdapter;
 	/** Solo Plan state machine of this generation (PiX 1.4.0). */
 	readonly planController: PlanController;
+	/** Workflow engine of this generation (PiX 1.4.3): children spawn through the generation's AgentTaskService via the injected spawner (host/engine never import AgentTaskService). */
+	readonly workflowEngine: WorkerThreadWorkflowEngine;
+	/** Durable projection + V143 lifecycle binding of this generation's workflow runs. */
+	readonly workflowRecorder: WorkflowRecorder;
 }
 
 function globPatternToRegExp(pattern: string): RegExp {
@@ -409,6 +440,21 @@ export class SessionBridge {
 	getPlanController(): PlanController | null {
 		return this._generation?.planController ?? null;
 	}
+
+	/** Solo workflow recorder of the current generation (null for team-leader); ipc-handlers resync against this instance. */
+	getWorkflowRecorder(): WorkflowRecorder | null {
+		return this._generation?.workflowRecorder ?? null;
+	}
+
+	/**
+	 * Parent-session entry stream for the workflow recorder's restore fallback
+	 * (plan §4.9): injected into subscribeWorkflowEventForwarding by
+	 * ipc-handlers, which cannot reach the session manager itself.
+	 */
+	getSessionWorkflowEntries(): SessionEntry[] {
+		return this._sessionManager?.getEntries() ?? [];
+	}
+
 
 	/** Get the current working directory (empty if no session started). */
 	getCwd(): string {
@@ -2103,6 +2149,44 @@ export class SessionBridge {
 					getSubmissionContext: (toolCallId: string) => runner.assembleSubmissionContext(toolCallId),
 				};
 
+				// Solo workflow engine + recorder (PiX 1.4.3): the engine borrows
+				// this generation's app-level AgentTaskService through the
+				// injected spawner seam - the host and the engine never import
+				// AgentTaskService (plan 2.6). The recorder's append sink is the
+				// generation's sessionManager (a no-op when none is bound), and
+				// its lifecycle callback is the ONLY productEventCollector.record
+				// call for workflow runs.
+				const workflowEngine = new WorkerThreadWorkflowEngine(
+					createAgentTaskChildSpawner(this._agentTaskService!),
+				);
+				const workflowRecorder = createWorkflowRecorder({
+					append: (data) => {
+						this._sessionManager?.appendCustomEntry(WORKFLOW_RECORD_CUSTOM_TYPE, data);
+					},
+					engine: workflowEngine,
+					onLifecycle: (event, payload) => this._recordWorkflowLifecycle(event, payload),
+				});
+				// Borrow-and-use parent ref per tool call: getSubmissionContext is
+				// called once per child-start and only valid during createTaskGroup.
+				const workflowHost: WorkflowToolHost = {
+					engine: workflowEngine,
+					recorder: workflowRecorder,
+					// Contract (plan §4.7 step 1): throws when no session is active.
+					// A null parentSessionRef must never silently publish a run into
+					// an empty-sessionId group that would escape per-session
+					// detach-cancel.
+					getParentRef: (toolCallId: string) => {
+						if (parentSessionRef === null) {
+							throw new Error("workflow tool called without an active parent session");
+						}
+						return {
+							sessionId: parentSessionRef.sessionId,
+							toolCallId,
+							getSubmissionContext: () => runner.assembleSubmissionContext(toolCallId),
+						};
+					},
+				};
+
 				// Solo Plan state machine (PiX 1.4.0). Created before the parent
 				// session so its tools can be mounted; the session reference is
 				// resolved lazily via parentSessionRef (set right after
@@ -2185,6 +2269,8 @@ export class SessionBridge {
 					runner,
 					mcpAdapter,
 					planController,
+					workflowEngine,
+					workflowRecorder,
 				};
 				this._generation = generation;
 
@@ -2213,6 +2299,8 @@ export class SessionBridge {
 						createSubagentToolDefinition(host) as ToolDefinition,
 						createSubmitUserPlanTool({ controller: planController }) as ToolDefinition,
 						createUpdatePlanStepTool({ controller: planController }) as ToolDefinition,
+						createWorkflowToolDefinition(workflowHost) as ToolDefinition,
+						createRalphToolDefinition(workflowHost) as ToolDefinition,
 					],
 					// Authoritative host tool policy during planning/revising;
 					// survives extension reloads (PiX 1.4.0 F1).
@@ -2283,6 +2371,22 @@ export class SessionBridge {
 		this._markUserInputQueueClosing();
 		this._settleClosedUserInputQueue();
 		if (generation) {
+			// 1.4.3 (S8): candidate create/bind/activate failure shares the
+			// close-path prefix - dispose every live workflow run FIRST, then
+			// detach this session's still-foreground groups so they continue in
+			// the app service as backgrounded, then dispose plan/runner/session.
+			try {
+				await generation.workflowEngine?.disposeAll(this._appShuttingDown);
+			} catch (err) {
+				console.warn("[SessionBridge] Error during workflow engine dispose:", err);
+			}
+			if (this._agentTaskService && generation.session) {
+				try {
+					this._agentTaskService.detachForegroundGroupsForSession(generation.session.sessionId);
+				} catch (err) {
+					console.warn("[SessionBridge] Error during foreground group detach:", err);
+				}
+			}
 			try {
 				await generation.planController.dispose("host_disposed");
 			} catch (err) {
@@ -2354,6 +2458,12 @@ export class SessionBridge {
 			});
 			this._planTaskLinkHydration = "session_reopen";
 		}
+		// Workflow rebuild (plan §2.3): fold the persisted pix-workflow-v1
+		// CustomEntries of the current branch into this generation's recorder so
+		// interrupted-prefix runs survive session switches/restarts. restore
+		// merges into the in-memory mirror (dedup), so later same-instance
+		// resync re-pushes keep the restored runs instead of wiping them.
+		this._generation?.workflowRecorder.restore(session.sessionManager.getEntries());
 		this._emitLifecycle("ready");
 	}
 
@@ -2495,11 +2605,9 @@ export class SessionBridge {
 	/**
 	 * 1.4.2 (R4): register the active Solo session as the result delivery sink
 	 * (design plan §4.5: "当前打开的 Solo SessionBridge 按 sessionId+workspaceId
-	 * 注册 sink"). The sink injects the structured result as a custom message
-	 * with triggerTurn:false; the target must still be this open session AND
-	 * idle - it never steers/follows-up/triggers a model turn. A busy or
-	 * vanished session surfaces target_session_busy / target_session_not_open
-	 * through the sendResultToSession envelope.
+	 * 注册 sink"). Background completions inject a custom message: followUp
+	 * while the parent is streaming (consumed after the current turn would
+	 * stop), or triggerTurn when idle so the parent actually sees the report.
 	 */
 	private _registerDeliverySink(session: AgentSession): void {
 		const service = this._agentTaskService;
@@ -2518,16 +2626,14 @@ export class SessionBridge {
 				if (!current || current.sessionId !== sessionId) {
 					throw new Error("target_session_not_open");
 				}
-				if (current.isStreaming) {
-					throw new Error("target_session_busy");
-				}
+				const streaming = current.isStreaming;
 				await current.sendCustomMessage(
 					{
 						customType: "pix-agent-task-result",
 						content: this._formatDeliveryContent(content),
 						display: true,
 					},
-					{ triggerTurn: false },
+					streaming ? { deliverAs: "followUp" } : { triggerTurn: true },
 				);
 			},
 		);
@@ -2535,13 +2641,20 @@ export class SessionBridge {
 
 	/** Human-readable chat text for one delivered task result. */
 	private _formatDeliveryContent(content: AgentTaskDeliveryContent): string {
-		const lines: string[] = [];
-		lines.push(`Agent task ${content.taskId} finished.`);
+		const lines = [
+			"A background subagent task finished.",
+			`Task ID: ${content.taskId}`,
+			`Group ID: ${content.groupId}`,
+			`Status: ${content.status}`,
+		];
 		if (content.planLink) {
 			lines.push(`Plan step ${content.planLink.stepId} (plan ${content.planLink.planId}, version ${content.planLink.version}).`);
 		}
 		if (content.summary !== "") {
 			lines.push(content.summary);
+		}
+		if (content.errorMessage) {
+			lines.push(content.errorMessage);
 		}
 		if (content.finalOutput !== "") {
 			lines.push(content.finalOutput);
@@ -2595,6 +2708,28 @@ export class SessionBridge {
 	}
 
 	/**
+	 * 1.4.3 (S8): the ONLY productEventCollector.record call for workflow runs,
+	 * bound as the recorder's onLifecycle callback. The payload carries only
+	 * existing ProductEventPayload fields (status / durationMs / counts) -
+	 * never script, prompt or value.
+	 */
+	private _recordWorkflowLifecycle(event: WorkflowLifecycleEvent, payload: WorkflowLifecyclePayload): void {
+		const collector = this._productEventCollector;
+		if (!collector) return;
+		const name = WORKFLOW_PRODUCT_EVENT_NAMES[event];
+		if (name === undefined) return;
+		collector.record({
+			schemaVersion: PRODUCT_EVENT_SCHEMA_VERSION,
+			name: name as unknown as ProductEventName,
+			payload: {
+				...(payload.status !== undefined ? { status: payload.status } : {}),
+				...(payload.durationMs !== undefined ? { durationMs: payload.durationMs } : {}),
+				...(payload.counts !== undefined ? { counts: payload.counts } : {}),
+			},
+		});
+	}
+
+	/**
 	 * Rebuild subagent usage for a resumed parent session by scanning persisted
 	 * agent tool result messages. Only messages that pass the shared type guard
 	 * are aggregated; live terminal tasks keep reporting through the runner.
@@ -2635,10 +2770,26 @@ export class SessionBridge {
 		// stays in the panel (design plan §5.4).
 		this._deliverySinkUnsubscribe?.();
 		this._deliverySinkUnsubscribe = null;
+		// 1.4.3 (S8): workflow children are foreground AgentTask groups of this
+		// session; cancel + bounded-dispose every live workflow run BEFORE the
+		// detach below - a detached group cannot be killed by cancelGroup
+		// anymore, so the parent run's children must never keep running in the
+		// task panel after the parent dies (locked close order, plan 2.6).
+		// disposeAll cancels each live run and awaits every registered child's
+		// by-taskId cancel (or disposeGraceMs); it never touches ordinary
+		// foreground agent groups or Plan delegation groups.
+		if (generation?.workflowEngine) {
+			try {
+				await generation.workflowEngine.disposeAll(this._appShuttingDown);
+			} catch (err) {
+				console.warn("[SessionBridge] Error during workflow engine dispose:", err);
+			}
+		}
 		// 1.4.1 session switch/close: detach this session's still-foreground
-		// groups FIRST (they continue in the app service as backgrounded and
-		// the facade's parent-signal listeners are removed), so the parent
-		// signal below never misclassifies a session switch as user_cancel.
+		// groups AFTER the workflow disposeAll (they continue in the app
+		// service as backgrounded and the facade's parent-signal listeners are
+		// removed), so the parent signal below never misclassifies a session
+		// switch as user_cancel.
 		if (this._agentTaskService && session) {
 			try {
 				this._agentTaskService.detachForegroundGroupsForSession(session.sessionId);

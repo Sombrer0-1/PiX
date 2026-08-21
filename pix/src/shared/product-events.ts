@@ -59,8 +59,21 @@ export const PRODUCT_EVENT_NAMES_V142 = [
 ] as const;
 
 export type ProductEventNameV142 = (typeof PRODUCT_EVENT_NAMES_V142)[number];
-/** 1.4.1 extends the alias with the `agent_task_*` names; 1.4.2 (R2) adds interrupted/restored, (R3) the resume_* names. */
-export type ProductEventName = ProductEventNameV140 | ProductEventNameV141 | ProductEventNameV142;
+
+export const PRODUCT_EVENT_NAMES_V143 = [
+  "workflow_started",
+  "workflow_completed",
+  "workflow_failed",
+  "workflow_cancelled",
+] as const;
+
+export type ProductEventNameV143 = (typeof PRODUCT_EVENT_NAMES_V143)[number];
+/** 1.4.1 extends the alias with the `agent_task_*` names; 1.4.2 (R2) adds interrupted/restored, (R3) the resume_* names; 1.4.3 adds the `workflow_*` names. */
+export type ProductEventName =
+  | ProductEventNameV140
+  | ProductEventNameV141
+  | ProductEventNameV142
+  | ProductEventNameV143;
 
 /** Error categories mirror PlanGenerationFailure codes (plan-types §4.1). */
 export const PRODUCT_EVENT_ERROR_CATEGORIES = [
@@ -176,7 +189,16 @@ function isProductEventPayload(value: unknown): value is ProductEventPayload {
 export function isProductEvent(value: unknown): value is ProductEvent {
   if (!isRecord(value)) return false;
   if (value.schemaVersion !== PRODUCT_EVENT_SCHEMA_VERSION) return false;
-  if (!isOneOf(value.name, [...PRODUCT_EVENT_NAMES_V140, ...PRODUCT_EVENT_NAMES_V141, ...PRODUCT_EVENT_NAMES_V142])) return false;
+  if (
+    !isOneOf(value.name, [
+      ...PRODUCT_EVENT_NAMES_V140,
+      ...PRODUCT_EVENT_NAMES_V141,
+      ...PRODUCT_EVENT_NAMES_V142,
+      ...PRODUCT_EVENT_NAMES_V143,
+    ])
+  ) {
+    return false;
+  }
   return isProductEventPayload(value.payload);
 }
 

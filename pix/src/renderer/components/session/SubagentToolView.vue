@@ -468,7 +468,7 @@ function toggleBody(): void {
           <span class="subagent-title">已转后台</span>
           <span class="subagent-source">{{ groupModeLabel(groupHandle.mode) }}</span>
           <span class="subagent-status backgrounded">{{ groupHandle.tasks.length }} 个任务</span>
-          <span class="subagent-summary">任务已转为后台执行，可在右侧任务面板查看进度与结果</span>
+          <span class="subagent-summary">任务已转为后台执行；完成后结果会自动回到本会话。也可在右侧任务面板查看进度。</span>
         </div>
         <div class="subagent-group-tasks">
           <div

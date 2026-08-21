@@ -25,6 +25,7 @@ import WorkerStatusBar from "../team/WorkerStatusBar.vue";
 import PlanModeToggle from "../plan/PlanModeToggle.vue";
 import PlanPanel from "../plan/PlanPanel.vue";
 import { usePlanStore } from "../../stores/plan-store";
+import { useWorkflowStore } from "../../stores/workflow-store";
 import type { PlanStatus } from "@shared/types.js";
 import type { RequestUserInputRequest, RequestUserInputQuestion } from "@/types/rpc";
 
@@ -34,6 +35,7 @@ const projectStore = useProjectStore();
 const settingsStore = useSettingsStore();
 const teamStore = useTeamStore();
 const planStore = usePlanStore();
+const workflowStore = useWorkflowStore();
 
 // Clarification props are driven by WorkspacePage request_user_input handling.
 const props = defineProps<{
@@ -314,6 +316,10 @@ onMounted(async () => {
   // Plan event mirror: subscribe once here so PlanPanel (v-if'ed on the plan
   // phase) never misses pushes; a remount replaces the subscription (§5.1).
   planStore.subscribeToEvents();
+  // Workflow run mirror: same subscription-point reasoning - the panel is
+  // v-if'ed on tool results, so subscribe next to the plan mirror; a remount
+  // replaces the subscription and get_snapshot re-syncs after session switch.
+  workflowStore.subscribeToEvents();
   if (sessionStore.displayBlocks.value.length > 0) {
     await nextTick();
     scrollContentToBottom();

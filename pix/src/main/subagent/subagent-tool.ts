@@ -96,7 +96,7 @@ const SubagentParams = Type.Object({
   run_in_background: Type.Optional(
     Type.Boolean({
       default: false,
-      description: "Start the delegated task(s) directly in the background and return a group handle immediately instead of waiting. Defaults to false: only set this when the USER explicitly asked for the work to run in the background; never set it merely because the task might take a while.",
+      description: "Start the delegated task(s) directly in the background and return a group handle immediately. You will be notified automatically when they complete. Defaults to false: only set this when the USER explicitly asked for the work to run in the background; never infer it from how long the task might take.",
     }),
   ),
 });
@@ -118,7 +118,7 @@ const TOOL_DESCRIPTION = [
   "- chain: sequential steps; the first step replaces {previous} with an empty string, later steps replace every {previous} with the previous step's output.",
   "subagent_type defaults to general-purpose when omitted.",
   "agentScope defaults to user; project or both may select project-defined agents, which require explicit user approval.",
-  "run_in_background defaults to false and waits for the result. Only set run_in_background=true when the USER explicitly requested background execution; never infer it from how long the task might take - long tasks are backgrounded automatically.",
+  "run_in_background defaults to false and waits for the result. Only set run_in_background=true when the USER explicitly requested background execution; never infer it from how long the task might take. When run in the background, you will be notified automatically when it completes — do not sleep, poll, or check on its progress.",
 ].join(" ");
 
 /**
@@ -397,7 +397,7 @@ export function createSubagentToolDefinition(host: SubagentToolHost): ToolDefini
       "Each delegated task must be fully self-contained; the subagent has its own context window and cannot see the parent conversation.",
       "Parallel task items must be independent of each other; ordering is not guaranteed.",
       "Chain steps may reference the previous step output with the {previous} placeholder.",
-      "run_in_background defaults to false. Only set it to true when the user explicitly asked for the work to run in the background; never set it merely because the task might take a while - long-running tasks are backgrounded automatically.",
+      "run_in_background defaults to false. Only set it to true when the user explicitly asked for the work to run in the background; never infer it from how long the task might take. When running in the background you will be notified automatically when it completes — do not sleep, poll, or check on its progress.",
     ],
     parameters: SubagentParams,
     executionMode: "parallel",

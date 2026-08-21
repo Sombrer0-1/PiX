@@ -47,7 +47,8 @@ export const AGENT_TASK_MAX_ACTIVITIES = 20;
 export const AGENT_TASK_MAX_FINAL_OUTPUT_BYTES = 48 * 1024;
 /** Recent-activity window cap for renderer/replay snapshots (same value as the hard cap). */
 export const AGENT_TASK_MAX_RECENT_ACTIVITIES = 20;
-export const DEFAULT_AUTO_BACKGROUND_MS = 120_000;
+/** Off by default: foreground agent tools wait for the result. */
+export const DEFAULT_AUTO_BACKGROUND_MS = 0;
 
 export type AgentTaskExecutionMode = "approval" | "unattended" | "read-only";
 export type AgentTaskStatus =
@@ -76,7 +77,17 @@ export interface AgentDefinitionSnapshot {
 export interface AgentTaskModelSnapshot { provider: string; modelId: string; }
 export type AgentTaskAgentScope = "user" | "project" | "both";
 export type AgentTaskItemSpec =
-  | { resolution: "ready"; index: number; prompt: string; description: string; agent: AgentDefinitionSnapshot; model: AgentTaskModelSnapshot; maxTurns: number }
+  | {
+      resolution: "ready";
+      index: number;
+      prompt: string;
+      description: string;
+      agent: AgentDefinitionSnapshot;
+      model: AgentTaskModelSnapshot;
+      maxTurns: number;
+      /** workflow schema children only: must already be a subset-legal ObjectJsonSchema (the service does no subset gate). Absent is legal. */
+      outputSchema?: unknown;
+    }
   | { resolution: "rejected"; index: number; prompt: string; description: string; requestedAgentName?: string; failureReason: AgentTaskFailureReason; errorMessage: string };
 export interface AgentTaskItemSummary {
   index: number; agentName: string; agentSource: "user"|"project"|"built-in"|"unknown";
@@ -464,6 +475,40 @@ export function isAgentTaskInfo(v: unknown): v is AgentTaskInfo {
   // resume prepare in 1.4.2).
   if (typeof v.generation !== "number" || !Number.isInteger(v.generation) || v.generation < 0) {
     return false;
+  }
+  return true;
+}
+
+/**
+ * Non-throwing structural narrowing of an unknown value into one item spec
+ * entry (the frozen preflight unit carried by AgentTaskSpec.items). Checks the
+ * ready/rejected variant discriminants, the frozen agent/model snapshots and
+ * the optional workflow outputSchema (absent is legal; present must be a plain
+ * object — subset-legal ObjectJsonSchema shape is the worker's gate, not
+ * checked here).
+ */
+export function isAgentTaskItemSpec(value: unknown): value is AgentTaskItemSpec {
+  if (!isRecord(value)) return false;
+  if (!isFiniteNonNegative(value.index)) return false;
+  if (typeof value.prompt !== "string" || typeof value.description !== "string") return false;
+  if (value.resolution === "rejected") {
+    if (value.requestedAgentName !== undefined && typeof value.requestedAgentName !== "string") return false;
+    if (!isOneOf(value.failureReason, AGENT_TASK_FAILURE_REASONS)) return false;
+    return typeof value.errorMessage === "string";
+  }
+  if (value.resolution !== "ready") return false;
+  const agent = value.agent;
+  if (!isRecord(agent)) return false;
+  if (typeof agent.name !== "string" || typeof agent.description !== "string") return false;
+  if (typeof agent.systemPrompt !== "string") return false;
+  if (!isOneOf(agent.source, AGENT_TASK_AGENT_SOURCES)) return false;
+  const model = value.model;
+  if (!isRecord(model) || typeof model.provider !== "string" || typeof model.modelId !== "string") return false;
+  if (!isFiniteNonNegative(value.maxTurns)) return false;
+  if (value.outputSchema !== undefined) {
+    if (typeof value.outputSchema !== "object" || value.outputSchema === null || Array.isArray(value.outputSchema)) {
+      return false;
+    }
   }
   return true;
 }

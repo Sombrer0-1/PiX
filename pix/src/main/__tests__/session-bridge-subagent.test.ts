@@ -1226,7 +1226,7 @@ await run("foreground plan delegation during a session switch persists waiting_i
   assertNoUnhandledRejections();
 });
 
-await run("session delivery sink: registered on activate, injects with triggerTurn:false, unregistered on close", async () => {
+await run("session delivery sink: registered on activate, followUp/triggerTurn, unregistered on close", async () => {
   const restoreHooks = installNeverSettlingRuntimeHooks();
   try {
     const service = makeTaskService();
@@ -1234,6 +1234,17 @@ await run("session delivery sink: registered on activate, injects with triggerTu
     await bridge.start(makeLocation());
     const b = accessBridge(bridge);
     const session = b._session!;
+
+    const sendOptions: Array<{ triggerTurn?: boolean; deliverAs?: string }> = [];
+    const originalSend = session.sendCustomMessage.bind(session);
+    session.sendCustomMessage = async (message, options) => {
+      sendOptions.push({
+        triggerTurn: options?.triggerTurn,
+        deliverAs: options?.deliverAs,
+      });
+      // Persist without starting a model turn so this wiring test stays offline.
+      await originalSend(message, { triggerTurn: false });
+    };
 
     // A task of the same project/workspace, still running in the service.
     const context = b._generation!.runner.assembleSubmissionContext("delivery-test");
@@ -1253,10 +1264,10 @@ await run("session delivery sink: registered on activate, injects with triggerTu
     const taskId = handle.tasks[0].taskId;
     const generation = handle.tasks[0].generation;
 
-    // The active Solo session was registered as the sink: delivery succeeds
-    // and the structured result is injected as a custom message (no turn).
+    // Idle parent: delivery injects and would trigger a turn.
     const delivered = await service.sendResultToSession(taskId, generation, session.sessionId);
     assertEqual(delivered.ok, true, "send_to_session delivers to the open Solo session");
+    assertEqual(sendOptions[0]?.triggerTurn, true, "idle delivery triggers a parent turn");
     const custom = session.messages.find(
       (message) => message.role === "custom" && message.customType === "pix-agent-task-result",
     );

@@ -102,6 +102,8 @@ export interface SubagentSingleResult {
   usage: SubagentUsage;
   /** "provider/modelId" */
   model?: string;
+  /** workflow schema children only: the capture-validated structured value (submit_workflow_result). Never present on the no-schema path. */
+  structured?: unknown;
   failureReason?: SubagentFailureReason;
   errorMessage?: string;
   startedAt?: number;
@@ -137,6 +139,16 @@ function isOneOf(value: unknown, allowed: readonly string[]): boolean {
 
 function utf8ByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
+}
+
+/** The shared-leaf property: a value that survives a structuredClone round-trip. */
+function isJsonClonable(value: unknown): boolean {
+  try {
+    structuredClone(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isSubagentUsage(value: unknown): value is SubagentUsage {
@@ -194,6 +206,7 @@ function isSubagentSingleResult(value: unknown): value is SubagentSingleResult {
     activities,
     usage,
     model,
+    structured,
     failureReason,
     errorMessage,
     startedAt,
@@ -214,6 +227,9 @@ function isSubagentSingleResult(value: unknown): value is SubagentSingleResult {
   if (!activities.every(isSubagentActivity)) return false;
   if (!isSubagentUsage(usage)) return false;
   if (model !== undefined && typeof model !== "string") return false;
+  // workflow schema children only: absent is legal, present must be a
+  // JSON-clonable value (the no-schema path never carries the field).
+  if (structured !== undefined && !isJsonClonable(structured)) return false;
   if (errorMessage !== undefined) {
     if (typeof errorMessage !== "string") return false;
     if (utf8ByteLength(errorMessage) > SUBAGENT_MAX_ERROR_MESSAGE_BYTES) return false;

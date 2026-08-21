@@ -11,7 +11,8 @@
  * the app-level `AgentTaskService`:
  *
  * - Direct background (run_in_background=true): createTaskGroup returns the
- *   group handle; nothing is awaited.
+ *   group handle; nothing is awaited. Terminal results are auto-delivered to
+ *   the parent session.
  * - Foreground: the facade subscribes to the group's service events within its
  *   own run scope, rebuilds throttled immutable `SubagentDetails` progress
  *   snapshots in the original mode/order, temporarily listens to the parent
@@ -19,7 +20,9 @@
  *   the group detaches), awaits `awaitGroup`, writes the aggregated usage into
  *   the parent generation's auxiliary accumulator exactly once and returns the
  *   details (cancelled maps to the legacy aborted result semantics). A
- *   detached/backgrounded group resolves the run with the group handle instead.
+ *   detached group (manual background / session switch) resolves the run with
+ *   the group handle instead; auto-background only flips panel presentation
+ *   and does not release this await.
  *
  * Every abandoned phase promise keeps a resolve/reject observer, so a late
  * rejection can never become an unhandled rejection.
@@ -284,9 +287,9 @@ export class SubagentRunner {
     }
     try {
       const result = await service.awaitGroup(group.groupId);
-      if (result.kind === "backgrounded") {
-        // Detached (auto/manual background): resolve the single tool await with
-        // the group handle; the tasks keep running in the service.
+        if (result.kind === "backgrounded") {
+        // Detached (direct/manual background or session switch): resolve the
+        // single tool await with the group handle; the tasks keep running.
         runState.emitProgress(true);
         return result.handle;
       }

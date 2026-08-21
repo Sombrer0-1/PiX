@@ -24,6 +24,7 @@ import {
   AGENT_TASK_TRANSITIONS,
   isAgentTaskInfo,
   isAgentTaskGroupHandle,
+  isAgentTaskItemSpec,
   type AgentTaskItemSpec,
   type AgentTaskSpec,
 } from "../../shared/agent-task-types.js";
@@ -209,7 +210,7 @@ run("constants", async () => {
   assertEqual(AGENT_TASK_MAX_ACTIVITIES, 20, "max activities is 20");
   assertEqual(AGENT_TASK_MAX_FINAL_OUTPUT_BYTES, 48 * 1024, "max final output is 48 KiB");
   assertEqual(AGENT_TASK_MAX_RECENT_ACTIVITIES, 20, "max recent activities is 20");
-  assertEqual(DEFAULT_AUTO_BACKGROUND_MS, 120_000, "default auto-background is 120 s");
+  assertEqual(DEFAULT_AUTO_BACKGROUND_MS, 0, "default auto-background is off");
 });
 
 run("transition table", async () => {
@@ -651,6 +652,72 @@ run("isAgentTaskGroupHandle", async () => {
     "task with unknown presentation rejected",
   );
   assert(!isAgentTaskGroupHandle({ ...handle, tasks: "tasks" }), "non-array tasks rejected");
+});
+
+// ============================================================================
+// isAgentTaskItemSpec: ready/rejected variants + the optional workflow
+// outputSchema (absent legal; present must be a plain object)
+// ============================================================================
+
+run("isAgentTaskItemSpec", async () => {
+  const ready = {
+    resolution: "ready",
+    index: 0,
+    prompt: "do the thing",
+    description: "A ready item",
+    agent: {
+      name: "general-purpose",
+      description: "General purpose",
+      systemPrompt: "You are a general purpose agent.",
+      source: "built-in",
+    },
+    model: { provider: "provider", modelId: "model-id" },
+    maxTurns: 40,
+  };
+  const rejected = {
+    resolution: "rejected",
+    index: 1,
+    prompt: "do the thing",
+    description: "A rejected item",
+    requestedAgentName: "no-such-agent",
+    failureReason: "unknown_agent",
+    errorMessage: "Unknown agent \"no-such-agent\".",
+  };
+
+  assert(isAgentTaskItemSpec(ready), "ready item without outputSchema passes");
+  assert(isAgentTaskItemSpec(rejected), "rejected item passes");
+  assert(
+    isAgentTaskItemSpec({ ...ready, outputSchema: { type: "object", properties: { a: { type: "object" } } } }),
+    "ready item with a plain-object outputSchema passes",
+  );
+  assert(isAgentTaskItemSpec({ ...ready, outputSchema: {} }), "empty plain-object outputSchema passes");
+  assert(!isAgentTaskItemSpec({ ...ready, outputSchema: "object" }), "string outputSchema rejected");
+  assert(!isAgentTaskItemSpec({ ...ready, outputSchema: 42 }), "numeric outputSchema rejected");
+  assert(!isAgentTaskItemSpec({ ...ready, outputSchema: ["a"] }), "array outputSchema rejected");
+  assert(!isAgentTaskItemSpec({ ...ready, outputSchema: null }), "null outputSchema rejected");
+  assert(isAgentTaskItemSpec({ ...ready, outputSchema: undefined }), "explicit undefined outputSchema is absent (legal)");
+  assert(!isAgentTaskItemSpec({ resolution: "ready", index: 0, prompt: "p", description: "d", maxTurns: 40 }), "missing agent rejected");
+  assert(!isAgentTaskItemSpec({ ...ready, resolution: "bogus" }), "unknown resolution rejected");
+  assert(!isAgentTaskItemSpec({ ...rejected, failureReason: "bogus" }), "unknown rejected failureReason rejected");
+  assert(!isAgentTaskItemSpec({ ...rejected, errorMessage: 42 }), "non-string rejected errorMessage rejected");
+
+  // The workflow extras outputSchema is plain data: JSON round-trip preserves it.
+  const withSchema = { ...ready, outputSchema: { type: "object", required: ["answer"] } };
+  const roundTripped = JSON.parse(JSON.stringify(withSchema)) as unknown;
+  assert(isAgentTaskItemSpec(roundTripped), "ready item with outputSchema survives JSON round-trip");
+  assertEqual(
+    JSON.stringify(roundTripped),
+    JSON.stringify(withSchema),
+    "round-trip preserves the exact outputSchema shape",
+  );
+
+  // A workflow ready item (outputSchema) inside a stored info's itemSummaries
+  // shape is unaffected; results with the structured field stay legal for the
+  // stored-result guard.
+  assert(
+    isAgentTaskInfo(makeInfoInput({ results: [makeResultInput({ structured: { answer: 42 } })] })),
+    "info whose result carries the workflow structured field passes",
+  );
 });
 
 // ============================================================================

@@ -40,6 +40,11 @@ import {
   resyncPlanEventForwarding,
   subscribePlanEventForwarding,
 } from "./ipc-plan-adapters.js";
+import {
+  registerWorkflowIpcHandlers,
+  resyncWorkflowEventForwarding,
+  subscribeWorkflowEventForwarding,
+} from "./ipc-workflow-adapters.js";
 import type { TeamManager } from "./team-manager.js";
 import { readWorkspaceMode, teamSnapshotPath, writeWorkspaceMode } from "./team-persistence.js";
 import { WslDistroResolver } from "./wsl/wsl-distro.js";
@@ -368,6 +373,7 @@ export function registerIpcHandlers(
       // forwarding so the mirror converges without waiting for the next
       // plan command.
       resyncPlanEventForwarding();
+      resyncWorkflowEventForwarding();
       return { success: true };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -381,6 +387,7 @@ export function registerIpcHandlers(
       console.error("[ipc] Error during single session dispose:", err);
     }
     resyncPlanEventForwarding();
+    resyncWorkflowEventForwarding();
     return { success: true };
   });
 
@@ -394,6 +401,7 @@ export function registerIpcHandlers(
       await disposeTeamRuntime(true);
       await singleSessionBridge.dispose();
       resyncPlanEventForwarding();
+      resyncWorkflowEventForwarding();
       await teamLeaderSessionBridge.start(location, settingsStore.getAll());
       // TeamManager.initialize takes the borrowed leader context (S8); the
       // leader SessionBridge owns the backend and TeamManager never disposes it
@@ -539,6 +547,13 @@ export function registerIpcHandlers(
   // =========================================================================
 
   registerPlanIpcHandlers(ipcMain, () => singleSessionBridge.getPlanController());
+
+  // =========================================================================
+  // Workflow Commands (PiX 1.4.3; recorder of the current solo generation,
+  // design plan §3)
+  // =========================================================================
+
+  registerWorkflowIpcHandlers(ipcMain, () => singleSessionBridge.getWorkflowRecorder());
 
   // =========================================================================
   // Agent Task Commands (PiX 1.4.1; app-level AgentTaskService, design plan §3)
@@ -903,11 +918,13 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       // plan-event forwarding so the renderer mirror converges to the new
       // session's plan (the re-sync pushes a fresh snapshot on change).
       resyncPlanEventForwarding();
+      resyncWorkflowEventForwarding();
       return result;
     }
     case "fork": {
       const result = await bridge.fork(cmd.entryId, cmd.position ?? "before", cmd.label);
       resyncPlanEventForwarding();
+      resyncWorkflowEventForwarding();
       return result;
     }
     case "navigate_tree": {
@@ -918,11 +935,13 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
         label: cmd.label,
       });
       resyncPlanEventForwarding();
+      resyncWorkflowEventForwarding();
       return result;
     }
     case "clone": {
       const result = await bridge.clone();
       resyncPlanEventForwarding();
+      resyncWorkflowEventForwarding();
       return result;
     }
     case "get_last_assistant_text":
@@ -955,6 +974,7 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       // Like switch_session/fork/clone: the new session owns a fresh
       // PlanController, so re-sync plan-event forwarding to it.
       resyncPlanEventForwarding();
+      resyncWorkflowEventForwarding();
       return result;
     }
 
@@ -1091,6 +1111,26 @@ export function setupEventForwarding(
         return win && !win.isDestroyed() ? win.webContents : null;
       },
       () => singleSessionBridge.getPlanController(),
+    ),
+  );
+
+  // Forward WorkflowRecorder fold changes (PiX 1.4.3) on the dedicated
+  // workflow-event channel. Like the PlanController, each solo runtime
+  // generation owns its own recorder, so the subscription is re-synced to
+  // the current instance (command-time hook + the session-switching paths
+  // via resyncWorkflowEventForwarding). The entry stream for the recorder's
+  // restore fallback is injected here: the adapter never imports
+  // SessionBridge, and the bridge restores the same entries at generation
+  // activation (plan §2.3), so a swapped-instance resync re-folding them is
+  // idempotent (the recorder dedups restored records).
+  eventForwardingUnsubscribes.push(
+    subscribeWorkflowEventForwarding(
+      () => {
+        const win = getWin();
+        return win && !win.isDestroyed() ? win.webContents : null;
+      },
+      () => singleSessionBridge.getWorkflowRecorder(),
+      () => singleSessionBridge.getSessionWorkflowEntries(),
     ),
   );
 
@@ -1288,3 +1328,10 @@ export {
   registerAgentTaskIpcHandlers,
   subscribeAgentTaskEventForwarding,
 } from "./ipc-agent-task-adapters.js";
+
+export {
+  executeWorkflowCommand,
+  registerWorkflowIpcHandlers,
+  resyncWorkflowEventForwarding,
+  subscribeWorkflowEventForwarding,
+} from "./ipc-workflow-adapters.js";
