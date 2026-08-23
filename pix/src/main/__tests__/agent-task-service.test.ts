@@ -830,12 +830,14 @@ async function testGroupDetach(): Promise<void> {
   const context = makeContext(harness);
   const events = eventsOf(harness);
   const handle = await harness.service.createTaskGroup(makeParams("parallel", [makeTask(0), makeTask(1)]), context, "foreground");
-  const [taskA, taskB] = handle.tasks;
 
   const awaitPromise = harness.service.awaitGroup(handle.groupId);
 
-  const result = harness.service.background(taskA.taskId, taskA.generation);
-  assertEqual(result.ok, true, "manual background accepted");
+  // 1.5 (P1): the manual background command is gone; the session-switch path
+  // (detachForegroundGroupsForSession) is the detach entry point.
+  const detachedHandles = harness.service.detachForegroundGroupsForSession("session-1");
+  assertEqual(detachedHandles.length, 1, "session detach returns the group handle");
+  assertEqual(detachedHandles[0].groupId, handle.groupId, "detached handle matches the group");
   const awaitedResult = await awaitPromise;
   assertEqual(awaitedResult.kind, "backgrounded", "detached group await resolves backgrounded");
   const backgrounded = awaitedResult as { kind: "backgrounded"; handle: AgentTaskGroupHandle };
@@ -847,33 +849,13 @@ async function testGroupDetach(): Promise<void> {
   assert(FakeRuntime.instances.every((fake) => fake.abortCalls === 0), "detach never aborts runtimes (no restart)");
   assertEqual(FakeRuntime.instances.length, 2, "no runtime was recreated");
 
-  // Idempotent: backgrounding again is a no-op success.
-  const again = harness.service.background(taskB.taskId, taskB.generation);
-  assertEqual(again.ok, true, "second background is idempotent");
-
-  // Display-only foreground switch does not touch the group state.
-  const foregroundResult = harness.service.foreground(taskB.taskId, taskB.generation);
-  assertEqual(foregroundResult.ok, true, "foreground switch accepted");
-  assertEqual(findTask(harness, taskB.taskId).presentation, "foreground", "foreground switch is display-only");
-  assertEqual(findTask(harness, taskA.taskId).presentation, "background", "sibling stays background");
-
-  // Stale generation commands are rejected with stale_generation.
-  assertEqual(harness.service.background(taskA.taskId, 99).ok, false, "stale background rejected");
-  assertEqual(harness.service.foreground(taskA.taskId, 99).ok, false, "stale foreground rejected");
+  // Idempotent: a second session detach finds nothing left to detach.
+  const again = harness.service.detachForegroundGroupsForSession("session-1");
+  assertEqual(again.length, 0, "second detach is a no-op");
 
   // awaitGroup on the detached group returns the handle immediately.
   const secondAwait = await harness.service.awaitGroup(handle.groupId);
   assertEqual(secondAwait.kind, "backgrounded", "await on detached group resolves backgrounded immediately");
-
-  // Detach cleanup for a parent session.
-  const harness2 = makeHarness();
-  const context2 = makeContext(harness2);
-  const handle2 = await harness2.service.createTaskGroup(makeParams("single", [makeTask(0)]), context2, "foreground");
-  const detached = harness2.service.detachForegroundGroupsForSession("session-1");
-  assertEqual(detached.length, 1, "session detach returns the group handle");
-  assertEqual(detached[0].groupId, handle2.groupId, "detached handle matches the group");
-  const afterDetach = findTask(harness2, handle2.tasks[0].taskId);
-  assertEqual(afterDetach.presentation, "background", "session detach flips presentation to background");
 
   // Run-in-background groups never attach: awaitGroup resolves immediately.
   const harness3 = makeHarness();
@@ -955,14 +937,13 @@ async function testAutoBackgroundTimer(): Promise<void> {
   const warningStates = byType(events, "task_state").length;
   assert(warningStates >= 2, "warning emission produced additional task_state events");
 
-  // continueForegroundWait cancels this round and clears the fields.
-  const keep = harness.service.continueForegroundWait(taskId, 0);
-  assertEqual(keep.ok, true, "continueForegroundWait accepted");
-  assertEqual(findTask(harness, taskId).autoBackground, undefined, "autoBackground fields cleared after continue");
+  // 1.5 (P1): auto-backgrounding is fully automatic (no continue-wait
+  // interaction); the deadline fires and flips the panel presentation only -
+  // no restart, no await release, status stays running.
   fakeTimers.fireAll();
-  assertEqual(findTask(harness, taskId).status, "running", "deadline after continue does not background (no restart)");
-  assertEqual(findTask(harness, taskId).presentation, "foreground", "group stays foreground after continue");
-  assertEqual(harness.service.continueForegroundWait(taskId, 0).ok, false, "second continue has no timer to cancel");
+  assertEqual(findTask(harness, taskId).status, "running", "auto-background does not restart the task");
+  assertEqual(findTask(harness, taskId).presentation, "background", "deadline flips the group to background");
+  assertEqual(findTask(harness, taskId).autoBackground, undefined, "auto-background clears the mirrored fields");
 
   // A second group hits the deadline: panel presentation flips, parent await stays.
   const harness2 = makeHarness({
@@ -1058,7 +1039,7 @@ async function testForegroundAwaitRebuild(): Promise<void> {
   assertEqual(details3.results[0].failureReason, "aborted", "aborted result keeps failureReason aborted");
 }
 
-async function testPlanGroupConsumptionAndClear(): Promise<void> {
+async function testPlanGroupConsumption(): Promise<void> {
   const harness = makeHarness();
   const context = makeContext(harness);
   const link: AgentTaskPlanLink = { planId: "plan-1", version: 1, stepId: "step-1" };
@@ -1069,11 +1050,6 @@ async function testPlanGroupConsumptionAndClear(): Promise<void> {
   );
   const taskId = handle.tasks[0].taskId;
   assertEqual(findTask(harness, taskId).planLinkState, "pending", "plan-linked task starts pending");
-
-  // Running tasks cannot be cleared.
-  const clearRunning = await harness.service.clearTask(taskId, 0, true);
-  assertEqual(clearRunning.ok, false, "running task clear rejected");
-  assertEqual(clearRunning.reason, "task_not_terminal", "clear reason is task_not_terminal");
 
   // Cancel the whole group (the fake runtime settles on abort).
   await harness.service.cancel(taskId, 0, "user_cancel");
@@ -1088,21 +1064,12 @@ async function testPlanGroupConsumptionAndClear(): Promise<void> {
     assertIncludes(groupResult.summary, "cancelled", "group summary lists the status");
   }
 
-  // Pending link blocks clearing.
-  const clearPending = await harness.service.clearTask(taskId, 0, true);
-  assertEqual(clearPending.ok, false, "pending-link clear rejected");
-  assertEqual(clearPending.reason, "plan_pending", "clear reason is plan_pending");
-
-  // Consumption is idempotent and unlocks clearing.
+  // Consumption is idempotent.
   await harness.service.confirmPlanTaskGroupConsumed(handle.groupId, link);
   await harness.service.confirmPlanTaskGroupConsumed(handle.groupId, link);
   assertEqual(findTask(harness, taskId).planLinkState, "consumed", "consumption is idempotent");
-  const clearNoConfirm = await harness.service.clearTask(taskId, 0, false);
-  assertEqual(clearNoConfirm.ok, false, "undelivered results need confirmation");
-  assertEqual(clearNoConfirm.reason, "confirm_required", "clear reason is confirm_required");
-  const clearConfirmed = await harness.service.clearTask(taskId, 0, true);
-  assertEqual(clearConfirmed.ok, true, "confirmed clear succeeds");
-  assertEqual(harness.service.getAll().tasks.length, 0, "cleared task is gone from getAll");
+  // 1.5 (P1): pending Plan links stay protected from the retention pass (the
+  // manual clear is gone; the exemption is asserted in the retention tests).
 
   // Link mismatch is rejected for consumption.
   const harness2 = makeHarness();
@@ -1115,13 +1082,11 @@ async function testPlanGroupConsumptionAndClear(): Promise<void> {
   const mismatched = await harness2.service.getPlanTaskGroupResult(handle2.groupId, { planId: "plan-x", version: 9, stepId: "step-9" });
   assertEqual(mismatched.ok, false, "link mismatch rejected");
 
-  // Release path: released links are also clearable like ordinary results.
+  // Release path.
   await harness2.service.cancel(handle2.tasks[0].taskId, 0, "user_cancel");
   await waitForStatus(harness2, handle2.tasks[0].taskId, "cancelled");
   await harness2.service.releasePlanTaskGroup(handle2.groupId, link, "plan_cancelled");
   assertEqual(findTask(harness2, handle2.tasks[0].taskId).planLinkState, "released", "release flips to released");
-  const clearReleased = await harness2.service.clearTask(handle2.tasks[0].taskId, 0, true);
-  assertEqual(clearReleased.ok, true, "released task clearable");
 }
 
 async function testDeliverySink(): Promise<void> {
@@ -1175,10 +1140,6 @@ async function testDeliverySink(): Promise<void> {
   const stale = await harness.service.sendResultToSession(taskId, 99, "session-target");
   assertEqual(stale.ok, false, "stale generation rejected");
   assertEqual(stale.reason, "stale_generation", "stale reason is stale_generation");
-
-  // Clear after delivery without confirmation works (data was delivered).
-  const clear = await harness.service.clearTask(taskId, 0, false);
-  assertEqual(clear.ok, true, "delivered terminal task clears without confirmation");
 }
 
 async function testAutoDeliverOnDetachedComplete(): Promise<void> {
@@ -1193,9 +1154,10 @@ async function testAutoDeliverOnDetachedComplete(): Promise<void> {
   });
 
   const awaitPromise = harness.service.awaitGroup(handle.groupId);
-  harness.service.background(taskId, 0);
+  // 1.5 (P1): detach via the session-switch path (manual background is gone).
+  harness.service.detachForegroundGroupsForSession("session-1");
   const detached = await awaitPromise;
-  assertEqual(detached.kind, "backgrounded", "manual background releases the parent await");
+  assertEqual(detached.kind, "backgrounded", "session detach releases the parent await");
 
   FakeRuntime.instances[0].complete();
   await waitForStatus(harness, taskId, "completed");
@@ -1234,7 +1196,7 @@ async function testAutoDeliverOnDetachedComplete(): Promise<void> {
   harness3.service.registerSessionDeliverySink("session-1", findTask(harness3, taskId3).workspaceId, async (content) => {
     planDelivered.push(content);
   });
-  harness3.service.background(taskId3, 0);
+  harness3.service.detachForegroundGroupsForSession("session-1");
   FakeRuntime.instances[0].complete();
   await waitForStatus(harness3, taskId3, "completed");
   await drain();
@@ -1478,11 +1440,11 @@ async function testProductEvents(): Promise<void> {
   const failedEvent = harness2.events.records.find((event) => event.name === "agent_task_failed");
   assertEqual(failedEvent?.payload.errorCategory, "internal_error", "failed event carries an error category");
 
-  // Backgrounded.
+  // Backgrounded (via the session detach path; manual background is gone).
   const harness3 = makeHarness();
   const context3 = makeContext(harness3);
   const handle3 = await harness3.service.createTaskGroup(makeParams("single", [makeTask(0)]), context3, "foreground");
-  harness3.service.background(handle3.tasks[0].taskId, 0);
+  harness3.service.detachForegroundGroupsForSession("session-1");
   assert(harness3.events.records.some((event) => event.name === "agent_task_backgrounded"), "agent_task_backgrounded recorded");
 
   // Cancelled.
@@ -1549,11 +1511,11 @@ async function main(): Promise<void> {
   await run("ReadonlyModelRegistry model resolution", testModelResolution);
   await run("project approval: user / signal / hostDisposed three-way race", testApprovalRaces);
   await run("input routing: triple validation + per-task FIFO", testInputTripleValidation);
-  await run("group detach: background / session detach / direct background", testGroupDetach);
+  await run("group detach: session detach / direct background", testGroupDetach);
   await run("detached group: cancelGroup never cancels; explicit cancel still works", testDetachedGroupCancelGroup);
-  await run("auto-background: injectable clock warning / continue / no-restart", testAutoBackgroundTimer);
+  await run("auto-background: injectable clock warning / pure-automatic flip", testAutoBackgroundTimer);
   await run("foreground await: SubagentDetails rebuild + cancelled aborted semantics", testForegroundAwaitRebuild);
-  await run("Plan group consumption + clear semantics", testPlanGroupConsumptionAndClear);
+  await run("Plan group consumption", testPlanGroupConsumption);
   await run("result delivery sink", testDeliverySink);
   await run("detached completion auto-delivers to the parent session", testAutoDeliverOnDetachedComplete);
   await run("dispose: bounded shutdown + stop reasons", testDisposeAndStopReasons);

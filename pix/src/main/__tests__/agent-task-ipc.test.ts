@@ -1,17 +1,19 @@
 /**
- * AgentTask IPC tests (PiX 1.4.1, B5).
+ * AgentTask IPC tests (PiX 1.4.1 B5; 1.5 P1 surface).
  *
  * Covers the §4.9 AgentTaskCommand/AgentTaskEvent contract end-to-end with an
- * INJECTABLE IPC adapter (pure Node, no Electron runtime): every command type,
- * the existing {success,data?,error,code?} PixApi envelope (data-bearing
- * commands carry data, data-less commands omit it), per-command data
- * narrowing (get_all -> AgentTaskInfo[], get_active_input_requests ->
- * AgentTaskInputRequest[]), stale generation rejection on every
- * mutation/delivery command, continue_foreground_wait semantics, the dedicated
- * agent-task-input-request channel (input requests never travel on the
- * ordinary event stream), the main-only task_file_change event never crossing
- * IPC, the remount catch-up (get-pending-agent-task-input-requests), throttled
- * activities/output reaching the renderer and state visibility within 1s.
+ * INJECTABLE IPC adapter (pure Node, no Electron runtime): the 1.5 command
+ * surface (cancel / respond_input / cancel_input / get_all /
+ * get_active_input_requests / export_diagnostics), rejection of the removed
+ * 1.4 manual-operation commands, the existing {success,data?,error,code?}
+ * PixApi envelope (data-bearing commands carry data, data-less commands omit
+ * it), per-command data narrowing, the dedicated agent-task-input-request
+ * channel (input requests never travel on the ordinary event stream), the
+ * main-only task_file_change event never crossing IPC, the remount catch-up
+ * (get-pending-agent-task-input-requests), throttled activities/output
+ * reaching the renderer, state visibility within 1s, and the 1.5 delivery
+ * catch-up (an undelivered terminal background result lands the moment its
+ * parent session opens a sink).
  *
  * IPC harness rule (design plan §3): the test registers the REAL production
  * handlers from ipc-agent-task-adapters.ts on a top-level-imported injectable
@@ -29,7 +31,7 @@
  * Run with: npm exec tsx -- src/main/__tests__/agent-task-ipc.test.ts
  */
 
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -39,6 +41,7 @@ import {
   isAgentTaskInfo,
   type AgentTaskActivity,
   type AgentTaskInfo,
+  type AgentTaskLogSnapshot,
   type AgentTaskSpec,
   type AgentTaskUsage,
 } from "../../shared/agent-task-types.js";
@@ -53,6 +56,7 @@ import type {
 import type { SubagentDetails, SubagentSingleResult } from "../../shared/subagent-types.js";
 import type { ProjectLocation } from "../../shared/project-location.js";
 import {
+  isAgentTaskCommand,
   registerAgentTaskIpcHandlers,
   subscribeAgentTaskEventForwarding,
   type IpcMainLike,
@@ -255,7 +259,9 @@ type AgentTaskRuntimeEventLike =
   | { type: "output"; text: string; truncated: boolean; originalBytes: number }
   | { type: "file_change"; change: FileChangeSummary; aggregate: TurnDiffSummary }
   | { type: "assistant_finalized"; entryId: string }
-  | { type: "item_result"; result: SubagentSingleResult };
+  | { type: "item_result"; result: SubagentSingleResult }
+  | { type: "nested_transcript"; itemIndex: number; event: object }
+  | { type: "item_session"; itemIndex: number; sessionFileName: string };
 
 class FakeRuntime {
   static instances: FakeRuntime[] = [];
@@ -390,6 +396,23 @@ class FakeRuntime {
     return Promise.resolve();
   }
 
+  // 1.5 (P3): transcript forwarding switch mirror.
+  forwarding = false;
+  readonly forwardingCalls: boolean[] = [];
+
+  setTranscriptForwarding(enabled: boolean): void {
+    this.forwarding = enabled;
+    this.forwardingCalls.push(enabled);
+  }
+
+  emitNestedTranscript(itemIndex: number, event: object): void {
+    this.onEvent?.({ type: "nested_transcript", itemIndex, event });
+  }
+
+  emitItemSession(itemIndex: number, sessionFileName: string): void {
+    this.onEvent?.({ type: "item_session", itemIndex, sessionFileName });
+  }
+
   resolveInput(requestId: string, response: RequestUserInputResponse): boolean {
     this.resolveInputCalls.push({ requestId, response });
     return true;
@@ -405,6 +428,7 @@ interface Harness {
   service: AgentTaskService;
   events: ProductEventCollector;
   settings: SettingsStore;
+  store: AgentTaskStore;
   storeRoot: string;
   resolveHostDisposed: () => void;
   hostDisposed: Promise<"host_disposed">;
@@ -441,7 +465,7 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>, opts?: { s
     },
     ...extraHooks,
   });
-  return { service, events, settings, storeRoot, resolveHostDisposed, hostDisposed };
+  return { service, events, settings, store, storeRoot, resolveHostDisposed, hostDisposed };
 }
 
 function makeContext(harness: Harness, overrides?: Partial<AgentTaskSubmissionContext>): AgentTaskSubmissionContext {
@@ -566,7 +590,7 @@ await run("registration: invalid commands rejected with invalid_agent_task_comma
   const badGeneration = (await ipc.invoke("agent-task-command", { type: "cancel", taskId: "t", generation: "1" })) as PixCommandResult;
   assertFailure(badGeneration, "non-numeric generation rejected");
 
-  const negativeGeneration = (await ipc.invoke("agent-task-command", { type: "background", taskId: "t", generation: -1 })) as PixCommandResult;
+  const negativeGeneration = (await ipc.invoke("agent-task-command", { type: "cancel", taskId: "t", generation: -1 })) as PixCommandResult;
   assertFailure(negativeGeneration, "negative generation rejected");
 
   const noResponse = (await ipc.invoke("agent-task-command", {
@@ -576,20 +600,92 @@ await run("registration: invalid commands rejected with invalid_agent_task_comma
     generation: 0,
   })) as PixCommandResult;
   assertFailure(noResponse, "respond_input without response rejected");
+});
 
-  const noTarget = (await ipc.invoke("agent-task-command", { type: "send_to_session", taskId: "t", generation: 0 })) as PixCommandResult;
-  assertFailure(noTarget, "send_to_session without targetSessionId rejected");
+await run("registration: removed 1.4 manual-operation commands are rejected", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
 
-  const noConfirm = (await ipc.invoke("agent-task-command", { type: "clear", taskId: "t", generation: 0 })) as PixCommandResult;
-  assertFailure(noConfirm, "clear without confirmDataLoss rejected");
+  // 1.5 (P1): send_to_session / clear / clear_all_terminal / background /
+  // foreground / continue_foreground_wait / resume / mark_failed /
+  // get_resume_summary are gone from the contract - delivery catch-up,
+  // auto-recovery and retention are main-process automations now.
+  const removed: Array<Record<string, unknown>> = [
+    { type: "background", taskId: "t", generation: 0 },
+    { type: "foreground", taskId: "t", generation: 0 },
+    { type: "continue_foreground_wait", taskId: "t", generation: 0 },
+    { type: "send_to_session", taskId: "t", generation: 0, targetSessionId: "s" },
+    { type: "clear", taskId: "t", generation: 0, confirmDataLoss: true },
+    { type: "clear_all_terminal", confirm: true },
+    { type: "resume", taskId: "t", generation: 0, decision: { action: "continue", confirmWorkspaceChanges: false } },
+    { type: "mark_failed", taskId: "t", generation: 0 },
+    { type: "get_resume_summary", taskId: "t", generation: 0 },
+  ];
+  for (const command of removed) {
+    const result = (await ipc.invoke("agent-task-command", command)) as PixCommandResult;
+    const failure = assertFailure(result, `${command.type} rejected`);
+    assertEqual(failure.code, "invalid_agent_task_command", `${command.type} invalid_agent_task_command code`);
+  }
+});
 
-  const badConfirm = (await ipc.invoke("agent-task-command", {
-    type: "clear",
-    taskId: "t",
-    generation: 0,
-    confirmDataLoss: "yes",
-  })) as PixCommandResult;
-  assertFailure(badConfirm, "non-boolean confirmDataLoss rejected");
+await run("S1/S4: V15 commands pass the guard; watch/unwatch/get_transcript dispatch for real", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+
+  // Structural guard: every legal V15 command shape passes isAgentTaskCommand
+  // (get_transcript accepts itemIndex/cursor/limit either absent or valid).
+  const valid: Array<Record<string, unknown>> = [
+    { type: "watch_task", taskId: "t-1" },
+    { type: "unwatch_task", taskId: "t-1" },
+    { type: "get_transcript", taskId: "t-1" },
+    { type: "get_transcript", taskId: "t-1", itemIndex: 0 },
+    { type: "get_transcript", taskId: "t-1", itemIndex: 3, cursor: "o=42", limit: 200 },
+    { type: "get_transcript", taskId: "t-1", limit: 1000 },
+    { type: "get_task_log", taskId: "t-1" },
+  ];
+  for (const command of valid) {
+    assert(isAgentTaskCommand(command), `structural guard accepts ${command.type}`);
+  }
+
+  // Negative guard paths: missing taskId, non-integer/negative itemIndex,
+  // non-positive/non-integer limit, non-string cursor.
+  const invalid: Array<Record<string, unknown>> = [
+    { type: "watch_task" },
+    { type: "unwatch_task", taskId: 7 },
+    { type: "get_task_log" },
+    { type: "get_transcript", taskId: "t-1", itemIndex: -1 },
+    { type: "get_transcript", taskId: "t-1", itemIndex: 1.5 },
+    { type: "get_transcript", taskId: "t-1", limit: 0 },
+    { type: "get_transcript", taskId: "t-1", limit: -5 },
+    { type: "get_transcript", taskId: "t-1", limit: 200.5 },
+    { type: "get_transcript", taskId: "t-1", cursor: 42 },
+  ];
+  for (const command of invalid) {
+    assert(!isAgentTaskCommand(command), `structural guard rejects ${JSON.stringify(command)}`);
+  }
+
+  // watch_task on an unknown task is the precise not_found mapping.
+  const watchUnknown = (await ipc.invoke("agent-task-command", { type: "watch_task", taskId: "t-1" })) as PixCommandResult;
+  const watchFailure = assertFailure(watchUnknown, "watch_task fails for an unknown task");
+  assertEqual(watchFailure.code, "not_found", "watch_task not_found code");
+  assertEqual(watchFailure.error, "Agent task not found: t-1", "watch_task not_found error text");
+
+  // unwatch_task is idempotent: an unknown task still succeeds.
+  const unwatchUnknown = (await ipc.invoke("agent-task-command", { type: "unwatch_task", taskId: "t-1" })) as PixCommandResult;
+  assertEqual(unwatchUnknown.success, true, "unwatch_task succeeds for an unknown task");
+
+  // get_transcript / get_task_log on an unknown task are the same not_found
+  // mapping (the latter lands with S6's real dispatch).
+  const transcriptUnknown = (await ipc.invoke("agent-task-command", { type: "get_transcript", taskId: "t-1" })) as PixCommandResult;
+  const transcriptFailure = assertFailure(transcriptUnknown, "get_transcript fails for an unknown task");
+  assertEqual(transcriptFailure.code, "not_found", "get_transcript not_found code");
+  assertEqual(transcriptFailure.error, "Agent task not found: t-1", "get_transcript not_found error text");
+  const getTaskLog = (await ipc.invoke("agent-task-command", { type: "get_task_log", taskId: "t-1" })) as PixCommandResult;
+  const getTaskLogFailure = assertFailure(getTaskLog, "get_task_log fails for an unknown task");
+  assertEqual(getTaskLogFailure.code, "not_found", "get_task_log not_found code");
+  assertEqual(getTaskLogFailure.error, "Agent task not found: t-1", "get_task_log not_found error text");
 });
 
 await run("get_all / get_active_input_requests: data envelopes + per-command narrowing", async () => {
@@ -675,103 +771,59 @@ await run("cancel: success envelope, forwarded task_state, stale generation", as
   unsubscribe();
 });
 
-await run("stale generation rejected on every mutation/delivery command", async () => {
+await run("delivery catch-up: an undelivered terminal background result lands when the parent sink opens", async () => {
   const harness = makeHarness();
   const ipc = new FakeIpcMain();
   registerAgentTaskIpcHandlers(ipc, harness.service);
-  const { taskId } = await createSingleForegroundTask(harness);
-
-  const commands: AgentTaskCommand[] = [
-    { type: "background", taskId, generation: 999 },
-    { type: "foreground", taskId, generation: 999 },
-    { type: "continue_foreground_wait", taskId, generation: 999 },
-    { type: "send_to_session", taskId, generation: 999, targetSessionId: "session-x" },
-    { type: "clear", taskId, generation: 999, confirmDataLoss: true },
-  ];
-  for (const command of commands) {
-    const result = (await ipc.invoke("agent-task-command", command)) as PixCommandResult;
-    const failure = assertFailure(result, `${command.type} with a stale generation fails`);
-    assertEqual(failure.code, "stale_generation", `${command.type} stale_generation code`);
-  }
-});
-
-await run("background / foreground: presentation switches + forwarded states", async () => {
-  const harness = makeHarness();
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-  const webContents = new FakeWebContents();
-  const unsubscribe = subscribeAgentTaskEventForwarding(() => webContents, harness.service);
-  const { taskId } = await createSingleForegroundTask(harness);
-
-  // background detaches the whole foreground group; the child flips to
-  // background and the group handle resolves the parent tool await.
-  const backgrounded = (await ipc.invoke("agent-task-command", { type: "background", taskId, generation: 0 })) as PixCommandResult;
-  assertEqual(backgrounded.success, true, "background succeeds");
-  if (backgrounded.success === true) {
-    assert(!("data" in backgrounded), "data-less command omits data on success");
-  }
-  await waitFor(
-    () => taskStateEvents(webContents).some((e) => e.task.taskId === taskId && e.task.presentation === "background"),
-    20000,
-    "background task_state forwarded",
+  // Direct background (lane B): the group starts detached, so its terminal
+  // result is eligible for auto-delivery / catch-up.
+  const handle = await harness.service.createTaskGroup(
+    makeParams("single", [makeTask(0)], { runInBackground: true }),
+    makeContext(harness),
+    "foreground",
   );
-  assertEqual(findTask(harness, taskId).presentation, "background", "service info presentation is background");
-  // Backgrounding a detached group is idempotent.
-  const again = (await ipc.invoke("agent-task-command", { type: "background", taskId, generation: 0 })) as PixCommandResult;
-  assertEqual(again.success, true, "background on an already-background group is idempotent");
+  const taskId = handle.tasks[0].taskId;
+  const runtime = FakeRuntime.instances.find((fake) => fake.spec.taskId === taskId);
+  if (!runtime) {
+    throw new Error("FakeRuntime for the background task not found");
+  }
+  const workspaceId = findTask(harness, taskId).workspaceId;
+  const parentSessionId = findTask(harness, taskId).parentSessionId;
 
-  // foreground is a display-only switch back.
-  const foregrounded = (await ipc.invoke("agent-task-command", { type: "foreground", taskId, generation: 0 })) as PixCommandResult;
-  assertEqual(foregrounded.success, true, "foreground succeeds");
-  await waitFor(
-    () => taskStateEvents(webContents).some((e) => e.task.taskId === taskId && e.task.presentation === "foreground"),
-    20000,
-    "foreground task_state forwarded",
-  );
-  assertEqual(findTask(harness, taskId).presentation, "foreground", "service info presentation is foreground");
+  // The task finishes while NO sink exists: the result stays undelivered.
+  runtime.complete();
+  await waitFor(() => findTask(harness, taskId).status === "completed", 20000, "task completed");
+  assertEqual(findTask(harness, taskId).deliveredSessionIds.length, 0, "no delivery without an open sink");
 
-  unsubscribe();
-});
-
-await run("continue_foreground_wait: cancels this round of the auto-background timer", async () => {
-  const BASE = 1_000_000;
-  const AUTO_MS = 120_000;
-  const fakeTimers = makeFakeTimers(BASE);
-  const harness = makeHarness({
-    now: fakeTimers.now,
-    setTimer: fakeTimers.setTimer,
-    autoBackgroundMsOverride: AUTO_MS,
+  // A sink for another workspace opens: no catch-up (workspace guard).
+  let wrongDelivered = 0;
+  harness.service.registerSessionDeliverySink("other-session", "other-workspace", async () => {
+    wrongDelivered++;
   });
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-  const { taskId } = await createSingleForegroundTask(harness);
+  await drain();
+  await drain();
+  assertEqual(wrongDelivered, 0, "no catch-up to a different workspace session");
+  assertEqual(findTask(harness, taskId).deliveredSessionIds.length, 0, "still undelivered");
 
-  const before = findTask(harness, taskId);
-  assert(before.autoBackground !== undefined, "foreground child mirrors the autoBackground deadline");
-  assertEqual(before.autoBackground!.deadlineAt, BASE + AUTO_MS, "deadline uses the injectable clock");
+  // The parent session opens its sink: the catch-up delivers exactly once.
+  let delivered = 0;
+  const deliveredContents: string[] = [];
+  harness.service.registerSessionDeliverySink(parentSessionId, workspaceId, async (content) => {
+    delivered++;
+    deliveredContents.push(content.taskId);
+  });
+  await waitFor(() => findTask(harness, taskId).deliveredSessionIds.includes(parentSessionId), 20000, "catch-up delivered");
+  assertEqual(delivered, 1, "the delivery sink ran once");
+  assertEqual(deliveredContents[0], taskId, "the sink received this task's result");
+  assertEqual(findTask(harness, taskId).deliveredSessionIds.length, 1, "delivery recorded once");
 
-  const continued = (await ipc.invoke("agent-task-command", { type: "continue_foreground_wait", taskId, generation: 0 })) as PixCommandResult;
-  assertEqual(continued.success, true, "continue_foreground_wait succeeds");
-  if (continued.success === true) {
-    assert(!("data" in continued), "data-less command omits data on success");
-  }
-  assertEqual(findTask(harness, taskId).autoBackground, undefined, "autoBackground fields cleared after continue");
-
-  // The cancelled timer never fires: the group stays foreground.
-  fakeTimers.fireAll();
-  assertEqual(findTask(harness, taskId).presentation, "foreground", "no auto-background after the timer was cancelled");
-  assertEqual(findTask(harness, taskId).status, "running", "task still running");
-
-  // A background (detached) group has no auto-background timer.
-  const { taskId: taskId2 } = await createSingleForegroundTask(harness);
-  await ipc.invoke("agent-task-command", { type: "background", taskId: taskId2, generation: 0 });
-  const onBackground = (await ipc.invoke("agent-task-command", {
-    type: "continue_foreground_wait",
-    taskId: taskId2,
-    generation: 0,
-  })) as PixCommandResult;
-  const onBackgroundFailure = assertFailure(onBackground, "continue on a background group fails");
-  assertEqual(onBackgroundFailure.code, "no_auto_background", "no_auto_background code");
+  // Re-registering the same session's sink never double-delivers.
+  harness.service.registerSessionDeliverySink(parentSessionId, workspaceId, async () => {
+    delivered++;
+  });
+  await drain();
+  await drain();
+  assertEqual(delivered, 1, "duplicate delivery suppressed by deliveredSessionIds");
 });
 
 await run("respond_input / cancel_input: triple validation + dedicated input channel", async () => {
@@ -949,6 +1001,243 @@ await run("main-only task_file_change never crosses IPC", async () => {
   unsubscribe();
 });
 
+await run("P3: watch_task/unwatch_task live transitions + task_transcript forwarding", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+  const webContents = new FakeWebContents();
+  const unsubscribe = subscribeAgentTaskEventForwarding(() => webContents, harness.service);
+  const { taskId, runtime } = await createSingleForegroundTask(harness);
+
+  // Before watching: no transcript events cross and the runtime is not
+  // forwarding (zero subscription keeps zero overhead).
+  runtime.emitNestedTranscript(0, { type: "message_start", message: { role: "assistant", content: "hi" } });
+  await drain();
+  assert(!webContents.eventsOn("agent-task-event").some((e) => (e as AgentTaskEvent).type === "task_transcript"), "no task_transcript before watch");
+  assertEqual(runtime.forwarding, false, "runtime forwarding off before watch");
+
+  // watch_task on a running task: forwarding switches on immediately (0->1).
+  const watched = (await ipc.invoke("agent-task-command", { type: "watch_task", taskId })) as PixCommandResult;
+  assertEqual(watched.success, true, "watch_task succeeds on a mirror task");
+  assertEqual(harness.service.isTaskWatched(taskId), true, "watcher registered");
+  assertEqual(runtime.forwarding, true, "runtime forwarding enabled on watch");
+
+  // The whitelisted nested event crosses IPC as a task_transcript.
+  runtime.emitNestedTranscript(0, { type: "message_start", message: { role: "assistant", content: "live text" } });
+  await waitFor(
+    () => webContents.eventsOn("agent-task-event").some((e) => (e as AgentTaskEvent).type === "task_transcript"),
+    20000,
+    "task_transcript forwarded",
+  );
+  const transcript = webContents
+    .eventsOn("agent-task-event")
+    .find((e) => (e as AgentTaskEvent).type === "task_transcript") as Extract<AgentTaskEvent, { type: "task_transcript" }>;
+  assertEqual(transcript.taskId, taskId, "task_transcript carries the taskId");
+  assertEqual(transcript.itemIndex, 0, "task_transcript carries the itemIndex");
+  assertEqual((transcript.event as { type: string }).type, "message_start", "task_transcript carries the nested event verbatim");
+
+  // Counting: two watches keep streaming through one unwatch; the second
+  // unwatch (1->0) switches forwarding off.
+  await ipc.invoke("agent-task-command", { type: "watch_task", taskId });
+  await ipc.invoke("agent-task-command", { type: "unwatch_task", taskId });
+  assertEqual(harness.service.isTaskWatched(taskId), true, "still watched after one unwatch (counting)");
+  await ipc.invoke("agent-task-command", { type: "unwatch_task", taskId });
+  assertEqual(harness.service.isTaskWatched(taskId), false, "watcher cleared after the second unwatch");
+  assertEqual(runtime.forwarding, false, "runtime forwarding off after the last unwatch");
+
+  unsubscribe();
+});
+
+await run("P4: task_file_change crosses IPC only for watched tasks, only change", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+  const webContents = new FakeWebContents();
+  const unsubscribe = subscribeAgentTaskEventForwarding(() => webContents, harness.service);
+  const { taskId, runtime } = await createSingleForegroundTask(harness);
+
+  // Unwatched: the file change stays main-only (same as before S4).
+  const sentBefore = webContents.sent.length;
+  runtime.emitFileChange();
+  await drain();
+  assertEqual(webContents.sent.length, sentBefore, "unwatched file change never crosses IPC");
+
+  // Watched: forwards exactly {taskId, change} - aggregate/planLink stripped.
+  await ipc.invoke("agent-task-command", { type: "watch_task", taskId });
+  runtime.emitFileChange();
+  await waitFor(
+    () => webContents.eventsOn("agent-task-event").some((e) => (e as AgentTaskEvent).type === "task_file_change"),
+    20000,
+    "watched file change forwarded",
+  );
+  const forwarded = webContents
+    .eventsOn("agent-task-event")
+    .find((e) => (e as AgentTaskEvent).type === "task_file_change") as Record<string, unknown>;
+  assertEqual(forwarded.taskId, taskId, "forwarded change carries the taskId");
+  assertEqual((forwarded.change as { path: string }).path, "src/a.txt", "forwarded change payload");
+  assert(!("planLink" in forwarded), "planLink stripped before IPC");
+  assert(!("aggregate" in forwarded), "aggregate stripped before IPC");
+
+  unsubscribe();
+});
+
+await run("S6: get_task_log dispatch - happy path + drain barrier + not_found", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+  const { taskId, runtime } = await createSingleForegroundTask(harness);
+
+  // Happy path: the created task's log already holds its state events.
+  const snap = (await ipc.invoke("agent-task-command", { type: "get_task_log", taskId })) as PixCommandResult<AgentTaskLogSnapshot>;
+  assertEqual(snap.success, true, "get_task_log succeeds");
+  if (snap.success === true) {
+    assert("data" in snap, "data-bearing command carries data");
+    assertEqual(snap.data!.taskId, taskId, "snapshot carries the taskId");
+    assert(Array.isArray(snap.data!.events), "snapshot events is an array");
+    assert(snap.data!.events.length >= 1, "creation state events readable");
+    assertEqual(snap.data!.truncated, false, "small log is not truncated");
+    assert(
+      snap.data!.events.every((event) => typeof event.seq === "number" && typeof event.type === "string"),
+      "events carry seq/ts/type metadata",
+    );
+  }
+
+  // Drain barrier: a file_change emitted right before the read is flushed by
+  // the service's getTaskLog (persist queue drained first), payload = change
+  // only (single change, never the turn aggregate).
+  runtime.emitFileChange();
+  const afterChange = (await ipc.invoke("agent-task-command", { type: "get_task_log", taskId })) as PixCommandResult<AgentTaskLogSnapshot>;
+  if (afterChange.success === true) {
+    const fileChange = afterChange.data!.events.find((event) => event.type === "file_change");
+    assert(fileChange !== undefined, "file_change landed in the snapshot");
+    if (fileChange !== undefined) {
+      assertEqual((fileChange.change as { toolCallId: string }).toolCallId, "fc-1", "change payload persisted");
+      assert(!("aggregate" in fileChange), "aggregate never persisted");
+    }
+  }
+
+  // Unknown task: the same not_found mapping as get_transcript.
+  const unknown = (await ipc.invoke("agent-task-command", { type: "get_task_log", taskId: "no-such-task" })) as PixCommandResult;
+  const unknownFailure = assertFailure(unknown, "get_task_log on an unknown task fails");
+  assertEqual(unknownFailure.code, "not_found", "get_task_log not_found code");
+  assertEqual(unknownFailure.error, "Agent task not found: no-such-task", "get_task_log not_found error text");
+});
+
+await run("P3: get_transcript happy path (legacy single-file fallback, cursor continuation)", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+  const { taskId } = await createSingleForegroundTask(harness);
+  const workspaceId = findTask(harness, taskId).workspaceId;
+
+  // A session file with Chinese/emoji content; the task has NO item_session
+  // entries, so the legacy single-file fallback maps every item to it.
+  const sessionsDir = join(harness.storeRoot, workspaceId, taskId, "sessions");
+  mkdirSync(sessionsDir, { recursive: true });
+  const lines = [
+    { type: "session", id: "s1", timestamp: "2026-01-01T00:00:00Z", cwd: "E:\\proj\\demo" },
+    { type: "message", id: "m1", timestamp: "2026-01-01T00:00:01Z", role: "user", content: "你好 🎉" },
+    { type: "message", id: "m2", timestamp: "2026-01-01T00:00:02Z", role: "assistant", content: "第一页" },
+    { type: "message", id: "m3", timestamp: "2026-01-01T00:00:03Z", role: "assistant", content: "第二页 emoji 🚀" },
+  ];
+  writeFileSync(join(sessionsDir, "session-a.jsonl"), lines.map((line) => `${JSON.stringify(line)}\n`).join(""));
+
+  // Defaults: itemIndex 0, limit 200 - the whole file (header excluded).
+  const page1 = (await ipc.invoke("agent-task-command", { type: "get_transcript", taskId })) as PixCommandResult<{
+    taskId: string;
+    itemIndex: number;
+    entries: unknown[];
+    totalCount: number;
+    nextCursor: string | null;
+    skippedLines: number;
+  }>;
+  assertEqual(page1.success, true, "get_transcript succeeds");
+  if (page1.success === true) {
+    assertEqual(page1.data!.taskId, taskId, "page carries the taskId");
+    assertEqual(page1.data!.itemIndex, 0, "itemIndex defaults to 0");
+    assertEqual(page1.data!.entries.length, 3, "three message entries, no header row");
+    assertEqual(page1.data!.totalCount, 3, "whole-file totalCount");
+    assertEqual(page1.data!.nextCursor, null, "one page covers the file");
+    const first = page1.data!.entries[0] as { content: string };
+    assertEqual(first.content, "你好 🎉", "multi-byte content intact");
+  }
+
+  // limit 1 + cursor continuation: the byte offset cursor resumes exactly.
+  const slice1 = (await ipc.invoke("agent-task-command", {
+    type: "get_transcript",
+    taskId,
+    itemIndex: 0,
+    limit: 1,
+  })) as PixCommandResult<{ entries: unknown[]; nextCursor: string | null }>;
+  assertEqual(slice1.success, true, "limited page succeeds");
+  if (slice1.success === true) {
+    assertEqual(slice1.data!.entries.length, 1, "limit respected");
+    assert(typeof slice1.data!.nextCursor === "string", "not at the end after one entry");
+    const slice2 = (await ipc.invoke("agent-task-command", {
+      type: "get_transcript",
+      taskId,
+      itemIndex: 0,
+      limit: 1,
+      cursor: slice1.data!.nextCursor!,
+    })) as PixCommandResult<{ entries: unknown[]; nextCursor: string | null }>;
+    assertEqual(slice2.success, true, "continuation page succeeds");
+    if (slice2.success === true) {
+      assertEqual((slice2.data!.entries[0] as { id: string }).id, "m2", "continuation resumes at the next entry");
+      const slice3 = (await ipc.invoke("agent-task-command", {
+        type: "get_transcript",
+        taskId,
+        itemIndex: 0,
+        limit: 1,
+        cursor: slice2.data!.nextCursor!,
+      })) as PixCommandResult<{ entries: unknown[]; nextCursor: string | null }>;
+      if (slice3.success === true) {
+        assertEqual((slice3.data!.entries[0] as { id: string }).id, "m3", "second continuation reaches m3");
+        assertEqual(slice3.data!.nextCursor, null, "final page signals the end");
+      }
+    }
+  }
+
+  // limit clamping: 0 -> 1, beyond 1000 -> 1000.
+  const clamped = (await ipc.invoke("agent-task-command", {
+    type: "get_transcript",
+    taskId,
+    limit: 0,
+  })) as PixCommandResult<{ entries: unknown[] }>;
+  if (clamped.success === true) {
+    assertEqual(clamped.data!.entries.length, 1, "limit 0 clamps to 1");
+  }
+  const huge = (await ipc.invoke("agent-task-command", {
+    type: "get_transcript",
+    taskId,
+    limit: 5000,
+  })) as PixCommandResult<{ entries: unknown[] }>;
+  if (huge.success === true) {
+    assertEqual(huge.data!.entries.length, 3, "limit 5000 clamps to 1000 (file has 3)");
+  }
+});
+
+await run("P3: get_transcript I/O errors are not mapped to not_found", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+  const { taskId } = await createSingleForegroundTask(harness);
+  const workspaceId = findTask(harness, taskId).workspaceId;
+
+  // A malicious/escaping session file name in the log: the mapping resolves it
+  // and the path guard throws. The error must surface with its original
+  // message - never a not_found.
+  await harness.store.appendEvent(workspaceId, taskId, {
+    type: "item_session",
+    itemIndex: 0,
+    sessionFileName: "..\\evil.jsonl",
+  });
+  const result = (await ipc.invoke("agent-task-command", { type: "get_transcript", taskId, itemIndex: 0 })) as PixCommandResult;
+  const failure = assertFailure(result, "escaping session file name fails the read");
+  assertEqual(failure.code, "agent_task_command_failed", "I/O failure is agent_task_command_failed");
+  assert(failure.error.includes("session transcript file name"), "original error message preserved");
+  assert(!failure.error.includes("not_found"), "message never rewritten to not_found");
+});
+
 await run("throttled activities/output reach the renderer on agent-task-event", async () => {
   // Injectable fake clock + timers: the service's 100ms throttle merges
   // within-window emissions, and the deterministic fireAll flush proves the
@@ -1042,150 +1331,6 @@ await run("throttled activities/output reach the renderer on agent-task-event", 
   unsubscribe();
 });
 
-await run("send_to_session: delivery semantics + stale generation", async () => {
-  const harness = makeHarness();
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-  const { taskId, runtime } = await createSingleForegroundTask(harness);
-
-  // No open sink for the target session yet.
-  const noSink = (await ipc.invoke("agent-task-command", {
-    type: "send_to_session",
-    taskId,
-    generation: 0,
-    targetSessionId: "target-session",
-  })) as PixCommandResult;
-  const noSinkFailure = assertFailure(noSink, "send without an open sink fails");
-  assertEqual(noSinkFailure.code, "target_session_not_open", "target_session_not_open code");
-
-  // Open a sink for the task's workspace and complete the task.
-  const workspaceId = findTask(harness, taskId).workspaceId;
-  let delivered = 0;
-  harness.service.registerSessionDeliverySink("target-session", workspaceId, async () => {
-    delivered++;
-  });
-  runtime.complete();
-  await waitFor(() => findTask(harness, taskId).status === "completed", 20000, "task completed");
-
-  const delivered1 = (await ipc.invoke("agent-task-command", {
-    type: "send_to_session",
-    taskId,
-    generation: 0,
-    targetSessionId: "target-session",
-  })) as PixCommandResult;
-  assertEqual(delivered1.success, true, "send_to_session succeeds once");
-  assertEqual(delivered, 1, "the delivery sink ran");
-  if (delivered1.success === true) {
-    assert(!("data" in delivered1), "data-less command omits data on success");
-  }
-
-  // Default is once per task per target session.
-  const duplicate = (await ipc.invoke("agent-task-command", {
-    type: "send_to_session",
-    taskId,
-    generation: 0,
-    targetSessionId: "target-session",
-  })) as PixCommandResult;
-  const duplicateFailure = assertFailure(duplicate, "duplicate delivery without confirmation fails");
-  assertEqual(duplicateFailure.code, "duplicate_delivery", "duplicate_delivery code");
-
-  // confirmDuplicate: true explicitly allows the repeat.
-  const confirmed = (await ipc.invoke("agent-task-command", {
-    type: "send_to_session",
-    taskId,
-    generation: 0,
-    targetSessionId: "target-session",
-    confirmDuplicate: true,
-  })) as PixCommandResult;
-  assertEqual(confirmed.success, true, "duplicate delivery with confirmDuplicate succeeds");
-  assertEqual(delivered, 2, "the delivery sink ran again");
-
-  // A wrong workspace sink rejects the delivery.
-  harness.service.registerSessionDeliverySink("other-workspace-session", "other-workspace", async () => {});
-  const wrongWorkspace = (await ipc.invoke("agent-task-command", {
-    type: "send_to_session",
-    taskId,
-    generation: 0,
-    targetSessionId: "other-workspace-session",
-  })) as PixCommandResult;
-  const wrongWorkspaceFailure = assertFailure(wrongWorkspace, "send to a different workspace fails");
-  assertEqual(wrongWorkspaceFailure.code, "workspace_mismatch", "workspace_mismatch code");
-
-  // Stale generation is rejected before any delivery side effect.
-  const stale = (await ipc.invoke("agent-task-command", {
-    type: "send_to_session",
-    taskId,
-    generation: 999,
-    targetSessionId: "target-session",
-  })) as PixCommandResult;
-  const staleFailure = assertFailure(stale, "send with a stale generation fails");
-  assertEqual(staleFailure.code, "stale_generation", "stale_generation code");
-});
-
-await run("clear: terminal gate, data-loss confirmation and plan-pending protection", async () => {
-  const harness = makeHarness();
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-  const { taskId, runtime } = await createSingleForegroundTask(harness);
-
-  // Non-terminal tasks are never clearable.
-  const nonTerminal = (await ipc.invoke("agent-task-command", {
-    type: "clear",
-    taskId,
-    generation: 0,
-    confirmDataLoss: true,
-  })) as PixCommandResult;
-  const nonTerminalFailure = assertFailure(nonTerminal, "clear on a running task fails");
-  assertEqual(nonTerminalFailure.code, "task_not_terminal", "task_not_terminal code");
-
-  // Terminal but never delivered: the UI needs the explicit data-loss
-  // confirmation.
-  runtime.complete();
-  await waitFor(() => findTask(harness, taskId).status === "completed", 20000, "task completed");
-  const noConfirm = (await ipc.invoke("agent-task-command", {
-    type: "clear",
-    taskId,
-    generation: 0,
-    confirmDataLoss: false,
-  })) as PixCommandResult;
-  const noConfirmFailure = assertFailure(noConfirm, "clear without data-loss confirmation fails");
-  assertEqual(noConfirmFailure.code, "confirm_required", "confirm_required code");
-
-  const cleared = (await ipc.invoke("agent-task-command", {
-    type: "clear",
-    taskId,
-    generation: 0,
-    confirmDataLoss: true,
-  })) as PixCommandResult;
-  assertEqual(cleared.success, true, "clear with confirmation succeeds");
-  assertEqual(harness.service.getAll().tasks.some((info) => info.taskId === taskId), false, "task removed from get_all");
-
-  // A Plan-linked task with pending consumption is protected from clearing.
-  const linked = await createSingleForegroundTask(harness, {
-    planLink: { planId: "plan-1", version: 1, stepId: "step-0" },
-  });
-  linked.runtime.complete();
-  await waitFor(() => findTask(harness, linked.taskId).status === "completed", 20000, "linked task completed");
-  const linkedClear = (await ipc.invoke("agent-task-command", {
-    type: "clear",
-    taskId: linked.taskId,
-    generation: 0,
-    confirmDataLoss: true,
-  })) as PixCommandResult;
-  const linkedClearFailure = assertFailure(linkedClear, "clear on a pending Plan link fails");
-  assertEqual(linkedClearFailure.code, "plan_pending", "plan_pending code");
-
-  // Stale generation is rejected before any state check.
-  const stale = (await ipc.invoke("agent-task-command", {
-    type: "clear",
-    taskId: linked.taskId,
-    generation: 999,
-    confirmDataLoss: true,
-  })) as PixCommandResult;
-  const staleFailure = assertFailure(stale, "clear with a stale generation fails");
-  assertEqual(staleFailure.code, "stale_generation", "stale_generation code");
-});
-
 await run("state visible within 1s of a command", async () => {
   const harness = makeHarness();
   const ipc = new FakeIpcMain();
@@ -1195,16 +1340,16 @@ await run("state visible within 1s of a command", async () => {
   const { taskId } = await createSingleForegroundTask(harness);
 
   const start = Date.now();
-  await ipc.invoke("agent-task-command", { type: "background", taskId, generation: 0 });
+  await ipc.invoke("agent-task-command", { type: "cancel", taskId, generation: 0 });
   await waitFor(
-    () => taskStateEvents(webContents).some((e) => e.task.taskId === taskId && e.task.presentation === "background"),
+    () => taskStateEvents(webContents).some((e) => e.task.taskId === taskId && e.task.status === "cancelled"),
     20000,
-    "backgrounded state forwarded",
+    "cancelled state forwarded",
   );
   const elapsed = Date.now() - start;
   assert(elapsed < 1000, `task state visible within 1s (${elapsed}ms)`);
-  const state = taskStateEvents(webContents).find((e) => e.task.taskId === taskId && e.task.presentation === "background")!;
-  assertEqual(state.task.status, "running", "backgrounding does not change the status");
+  const state = taskStateEvents(webContents).find((e) => e.task.taskId === taskId && e.task.status === "cancelled")!;
+  assertEqual(state.task.status, "cancelled", "cancel reaches the terminal state");
   assertEqual(state.task.generation, 0, "forwarded state carries the current generation");
 
   unsubscribe();
@@ -1254,26 +1399,26 @@ await run("R2: recovery_issue events cross IPC; corrupt records stay out of the 
   // A workspace whose task.json is unreadable produces a recovery issue, not a
   // forged AgentTaskInfo. Write the corrupt file directly through the store's
   // own writeMetadata, then corrupt it on disk.
-  const harness = makeHarness();
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-  const webContents = new FakeWebContents();
-  const unsubscribe = subscribeAgentTaskEventForwarding(() => webContents, harness.service);
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-agent-task-ipc-store-r2-"));
+  const harnessA = makeHarness(undefined, { storeRoot });
+  const ipcA = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipcA, harnessA.service);
 
-  const handle = await harness.service.createTaskGroup(makeParams("single", [makeTask(0)]), makeContext(harness), "foreground");
+  const handle = await harnessA.service.createTaskGroup(makeParams("single", [makeTask(0)]), makeContext(harnessA), "foreground");
   const taskId = handle.tasks[0].taskId;
   const workspaceId = workspaceIdOf(PROJECT.physicalPath);
   // Wait until the metadata write landed, then corrupt task.json.
   await waitFor(
-    () => existsSync(join(harness.storeRoot, workspaceId, taskId, "task.json")),
+    () => existsSync(join(storeRoot, workspaceId, taskId, "task.json")),
     20000,
     "task.json written",
   );
-  rmSync(join(harness.storeRoot, workspaceId, taskId, "task.json"), { force: true });
+  rmSync(join(storeRoot, workspaceId, taskId, "task.json"), { force: true });
 
   // A fresh service (same store root) restores; the corrupted task surfaces as
-  // a recovery_issue event and never as a task.
-  const harness2 = makeHarness(undefined, { storeRoot: harness.storeRoot });
+  // a recovery_issue event and never as a task. Auto-recovery is disabled to
+  // keep this hydration-focused assertion isolated from the resume pass.
+  const harness2 = makeHarness({ disableAutoRecovery: true }, { storeRoot });
   const ipc2 = new FakeIpcMain();
   registerAgentTaskIpcHandlers(ipc2, harness2.service);
   const webContents2 = new FakeWebContents();
@@ -1306,26 +1451,27 @@ await run("R2: recovery_issue events cross IPC; corrupt records stay out of the 
     assertEqual(all.data!.recoveryIssues[0].code, "migration_failed", "issue code in the snapshot");
   }
 
-  // Clearing the recovery-corrupt task removes it from disk and the snapshot.
-  const cleared = (await ipc2.invoke("agent-task-command", {
+  // 1.5 (P1): the manual clear command is gone; the corrupt record stays as a
+  // read-only diagnostic (retention never deletes recovery-corrupt records).
+  const clearAttempt = (await ipc2.invoke("agent-task-command", {
     type: "clear",
     taskId,
     generation: 0,
     confirmDataLoss: true,
   })) as PixCommandResult;
-  assertEqual(cleared.success, true, "recovery-corrupt task is clearable");
-  const afterClear = (await ipc2.invoke("agent-task-command", { type: "get_all" })) as PixCommandResult<{
+  const clearFailure = assertFailure(clearAttempt, "clear command rejected");
+  assertEqual(clearFailure.code, "invalid_agent_task_command", "invalid_agent_task_command code");
+  const afterAttempt = (await ipc2.invoke("agent-task-command", { type: "get_all" })) as PixCommandResult<{
     recoveryIssues: unknown[];
   }>;
-  if (afterClear.success === true) {
-    assertEqual(afterClear.data!.recoveryIssues.length, 0, "cleared task drops its recovery issue");
+  if (afterAttempt.success === true) {
+    assertEqual(afterAttempt.data!.recoveryIssues.length, 1, "recovery issue persists without manual clearing");
   }
-  unsubscribe();
   unsubscribe2();
 });
 
 // ============================================================================
-// 1.4.2 (R3) recovery command tests
+// 1.4.2 (R3) diagnostics (1.5 P1: the only retained recovery command)
 // ============================================================================
 
 /** Restore an interrupted task on a real project dir (the resumer's environment check). */
@@ -1350,183 +1496,6 @@ async function restoreInterruptedTask(
   await harness2.service.restoreAll();
   return { harness: harness2, taskId, location };
 }
-
-await run("R3: resume command envelope + full restore->resume->running flow", async () => {
-  const projectDir = mkdtempSync(join(tmpdir(), "pix-ipc-resume-"));
-  const storeRoot = mkdtempSync(join(tmpdir(), "pix-ipc-resume-store-"));
-  const { harness, taskId } = await restoreInterruptedTask({ storeRoot, projectDir });
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-  const restored = findTask(harness, taskId);
-  assertEqual(restored.status, "interrupted", "task restored interrupted");
-  assertEqual(restored.generation, 0, "restored generation 0");
-
-  // Invalid decision shapes are rejected at the guard.
-  const badDecision = (await ipc.invoke("agent-task-command", {
-    type: "resume",
-    taskId,
-    generation: 0,
-    decision: { action: "switch_model", modelId: "x" },
-  })) as PixCommandResult;
-  assertFailure(badDecision, "switch_model without provider rejected");
-
-  // Successful resume: data-less success envelope; task runs immediately.
-  const resumed = (await ipc.invoke("agent-task-command", {
-    type: "resume",
-    taskId,
-    generation: 0,
-    decision: { action: "continue", confirmWorkspaceChanges: true },
-  })) as PixCommandResult;
-  assertEqual(resumed.success, true, "resume succeeds");
-  if (resumed.success === true) {
-    assert(!("data" in resumed), "data-less command omits data on success");
-  }
-  const after = findTask(harness, taskId);
-  assertEqual(after.status, "running", "slot granted immediately");
-  assertEqual(after.generation, 1, "generation bumped to 1");
-  const resumedFake = FakeRuntime.instances.find((candidate) => candidate.spec.taskId === taskId && candidate.prepareCalls > 0);
-  assert(resumedFake !== undefined, "resumed runtime prepared");
-  const sessionsDir = join(harness.storeRoot, workspaceIdOf(projectDir), taskId, "sessions");
-  assertEqual(existsSync(sessionsDir) ? readdirSync(sessionsDir).length : 0, 1, "resumer created the next-item session file");
-
-  // Stale generation is rejected with the stale_generation code.
-  const stale = (await ipc.invoke("agent-task-command", {
-    type: "resume",
-    taskId,
-    generation: 0,
-    decision: { action: "continue", confirmWorkspaceChanges: true },
-  })) as PixCommandResult;
-  const staleFailure = assertFailure(stale, "resume with a stale generation fails");
-  assertEqual(staleFailure.code, "stale_generation", "stale_generation code");
-
-  // A new finalized assistant message is the success criterion (product event).
-  resumedFake!.emitAssistantFinalized();
-  await drain();
-  assert(harness.events.records.some((e) => e.name === "agent_task_resume_succeeded"), "resume_succeeded product event recorded");
-
-  // get_resume_summary on a non-interrupted task fails with task_not_interrupted.
-  const notInterrupted = (await ipc.invoke("agent-task-command", {
-    type: "get_resume_summary",
-    taskId,
-    generation: 1,
-  })) as PixCommandResult;
-  const notInterruptedFailure = assertFailure(notInterrupted, "summary on a non-interrupted task fails");
-  assertEqual(notInterruptedFailure.code, "task_not_interrupted", "task_not_interrupted code");
-
-  rmSync(projectDir, { recursive: true, force: true });
-});
-
-await run("R3: mark_failed command converts interrupted to failed(user_decision)", async () => {
-  const projectDir = mkdtempSync(join(tmpdir(), "pix-ipc-mark-"));
-  const storeRoot = mkdtempSync(join(tmpdir(), "pix-ipc-mark-store-"));
-  const { harness, taskId } = await restoreInterruptedTask({ storeRoot, projectDir });
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-
-  const marked = (await ipc.invoke("agent-task-command", { type: "mark_failed", taskId, generation: 0 })) as PixCommandResult;
-  assertEqual(marked.success, true, "mark_failed succeeds");
-  if (marked.success === true) {
-    assert(!("data" in marked), "data-less command omits data on success");
-  }
-  const info = findTask(harness, taskId);
-  assertEqual(info.status, "failed", "task failed");
-  assertEqual(info.failureReason, "user_decision", "user_decision reason");
-
-  const stale = (await ipc.invoke("agent-task-command", { type: "mark_failed", taskId, generation: 999 })) as PixCommandResult;
-  const staleFailure = assertFailure(stale, "mark_failed with a stale generation fails");
-  assertEqual(staleFailure.code, "stale_generation", "stale_generation code");
-
-  const again = (await ipc.invoke("agent-task-command", { type: "mark_failed", taskId, generation: 0 })) as PixCommandResult;
-  const againFailure = assertFailure(again, "mark_failed on a non-interrupted task fails");
-  assertEqual(againFailure.code, "task_not_interrupted", "task_not_interrupted code");
-
-  rmSync(projectDir, { recursive: true, force: true });
-});
-
-await run("R3: get_resume_summary command returns the plain-data summary", async () => {
-  const projectDir = mkdtempSync(join(tmpdir(), "pix-ipc-summary-"));
-  const storeRoot = mkdtempSync(join(tmpdir(), "pix-ipc-summary-store-"));
-  const { harness, taskId } = await restoreInterruptedTask({ storeRoot, projectDir });
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-
-  const summaryResult = (await ipc.invoke("agent-task-command", {
-    type: "get_resume_summary",
-    taskId,
-    generation: 0,
-  })) as PixCommandResult<{
-    taskId: string;
-    generation: number;
-    openToolCalls: unknown[];
-    modelChanged: boolean;
-    environmentChanged: boolean;
-    workspaceChanges: unknown[];
-  }>;
-  assertEqual(summaryResult.success, true, "get_resume_summary succeeds");
-  if (summaryResult.success === true) {
-    assert("data" in summaryResult, "data-bearing command carries data");
-    assertEqual(summaryResult.data!.taskId, taskId, "summary carries the taskId");
-    assertEqual(summaryResult.data!.generation, 0, "summary carries the generation");
-    assertEqual(summaryResult.data!.openToolCalls.length, 0, "no open calls on the fresh transcript");
-    assertEqual(summaryResult.data!.workspaceChanges.length, 0, "no workspace changes");
-    assertEqual(summaryResult.data!.modelChanged, false, "model unchanged");
-    assertEqual(summaryResult.data!.environmentChanged, false, "environment available");
-  }
-
-  const stale = (await ipc.invoke("agent-task-command", {
-    type: "get_resume_summary",
-    taskId,
-    generation: 999,
-  })) as PixCommandResult;
-  const staleFailure = assertFailure(stale, "stale generation summary fails");
-  assertEqual(staleFailure.code, "stale_generation", "stale_generation code");
-
-  rmSync(projectDir, { recursive: true, force: true });
-});
-
-await run("R3: clear_all_terminal command returns cleared/protected and never touches interrupted/pending-link", async () => {
-  const projectDir = mkdtempSync(join(tmpdir(), "pix-ipc-clearall-"));
-  const location: ProjectLocation = {
-    path: projectDir,
-    physicalPath: projectDir,
-    name: "ipc-r3",
-    environment: { kind: "windows" },
-  };
-  const harness = makeHarness();
-  const ipc = new FakeIpcMain();
-  registerAgentTaskIpcHandlers(ipc, harness.service);
-
-  // Plain completed task.
-  const plain = await createSingleForegroundTask(harness);
-  plain.runtime.complete();
-  await waitFor(() => findTask(harness, plain.taskId).status === "completed", 20000, "plain task completed");
-  // Pending-link completed task.
-  const linked = await createSingleForegroundTask(harness, {
-    planLink: { planId: "plan-1", version: 1, stepId: "step-0" },
-  });
-  linked.runtime.complete();
-  await waitFor(() => findTask(harness, linked.taskId).status === "completed", 20000, "linked task completed");
-
-  const noConfirm = (await ipc.invoke("agent-task-command", { type: "clear_all_terminal", confirm: false })) as PixCommandResult;
-  const noConfirmFailure = assertFailure(noConfirm, "clear_all_terminal without confirm fails");
-  assertEqual(noConfirmFailure.code, "confirm_required", "confirm_required code");
-
-  const result = (await ipc.invoke("agent-task-command", {
-    type: "clear_all_terminal",
-    workspaceId: workspaceIdOf(PROJECT.physicalPath),
-    confirm: true,
-  })) as PixCommandResult<{ cleared: number; protectedTaskIds: string[] }>;
-  assertEqual(result.success, true, "clear_all_terminal succeeds");
-  if (result.success === true) {
-    assert("data" in result, "data-bearing command carries data");
-    assertEqual(result.data!.cleared, 1, "only the plain terminal task cleared");
-    assert(result.data!.protectedTaskIds.includes(linked.taskId), "pending-link task protected");
-  }
-  assertEqual(harness.service.getAll().tasks.some((t) => t.taskId === plain.taskId), false, "cleared task removed");
-  assertEqual(findTask(harness, linked.taskId).status, "completed", "pending-link task stays");
-
-  rmSync(projectDir, { recursive: true, force: true });
-});
 
 await run("R3: export_diagnostics command returns metadata-only content", async () => {
   const projectDir = mkdtempSync(join(tmpdir(), "pix-ipc-diag-"));

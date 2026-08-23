@@ -1,17 +1,18 @@
 /**
- * Agent task store tests (PiX 1.4.1, stage B6).
+ * Agent task store tests (PiX 1.4.1, stage B6; 1.5 P2 stage S2).
  *
- * Acceptance: waiting / running+queued / recent grouping, group-level
- * auto-background deadline mirroring, event idempotency and active inputs.
- * The store talks to main only through window.pixApi (sendAgentTaskCommand /
- * onAgentTaskEvent / onAgentTaskInputRequest), so the tests stub that surface
- * in happy-dom - no Electron runtime is loaded.
+ * Acceptance: waiting / running+queued / terminal grouping, group-level
+ * auto-background deadline mirroring, event idempotency, active inputs,
+ * task center open/close deep-link state and task_removed mirror convergence
+ * (including selectedTaskId cleanup). The store talks to main only through
+ * window.pixApi (sendAgentTaskCommand / onAgentTaskEvent /
+ * onAgentTaskInputRequest), so the tests stub that surface in happy-dom - no
+ * Electron runtime is loaded.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import type { PixApi } from "../../main/preload";
-import { AGENT_TASK_MAX_RECENT_ACTIVITIES } from "@shared/agent-task-types.js";
 import type {
   AgentTaskActivity,
   AgentTaskInfo,
@@ -229,7 +230,7 @@ describe("grouping", () => {
 
     expect(store.waitingTasks.map((t) => t.taskId)).toEqual(["wait-1"]);
     expect(store.activeTasks.map((t) => t.taskId)).toEqual(["run-1", "queue-1"]);
-    expect(store.recentTasks.map((t) => t.taskId)).toEqual(["cancel-1", "fail-1", "done-1"]);
+    expect(store.terminalTasks.map((t) => t.taskId)).toEqual(["cancel-1", "fail-1", "done-1"]);
     expect(store.tasks).toHaveLength(6);
   });
 
@@ -250,21 +251,35 @@ describe("grouping", () => {
     expect(store.activeTasks.map((t) => t.taskId)).toEqual(["b", "a", "c"]);
   });
 
-  it("bounds recent to AGENT_TASK_MAX_RECENT_ACTIVITIES, most recently ended first", () => {
+  it("terminalTasks keeps the full terminal mirror, most recently ended first (no 20-cap)", () => {
     const store = useAgentTaskStore();
     store.subscribeToEvents();
 
-    for (let i = 0; i < AGENT_TASK_MAX_RECENT_ACTIVITIES + 5; i += 1) {
+    for (let i = 0; i < 25; i += 1) {
       emit({
         type: "task_state",
         task: makeTask({ taskId: `done-${i}`, status: "completed", endedAt: i }),
       });
     }
 
-    expect(store.recentTasks).toHaveLength(AGENT_TASK_MAX_RECENT_ACTIVITIES);
-    expect(store.recentTasks[0].taskId).toBe(`done-${AGENT_TASK_MAX_RECENT_ACTIVITIES + 4}`);
-    // The oldest terminal tasks stay in the full mirror but outside the group.
-    expect(store.tasks).toHaveLength(AGENT_TASK_MAX_RECENT_ACTIVITIES + 5);
+    expect(store.terminalTasks).toHaveLength(25);
+    expect(store.terminalTasks[0].taskId).toBe("done-24");
+    // 1.5 (P2): the cap is gone - the history view renders the full mirror and
+    // the retention pass is the bound.
+    expect(store.tasks).toHaveLength(25);
+  });
+
+  it("terminalTasks excludes running/queued/waiting_input/interrupted tasks", () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+
+    emit({ type: "task_state", task: makeTask({ taskId: "run-1", status: "running", startedAt: 1 }) });
+    emit({ type: "task_state", task: makeTask({ taskId: "queue-1", status: "queued", queuePosition: 1 }) });
+    emit({ type: "task_state", task: makeTask({ taskId: "wait-1", status: "waiting_input", startedAt: 1 }) });
+    emit({ type: "task_state", task: makeTask({ taskId: "int-1", status: "interrupted" }) });
+    emit({ type: "task_state", task: makeTask({ taskId: "done-1", status: "completed", endedAt: 5 }) });
+
+    expect(store.terminalTasks.map((t) => t.taskId)).toEqual(["done-1"]);
   });
 
   it("tracks the selected task", () => {
@@ -281,6 +296,48 @@ describe("grouping", () => {
 
     store.selectTask(null);
     expect(store.selectedTask).toBeNull();
+  });
+});
+
+// ============================================================================
+// Task center open/close (1.5 P2): the only entry / exit of the center view
+// ============================================================================
+
+describe("task center", () => {
+  it("openTaskCenter() opens without changing the selection", () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    emit({ type: "task_state", task: makeTask({ taskId: "task-1", status: "running", startedAt: 1 }) });
+
+    expect(store.centerOpen).toBe(false);
+    store.openTaskCenter();
+    expect(store.centerOpen).toBe(true);
+    expect(store.selectedTaskId).toBeNull();
+
+    store.closeTaskCenter();
+    expect(store.centerOpen).toBe(false);
+  });
+
+  it("openTaskCenter(taskId) opens already focused on the task (deep link)", () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    emit({ type: "task_state", task: makeTask({ taskId: "task-1", status: "completed", endedAt: 5 }) });
+
+    store.openTaskCenter("task-1");
+    expect(store.centerOpen).toBe(true);
+    expect(store.selectedTaskId).toBe("task-1");
+    expect(store.selectedTask?.taskId).toBe("task-1");
+  });
+
+  it("closeTaskCenter does not clear the selection (reopening keeps this task focused)", () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    emit({ type: "task_state", task: makeTask({ taskId: "task-1", status: "running", startedAt: 1 }) });
+
+    store.openTaskCenter("task-1");
+    store.closeTaskCenter();
+    expect(store.centerOpen).toBe(false);
+    expect(store.selectedTaskId).toBe("task-1");
   });
 });
 
@@ -589,15 +646,6 @@ describe("command actions", () => {
     await store.cancel("task-1", 0);
     expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "cancel", taskId: "task-1", generation: 0 });
 
-    await store.background("task-1", 0);
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "background", taskId: "task-1", generation: 0 });
-
-    await store.foreground("task-1", 0);
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "foreground", taskId: "task-1", generation: 0 });
-
-    await store.continueForegroundWait("task-1", 0);
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "continue_foreground_wait", taskId: "task-1", generation: 0 });
-
     await store.respondInput("task-1", "req-1", 0, makeResponse());
     expect(sendAgentTaskCommand).toHaveBeenCalledWith({
       type: "respond_input",
@@ -610,26 +658,26 @@ describe("command actions", () => {
     await store.cancelInput("task-1", "req-1", 0);
     expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "cancel_input", taskId: "task-1", requestId: "req-1", generation: 0 });
 
-    await store.sendToSession("task-1", 0, "session-9");
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({
-      type: "send_to_session",
-      taskId: "task-1",
-      generation: 0,
-      targetSessionId: "session-9",
-      confirmDuplicate: undefined,
-    });
+    await store.exportDiagnostics("task-1");
+    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "export_diagnostics", taskId: "task-1" });
 
-    await store.sendToSession("task-1", 0, "session-9", true);
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({
-      type: "send_to_session",
-      taskId: "task-1",
-      generation: 0,
-      targetSessionId: "session-9",
-      confirmDuplicate: true,
-    });
-
-    await store.clearTask("task-1", 0, true);
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "clear", taskId: "task-1", generation: 0, confirmDataLoss: true });
+    // 1.5 (P1): the manual-operation commands (background / foreground /
+    // continue_foreground_wait / send_to_session / clear / clear_all_terminal /
+    // resume / mark_failed / get_resume_summary) are gone from the store.
+    const storeActions = Object.keys(store);
+    for (const removed of [
+      "background",
+      "foreground",
+      "continueForegroundWait",
+      "sendToSession",
+      "clearTask",
+      "clearAllTerminal",
+      "getResumeSummary",
+      "resume",
+      "markFailed",
+    ]) {
+      expect(storeActions, `removed action ${removed}`).not.toContain(removed);
+    }
   });
 
   it("surfaces command failures in lastError", async () => {
@@ -652,7 +700,7 @@ describe("command actions", () => {
 
     const response: PixCommandResult<undefined> = { success: true };
     sendAgentTaskCommand.mockResolvedValue(response);
-    const result = await store.background("task-1", 0);
+    const result = await store.cancel("task-1", 0);
 
     expect(result).toEqual(response);
     expect(store.lastError).toBeNull();
@@ -660,105 +708,210 @@ describe("command actions", () => {
 });
 
 // ============================================================================
-// Clear mirror convergence (G-20/G-25): main deletes the record without
-// emitting any task event, so a successful clear must rewrite the mirror.
+// task_removed mirror convergence (1.5 P1): the retention pass deletes
+// terminal records in main and announces each one through a task_removed
+// push; the renderer converges every mirror off that event.
 // ============================================================================
 
-describe("clear mirror convergence", () => {
-  it("removes a cleared task and its input requests / recovery issue from the mirrors", async () => {
+describe("task_removed mirror convergence", () => {
+  it("removes the deleted task and its input requests / recovery issue / selection from the mirrors", async () => {
     const store = useAgentTaskStore();
     store.subscribeToEvents();
     emit({ type: "task_state", task: makeTask({ taskId: "done-1", status: "completed", endedAt: 5 }) });
+    emit({ type: "task_state", task: makeTask({ taskId: "run-1", status: "running", startedAt: 6 }) });
     emitInput(makeInputRequest({ taskId: "done-1", requestId: "req-1" }));
     emit({ type: "recovery_issue", issue: makeRecoveryIssue({ taskId: "done-1" }) });
     emit({ type: "recovery_issue", issue: makeRecoveryIssue({ taskId: "other-1" }) });
-    sendAgentTaskCommand.mockResolvedValue({ success: true });
+    store.openTaskCenter("done-1");
 
-    const result = await store.clearTask("done-1", 0, true);
+    emit({ type: "task_removed", taskId: "done-1" });
 
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({
-      type: "clear",
-      taskId: "done-1",
-      generation: 0,
-      confirmDataLoss: true,
-    });
-    expect(result.success).toBe(true);
-    expect(store.tasks.map((t) => t.taskId)).toEqual([]);
+    expect(store.tasks.map((t) => t.taskId)).toEqual(["run-1"]);
     expect(store.activeInputRequests).toHaveLength(0);
     expect(store.recoveryIssues.map((i) => i.taskId)).toEqual(["other-1"]);
+    // 1.5 (P2): the deleted selected task loses the selection (empty detail placeholder).
+    expect(store.selectedTaskId).toBeNull();
+    expect(store.selectedTask).toBeNull();
   });
 
-  it("keeps the mirrors when clear fails", async () => {
+  it("keeps the selection when the removed task is not the selected one", async () => {
     const store = useAgentTaskStore();
     store.subscribeToEvents();
     emit({ type: "task_state", task: makeTask({ taskId: "done-1", status: "completed", endedAt: 5 }) });
-    emitInput(makeInputRequest({ taskId: "done-1", requestId: "req-1" }));
-    sendAgentTaskCommand.mockResolvedValue({ success: false, code: "not_found", error: "Task not found." });
+    emit({ type: "task_state", task: makeTask({ taskId: "run-1", status: "running", startedAt: 6 }) });
+    store.selectTask("run-1");
 
-    await store.clearTask("done-1", 0, true);
+    emit({ type: "task_removed", taskId: "done-1" });
 
-    expect(store.tasks.map((t) => t.taskId)).toEqual(["done-1"]);
-    expect(store.activeInputRequests.map((r) => r.taskId)).toEqual(["done-1"]);
+    expect(store.selectedTaskId).toBe("run-1");
   });
 
-  it("is idempotent when the cleared task is already gone from the mirror", async () => {
+  it("is idempotent when the removed task is already gone from the mirror", async () => {
     const store = useAgentTaskStore();
     store.subscribeToEvents();
-    // Recovery-issue-only record: no task entry, only the issue mirror row.
-    emit({ type: "recovery_issue", issue: makeRecoveryIssue({ taskId: "corrupt-1" }) });
-    sendAgentTaskCommand.mockResolvedValue({ success: true });
+    emit({ type: "task_state", task: makeTask({ taskId: "run-1", status: "running", startedAt: 1 }) });
 
-    await store.clearTask("corrupt-1", 0, true);
+    emit({ type: "task_removed", taskId: "never-known" });
+    emit({ type: "task_removed", taskId: "run-1" });
+    emit({ type: "task_removed", taskId: "run-1" });
 
     expect(store.tasks).toHaveLength(0);
-    expect(store.recoveryIssues).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// Transcript channel (1.5 P3 stage S5): watch/unwatch commands, per-task
+// transcript buffer (disk paging + live ring with seq cursor), terminal
+// watched clear and task_removed cleanup.
+// ============================================================================
+
+describe("transcript channel", () => {
+  it("watchTask sends watch_task and marks the task watched locally", async () => {
+    const store = useAgentTaskStore();
+
+    await store.watchTask("task-1");
+
+    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "watch_task", taskId: "task-1" });
+    expect(store.transcripts["task-1"]?.watched).toBe(true);
   });
 
-  it("removes terminal tasks after clearAllTerminal succeeds, keeping protected and non-terminal ones", async () => {
+  it("unwatchTask sends unwatch_task and clears the local watched flag", async () => {
     const store = useAgentTaskStore();
-    store.subscribeToEvents();
-    emit({ type: "task_state", task: makeTask({ taskId: "done-1", status: "completed", endedAt: 5 }) });
-    emit({ type: "task_state", task: makeTask({ taskId: "fail-1", status: "failed", endedAt: 6 }) });
-    emit({ type: "task_state", task: makeTask({ taskId: "run-1", status: "running", startedAt: 1 }) });
-    emit({ type: "task_state", task: makeTask({ taskId: "inter-1", status: "interrupted" }) });
-    emit({ type: "task_state", task: makeTask({ taskId: "link-1", status: "completed", endedAt: 7, planLinkState: "pending" }) });
-    emit({ type: "recovery_issue", issue: makeRecoveryIssue({ taskId: "corrupt-1" }) });
-    sendAgentTaskCommand.mockResolvedValue({
-      success: true,
-      data: { cleared: 2, protectedTaskIds: ["run-1", "inter-1", "link-1", "corrupt-1"] },
+    await store.watchTask("task-1");
+
+    store.unwatchTask("task-1");
+
+    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "unwatch_task", taskId: "task-1" });
+    expect(store.transcripts["task-1"]?.watched).toBe(false);
+  });
+
+  it("loadTranscriptPage drains pages until nextCursor is null and accumulates the full entries", async () => {
+    const store = useAgentTaskStore();
+    let page = 0;
+    sendAgentTaskCommand.mockImplementation(async (command: Record<string, unknown>) => {
+      if (command.type === "get_transcript") {
+        page += 1;
+        return page === 1
+          ? { success: true, data: { taskId: "task-1", itemIndex: 0, entries: [{ n: 1 }, { n: 2 }], totalCount: 3, nextCursor: "c1" } }
+          : { success: true, data: { taskId: "task-1", itemIndex: 0, entries: [{ n: 3 }], totalCount: 3, nextCursor: null } };
+      }
+      return { success: true };
     });
 
-    const result = await store.clearAllTerminal("ws-1", true);
+    await store.loadTranscriptPage("task-1");
 
-    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "clear_all_terminal", workspaceId: "ws-1", confirm: true });
-    expect(result.success).toBe(true);
-    expect(store.tasks.map((t) => t.taskId).sort()).toEqual(["inter-1", "link-1", "run-1"]);
-    expect(store.recoveryIssues.map((i) => i.taskId)).toEqual(["corrupt-1"]);
+    expect(page).toBe(2);
+    const transcriptCalls = sendAgentTaskCommand.mock.calls
+      .filter(([command]) => (command as { type: string }).type === "get_transcript")
+      .map(([command]) => command as { type: string; taskId: string; itemIndex: number; cursor?: string });
+    expect(transcriptCalls.map((call) => call.cursor)).toEqual([undefined, "c1"]);
+    const item = store.transcripts["task-1"]?.byItem[0];
+    expect(item?.entries).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+    expect(item?.totalCount).toBe(3);
+    expect(item?.nextCursor).toBeNull();
+    expect(item?.loading).toBe(false);
   });
 
-  it("keeps tasks of other workspaces when clearAllTerminal scopes to one workspace", async () => {
+  it("marks byItem.loading while the paging command is in flight", async () => {
     const store = useAgentTaskStore();
-    store.subscribeToEvents();
-    emit({ type: "task_state", task: makeTask({ taskId: "done-1", status: "completed", endedAt: 5 }) });
-    emit({ type: "task_state", task: makeTask({ taskId: "done-2", status: "completed", endedAt: 6, workspaceId: "ws-2" }) });
-    sendAgentTaskCommand.mockResolvedValue({
+    let resolvePage: ((value: unknown) => void) | undefined;
+    sendAgentTaskCommand.mockImplementation(
+      () => new Promise((resolve) => { resolvePage = resolve; }),
+    );
+
+    const pending = store.loadTranscriptPage("task-1");
+
+    expect(store.transcripts["task-1"]?.byItem[0]?.loading).toBe(true);
+    resolvePage?.({
       success: true,
-      data: { cleared: 1, protectedTaskIds: [] },
+      data: { taskId: "task-1", itemIndex: 0, entries: [{ n: 1 }], totalCount: 1, nextCursor: null },
+    });
+    await pending;
+    const item = store.transcripts["task-1"]?.byItem[0];
+    expect(item?.loading).toBe(false);
+    expect(item?.entries).toHaveLength(1);
+  });
+
+  it("keeps the previous entries when a re-drain fails (disk replay failure is not a regression)", async () => {
+    const store = useAgentTaskStore();
+    let fail = false;
+    sendAgentTaskCommand.mockImplementation(async (command: Record<string, unknown>) => {
+      if (command.type === "get_transcript") {
+        if (fail) return { success: false, code: "agent_task_command_failed", error: "io" };
+        return { success: true, data: { taskId: "task-1", itemIndex: 0, entries: [{ n: 1 }], totalCount: 1, nextCursor: null } };
+      }
+      return { success: true };
     });
 
-    await store.clearAllTerminal("ws-1", true);
+    await store.loadTranscriptPage("task-1");
+    expect(store.transcripts["task-1"]?.byItem[0]?.entries).toHaveLength(1);
 
-    expect(store.tasks.map((t) => t.taskId)).toEqual(["done-2"]);
+    fail = true;
+    await store.loadTranscriptPage("task-1");
+    expect(store.transcripts["task-1"]?.byItem[0]?.entries).toHaveLength(1);
+    expect(store.lastError).toBe("io");
   });
 
-  it("keeps the mirrors when clearAllTerminal fails", async () => {
+  it("accumulates task_transcript pushes with a monotonic seq per task", () => {
     const store = useAgentTaskStore();
     store.subscribeToEvents();
-    emit({ type: "task_state", task: makeTask({ taskId: "done-1", status: "completed", endedAt: 5 }) });
-    sendAgentTaskCommand.mockResolvedValue({ success: false, code: "confirm_required", error: "Confirm required." });
 
-    await store.clearAllTerminal("ws-1", false);
+    emit({ type: "task_transcript", taskId: "task-1", itemIndex: 0, event: { type: "turn_start" } });
+    emit({ type: "task_transcript", taskId: "task-2", itemIndex: 1, event: { type: "turn_start" } });
+    emit({ type: "task_transcript", taskId: "task-1", itemIndex: 0, event: { type: "turn_end", message: { role: "assistant", content: "x" }, toolResults: [] } });
 
-    expect(store.tasks.map((t) => t.taskId)).toEqual(["done-1"]);
+    expect(store.transcripts["task-1"]?.liveEvents.map((entry) => entry.seq)).toEqual([0, 2]);
+    expect(store.transcripts["task-2"]?.liveEvents.map((entry) => entry.seq)).toEqual([1]);
+    // 初始 consumedSeq 为 0(未消费)。
+    expect(store.transcripts["task-1"]?.consumedSeq).toBe(0);
+  });
+
+  it("caps the live ring at 4000 (drop oldest, liveDropped=true)", () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+
+    for (let i = 0; i < 4001; i += 1) {
+      emit({ type: "task_transcript", taskId: "task-1", itemIndex: i % 2, event: { type: "turn_start" } });
+    }
+
+    const state = store.transcripts["task-1"];
+    expect(state?.liveEvents).toHaveLength(4000);
+    expect(state?.liveEvents[0].seq).toBe(1);
+    expect(state?.liveEvents[3999].seq).toBe(4000);
+    expect(state?.liveDropped).toBe(true);
+    // 未 watch 的任务不置 watched。
+    expect(state?.watched).toBe(false);
+  });
+
+  it("a terminal task_state while watched clears the local watched flag", async () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    await store.watchTask("task-1");
+    expect(store.transcripts["task-1"]?.watched).toBe(true);
+
+    emit({ type: "task_state", task: makeTask({ taskId: "task-1", status: "completed", endedAt: 5 }) });
+    expect(store.transcripts["task-1"]?.watched).toBe(false);
+
+    // 非终态 push 不误清。
+    await store.watchTask("task-1");
+    emit({ type: "task_state", task: makeTask({ taskId: "task-1", status: "running", startedAt: 6 }) });
+    expect(store.transcripts["task-1"]?.watched).toBe(true);
+  });
+
+  it("task_removed clears transcripts[taskId] and the selection", async () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    emit({ type: "task_state", task: makeTask({ taskId: "task-1", status: "running", startedAt: 1 }) });
+    await store.watchTask("task-1");
+    emit({ type: "task_transcript", taskId: "task-1", itemIndex: 0, event: { type: "turn_start" } });
+    store.openTaskCenter("task-1");
+
+    emit({ type: "task_removed", taskId: "task-1" });
+
+    expect(store.transcripts["task-1"]).toBeUndefined();
+    expect(store.selectedTaskId).toBeNull();
+    // 幂等:重复删除不重建缓存。
+    emit({ type: "task_removed", taskId: "task-1" });
+    expect(store.transcripts["task-1"]).toBeUndefined();
   });
 });

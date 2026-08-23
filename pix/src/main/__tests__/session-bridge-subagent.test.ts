@@ -1268,6 +1268,22 @@ await run("session delivery sink: registered on activate, followUp/triggerTurn, 
     const delivered = await service.sendResultToSession(taskId, generation, session.sessionId);
     assertEqual(delivered.ok, true, "send_to_session delivers to the open Solo session");
     assertEqual(sendOptions[0]?.triggerTurn, true, "idle delivery triggers a parent turn");
+    // 1.5 (P1) 6.7 verification: a STREAMING parent receives the delivery as a
+    // followUp (queued into the running turn) instead of triggering a new one.
+    const originalIsStreaming = Object.getOwnPropertyDescriptor(session, "isStreaming");
+    Object.defineProperty(session, "isStreaming", { get: () => true, configurable: true });
+    try {
+      const followUp = await service.sendResultToSession(taskId, generation, session.sessionId, true);
+      assertEqual(followUp.ok, true, "streaming delivery accepted (confirmDuplicate)");
+      assertEqual(sendOptions[1]?.deliverAs, "followUp", "streaming delivery rides the followUp queue");
+      assertEqual(sendOptions[1]?.triggerTurn, undefined, "streaming delivery never triggers a second turn");
+    } finally {
+      if (originalIsStreaming) {
+        Object.defineProperty(session, "isStreaming", originalIsStreaming);
+      } else {
+        delete (session as { isStreaming?: boolean }).isStreaming;
+      }
+    }
     const custom = session.messages.find(
       (message) => message.role === "custom" && message.customType === "pix-agent-task-result",
     );

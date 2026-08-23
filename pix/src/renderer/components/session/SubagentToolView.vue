@@ -18,7 +18,7 @@
  * are semantic buttons, the running region uses aria-live="polite" and all
  * motion is disabled under prefers-reduced-motion.
  */
-import { computed, ref, watch } from "vue";
+import { computed, ref } from "vue";
 import { aggregateSubagentUsage, isSubagentDetails } from "@shared/subagent-types.js";
 import { isAgentTaskGroupHandle } from "@shared/agent-task-types.js";
 import type { AgentTaskGroupHandle } from "@shared/agent-task-types.js";
@@ -36,6 +36,11 @@ const props = defineProps<{
   result: unknown;
   args: unknown;
   isError: boolean;
+  /**
+   * 1.5 (P4):主会话中该 agent 工具的 toolCallId(SessionView 透传),用于终态
+   * 折叠后深链任务中心(经 store.tasks 按 parentToolCallId 定位组内首个任务)。
+   */
+  toolCallId?: string;
 }>();
 
 const taskStore = useAgentTaskStore();
@@ -198,11 +203,39 @@ const isFullyTerminal = computed(
   () => results.value.length > 0 && results.value.every((r) => r.status !== "queued" && r.status !== "running"),
 );
 
-/** Terminal results expand by default so final output and tokens/cost are
- *  visible without interaction; the user can still collapse afterwards. */
-watch(isFullyTerminal, (terminal) => {
-  if (terminal) expanded.value = true;
-}, { immediate: true });
+/** 1.5 (P4):终态折叠——所有 result 非 queued/running 时整体折叠为一行摘要
+ *  (「Done · N 工具调用 · M tokens · Xs」风格),点击 header 仍可展开详情。 */
+const foldToolCount = computed(() => results.value.reduce((sum, item) => sum + item.toolUseCount, 0));
+
+const foldSummary = computed(() => {
+  const tokens = aggregate.value?.totalTokens ?? 0;
+  const duration = details.value?.durationMs ?? 0;
+  return `${overallStatusLabel.value} · ${foldToolCount.value} 工具调用 · ${formatTokens(tokens)} tokens · ${formatDuration(duration)}`;
+});
+
+/** 深链目标:store.tasks 中 parentToolCallId === toolCallId 的任务里 createdAt
+ *  最早的一个(foreground parallel 组共享 parentToolCallId,定位组内首个;同组
+ *  其余任务在任务中心列表相邻可见——已知局限,plan 接受)。找不到匹配(如 retention
+ *  已回收)则隐藏按钮,折叠摘要不受影响。 */
+const detailTaskId = computed<string | null>(() => {
+  if (!props.toolCallId) return null;
+  let earliestId: string | null = null;
+  let earliestAt = Number.POSITIVE_INFINITY;
+  for (const task of taskStore.tasks) {
+    if (task.parentToolCallId !== props.toolCallId) continue;
+    if (task.createdAt < earliestAt) {
+      earliestAt = task.createdAt;
+      earliestId = task.taskId;
+    }
+  }
+  return earliestId;
+});
+
+function openTaskDetails(): void {
+  if (detailTaskId.value) {
+    taskStore.openTaskCenter(detailTaskId.value);
+  }
+}
 
 const aggregate = computed(() => (details.value ? aggregateSubagentUsage(details.value) : null));
 
@@ -384,11 +417,23 @@ function toggleBody(): void {
         </span>
         <span v-if="singleMeta" class="subagent-meta">{{ singleMeta }}</span>
         <span class="subagent-summary">{{ headerSummary }}</span>
+        <span v-if="isFullyTerminal" class="subagent-fold-summary" data-test="subagent-fold-summary">{{ foldSummary }}</span>
         <span class="subagent-toggle">
           {{ bodyOpen ? "收起" : "展开" }}
           <v-icon :icon="bodyOpen ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="14" />
         </span>
       </button>
+
+      <div v-if="isFullyTerminal && detailTaskId" class="subagent-fold-actions">
+        <button
+          type="button"
+          class="subagent-detail-btn"
+          data-test="subagent-view-detail-btn"
+          @click.stop="openTaskDetails"
+        >
+          查看详情
+        </button>
+      </div>
 
       <div v-if="bodyOpen" class="subagent-body">
         <div v-if="liveSummary" class="subagent-live-summary" aria-live="polite">{{ liveSummary }}</div>
@@ -630,6 +675,43 @@ function toggleBody(): void {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-secondary);
   overflow-wrap: anywhere;
+}
+
+/* ── 终态折叠一行摘要 + 查看详情深链 (1.5 P4) ── */
+.subagent-fold-summary {
+  flex-shrink: 0;
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow-wrap: anywhere;
+}
+
+.subagent-fold-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 4px 8px;
+  border-top: 1px solid var(--pix-border-light);
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.subagent-detail-btn {
+  flex-shrink: 0;
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  padding: 3px 12px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+  border: 1px solid var(--pix-border-light);
+  cursor: pointer;
+  transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
+}
+
+.subagent-detail-btn:hover {
+  background: var(--pix-accent);
+  color: #ffffff;
 }
 
 .subagent-toggle {

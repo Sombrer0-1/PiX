@@ -12,13 +12,15 @@
  * onto that stream (design plan §4.9). 1.4.2 (R2/R3) adds the recovery
  * commands (resume / mark_failed / get_resume_summary / export_diagnostics /
  * clear_all_terminal) and the storage_status / recovery_issue events; the
- * transport follows the V142 command union with its per-command data shapes.
+ * transport follows the V15 command union with its per-command data shapes
+ * (the V15 union extends V142 with the task-center watch/transcript/log
+ * commands).
  */
 
 import type { PixApi } from "../../main/preload";
 import type {
-  AgentTaskCommandDataV142,
-  AgentTaskCommandV142,
+  AgentTaskCommandDataV15,
+  AgentTaskCommandV15,
   AgentTaskEvent,
   AgentTaskInputRequest,
   PixCommandResult,
@@ -26,9 +28,9 @@ import type {
 
 /** Minimal agent-task IPC surface the task store needs over the preload pixApi. */
 export interface AgentTaskTransport {
-  sendAgentTaskCommand: <C extends AgentTaskCommandV142>(
+  sendAgentTaskCommand: <C extends AgentTaskCommandV15>(
     command: C,
-  ) => Promise<PixCommandResult<AgentTaskCommandDataV142<C>>>;
+  ) => Promise<PixCommandResult<AgentTaskCommandDataV15<C>>>;
   onAgentTaskEvent: (callback: (event: AgentTaskEvent) => void) => () => void;
   onAgentTaskInputRequest: (callback: (request: AgentTaskInputRequest) => void) => () => void;
 }

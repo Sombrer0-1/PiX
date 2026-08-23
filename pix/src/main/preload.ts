@@ -7,8 +7,8 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
   AgentSessionEvent,
-  AgentTaskCommandDataV142,
-  AgentTaskCommandV142,
+  AgentTaskCommandDataV15,
+  AgentTaskCommandV15,
   AgentTaskEvent,
   AgentTaskInputRequest,
   ExecutionEnvironmentInfo,
@@ -142,10 +142,11 @@ export interface PixApi {
   sendWorkflowCommand: (command: WorkflowCommand) => Promise<PixCommandResult<WorkflowViewState[]>>;
   onWorkflowEvent: (callback: (event: WorkflowEvent) => void) => () => void;
 
-  // Agent task commands (PiX 1.4.1 + 1.4.2 R2/R3; the data shape is narrowed
-  // per command type - get_all returns the AgentTaskListSnapshot since R2,
-  // recovery commands arrive with R3)
-  sendAgentTaskCommand<C extends AgentTaskCommandV142>(command: C): Promise<PixCommandResult<AgentTaskCommandDataV142<C>>>;
+  // Agent task commands (PiX 1.4.1 + 1.4.2 R2/R3 + 1.5 V15; the data shape is
+  // narrowed per command type - get_all returns the AgentTaskListSnapshot since
+  // R2, recovery commands arrive with R3, the task-center transcript/log
+  // commands arrive with the V15 union)
+  sendAgentTaskCommand<C extends AgentTaskCommandV15>(command: C): Promise<PixCommandResult<AgentTaskCommandDataV15<C>>>;
   onAgentTaskEvent: (callback: (event: AgentTaskEvent) => void) => () => void;
   onAgentTaskInputRequest: (callback: (request: AgentTaskInputRequest) => void) => () => void;
   getPendingAgentTaskInputRequests: () => Promise<AgentTaskInputRequest[]>;
@@ -326,8 +327,8 @@ const api: PixApi = {
   },
 
   // Agent task commands
-  sendAgentTaskCommand: <C extends AgentTaskCommandV142>(command: C) =>
-    ipcRenderer.invoke("agent-task-command", command) as Promise<PixCommandResult<AgentTaskCommandDataV142<C>>>,
+  sendAgentTaskCommand: <C extends AgentTaskCommandV15>(command: C) =>
+    ipcRenderer.invoke("agent-task-command", command) as Promise<PixCommandResult<AgentTaskCommandDataV15<C>>>,
   onAgentTaskEvent: (callback: (event: AgentTaskEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: AgentTaskEvent) => callback(data);
     ipcRenderer.on("agent-task-event", handler);

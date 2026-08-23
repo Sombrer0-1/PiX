@@ -45,6 +45,7 @@ import {
   type AgentTaskUsage,
 } from "../../shared/agent-task-types.js";
 import type { SubagentSingleResult } from "../../shared/subagent-types.js";
+import type { FileChangeSummary } from "../../shared/types.js";
 
 export const AGENT_TASK_DEFAULT_MAX_TASK_BYTES = 25 * 1024 * 1024; // PRD C5
 export const AGENT_TASK_DEFAULT_MAX_WORKSPACE_BYTES = 500 * 1024 * 1024; // PRD C5
@@ -75,6 +76,8 @@ export interface TaskIndexEntry {
   updatedAt: number;
   schemaVersion: number;
   lastWriterRunId: string;
+  /** 1.5 (P1): the owning group's workflow-owned flag, persisted so hydration (and retention exemptions) survive restarts. */
+  workflowOwned?: boolean;
 }
 export interface TaskIndex {
   schemaVersion: number;
@@ -100,7 +103,15 @@ export type TaskLogEventPayload =
   | { type: "plan_released"; planLink: AgentTaskPlanLink; reason: "plan_revised" | "plan_cancelled"; releasedAt: number }
   | { type: "input_requested"; request: AgentTaskInputRequest }
   | { type: "input_settled"; requestId: string; generation: number; outcome: "answered" | "cancelled" | "shutdown" }
-  | { type: "diagnostic"; code: string; message: string };
+  | { type: "diagnostic"; code: string; message: string }
+  // 1.5 (P3): item -> session transcript file binding, reported by the runtime
+  // at item start and at resume preparation; replayed by getTranscriptPage to
+  // locate each item's file (log-driven mapping, never directory enumeration).
+  | { type: "item_session"; itemIndex: number; sessionFileName: string }
+  // 1.5 (P4): a single file change, persisted per event (never a turn
+  // aggregate - TurnDiffSummary.changes accumulates in-turn and per-event
+  // aggregates would duplicate O(k^2); the renderer aggregates itself).
+  | { type: "file_change"; change: FileChangeSummary };
 export type TaskLogEvent = TaskLogEventPayload & { seq: number; ts: number };
 export interface OpenToolCall {
   toolCallId: string;
@@ -140,6 +151,18 @@ export interface SessionTranscriptInspection {
   kind: "valid" | "tail_corrupt" | "invalid";
   lastValidByteOffset: number;
   diagnostics: TaskStorageDiagnostic[];
+}
+/**
+ * 宽松分页读的返回(design plan §4.3)。entries 为该 item 的 session JSONL
+ * 中口径内的条目(message + display!==false 的 custom_message);totalCount 为
+ * 同口径的全文件计数;nextCursor 内部编码 {"o":<byteOffset>},到文件尾为
+ * null;skippedLines 为解析失败的行数(诊断用)。坏行跳过不计入任何计数。
+ */
+export interface TranscriptPageRead {
+  entries: unknown[];
+  totalCount: number;
+  nextCursor: string | null;
+  skippedLines: number;
 }
 export interface TaskBudgetReservation {
   reservationId: string;
@@ -291,6 +314,8 @@ function isTaskIndexEntry(value: unknown): boolean {
   if (!isFiniteNonNegative(value.updatedAt)) return false;
   if (typeof value.schemaVersion !== "number") return false;
   if (typeof value.lastWriterRunId !== "string") return false;
+  // 1.5 (P1): optional since pre-1.5 indexes never carry it.
+  if (value.workflowOwned !== undefined && typeof value.workflowOwned !== "boolean") return false;
   return true;
 }
 
@@ -398,6 +423,24 @@ function isTaskLogEventPayload(value: unknown): value is TaskLogEventPayload {
       );
     case "diagnostic":
       return typeof value.code === "string" && typeof value.message === "string";
+    case "item_session":
+      return isFiniteNonNegative(value.itemIndex) && typeof value.sessionFileName === "string";
+    case "file_change": {
+      // Mirrors the FileChangeSummary shape (added/removed from DiffSummary,
+      // toolCallId/toolName required, the rest optional).
+      const change = value.change;
+      if (!isRecord(change)) return false;
+      return (
+        isFiniteNonNegative(change.added) &&
+        isFiniteNonNegative(change.removed) &&
+        typeof change.toolCallId === "string" &&
+        typeof change.toolName === "string" &&
+        (change.path === undefined || typeof change.path === "string") &&
+        (change.diff === undefined || typeof change.diff === "string") &&
+        (change.patch === undefined || typeof change.patch === "string") &&
+        (change.firstChangedLine === undefined || isFiniteNonNegative(change.firstChangedLine))
+      );
+    }
     default:
       return false;
   }
@@ -1310,6 +1353,119 @@ export class AgentTaskStore {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     AgentTaskStore._assertSafeComponent(taskId, "taskId");
     return join(this._rootDir, workspaceId, taskId, "sessions");
+  }
+
+  /**
+   * 宽松分页读:按传入的 sessionFileName 读该 item 的 session 文件(design
+   * plan §4.3)。不修复、不报错(文件不存在返回全空结果)、坏行跳过并计入
+   * skippedLines、绝不写盘;cursor 缺省从头读,nextCursor 内部编码
+   * {"o":<byteOffset>},到文件尾为 null。与 resumer 的严格扫描器
+   * (inspectSessionTranscript)是两个独立实现:本读取器只做口径筛选,不做
+   * 任何结构校验或修复。
+   */
+  async readTranscriptPage(
+    workspaceId: string,
+    taskId: string,
+    sessionFileName: string,
+    cursor: string | undefined,
+    limit: number,
+  ): Promise<TranscriptPageRead> {
+    const sessionPath = this._sessionTranscriptPath(workspaceId, taskId, sessionFileName);
+    return AgentTaskStore._readFileSafe(sessionPath).then((buffer) => {
+      const empty: TranscriptPageRead = { entries: [], totalCount: 0, nextCursor: null, skippedLines: 0 };
+      if (buffer === null) {
+        return empty;
+      }
+      // Line table over BYTE offsets (never string indices): a cursor must
+      // resume at an exact byte-offset line start even when the file holds
+      // multi-byte UTF-8 content (中文/emoji).
+      const newlineIndexes: number[] = [];
+      for (let i = 0; i < buffer.length; i++) {
+        if (buffer[i] === 0x0a) newlineIndexes.push(i);
+      }
+      const lines: Array<{ start: number; endExclusive: number }> = [];
+      let start = 0;
+      for (const newline of newlineIndexes) {
+        lines.push({ start, endExclusive: newline + 1 });
+        start = newline + 1;
+      }
+      if (start < buffer.length) {
+        lines.push({ start, endExclusive: buffer.length });
+      }
+      // From-cursor handling stays lenient: an unparsable or out-of-range
+      // cursor restarts from the nearest line boundary (or EOF), never throws.
+      let from = 0;
+      if (cursor !== undefined) {
+        try {
+          const parsed = JSON.parse(cursor) as { o?: unknown };
+          if (typeof parsed.o === "number" && Number.isInteger(parsed.o) && parsed.o >= 0) {
+            from = Math.min(parsed.o, buffer.length);
+          }
+        } catch {
+          from = 0;
+        }
+      }
+      // totalCount/skippedLines are whole-file facts (诊断用), independent of
+      // the page window; entries/nextCursor are page-window facts.
+      let totalCount = 0;
+      let skippedLines = 0;
+      const page: unknown[] = [];
+      let nextCursor: string | null = null;
+      for (const line of lines) {
+        const isTail = line.start >= from;
+        let parsed: unknown = null;
+        try {
+          // Slice the BUFFER (byte offsets) and decode per line: a string
+          // slice would index by UTF-16 units and misalign every multi-byte
+          // character (中文/emoji 跨页).
+          const lineText = buffer.toString("utf8", line.start, line.endExclusive);
+          parsed = JSON.parse(lineText);
+        } catch {
+          parsed = null;
+        }
+        if (parsed === null) {
+          skippedLines++;
+          continue;
+        }
+        const record = parsed as Record<string, unknown>;
+        const isEntry =
+          typeof record.type === "string" &&
+          (record.type === "message" || (record.type === "custom_message" && record.display !== false));
+        if (!isEntry) {
+          continue;
+        }
+        totalCount++;
+        if (isTail && page.length < limit) {
+          page.push(parsed);
+          if (page.length === limit) {
+            // The page cut the file; the cursor continues after this entry line.
+            nextCursor = line.endExclusive < buffer.length ? JSON.stringify({ o: line.endExclusive }) : null;
+          }
+        }
+      }
+      // The tail held fewer entries than the limit: the file is exhausted.
+      if (page.length < limit) {
+        nextCursor = null;
+      }
+      return { entries: page, totalCount, nextCursor, skippedLines };
+    });
+  }
+
+  /** sessions 目录下的 .jsonl 文件名列表(字典序)。仅用于降级映射与诊断;目录不存在返回 []。 */
+  async listSessionFiles(workspaceId: string, taskId: string): Promise<string[]> {
+    AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
+    AgentTaskStore._assertSafeComponent(taskId, "taskId");
+    const sessionsDir = this.getTaskSessionDir(workspaceId, taskId);
+    let entries;
+    try {
+      entries = await readdir(sessionsDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    return entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+      .map((entry) => entry.name)
+      .sort();
   }
 
   /** Strict line-by-line/header inspection; never modifies the original file. */

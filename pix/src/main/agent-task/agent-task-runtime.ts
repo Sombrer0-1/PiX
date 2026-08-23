@@ -149,6 +149,26 @@ export const RESUME_TURN_MESSAGE =
 
 const TEXT_UPDATE_THROTTLE_MS = 100;
 
+/**
+ * 1.5 (P3): nested-session event types forwarded for live transcript viewing.
+ * The whitelist mirrors upstream §5.2: compaction/api_error/retry/vision are
+ * deliberately excluded (the task transcript does not chase full session-event
+ * parity; an accepted trade-off).
+ */
+const TRANSCRIPT_FORWARD_WHITELIST = new Set<AgentSessionEvent["type"]>([
+  "agent_start",
+  "agent_end",
+  "turn_start",
+  "turn_end",
+  "message_start",
+  "message_update",
+  "message_end",
+  "tool_execution_start",
+  "tool_execution_update",
+  "tool_execution_end",
+  "file_change",
+]);
+
 /** Workspace-fingerprint tool allowlist (design plan §4.7); bash is excluded. */
 const FINGERPRINT_TOOLS = new Set(["read", "grep", "find", "ls", "edit", "write"]);
 /** Tool arg fields that may carry a workspace path. */
@@ -422,7 +442,13 @@ export type AgentTaskRuntimeEvent =
   | AgentTaskRuntimeEventV141
   | { type: "checkpoint"; checkpoint: TaskCheckpoint }
   | { type: "assistant_finalized"; entryId: string }
-  | { type: "item_result"; result: SubagentSingleResult };
+  | { type: "item_result"; result: SubagentSingleResult }
+  // 1.5 (P3): transcript live forwarding + item->session-file binding.
+  // nested_transcript streams whitelisted nested session events through the
+  // service throttle queue; item_session maps an item to its session file in
+  // the task log (the service persists it, getTranscriptPage replays it).
+  | { type: "nested_transcript"; itemIndex: number; event: AgentSessionEvent } // coding-agent 类型
+  | { type: "item_session"; itemIndex: number; sessionFileName: string };
 
 /**
  * 1.4.2 (R3): resume seed handed to prepareResume (design plan §4.6). The
@@ -482,6 +508,9 @@ export class AgentTaskRuntime {
   private _fingerprintChain: Promise<void> = Promise.resolve();
   /** The run() callback; checkpoint events are delivered through it. */
   private _runOnEvent: ((event: AgentTaskRuntimeEvent) => void) | undefined;
+
+  // 1.5 (P3): nested-transcript live forwarding master switch.
+  private _transcriptForwarding = false;
 
   // 1.4.2 (R3) resume state (only set by prepareResume).
   private _resumeSeed: AgentTaskRuntimeResumeSeed | undefined;
@@ -732,6 +761,17 @@ export class AgentTaskRuntime {
     this._pendingInputs.delete(requestId);
     pending.resolve({ id: requestId, answers: {}, cancelled: true });
     return true;
+  }
+
+  /**
+   * 1.5 (P3): master switch for nested-transcript live forwarding (zero
+   * subscriptions keep zero overhead; nothing is produced while disabled).
+   * The service turns it on when a watcher's count goes 0->1, off on 1->0 and
+   * at terminal convergence. item_session is NOT gated by this switch (always
+   * reported; the service decides its own persistence).
+   */
+  setTranscriptForwarding(enabled: boolean): void {
+    this._transcriptForwarding = enabled;
   }
 
   // =========================================================================
@@ -1097,6 +1137,15 @@ export class AgentTaskRuntime {
       if (this._taskSessionDir !== undefined) {
         this._queueCheckpoint("item_start");
       }
+      // 1.5 (P3): report the item->session-file binding for the task log. The
+      // file name is final once the SessionManager is ready (its content may
+      // still flush later; the file name is what maps); a resumed item re-uses
+      // the prepared session, so the file is the seed's sessionFileName. An
+      // in-memory session (no taskSessionDir) has no file to map - skip.
+      const itemSessionFileName = this._currentSessionFileName();
+      if (itemSessionFileName !== null) {
+        state.onEvent({ type: "item_session", itemIndex: this._activeItemIndex, sessionFileName: itemSessionFileName });
+      }
 
       // Tool activation: undefined means all registered non-denylisted tools;
       // an explicit list must all be registered, otherwise the item fails
@@ -1388,6 +1437,15 @@ export class AgentTaskRuntime {
     nested: AgentSession | undefined,
     schemaChild: boolean,
   ): void {
+    // 1.5 (P3): live transcript forwarding sits at the very top (before the
+    // switch) so the original per-case logic stays untouched. Gate = the
+    // forwarding switch AND the whitelist; the payload is forwarded by
+    // reference (no clone - structured clone happens at the service send
+    // boundary); itemIndex is the runtime's current item index (same source as
+    // the checkpoint activeItemIndex).
+    if (this._transcriptForwarding && TRANSCRIPT_FORWARD_WHITELIST.has(event.type)) {
+      this._runOnEvent?.({ type: "nested_transcript", itemIndex: this._activeItemIndex, event });
+    }
     switch (event.type) {
       case "message_update": {
         if (event.message.role === "assistant") {

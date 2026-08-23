@@ -78,27 +78,31 @@ import {
   AGENT_TASK_SCHEMA_VERSION,
   DEFAULT_AUTO_BACKGROUND_MS,
   type AgentTaskActivity,
-  type AgentTaskClearAllResult,
   type AgentTaskDiagnosticExport,
   type AgentTaskFailureReason,
   type AgentTaskGroupHandle,
   type AgentTaskInfo,
   type AgentTaskInputRequest,
   type AgentTaskListSnapshot,
+  type AgentTaskLogSnapshot,
   type AgentTaskPlanLink,
   type AgentTaskPresentation,
   type AgentTaskRecoveryIssue,
-  type AgentTaskResumeSummary,
   type AgentTaskSpec,
   type AgentTaskStatus,
   type AgentTaskStopReason,
   type AgentTaskStorageStatus,
+  type AgentTaskTranscriptPage,
   type AgentTaskUsage,
   type AgentDefinitionSnapshot,
   type AgentTaskItemSpec,
   type AgentTaskItemSummary,
   type ResumeDecision,
 } from "../../shared/agent-task-types.js";
+import {
+  selectRetentionRemovals,
+  type RetentionCandidate,
+} from "./agent-task-retention.js";
 import type { ProjectLocation } from "../../shared/project-location.js";
 import type { ProductEvent, ProductEventErrorCategory, ProductEventName, ProductEventPayload } from "../../shared/product-events.js";
 import {
@@ -109,7 +113,7 @@ import {
   type SubagentFailureReason,
   type SubagentSingleResult,
 } from "../../shared/subagent-types.js";
-import type { RequestUserInputResponse } from "../../shared/types.js";
+import type { AgentSessionEvent as SharedAgentSessionEvent, RequestUserInputResponse } from "../../shared/types.js";
 
 export const MAX_PARALLEL_TASKS = 8;
 export const DEFAULT_MAX_TURNS = 50;
@@ -121,6 +125,10 @@ export const AGENT_TASK_CREATION_RESERVE_BYTES = 256 * 1024;
 export const SHUTDOWN_ABORT_TIMEOUT_MS = 5_000;
 const AUTO_BACKGROUND_ALLOWED_VALUES = [60_000, 120_000, 300_000] as const;
 const EVENT_THROTTLE_MS = 100;
+/** 1.5 (P3): per-task pending transcript queue capacity (overflow drops the oldest; the renderer's disk replay is the loss backstop). */
+export const MAX_PENDING_TRANSCRIPTS = 1000;
+/** 1.5 (P4): getTaskLog event cap - the snapshot keeps the newest 10000 and sets truncated. */
+export const MAX_TASK_LOG_EVENTS = 10000;
 
 // ============================================================================
 // Public contract (design plan §4.5, 1.4.1)
@@ -178,10 +186,16 @@ export type AgentTaskServiceEventV141 =
   | { type: "task_output"; taskId: string; output: string; truncated: boolean }
   | { type: "task_file_change"; taskId: string; planLink?: AgentTaskPlanLink; change: FileChangeSummary; aggregate: TurnDiffSummary }; // main-only
 // 1.4.2 (R2): storage_status / recovery_issue join the service event union.
+// 1.5 (P1): task_removed - the retention pass deleted a terminal task record;
+// the renderer mirror converges through this push.
 export type AgentTaskServiceEvent =
   | AgentTaskServiceEventV141
   | { type: "storage_status"; status: AgentTaskStorageStatus }
-  | { type: "recovery_issue"; issue: AgentTaskRecoveryIssue };
+  | { type: "recovery_issue"; issue: AgentTaskRecoveryIssue }
+  | { type: "task_removed"; taskId: string }
+  // 1.5 (P3): per-item transcript events for watched tasks (main-only union;
+  // the adapters forward the same-shaped shared event verbatim).
+  | { type: "task_transcript"; taskId: string; itemIndex: number; event: SharedAgentSessionEvent };
 
 /** Main-only delivery content (1.4.2 named contract, design plan §4.5). */
 export interface AgentTaskDelivery {
@@ -196,11 +210,13 @@ export interface AgentTaskDelivery {
 }
 export type AgentTaskDeliveryContent = AgentTaskDelivery;
 
-/** 1.4.2 (R2): restoreAll() report. */
+/** 1.4.2 (R2): restoreAll() report. 1.5 (P1) adds the auto-recovery counts. */
 export interface AgentTaskRestoreReport {
   restored: number;
   interrupted: number;
   corrupted: number;
+  autoResumed: number;
+  autoFailed: number;
   diagnostics: string[];
 }
 
@@ -231,6 +247,10 @@ export interface AgentTaskServiceTestHooks {
   autoBackgroundMsOverride?: number;
   /** Overrides the per-task creation budget reservation (tests use tiny stores). */
   reserveBytesOverride?: number;
+  /** 1.5 (P1): skip the post-hydration auto-recovery pass (hydration-focused tests). */
+  disableAutoRecovery?: boolean;
+  /** 1.5 (P1): retention window overrides (retention tests use tiny windows). */
+  retentionOverride?: { keepCount?: number; keepAgeMs?: number; emergencyKeepCount?: number; undeliveredGraceMs?: number };
 }
 
 let testHooks: AgentTaskServiceTestHooks | undefined;
@@ -277,7 +297,11 @@ interface GroupEntry {
   taskIds: string[];
   createdAt: number;
   detached: boolean;
-  /** workflow children only (design plan §4.6): manual/auto backgrounding is forbidden for these groups. Internal field, never persisted. */
+  /**
+   * workflow children only (design plan §4.6): manual/auto backgrounding is
+   * forbidden for these groups. 1.5 (P1): mirrored into every index entry so
+   * hydration (and the retention exemption) survives restarts.
+   */
   workflowOwned: boolean;
   autoBackgroundTimer: AutoBackgroundTimer | undefined;
   awaiters: Array<{ resolve: (result: AgentTaskAwaitResult) => void }>;
@@ -302,11 +326,15 @@ interface TaskEntry {
   /** 1.4.2 (R3): a resumed run is waiting for its first finalized assistant message (resume_succeeded). */
   resumedRun: boolean;
   stopReason: AgentTaskStopReason | undefined;
+  /** 1.5 (P1): the owning group's workflow flag (fresh: from the group; hydrated: from the index entry). */
+  workflowOwned: boolean;
   outputState: { text: string; truncated: boolean; originalBytes: number };
   throttle: {
     lastEmitAt: number;
     pendingActivities: AgentTaskActivity[];
     pendingOutput: { text: string; truncated: boolean; originalBytes: number } | undefined;
+    // 1.5 (P3): throttled transcript queue; overflow drops the oldest entry.
+    pendingTranscript: Array<{ itemIndex: number; event: SharedAgentSessionEvent }>;
     timer: AgentTaskServiceTimerHandle | undefined;
   };
   /** 1.4.2 (R2) persistence bookkeeping. */
@@ -371,7 +399,7 @@ function emptyTaskUsage(): AgentTaskUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
 }
 
-function isTerminalStatus(status: AgentTaskInfo["status"]): boolean {
+function isTerminalStatus(status: AgentTaskInfo["status"]): status is "completed" | "failed" | "cancelled" {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
@@ -428,6 +456,8 @@ export class AgentTaskService {
   private readonly _indexGenerations = new Map<string, number>();
   /** 1.4.2 (R3): per-task resume mutex (one resume request in flight per task). */
   private readonly _resumeLocks = new Set<string>();
+  /** 1.5 (P3): per-task transcript watcher count (counting; 1-window app, no per-webContents distinction). */
+  private readonly _watchers = new Map<string, number>();
   private readonly _resumer: AgentTaskResumer;
   private _disposed = false;
   private _disposePromise: Promise<void> | undefined;
@@ -638,49 +668,6 @@ export class AgentTaskService {
     await Promise.all(entries.map((entry) => this.cancel(entry.info.taskId, entry.info.generation, reason)));
   }
 
-  /**
-   * Manual backgrounding. Any child of a foreground group detaches the whole
-   * group: every non-terminal child flips to background, the group-level timer
-   * is cancelled and the single parent tool await resolves with the handle.
-   * Tasks are never restarted. Idempotent for already-background/terminal
-   * groups.
-   */
-  background(taskId: string, generation: number): { ok: boolean; reason?: string } {
-    const entry = this._tasks.get(taskId);
-    if (!entry) return { ok: false, reason: "not_found" };
-    if (entry.info.generation !== generation) return { ok: false, reason: "stale_generation" };
-    const group = this._groups.get(entry.info.groupId);
-    if (!group) return { ok: false, reason: "group_not_found" };
-    // Workflow children must never background (design plan §4.6): cancelGroup
-    // on a detached group is a no-op, so a backgrounded workflow child would
-    // outlive its dead parent run. The UI/IPC must not background such groups.
-    if (group.workflowOwned) return { ok: false, reason: "workflow_owned" };
-    if (group.detached || group.terminalSnapshot) {
-      return { ok: true };
-    }
-    this._detachGroup(group);
-    return { ok: true };
-  }
-
-  /** Group-level "keep waiting": cancels this round of the auto-background timer and clears the mirrored fields; presentation/status unchanged. */
-  continueForegroundWait(taskId: string, generation: number): { ok: boolean; reason?: string } {
-    const entry = this._tasks.get(taskId);
-    if (!entry) return { ok: false, reason: "not_found" };
-    if (entry.info.generation !== generation) return { ok: false, reason: "stale_generation" };
-    const group = this._groups.get(entry.info.groupId);
-    if (!group || group.detached || group.presentation !== "foreground" || !group.autoBackgroundTimer) {
-      return { ok: false, reason: "no_auto_background" };
-    }
-    this._cancelAutoBackgroundTimer(group);
-    for (const childId of group.taskIds) {
-      const child = this._tasks.get(childId);
-      if (child && !isTerminalStatus(child.info.status)) {
-        this._emitTaskState(childId);
-      }
-    }
-    return { ok: true };
-  }
-
   /** Detach every still-attached group of the given parent session (session switch/close path). */
   detachForegroundGroupsForSession(parentSessionId: string): AgentTaskGroupHandle[] {
     const handles: AgentTaskGroupHandle[] = [];
@@ -691,20 +678,6 @@ export class AgentTaskService {
       }
     }
     return handles;
-  }
-
-  /** Display-only presentation switch; never touches the auto-background timer. */
-  foreground(taskId: string, generation: number): { ok: boolean; reason?: string } {
-    const entry = this._tasks.get(taskId);
-    if (!entry) return { ok: false, reason: "not_found" };
-    if (entry.info.generation !== generation) return { ok: false, reason: "stale_generation" };
-    if (isTerminalStatus(entry.info.status)) return { ok: false, reason: "already_terminal" };
-    entry.info.presentation = "foreground";
-    entry.info.updatedAt = this._now();
-    entry.persist.pendingEvents.push({ type: "presentation", presentation: "foreground" });
-    this._schedulePersist(taskId);
-    this._emitTaskState(taskId);
-    return { ok: true };
   }
 
   /** Deliver the user's answer; the response id must equal the request id. */
@@ -770,116 +743,25 @@ export class AgentTaskService {
   }
 
   /**
-   * 1.4.2: terminal tasks AND interrupted/recovery-corrupt tasks can be
-   * cleared (queued/running/waiting_input always refuse); pending Plan links
-   * block clearing; results not delivered anywhere need the UI's second
-   * confirmation (confirmDataLoss). Clearing also deletes the on-disk record
-   * (index, log, checkpoint, transcript) and drops the recovery issue.
+   * 1.5 (P1): the single deletion primitive for the retention pass - deletes
+   * the on-disk record (index, log, checkpoint, transcript), drops any recovery
+   * issue, removes the in-memory entry and notifies the renderer through
+   * task_removed. Runs only from the serialized retention pass, after the
+   * task's pending persistence flushes have drained.
    */
-  async clearTask(taskId: string, generation: number, confirmDataLoss: boolean): Promise<{ ok: boolean; reason?: string }> {
-    const entry = this._tasks.get(taskId);
-    if (!entry) {
-      // A recovery-corrupt task has no in-memory entry; its recovery issue is
-      // clearable (the unreadable record is deleted; the UI must confirm the
-      // data loss because the record cannot be fully read).
-      const issue = this._recoveryIssues.get(taskId);
-      if (!issue) return { ok: false, reason: "not_found" };
-      if (!confirmDataLoss) return { ok: false, reason: "confirm_required" };
-      await this._store.deleteTask(issue.workspaceId, issue.taskId);
-      // The persistent index must forget the cleared task, otherwise a restart
-      // re-surfaces it as a "recovery data corrupt" record (an index entry
-      // whose task.json no longer exists).
-      const nextGeneration = await this._store.removeFromIndex(issue.workspaceId, issue.taskId, this._runId);
-      if (nextGeneration !== undefined) {
-        this._indexGenerations.set(issue.workspaceId, nextGeneration);
-      }
-      this._recoveryIssues.delete(taskId);
-      await this._refreshStorageStatus(issue.workspaceId);
-      return { ok: true };
-    }
-    if (entry.info.generation !== generation) return { ok: false, reason: "stale_generation" };
-    if (!isTerminalStatus(entry.info.status) && entry.info.status !== "interrupted") {
-      return { ok: false, reason: "task_not_terminal" };
-    }
-    if (entry.info.planLinkState === "pending") return { ok: false, reason: "plan_pending" };
-    if (!confirmDataLoss && entry.info.deliveredSessionIds.length === 0) {
-      return { ok: false, reason: "confirm_required" };
-    }
+  private async _deleteTaskRecord(entry: TaskEntry): Promise<void> {
     const workspaceId = entry.info.workspaceId;
     await this._store.deleteTask(workspaceId, entry.info.taskId);
     this._recoveryIssues.delete(entry.info.taskId);
     this._removeTask(entry);
-    // The persistent index must forget the cleared task (see above); the store
-    // removes only this taskId so unrelated recovery-corrupt entries keep
-    // surfacing, and the empty entries array is still written when it was the
-    // workspace's last task.
+    // The persistent index must forget the deleted task, otherwise a restart
+    // re-surfaces it as a "recovery data corrupt" record (an index entry whose
+    // task.json no longer exists).
     const nextGeneration = await this._store.removeFromIndex(workspaceId, entry.info.taskId, this._runId);
     if (nextGeneration !== undefined) {
       this._indexGenerations.set(workspaceId, nextGeneration);
     }
-    await this._refreshStorageStatus(workspaceId);
-    return { ok: true };
-  }
-
-  // =========================================================================
-  // 1.4.2 (R3) recovery commands
-  // =========================================================================
-
-  /**
-   * Clear every terminal (completed/failed/cancelled) task of the workspace
-   * that is NOT protected by a pending Plan link. Interrupted and
-   * recovery-corrupt records are never part of this operation; their taskIds
-   * are returned as protectedTaskIds so the UI can state exactly what was not
-   * deleted (partial cleanup is never reported as full success).
-   */
-  async clearAllTerminal(
-    workspaceId: string | undefined,
-    confirm: boolean,
-  ): Promise<{ ok: true; data: AgentTaskClearAllResult } | { ok: false; reason: string }> {
-    if (!confirm) {
-      return { ok: false, reason: "confirm_required" };
-    }
-    const protectedTaskIds: string[] = [];
-    let cleared = 0;
-    const touchedWorkspaces = new Set<string>();
-    const candidates = [...this._tasks.values()].filter(
-      (entry) => workspaceId === undefined || entry.info.workspaceId === workspaceId,
-    );
-    for (const entry of candidates) {
-      const info = entry.info;
-      if (info.planLinkState === "pending") {
-        protectedTaskIds.push(info.taskId);
-        continue;
-      }
-      if (info.status === "completed" || info.status === "failed" || info.status === "cancelled") {
-        const workspaceId = info.workspaceId;
-        await this._store.deleteTask(workspaceId, info.taskId);
-        this._recoveryIssues.delete(info.taskId);
-        this._removeTask(entry);
-        // The persistent index must forget the cleared task (see clearTask);
-        // the empty entries array is still written when it was the last task.
-        const nextGeneration = await this._store.removeFromIndex(workspaceId, info.taskId, this._runId);
-        if (nextGeneration !== undefined) {
-          this._indexGenerations.set(workspaceId, nextGeneration);
-        }
-        touchedWorkspaces.add(workspaceId);
-        cleared++;
-      } else {
-        // interrupted (and any non-terminal) tasks are never cleared here.
-        protectedTaskIds.push(info.taskId);
-      }
-    }
-    // Corrupt records (recovery issues without an in-memory entry) are never
-    // part of the bulk clear either; their ids surface as protected.
-    for (const issue of this._recoveryIssues.values()) {
-      if ((workspaceId === undefined || issue.workspaceId === workspaceId) && !this._tasks.has(issue.taskId)) {
-        protectedTaskIds.push(issue.taskId);
-      }
-    }
-    for (const ws of touchedWorkspaces) {
-      await this._refreshStorageStatus(ws);
-    }
-    return { ok: true, data: { cleared, protectedTaskIds } };
+    this._emitServiceEvent({ type: "task_removed", taskId: entry.info.taskId });
   }
 
   /**
@@ -929,32 +811,6 @@ export class AgentTaskService {
       2,
     );
     return { fileName: `agent-task-${taskId}.diagnostics.json`, content };
-  }
-
-  /**
-   * 1.4.2 (R3): resume summary for the user's confirmation UI. The resumer
-   * computes the branch-truth open calls, workspace changes and the
-   * model/environment signals; failures are thrown with a stable reason code.
-   */
-  async getResumeSummary(taskId: string, generation: number): Promise<AgentTaskResumeSummary> {
-    const entry = this._tasks.get(taskId);
-    if (!entry) {
-      throw new Error("not_found");
-    }
-    if (entry.info.generation !== generation) {
-      throw new Error("stale_generation");
-    }
-    if (this._disposed) {
-      throw new Error("service_disposed");
-    }
-    if (entry.info.status !== "interrupted") {
-      throw new Error("task_not_interrupted");
-    }
-    const checkpoint = entry.persist.lastCheckpoint;
-    if (checkpoint === null) {
-      throw new Error("checkpoint_unavailable");
-    }
-    return this._resumer.getSummary(entry.info, checkpoint);
   }
 
   /**
@@ -1045,6 +901,18 @@ export class AgentTaskService {
       entry.info.updatedAt = this._now();
       this._logStateEvent(entry, from, "queued", "resume prepared");
       entry.persist.pendingCheckpoints.push({ ...prepared.checkpoint, generation: entry.info.generation });
+      // 1.5 (P3): the resumed item's session file is FINAL (the seed's
+      // sessionFileName, overriding any file the resumer created for the next
+      // item). The runtime cannot emit item_session before run() attaches its
+      // event channel, so the service persists the mapping from the prepared
+      // checkpoint - the same fact the runtime reports at item start.
+      if (prepared.checkpoint.sessionFileName !== null) {
+        entry.persist.pendingEvents.push({
+          type: "item_session",
+          itemIndex: prepared.activeItemIndex,
+          sessionFileName: prepared.checkpoint.sessionFileName,
+        });
+      }
       entry.persist.indexDirty = true;
       entry.persist.resumePersistPending = true;
       try {
@@ -1068,6 +936,12 @@ export class AgentTaskService {
 
       entry.runtime = prepared.runtime;
       entry.resumedRun = true;
+      // 1.5 (P3): resume handoff - a watcher that subscribed during the
+      // interrupted/queued phase must keep the stream once the slot grants the
+      // run (the count is also applied at the _startTask creation point).
+      if ((this._watchers.get(taskId) ?? 0) > 0) {
+        entry.runtime.setTranscriptForwarding(true);
+      }
       this._emitTaskState(taskId);
       this._scheduler.enqueue(taskId);
       this._refreshQueuePositions();
@@ -1081,8 +955,19 @@ export class AgentTaskService {
     }
   }
 
-  /** 1.4.2 (R3): explicit user decision - an interrupted task becomes failed(user_decision). */
-  async markFailed(taskId: string, generation: number, reason: "user_decision"): Promise<{ ok: boolean; reason?: string }> {
+  /**
+   * 1.4.2 (R3) manual mark-failed became the 1.5 (P1) internal convergence for
+   * interrupted tasks the auto-recovery pass could not resume: failed with the
+   * dedicated resume_blocked code (never user_decision - no user decided) and
+   * the concrete resume failure reason in the message. The failed result is
+   * auto-delivered to the parent session like any terminal background task.
+   */
+  async markFailed(
+    taskId: string,
+    generation: number,
+    reason: "user_decision" | "resume_blocked",
+    message?: string,
+  ): Promise<{ ok: boolean; reason?: string }> {
     const entry = this._tasks.get(taskId);
     if (!entry) return { ok: false, reason: "not_found" };
     if (entry.info.generation !== generation) return { ok: false, reason: "stale_generation" };
@@ -1092,7 +977,11 @@ export class AgentTaskService {
     const from = entry.info.status;
     entry.info.status = "failed";
     entry.info.failureReason = reason;
-    entry.info.errorMessage = "The task was marked failed by the user.";
+    entry.info.errorMessage =
+      message ??
+      (reason === "resume_blocked"
+        ? "The interrupted task could not be resumed automatically after restart."
+        : "The task was marked failed by the user.");
     entry.info.endedAt = now;
     entry.info.durationMs = Math.max(0, now - (entry.info.startedAt ?? now));
     entry.info.autoBackground = undefined;
@@ -1109,6 +998,7 @@ export class AgentTaskService {
       model: this._firstItemModel(entry.info),
     });
     this._checkGroupTerminal(entry.info.groupId);
+    this._maybeAutoDeliver(entry);
     return { ok: true };
   }
 
@@ -1174,12 +1064,121 @@ export class AgentTaskService {
     return this._input.getPending();
   }
 
+  /**
+   * 1.5 (P3): register a transcript watcher (counting; TaskDetailPanel is the
+   * single owner). Unknown tasks return false without throwing. The 0->1
+   * transition enables the runtime's live forwarding when a runtime already
+   * exists; a later runtime creation (_startTask / resume handoff) re-applies
+   * the current count so a queued-phase subscription never misses the stream.
+   */
+  watchTask(taskId: string): boolean {
+    const entry = this._tasks.get(taskId);
+    if (!entry) {
+      return false;
+    }
+    const prev = this._watchers.get(taskId) ?? 0;
+    this._watchers.set(taskId, prev + 1);
+    if (prev === 0) {
+      entry.runtime?.setTranscriptForwarding(true);
+    }
+    return true;
+  }
+
+  /** 1.5 (P3): release one watcher reference; an unknown task is an idempotent no-op (success). */
+  unwatchTask(taskId: string): void {
+    const prev = this._watchers.get(taskId) ?? 0;
+    if (prev <= 1) {
+      this._watchers.delete(taskId);
+    } else {
+      this._watchers.set(taskId, prev - 1);
+    }
+    if (prev === 1) {
+      this._tasks.get(taskId)?.runtime?.setTranscriptForwarding(false);
+    }
+  }
+
+  /** 1.5 (P3): adapters query - does the task hold at least one watcher? */
+  isTaskWatched(taskId: string): boolean {
+    return (this._watchers.get(taskId) ?? 0) > 0;
+  }
+
+  /**
+   * 1.5 (P3): 宽松读取任务 transcript 页(design plan §4.3/§4.5)。任务不在
+   * 镜像时抛 Error("not_found");item->session 文件映射由任务日志的
+   * item_session 条目回放构建(后写覆盖先写),无条目的旧任务走降级路径
+   * (单文件直映/字典序序数);读文件异常向上抛原始错误(getTaskLog 属 S6)。
+   */
+  async getTranscriptPage(
+    taskId: string,
+    itemIndex: number,
+    cursor: string | undefined,
+    limit: number,
+  ): Promise<AgentTaskTranscriptPage> {
+    const entry = this._tasks.get(taskId);
+    if (!entry) {
+      throw new Error("not_found");
+    }
+    // The mapping must reflect the latest flush (a runtime item_session emitted
+    // in the same tick would otherwise be missed by the log replay below).
+    await this._drainPersist();
+    const read = await this._store.readTask(entry.info.workspaceId, taskId);
+    const mapping = new Map<number, string>();
+    for (const event of read.events) {
+      if (event.type === "item_session") {
+        mapping.set(event.itemIndex, event.sessionFileName);
+      }
+    }
+    let sessionFileName: string | undefined;
+    if (mapping.size > 0) {
+      sessionFileName = mapping.get(itemIndex);
+    } else {
+      // Legacy task without item_session entries: one file maps every item;
+      // several files fall back to the lexicographic ordinal (best effort, no
+      // migration - orphan files are a known historical limitation).
+      const files = await this._store.listSessionFiles(entry.info.workspaceId, taskId);
+      if (files.length === 1) {
+        sessionFileName = files[0];
+      } else if (files.length > 1) {
+        sessionFileName = files[itemIndex];
+      }
+    }
+    if (sessionFileName === undefined) {
+      // No mapping and no file to fall back on: an honest empty page.
+      return { taskId, itemIndex, entries: [], totalCount: 0, nextCursor: null };
+    }
+    const page = await this._store.readTranscriptPage(entry.info.workspaceId, taskId, sessionFileName, cursor, limit);
+    return { taskId, itemIndex, ...page };
+  }
+
+  /**
+   * 1.5 (P4): 任务事件日志快照(design plan §4.2/§4.5)。任务不在镜像时抛
+   * Error("not_found");内部先 await _drainPersist() 保证终态后立即读取也能
+   * 看到已 flush 的尾部(事件/checkpoint 排队在串行 flush 队列上),再 readTask。
+   * 超过 MAX_TASK_LOG_EVENTS 条时只保留最新 10000 条并置 truncated=true。
+   */
+  async getTaskLog(taskId: string): Promise<AgentTaskLogSnapshot> {
+    const entry = this._tasks.get(taskId);
+    if (!entry) {
+      throw new Error("not_found");
+    }
+    await this._drainPersist();
+    const read = await this._store.readTask(entry.info.workspaceId, taskId);
+    const truncated = read.events.length > MAX_TASK_LOG_EVENTS;
+    const events = truncated ? read.events.slice(-MAX_TASK_LOG_EVENTS) : read.events;
+    return { taskId, events, truncated };
+  }
+
   registerSessionDeliverySink(
     sessionId: string,
     workspaceId: string,
     sink: (content: AgentTaskDeliveryContent) => Promise<void>,
   ): () => void {
     this._deliverySinks.set(sessionId, { workspaceId, sink });
+    // 1.5 (P1): the manual send-to-session fallback is gone; a session sink
+    // coming up is the one moment an undelivered terminal result can finally
+    // land, so catch up right here (sendResultToSession deduplicates through
+    // deliveredSessionIds, making the scan idempotent).
+    this._deliverPendingTerminalTasks(sessionId, workspaceId);
     return () => {
       if (this._deliverySinks.get(sessionId)?.sink === sink) {
         this._deliverySinks.delete(sessionId);
@@ -1696,6 +1695,9 @@ export class AgentTaskService {
 
   private _createTaskEntry(spec: AgentTaskSpec, presentation: AgentTaskPresentation): TaskEntry {
     const now = this._now();
+    // 1.5 (S1): the workflow-owned flag is known at group creation; mirror it
+    // into the initial AgentTaskInfo (later hydrated from the index entry).
+    const workflowOwned = this._groups.get(spec.groupId)?.workflowOwned ?? false;
     const info: AgentTaskInfo = {
       schemaVersion: AGENT_TASK_SCHEMA_VERSION,
       taskId: spec.taskId,
@@ -1725,6 +1727,7 @@ export class AgentTaskService {
       deliveredSessionIds: [],
       planLinkState: spec.planLink ? "pending" : "none",
       generation: 0,
+      workflowOwned,
     };
     const entry: TaskEntry = {
       spec,
@@ -1735,8 +1738,9 @@ export class AgentTaskService {
       cancelRequested: false,
       resumedRun: false,
       stopReason: undefined,
+      workflowOwned,
       outputState: { text: "", truncated: false, originalBytes: 0 },
-      throttle: { lastEmitAt: 0, pendingActivities: [], pendingOutput: undefined, timer: undefined },
+      throttle: { lastEmitAt: 0, pendingActivities: [], pendingOutput: undefined, pendingTranscript: [], timer: undefined },
       persist: {
         initialized: false,
         pendingEvents: [],
@@ -1803,6 +1807,13 @@ export class AgentTaskService {
     // idle session was built by prepareResume before the queued state landed);
     // only fresh tasks create a runtime here.
     entry.runtime = entry.runtime ?? this._createRuntime(entry.spec);
+    // 1.5 (P3): a watcher subscribed while the task was queued must see the
+    // stream from the first emitted event - initialize the (possibly fresh)
+    // runtime's forwarding state from the current watcher count (idempotent
+    // for the resume handoff, which already applied it).
+    if ((this._watchers.get(taskId) ?? 0) > 0) {
+      entry.runtime.setTranscriptForwarding(true);
+    }
     const runPromise = entry.runtime.run(controller.signal, (event) => this._onRuntimeEvent(taskId, event));
     this._inFlight.add(runPromise);
     runPromise.then(
@@ -1880,6 +1891,52 @@ export class AgentTaskService {
           change: event.change,
           aggregate: event.aggregate,
         });
+        // 1.5 (P4): persist the single change (never the turn aggregate -
+        // TurnDiffSummary.changes accumulates in-turn, per-event aggregates
+        // would duplicate O(k^2); the renderer aggregates from the stream).
+        entry.persist.pendingEvents.push({ type: "file_change", change: event.change });
+        this._schedulePersist(taskId);
+        break;
+      }
+      case "nested_transcript": {
+        // 1.5 (P3): live transcript - only watched tasks buffer; the 100ms
+        // throttle coalesces the stream. The runtime's nested_transcript.event
+        // is the coding-agent mirror union; the single allowed conversion seam
+        // (design plan §2.3) lands it on the shared union here - the two
+        // unions carry the same members, only the agents' source packages
+        // differ.
+        if ((this._watchers.get(taskId) ?? 0) <= 0) {
+          break;
+        }
+        const pending = entry.throttle.pendingTranscript;
+        const next: { itemIndex: number; event: SharedAgentSessionEvent } = {
+          itemIndex: event.itemIndex,
+          event: event.event as unknown as SharedAgentSessionEvent,
+        };
+        const tail = pending[pending.length - 1];
+        // Streaming text is a full snapshot: a trailing message_update is
+        // replaced in place (intermediate states are lossless). The merge is
+        // scoped to the same item so a chain's item boundary cannot swallow an
+        // update from the next item.
+        if (tail !== undefined && tail.itemIndex === next.itemIndex && tail.event.type === "message_update" && next.event.type === "message_update") {
+          tail.event = next.event;
+        } else {
+          pending.push(next);
+          if (pending.length > MAX_PENDING_TRANSCRIPTS) {
+            // Capacity overflow drops the OLDEST entry (the renderer's
+            // terminal/overflow disk replay is the backstop).
+            pending.splice(0, pending.length - MAX_PENDING_TRANSCRIPTS);
+          }
+        }
+        this._scheduleThrottleFlush(taskId);
+        break;
+      }
+      case "item_session": {
+        // 1.5 (P3): item->session-file binding is written to the task log
+        // immediately (same rule as activity: never throttled, watcher-
+        // independent - the mapping is a recovery fact, not a live view).
+        entry.persist.pendingEvents.push({ type: "item_session", itemIndex: event.itemIndex, sessionFileName: event.sessionFileName });
+        this._schedulePersist(taskId);
         break;
       }
       case "item_result": {
@@ -2028,13 +2085,27 @@ export class AgentTaskService {
     this._logStateEvent(entry, from, entry.info.status, entry.stopReason);
     entry.persist.indexDirty = true;
     this._schedulePersist(entry.info.taskId);
+    // 1.5 (P3): terminal convergence - the remaining transcript events flush
+    // BEFORE the terminal task_state (once the renderer observes the terminal
+    // state it replays from disk, so dropping the last live events is lossless
+    // by design); watchers are cleared and the live runtime's forwarding is
+    // switched off (an already-cleared runtime - entry.runtime undefined -
+    // needs nothing).
     this._flushThrottle(entry.info.taskId);
+    if ((this._watchers.get(entry.info.taskId) ?? 0) > 0) {
+      entry.runtime?.setTranscriptForwarding(false);
+    }
+    this._watchers.delete(entry.info.taskId);
     this._emitTaskState(entry.info.taskId);
     this._recordTaskTerminalEvent(entry.info);
     this._releaseSlot(entry);
     this._releaseResumeReservation(entry);
     this._checkGroupTerminal(entry.info.groupId);
     this._maybeAutoDeliver(entry);
+    // 1.5 (P1): every terminal transition is a retention point; the pass is
+    // serialized behind the flush queue and its own exemptions (pending Plan,
+    // undelivered-within-grace) protect freshly finished tasks.
+    this._scheduleRetention(entry.info.workspaceId);
   }
 
   /** Frees a held slot exactly once; terminal/aborted runs always release it. */
@@ -2468,6 +2539,9 @@ export class AgentTaskService {
       updatedAt: entry.info.updatedAt,
       schemaVersion: AGENT_TASK_SCHEMA_VERSION,
       lastWriterRunId: this._runId,
+      // 1.5 (P1): persisted so hydration rebuilds the group flag (retention
+      // exemption and the background/delivery guards survive restarts).
+      workflowOwned: entry.workflowOwned,
     };
   }
 
@@ -2486,6 +2560,12 @@ export class AgentTaskService {
     this._storageStatuses.set(workspaceId, status);
     if (!prev || prev.level !== level) {
       this._emitServiceEvent({ type: "storage_status", status });
+      // 1.5 (P1): reaching "full" activates the emergency retention window.
+      // Only the ok/warning -> full transition triggers (a pass that lands
+      // still-full cannot retrigger itself).
+      if (level === "full" && prev?.level !== "full") {
+        this._scheduleRetention(workspaceId);
+      }
     }
   }
 
@@ -2503,7 +2583,7 @@ export class AgentTaskService {
    * forge an AgentTaskInfo.
    */
   async restoreAll(): Promise<AgentTaskRestoreReport> {
-    const report: AgentTaskRestoreReport = { restored: 0, interrupted: 0, corrupted: 0, diagnostics: [] };
+    const report: AgentTaskRestoreReport = { restored: 0, interrupted: 0, corrupted: 0, autoResumed: 0, autoFailed: 0, diagnostics: [] };
     const workspaces = await this._store.listWorkspaces();
     for (const workspaceId of workspaces) {
       const index = await this._store.readIndex(workspaceId);
@@ -2547,7 +2627,47 @@ export class AgentTaskService {
       }
       await this._refreshStorageStatus(workspaceId);
     }
+    // 1.5 (P1): no task may linger in interrupted waiting for a user decision
+    // - the auto-recovery pass resumes what it safely can and converges the
+    // rest to failed(resume_blocked). Retention then trims the terminal
+    // history per the keep policy (both strictly after hydration settled).
+    if (!testHooks?.disableAutoRecovery) {
+      await this._autoRecoverInterruptedTasks(report);
+    }
+    const workspaceIds = [...this._storageStatuses.keys()];
+    for (const workspaceId of workspaceIds) {
+      this._scheduleRetention(workspaceId);
+    }
     return report;
+  }
+
+  /**
+   * 1.5 (P1) design plan §6.2: after hydration, every interrupted task gets an
+   * automatic decision through the SAME resume machinery a user decision used
+   * to trigger - fixed decision {continue, confirmWorkspaceChanges:false}
+   * (never auto-confirming workspace changes). A failed resume (workspace
+   * changed, corrupt transcript, model unavailable, storage) converges to
+   * failed(resume_blocked) with the concrete reason, auto-delivered like any
+   * terminal background task; recovery issues (e.g. mid_log_corrupt) stay
+   * visible alongside. Sequential on purpose: each resume reserves budget and
+   * enqueues, so a burst must not interleave.
+   */
+  private async _autoRecoverInterruptedTasks(report: AgentTaskRestoreReport): Promise<void> {
+    const interrupted = [...this._tasks.values()].filter((entry) => entry.info.status === "interrupted");
+    for (const entry of interrupted) {
+      const taskId = entry.info.taskId;
+      const generation = entry.info.generation;
+      const result = await this.resume(taskId, generation, { action: "continue", confirmWorkspaceChanges: false });
+      if (result.ok) {
+        report.autoResumed++;
+        continue;
+      }
+      const message = `Automatic resume after restart failed (${result.reason ?? "unknown"}). The task was converged to failed; see the recovery issue or diagnostics for details.`;
+      const failed = await this.markFailed(taskId, generation, "resume_blocked", message);
+      if (failed.ok) {
+        report.autoFailed++;
+      }
+    }
   }
 
   /**
@@ -2620,6 +2740,9 @@ export class AgentTaskService {
     }
 
     const info = this._rebuildInfoFromLog(read.metadata.spec, read.metadata.initialInfo, read.events, indexEntry);
+    // 1.5 (S1): the workflow-owned flag is read back from the persisted index
+    // entry (the log replay may predate the field; the index is authoritative).
+    info.workflowOwned = indexEntry.workflowOwned === true;
     // 1.4.2 (R3): the checkpoint generation must equal the folded task
     // generation (from the state events) or lag it by exactly one - the crash
     // window between a resume's queued state event and its generation+1
@@ -2666,8 +2789,9 @@ export class AgentTaskService {
       cancelRequested: false,
       resumedRun: false,
       stopReason: info.stopReason,
+      workflowOwned: indexEntry.workflowOwned === true,
       outputState: { text: info.finalOutput, truncated: info.outputTruncated, originalBytes: info.originalOutputBytes },
-      throttle: { lastEmitAt: 0, pendingActivities: [], pendingOutput: undefined, timer: undefined },
+      throttle: { lastEmitAt: 0, pendingActivities: [], pendingOutput: undefined, pendingTranscript: [], timer: undefined },
       persist: {
         initialized: true,
         pendingEvents: [],
@@ -2718,9 +2842,10 @@ export class AgentTaskService {
       taskIds: entries.map((entry) => entry.info.taskId),
       createdAt: Math.min(...entries.map((entry) => entry.info.createdAt)),
       detached: true,
-      // workflowOwned is an internal in-memory flag (never persisted): a
-      // restored group can no longer own workflow semantics, so it is false.
-      workflowOwned: false,
+      // 1.5 (P1): the workflow-owned flag now survives restarts through the
+      // persisted index entry, so workflow groups keep their retention
+      // exemption and delivery-guard semantics after hydration.
+      workflowOwned: entries.some((entry) => entry.workflowOwned),
       autoBackgroundTimer: undefined,
       awaiters: [],
       terminalSnapshot: undefined,
@@ -3185,6 +3310,38 @@ export class AgentTaskService {
   // Delivery + clearing
   // =========================================================================
 
+  /**
+   * Shared auto-delivery eligibility (design plan §6.1): terminal, detached
+   * group, not workflow-owned, not Plan-linked, a non-empty parent session,
+   * same workspace, not already delivered there.
+   */
+  private _isAutoDeliverable(entry: TaskEntry, targetSessionId: string, workspaceId: string): boolean {
+    if (!isTerminalStatus(entry.info.status)) return false;
+    if (entry.info.workspaceId !== workspaceId) return false;
+    if (entry.info.parentSessionId !== targetSessionId) return false;
+    if (entry.info.parentSessionId === "") return false;
+    if (entry.info.deliveredSessionIds.includes(targetSessionId)) return false;
+    const group = this._groups.get(entry.info.groupId);
+    if (!group || !group.detached || group.workflowOwned) return false;
+    if (entry.info.planLink) return false;
+    return true;
+  }
+
+  /**
+   * 1.5 (P1): deliver every still-undelivered terminal result of the session
+   * that just opened a sink (the task finished while no sink existed).
+   */
+  private _deliverPendingTerminalTasks(sessionId: string, workspaceId: string): void {
+    for (const entry of this._tasks.values()) {
+      if (!this._isAutoDeliverable(entry, sessionId, workspaceId)) continue;
+      void this.sendResultToSession(entry.info.taskId, entry.info.generation, sessionId).then((result) => {
+        if (!result.ok && result.reason !== "target_session_not_open" && result.reason !== "duplicate_delivery") {
+          console.warn("[AgentTaskService] delivery catch-up failed:", result.reason);
+        }
+      });
+    }
+  }
+
   private _resultSummary(info: AgentTaskInfo): string {
     const statuses = info.results
       .map((result) => `${result.agentName} [${result.status}${result.failureReason ? ` (${result.failureReason})` : ""}]`)
@@ -3199,21 +3356,13 @@ export class AgentTaskService {
    * workflow-owned groups have their own consumers.
    */
   private _maybeAutoDeliver(entry: TaskEntry): void {
-    const group = this._groups.get(entry.info.groupId);
-    if (!group || !group.detached || group.workflowOwned) {
+    if (entry.info.parentSessionId === "") {
       return;
     }
-    if (entry.info.planLink) {
+    if (!this._isAutoDeliverable(entry, entry.info.parentSessionId, entry.info.workspaceId)) {
       return;
     }
-    const parentSessionId = entry.info.parentSessionId;
-    if (parentSessionId === "") {
-      return;
-    }
-    if (entry.info.deliveredSessionIds.includes(parentSessionId)) {
-      return;
-    }
-    void this.sendResultToSession(entry.info.taskId, entry.info.generation, parentSessionId).then((result) => {
+    void this.sendResultToSession(entry.info.taskId, entry.info.generation, entry.info.parentSessionId).then((result) => {
       if (!result.ok && result.reason !== "target_session_not_open" && result.reason !== "duplicate_delivery") {
         console.warn("[AgentTaskService] auto-delivery failed:", result.reason);
       }
@@ -3238,6 +3387,66 @@ export class AgentTaskService {
         this._groups.delete(group.groupId);
       }
     }
+  }
+
+  // =========================================================================
+  // 1.5 (P1) retention (design plan §6.3)
+  // =========================================================================
+
+  /**
+   * Serialize one retention pass onto the persistence flush queue: it runs
+   * strictly after the workspace's pending flushes, so a task's terminal state
+   * event is durably written before its record could be deleted. The pass
+   * never schedules itself (its own storage refresh cannot retrigger it).
+   */
+  private _scheduleRetention(workspaceId: string): void {
+    this._flushTail = this._flushTail.then(
+      () => this._runRetentionForWorkspace(workspaceId).catch((err: unknown) => {
+        console.error("[AgentTaskService] retention pass failed:", err);
+      }),
+      () => this._runRetentionForWorkspace(workspaceId).catch((err: unknown) => {
+        console.error("[AgentTaskService] retention pass failed:", err);
+      }),
+    );
+  }
+
+  private async _runRetentionForWorkspace(workspaceId: string): Promise<void> {
+    const emergency = this._storageStatuses.get(workspaceId)?.level === "full";
+    const candidates: RetentionCandidate[] = [];
+    for (const entry of this._tasks.values()) {
+      if (entry.info.workspaceId !== workspaceId || !isTerminalStatus(entry.info.status)) {
+        continue;
+      }
+      candidates.push({
+        taskId: entry.info.taskId,
+        status: entry.info.status,
+        endedAt: entry.info.endedAt ?? entry.info.updatedAt,
+        planLinkState: entry.info.planLinkState,
+        parentSessionId: entry.info.parentSessionId,
+        deliveredCount: entry.info.deliveredSessionIds.length,
+        workflowOwned: entry.workflowOwned,
+      });
+    }
+    const removals = selectRetentionRemovals(candidates, {
+      now: this._now(),
+      emergency,
+      ...(testHooks?.retentionOverride ?? {}),
+    });
+    if (removals.length === 0) {
+      return;
+    }
+    for (const taskId of removals) {
+      const entry = this._tasks.get(taskId);
+      if (!entry || !isTerminalStatus(entry.info.status)) {
+        continue; //状态在快照之后变化:以当前为准,永不删非终态
+      }
+      try {
+        await this._deleteTaskRecord(entry);
+      } catch (err) {
+        console.error(`[AgentTaskService] retention delete failed for task ${taskId}:`, err);
+      }
+    }
+    await this._refreshStorageStatus(workspaceId);
   }
 
   // =========================================================================
@@ -3293,14 +3502,20 @@ export class AgentTaskService {
     }
     const activities = entry.throttle.pendingActivities;
     const output = entry.throttle.pendingOutput;
+    const transcripts = entry.throttle.pendingTranscript;
     entry.throttle.pendingActivities = [];
     entry.throttle.pendingOutput = undefined;
+    entry.throttle.pendingTranscript = [];
     entry.throttle.lastEmitAt = this._now();
     if (activities.length > 0) {
       this._emitServiceEvent({ type: "task_activities", taskId, activities });
     }
     if (output) {
       this._emitServiceEvent({ type: "task_output", taskId, output: output.text, truncated: output.truncated });
+    }
+    // 1.5 (P3): one task_transcript per buffered entry, in arrival order.
+    for (const pending of transcripts) {
+      this._emitServiceEvent({ type: "task_transcript", taskId, itemIndex: pending.itemIndex, event: pending.event });
     }
   }
 

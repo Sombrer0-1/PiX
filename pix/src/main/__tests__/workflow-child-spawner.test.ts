@@ -688,14 +688,20 @@ await run("spawner: backgrounded child rejects and dispose cancels by taskId eve
 // Section A: workflowOwned group protections
 // ============================================================================
 
-await run("workflowOwned: background() refuses with workflow_owned", async () => {
+await run("workflowOwned: the flag is persisted into the task index (restart-safe exemption)", async () => {
   const harness = makeHarness();
   const spawner = createAgentTaskChildSpawner(harness.service);
   const child = await spawner.start(makeRequest(), makeParent(harness), new AbortController().signal);
 
-  const outcome = harness.service.background(child.id, 0);
-  assertEqual(outcome.ok, false, "background() on a workflowOwned group fails");
-  assertEqual(outcome.reason, "workflow_owned", "failure reason is workflow_owned");
+  // 1.5 (P1): the manual background command is gone, so the workflow-owned
+  // guard is structural; what must survive restarts is the persisted flag
+  // (hydration restores the group exemption for retention and delivery).
+  const info = harness.service.getAll().tasks.find((task) => task.taskId === child.id);
+  assert(info !== undefined, "child task present");
+  const index = await harness.store.readIndex(info!.workspaceId);
+  const entry = index?.tasks.find((candidate) => candidate.taskId === child.id);
+  assert(entry !== undefined, "index entry present");
+  assertEqual(entry!.workflowOwned, true, "index entry persists workflowOwned: true");
   await child.dispose();
   await harness.service.dispose("user_cancel");
 });

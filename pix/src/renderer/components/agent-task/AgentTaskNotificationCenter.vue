@@ -2,10 +2,10 @@
 /**
  * AgentTaskNotificationCenter - 应用内任务通知中心（PiX 1.4.1）
  *
- * 展示 waiting_input / completed / failed 三类应用内通知与入口计数，挂载于
- * RightPanel 的 Agent 任务卡内（Shell 后台任务卡片上方）。点击通知按 taskId
- * 选中并展开具体任务（store.selectTask；AgentTaskPanel 监听 selectedTaskId
- * 自动展开并定位）。
+ * 展示 waiting_input / completed / failed 三类应用内通知与入口计数。1.5 (P2)
+ * 起唯一挂载于 AgentTaskLauncher（右栏启动器内部），点击通知经
+ * store.openTaskCenter(taskId) 打开任务中心并定位该任务——终态任务由
+ * TaskCenterView 自动切历史视图并高亮。全局仅此一处挂载。
  *
  * 可访问性：错误（failed）用 role="alert" 的 live region，普通状态
  * （waiting_input/completed）用 aria-live="polite"；每条的图标带 title 与
@@ -122,8 +122,8 @@ const latestFailed = computed(() => {
   return entry ? `任务失败：${entry.description || entry.taskId}` : "";
 });
 
-function selectTask(taskId: string): void {
-  store.selectTask(taskId);
+function openTask(taskId: string): void {
+  store.openTaskCenter(taskId);
 }
 
 function truncateText(text: string, maxLength: number): string {
@@ -151,7 +151,7 @@ function truncateText(text: string, maxLength: number): string {
         :data-test="`agent-task-notification-${entry.taskId}`"
         :aria-label="`${NOTIFY_LABELS[entry.status]}：${entry.description || entry.taskId}，点击查看任务`"
         :title="`${NOTIFY_LABELS[entry.status]}：${entry.description || entry.taskId}`"
-        @click="selectTask(entry.taskId)"
+        @click="openTask(entry.taskId)"
       >
         <v-icon :icon="NOTIFY_ICONS[entry.status]" size="13" :title="NOTIFY_LABELS[entry.status]" aria-hidden="true" />
         <span class="agent-task-notification-status">{{ NOTIFY_LABELS[entry.status] }}</span>

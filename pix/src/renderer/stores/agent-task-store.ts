@@ -1,23 +1,26 @@
 /**
- * Agent Task Store (PiX 1.4.1; 1.4.2 R5 adds the recovery surface)
+ * Agent Task Store (PiX 1.4.1; 1.4.2 R5 recovery surface; 1.5 P1 automation)
  *
  * Pinia mirror of the app-level agent task state owned by the main-process
  * AgentTaskService. The renderer never invents task state: every change
  * arrives as a task_state / task_activities / task_output /
- * task_input_dismissed / storage_status / recovery_issue event or as the
- * get_all / get_active_input_requests remount catch-up, and actions map
- * one-to-one onto the §4.9 AgentTaskCommand IPC contract through the
- * useAgentTaskRpc transport. The one exception: main emits no event when
- * clear / clear_all_terminal delete a task, so a successful clear rewrites
- * the mirror (removes the task) as a supplement to the event flow.
+ * task_input_dismissed / storage_status / recovery_issue / task_removed event
+ * or as the get_all / get_active_input_requests remount catch-up, and actions
+ * map one-to-one onto the §4.9 AgentTaskCommand IPC contract through the
+ * useAgentTaskRpc transport. 1.5 (P1): the manual-operation commands are gone
+ * (delivery catch-up, auto-recovery and retention run in main); the remaining
+ * actions are cancel (stop a runaway task), the input approvals and the
+ * diagnostics export. task_removed converges the mirror when the retention
+ * pass deletes a terminal record.
  *
  * 1.4.1 grouping: waiting (waiting_input), active (running+queued as one
- * group) and recent (completed/failed/cancelled, bounded by
- * AGENT_TASK_MAX_RECENT_ACTIVITIES). 1.4.2 (R5) adds the interrupted group
- * (restart hydration), plus the recoveryIssues and storageStatuses mirrors
- * delivered by the R2 get_all snapshot / storage_status / recovery_issue
- * events, and the recovery command actions (get_resume_summary, resume,
- * mark_failed, clear_all_terminal, export_diagnostics).
+ * group) and recent (completed/failed/cancelled). 1.5 (P2): recentTasks is
+ * replaced by the unbounded terminalTasks (endedAt desc) - the history view
+ * renders the full terminal mirror and retention is the bound. 1.4.2 (R5)
+ * adds the interrupted group
+ * (transient: 1.5 auto-recovery resolves it right after hydration), plus the
+ * recoveryIssues and storageStatuses mirrors delivered by the R2 get_all
+ * snapshot / storage_status / recovery_issue events.
  *
  * The auto-background deadline is group-level: every non-terminal child of an
  * attached foreground group mirrors the same deadlineAt/warningAt/warningActive
@@ -26,30 +29,46 @@
  * mirrored across the group's non-terminal tasks, and groupAutoBackgrounds
  * exposes one shared deadline per group. warningActive is monotonic within a
  * timer run, so an equal-deadline warning push never regresses siblings.
+ *
+ * 1.5 (P3/S5): the transcript channel. transcripts holds the per-task replay
+ * buffer (磁盘分页条目) plus the live ring (task_transcript events with a
+ * per-store monotonic seq, capped at 4000 with drop-oldest + liveDropped).
+ * TaskDetailPanel owns the write side (watchTask/unwatchTask); TaskTranscriptView
+ * owns the read side: it loads transcript pages through loadTranscriptPage,
+ * refolds the full entries array and consumes unconsumed live events by
+ * advancing consumedSeq. A terminal task_state while watched clears the local
+ * flag (the panel still sends unwatch_task on unmount - idempotent double
+ * insurance; main already stopped forwarding at terminal).
+ *
+ * 1.5 (P4/S7): the task-log channel. getTaskLog pulls the read-only events.jsonl
+ * snapshot (get_task_log, main drains persist first); fileChanges buffers the
+ * live task_file_change pushes per task (deduped by toolCallId, cleared by
+ * task_removed) - TaskFileChanges merges the two with history priority.
  */
 
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { useAgentTaskRpc } from "../composables/useAgentTaskRpc";
-import { AGENT_TASK_MAX_RECENT_ACTIVITIES } from "@shared/agent-task-types.js";
 import type {
   AgentTaskActivity,
-  AgentTaskClearAllResult,
   AgentTaskDiagnosticExport,
   AgentTaskInfo,
   AgentTaskInputRequest,
   AgentTaskRecoveryIssue,
-  AgentTaskResumeSummary,
+  AgentTaskStatus,
   AgentTaskStorageStatus,
-  ResumeDecision,
+  AgentTaskTranscriptPage,
 } from "@shared/agent-task-types.js";
 import type {
-  AgentTaskCommandDataV142,
-  AgentTaskCommandV142,
+  AgentTaskCommandDataV15,
+  AgentTaskCommandV15,
   AgentTaskEvent,
+  AgentSessionEvent,
+  FileChangeSummary,
   PixCommandResult,
   RequestUserInputResponse,
 } from "@shared/types.js";
+import type { AgentTaskLogSnapshot } from "@shared/agent-task-types.js";
 
 /** Shared auto-background deadline of one foreground task group. */
 export interface GroupAutoBackground {
@@ -59,6 +78,34 @@ export interface GroupAutoBackground {
 }
 
 const ACTIVE_STATUSES: ReadonlySet<AgentTaskInfo["status"]> = new Set(["queued", "running", "waiting_input"]);
+
+/** Terminal statuses: main stops transcript forwarding before the terminal
+ * task_state and the renderer trusts disk replay below. */
+const TERMINAL_STATUSES: ReadonlySet<AgentTaskStatus> = new Set(["completed", "failed", "cancelled"]);
+
+/** Live-event ring cap (Plan 4.8: 溢出丢最旧并置 liveDropped=true). */
+const TRANSCRIPT_LIVE_EVENTS_LIMIT = 4000;
+
+/**
+ * Per-task transcript buffer (Plan 4.8, S5). byItem accumulates the full
+ * disk-replay entries page by page (never incrementally appended - the view
+ * refolds the whole array through assembler.loadEntries); liveEvents is the
+ * per-task ring of task_transcript pushes with a monotonic seq. consumedSeq is
+ * the view-side consumption cursor: the view advances it (filtered by
+ * itemIndex) and the store only appends.
+ */
+export interface TaskTranscriptState {
+  byItem: Record<
+    number,
+    { entries: unknown[]; totalCount: number; nextCursor: string | null; loading: boolean }
+  >;
+  /** 直播事件环形缓冲:per-task 单调递增 seq(溢出丢最旧并置 liveDropped=true)。 */
+  liveEvents: Array<{ seq: number; itemIndex: number; event: AgentSessionEvent }>;
+  liveDropped: boolean;
+  watched: boolean;
+  /** 消费游标:已被视图确认消费的最大 seq(视图按 itemIndex 过滤后推进)。 */
+  consumedSeq: number;
+}
 
 export const useAgentTaskStore = defineStore("agent-task", () => {
   const taskRpc = useAgentTaskRpc();
@@ -79,8 +126,21 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
   /** 1.4.2 (R2/R5): per-workspace storage accounting (warning >= 80%, full at limit). */
   const storageStatuses = ref<AgentTaskStorageStatus[]>([]);
 
-  /** Task currently expanded/selected by the panel; null = none. */
+  /** Task currently expanded/selected by the task center; null = none. */
   const selectedTaskId = ref<string | null>(null);
+
+  /** 1.5 (P2): whether the task center view owns the center area (transient UI state, not persisted). */
+  const centerOpen = ref(false);
+
+  /** 1.5 (P3): per-task transcript buffers (disk replay pages + live event ring). */
+  const transcripts = ref<Record<string, TaskTranscriptState>>({});
+
+  /**
+   * 1.5 (P4): live file-change buffer per task (task_file_change pushes)。
+   * 按 toolCallId 去重(live 追加);task_removed 时清理对应项。历史(磁盘)由
+   * TaskFileChanges 经 get_task_log 拉取,并与本缓冲按 toolCallId 合并(历史优先)。
+   */
+  const fileChanges = ref<Record<string, FileChangeSummary[]>>({});
 
   /** Last error message from an agent-task command. */
   const lastError = ref<string | null>(null);
@@ -112,13 +172,16 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     tasks.value.filter((t) => t.status === "running" || t.status === "queued"),
   );
 
-  /** Most recently ended terminal tasks, bounded by AGENT_TASK_MAX_RECENT_ACTIVITIES. */
-  const recentTasks = computed(() => {
-    const recent = tasks.value
+  /**
+   * 1.5 (P2): full terminal mirror (completed|failed|cancelled, endedAt desc),
+   * replaces the recentTasks 20-entry cap - the history view renders the full
+   * mirror and the retention pass is the bound.
+   */
+  const terminalTasks = computed(() => {
+    return tasks.value
       .filter((t) => t.status === "completed" || t.status === "failed" || t.status === "cancelled")
       .slice()
       .sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0));
-    return recent.slice(0, AGENT_TASK_MAX_RECENT_ACTIVITIES);
   });
 
   /** The task selected via selectedTaskId, if still mirrored. */
@@ -299,10 +362,25 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     recoveryIssues.value = next;
   }
 
+  /** Append a live file change push (按 toolCallId 去重;重复的 live 追加被忽略)。 */
+  function appendFileChange(taskId: string, change: FileChangeSummary): void {
+    const list = fileChanges.value[taskId] ?? [];
+    if (list.some((item) => item.toolCallId === change.toolCallId)) return;
+    fileChanges.value = { ...fileChanges.value, [taskId]: [...list, change] };
+  }
+
   function handleAgentTaskEvent(event: AgentTaskEvent): void {
     switch (event.type) {
       case "task_state":
         applyTaskState(event.task);
+        // 终态收敛(双保险):main 在终态 task_state 之前已 flush 并清 watcher;
+        // 本地 watched 同样置 false(TaskDetailPanel 卸载时仍发 unwatch,幂等)。
+        if (TERMINAL_STATUSES.has(event.task.status)) {
+          const state = transcripts.value[event.task.taskId];
+          if (state) {
+            state.watched = false;
+          }
+        }
         break;
       case "task_activities":
         applyActivities(event.taskId, event.activities);
@@ -318,6 +396,15 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
         break;
       case "recovery_issue":
         applyRecoveryIssue(event.issue);
+        break;
+      case "task_transcript":
+        appendTranscriptEvent(event.taskId, event.itemIndex, event.event);
+        break;
+      case "task_file_change":
+        appendFileChange(event.taskId, event.change);
+        break;
+      case "task_removed":
+        removeTaskFromMirror(event.taskId);
         break;
     }
   }
@@ -410,13 +497,12 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
   /**
    * Send an agent-task command through the preload API. Every command carries
    * taskId+generation (stale responses are rejected in main, never here). The
-   * mirror is updated by events; the only command side effects that rewrite
-   * the mirror are the clear/clear_all_terminal success deletions below (main
-   * removes the record without emitting any task event).
+   * mirror is updated by events only; the retention pass announces deletions
+   * through task_removed.
    */
-  async function runCommand<C extends AgentTaskCommandV142>(
+  async function runCommand<C extends AgentTaskCommandV15>(
     command: C,
-  ): Promise<PixCommandResult<AgentTaskCommandDataV142<C>>> {
+  ): Promise<PixCommandResult<AgentTaskCommandDataV15<C>>> {
     try {
       const result = await taskRpc.sendAgentTaskCommand(command);
       if (result.success) {
@@ -432,20 +518,9 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     }
   }
 
+  /** Stop a queued/running/waiting task (the only task-level user control). */
   function cancel(taskId: string, generation: number): Promise<PixCommandResult<undefined>> {
     return runCommand({ type: "cancel", taskId, generation });
-  }
-
-  function background(taskId: string, generation: number): Promise<PixCommandResult<undefined>> {
-    return runCommand({ type: "background", taskId, generation });
-  }
-
-  function foreground(taskId: string, generation: number): Promise<PixCommandResult<undefined>> {
-    return runCommand({ type: "foreground", taskId, generation });
-  }
-
-  function continueForegroundWait(taskId: string, generation: number): Promise<PixCommandResult<undefined>> {
-    return runCommand({ type: "continue_foreground_wait", taskId, generation });
   }
 
   function respondInput(
@@ -461,97 +536,186 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     return runCommand({ type: "cancel_input", taskId, requestId, generation });
   }
 
-  function sendToSession(
-    taskId: string,
-    generation: number,
-    targetSessionId: string,
-    confirmDuplicate?: boolean,
-  ): Promise<PixCommandResult<undefined>> {
-    return runCommand({ type: "send_to_session", taskId, generation, targetSessionId, confirmDuplicate });
-  }
-
-  /** Terminal statuses that clear_all_terminal removes (main's semantics). */
-  function isTerminalStatus(status: AgentTaskInfo["status"]): boolean {
-    return status === "completed" || status === "failed" || status === "cancelled";
-  }
-
   /**
-   * Remove a deleted task from every mirror it appears in. Main deletes the
-   * on-disk record and in-memory entry of a cleared task without emitting any
-   * task event (the AgentTaskEventV142 union has no removal type), so a
-   * successful clear must converge the mirror here. Idempotent: the task may
-   * already be gone (a remount get_all refresh arrived first), and a task
-   * whose record only existed as a recovery issue has no task entry at all.
+   * Remove a deleted task from every mirror it appears in. 1.5 (P1): the
+   * retention pass deletes terminal records in main and announces each one
+   * through the task_removed push. Idempotent: the task may already be gone
+   * (a remount get_all refresh arrived first). 1.5 (P2): also clears
+   * selectedTaskId when the deleted task was the selected one (the task center
+   * falls back to its empty detail placeholder). 1.5 (P3): drops the task's
+   * transcript buffer with it (liveEvents/entries are per-task); 1.5 (P4):
+   * the file-changes live buffer is dropped the same way.
    */
   function removeTaskFromMirror(taskId: string): void {
     tasks.value = tasks.value.filter((t) => t.taskId !== taskId);
     activeInputRequests.value = activeInputRequests.value.filter((r) => r.taskId !== taskId);
     recoveryIssues.value = recoveryIssues.value.filter((i) => i.taskId !== taskId);
+    if (selectedTaskId.value === taskId) {
+      selectedTaskId.value = null;
+    }
+    if (transcripts.value[taskId]) {
+      const next = { ...transcripts.value };
+      delete next[taskId];
+      transcripts.value = next;
+    }
+    if (fileChanges.value[taskId]) {
+      const next = { ...fileChanges.value };
+      delete next[taskId];
+      fileChanges.value = next;
+    }
   }
 
-  function clearTask(taskId: string, generation: number, confirmDataLoss: boolean): Promise<PixCommandResult<undefined>> {
-    return runCommand({ type: "clear", taskId, generation, confirmDataLoss }).then((result) => {
-      // Main emits no removal event for clear; converge the mirror on success.
-      if (result.success) removeTaskFromMirror(taskId);
-      return result;
-    });
-  }
-
-  // ---- 1.4.2 (R3/R5) recovery commands -------------------------------------
-
-  /** Fetch the resume summary; shown to the user BEFORE any resume decision. */
-  function getResumeSummary(taskId: string, generation: number): Promise<PixCommandResult<AgentTaskResumeSummary>> {
-    return runCommand({ type: "get_resume_summary", taskId, generation });
-  }
-
-  /** Resume an interrupted task with the user's explicit workspace/model decision. */
-  function resume(taskId: string, generation: number, decision: ResumeDecision): Promise<PixCommandResult<undefined>> {
-    return runCommand({ type: "resume", taskId, generation, decision });
-  }
-
-  /** Mark an interrupted task failed (user decision). */
-  function markFailed(taskId: string, generation: number): Promise<PixCommandResult<undefined>> {
-    return runCommand({ type: "mark_failed", taskId, generation });
-  }
-
-  /** Clear all terminal tasks (interrupted/corrupt records stay protected). */
-  function clearAllTerminal(
-    workspaceId: string | undefined,
-    confirm: boolean,
-  ): Promise<PixCommandResult<AgentTaskClearAllResult>> {
-    return runCommand({ type: "clear_all_terminal", workspaceId, confirm }).then((result) => {
-      if (result.success && result.data) {
-        // Main returns only the cleared count plus protectedTaskIds and emits
-        // no removal events, so the mirror converges to main's semantics:
-        // terminal tasks of the workspace that are not protected are deleted;
-        // everything else (other workspaces, protected tasks, non-terminal
-        // tasks) stays.
-        const protectedIds = new Set(result.data.protectedTaskIds);
-        const workspaceMatch = (t: { workspaceId: string }): boolean =>
-          workspaceId === undefined || t.workspaceId === workspaceId;
-        tasks.value = tasks.value.filter(
-          (t) => !workspaceMatch(t) || protectedIds.has(t.taskId) || !isTerminalStatus(t.status),
-        );
-        // Corrupt records have no task entry; they surface as recovery issues
-        // and are returned as protected ids, so only those stay.
-        recoveryIssues.value = recoveryIssues.value.filter((i) => !workspaceMatch(i) || protectedIds.has(i.taskId));
-      }
-      return result;
-    });
-  }
-
-  /** Export a recovery issue's diagnostic payload. */
+  /** Export a task's diagnostic payload (retained for debugging). */
   function exportDiagnostics(taskId: string): Promise<PixCommandResult<AgentTaskDiagnosticExport>> {
     return runCommand({ type: "export_diagnostics", taskId });
   }
 
-  /** Select the task the panel should expand; null clears the selection. */
+  /** Select the task the task center should expand; null clears the selection. */
   function selectTask(taskId: string | null): void {
     selectedTaskId.value = taskId;
   }
 
+  /**
+   * 1.5 (P2): the only entry into the task center. taskId is optional - with
+   * it the center opens already focused on the task (terminal tasks flip the
+   * TaskCenterView to the history view); without it the center just opens.
+   */
+  function openTaskCenter(taskId?: string): void {
+    centerOpen.value = true;
+    if (taskId !== undefined) {
+      selectedTaskId.value = taskId;
+    }
+  }
+
+  function closeTaskCenter(): void {
+    centerOpen.value = false;
+  }
+
   function clearError(): void {
     lastError.value = null;
+  }
+
+  // ==========================================================================
+  // Transcript channel (1.5 P3/S5): TaskDetailPanel owns the write side
+  // (watch/unwatch), TaskTranscriptView owns the read side (pages + live ring).
+  // ==========================================================================
+
+  /** Per-store monotonic seq for live transcript events. */
+  let transcriptSeq = 0;
+
+  function ensureTranscriptState(taskId: string): TaskTranscriptState {
+    let state = transcripts.value[taskId];
+    if (!state) {
+      state = {
+        byItem: {},
+        liveEvents: [],
+        liveDropped: false,
+        watched: false,
+        consumedSeq: 0,
+      };
+      transcripts.value = { ...transcripts.value, [taskId]: state };
+    }
+    return state;
+  }
+
+  function ensureTranscriptItem(
+    state: TaskTranscriptState,
+    itemIndex: number,
+  ): TaskTranscriptState["byItem"][number] {
+    let item = state.byItem[itemIndex];
+    if (!item) {
+      item = { entries: [], totalCount: 0, nextCursor: null, loading: false };
+      state.byItem = { ...state.byItem, [itemIndex]: item };
+    }
+    return item;
+  }
+
+  /** Push a live transcript event onto the ring (drop-oldest at the cap). */
+  function appendTranscriptEvent(taskId: string, itemIndex: number, event: AgentSessionEvent): void {
+    const state = ensureTranscriptState(taskId);
+    const seq = transcriptSeq;
+    transcriptSeq += 1;
+    const next = [...state.liveEvents, { seq, itemIndex, event }];
+    if (next.length > TRANSCRIPT_LIVE_EVENTS_LIMIT) {
+      // 环形上限:溢出丢最旧,并置 liveDropped(true 后永久,live 丢失由
+      // 渲染端全量重放重建兜底)。
+      state.liveEvents = next.slice(next.length - TRANSCRIPT_LIVE_EVENTS_LIMIT);
+      state.liveDropped = true;
+    } else {
+      state.liveEvents = next;
+    }
+  }
+
+  /**
+   * Register a task watcher (发命令 + 本地 watched=true). TaskDetailPanel is
+   * the sole owner; the work-record and file-changes tabs both consume this
+   * subscription. Idempotent: main counts and repeats are no-ops.
+   */
+  async function watchTask(taskId: string): Promise<void> {
+    const state = ensureTranscriptState(taskId);
+    state.watched = true;
+    await runCommand({ type: "watch_task", taskId });
+  }
+
+  /** Release the task watcher (发命令 + watched=false). Idempotent; unknown
+   * tasks still return success in main. */
+  function unwatchTask(taskId: string): void {
+    const state = transcripts.value[taskId];
+    if (state) {
+      state.watched = false;
+    }
+    void runCommand({ type: "unwatch_task", taskId });
+  }
+
+  /**
+   * Load (or re-load, disk as truth) one item's transcript pages. Drains
+   * get_transcript from the head until nextCursor is null and replaces the
+   * item's entries with the full array; the caller (TaskTranscriptView)
+   * refolds the whole array through assembler.loadEntries - the assembler has
+   * no append semantics. A failed drain keeps the previous cache instead of
+   * regressing it to empty (the lastError banner surfaces the failure).
+   */
+  async function loadTranscriptPage(taskId: string, itemIndex = 0): Promise<void> {
+    const state = ensureTranscriptState(taskId);
+    const item = ensureTranscriptItem(state, itemIndex);
+    if (item.loading) return;
+    item.loading = true;
+    try {
+      let entries: unknown[] = [];
+      let totalCount = 0;
+      let nextCursor: string | null = null;
+      do {
+        // 显式结果注解:result.data.nextCursor 回流为命令参数,泛型推导会因
+        // 自引用退化为 any,这里断开循环(契约类型不变)。
+        const result: PixCommandResult<AgentTaskTranscriptPage> = await runCommand({
+          type: "get_transcript",
+          taskId,
+          itemIndex,
+          cursor: nextCursor ?? undefined,
+        });
+        if (!result.success || !result.data) break;
+        entries = entries.concat(result.data.entries);
+        totalCount = result.data.totalCount;
+        nextCursor = result.data.nextCursor;
+      } while (nextCursor !== null);
+      if (entries.length > 0 || item.entries.length === 0) {
+        item.entries = entries;
+        item.totalCount = totalCount;
+        item.nextCursor = nextCursor;
+      }
+    } finally {
+      item.loading = false;
+    }
+  }
+
+  // ==========================================================================
+  // 任务日志通道 (1.5 P4/S7):get_task_log 只读快照,服务端先 drain persist,
+  // 供 TaskFileChanges(历史 file_change)消费。
+  // ==========================================================================
+
+  /** 拉取任务事件日志(events.jsonl)只读快照;失败经 lastError 上报,不抛出。 */
+  function getTaskLog(taskId: string): Promise<PixCommandResult<AgentTaskLogSnapshot>> {
+    return runCommand({ type: "get_task_log", taskId });
   }
 
   // ==========================================================================
@@ -565,12 +729,15 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     recoveryIssues,
     storageStatuses,
     selectedTaskId,
+    centerOpen,
     lastError,
+    transcripts,
+    fileChanges,
     // Computed
     waitingTasks,
     interruptedTasks,
     activeTasks,
-    recentTasks,
+    terminalTasks,
     storageWarnings,
     storageFulls,
     groupAutoBackgrounds,
@@ -582,19 +749,18 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     bulkHydrationVersion,
     // Actions (map agent-task-command)
     cancel,
-    background,
-    foreground,
-    continueForegroundWait,
     respondInput,
     cancelInput,
-    sendToSession,
-    clearTask,
-    getResumeSummary,
-    resume,
-    markFailed,
-    clearAllTerminal,
     exportDiagnostics,
     selectTask,
+    openTaskCenter,
+    closeTaskCenter,
     clearError,
+    // Transcript channel
+    watchTask,
+    unwatchTask,
+    loadTranscriptPage,
+    // Task log channel (P4)
+    getTaskLog,
   };
 });

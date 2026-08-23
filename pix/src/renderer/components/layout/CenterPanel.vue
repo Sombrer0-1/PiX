@@ -26,6 +26,8 @@ import PlanModeToggle from "../plan/PlanModeToggle.vue";
 import PlanPanel from "../plan/PlanPanel.vue";
 import { usePlanStore } from "../../stores/plan-store";
 import { useWorkflowStore } from "../../stores/workflow-store";
+import { useAgentTaskStore } from "../../stores/agent-task-store";
+import TaskCenterView from "../agent-task/TaskCenterView.vue";
 import type { PlanStatus } from "@shared/types.js";
 import type { RequestUserInputRequest, RequestUserInputQuestion } from "@/types/rpc";
 
@@ -36,6 +38,22 @@ const settingsStore = useSettingsStore();
 const teamStore = useTeamStore();
 const planStore = usePlanStore();
 const workflowStore = useWorkflowStore();
+const agentTaskStore = useAgentTaskStore();
+
+/** sessionId -> 会话名（任务中心行/详情来源展示）。 */
+const agentTaskSessionNames = computed(() => {
+  const names: Record<string, string> = {};
+  for (const session of projectStore.sessions) {
+    if (session.name) names[session.id] = session.name;
+  }
+  return names;
+});
+
+/** 任务 tab 之外的会话视图切换：关闭任务中心并切回对应会话语义。 */
+function switchSessionView(mode: ViewMode): void {
+  agentTaskStore.closeTaskCenter();
+  sessionViewMode.value = mode;
+}
 
 // Clarification props are driven by WorkspacePage request_user_input handling.
 const props = defineProps<{
@@ -57,7 +75,8 @@ const emit = defineEmits<{
 type ViewMode = "session" | "raw" | "tree";
 type ExecutionMode = "read-only" | "approval" | "unattended";
 type WorkspaceMode = "solo" | "team";
-const viewMode = ref<ViewMode>("session");
+/** 会话视图模式（打开任务中心前的视图；任务中心经 store.centerOpen 顶层渲染）。 */
+const sessionViewMode = ref<ViewMode>("session");
 const showExportMenu = ref(false);
 const showForkDialog = ref(false);
 const showSwitchToSoloConfirmDialog = ref(false);
@@ -779,19 +798,24 @@ function sendQuickStart(prompt: string): void {
       <div class="topbar-center">
         <button
           class="view-tab"
-          :class="{ active: viewMode === 'session' }"
-          @click="viewMode = 'session'"
+          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'session' }"
+          @click="switchSessionView('session')"
         >会话</button>
         <button
           class="view-tab"
-          :class="{ active: viewMode === 'tree' }"
-          @click="viewMode = 'tree'"
+          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'tree' }"
+          @click="switchSessionView('tree')"
         >分支树</button>
         <button
           class="view-tab"
-          :class="{ active: viewMode === 'raw' }"
-          @click="viewMode = 'raw'"
+          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'raw' }"
+          @click="switchSessionView('raw')"
         >原始事件</button>
+        <button
+          class="view-tab"
+          :class="{ active: agentTaskStore.centerOpen }"
+          @click="agentTaskStore.openTaskCenter()"
+        >任务</button>
         <button class="topbar-action" @click="showForkDialog = true">创建分支</button>
         <v-menu v-model="showExportMenu" :close-on-content-click="true" location="bottom end">
           <template #activator="{ props: menuProps }">
@@ -875,8 +899,12 @@ function sendQuickStart(prompt: string): void {
       </div>
     </div>
 
+    <!-- 任务中心:顶层渲染于 team/solo 两分支之上(假设 6:team 模式同样生效);
+         打开前记住会话视图模式,关闭后回打开前视图(假设 5 期间隐藏 composer 与 PlanPanel)。 -->
+    <TaskCenterView v-if="agentTaskStore.centerOpen" :session-names="agentTaskSessionNames" />
+
     <!-- Team mode keeps Leader conversation and team workbench visible side by side. -->
-    <template v-if="teamStore.teamMode">
+    <template v-else-if="teamStore.teamMode">
       <!-- Sticky team command bar -->
       <WorkerStatusBar />
 
@@ -898,8 +926,8 @@ function sendQuickStart(prompt: string): void {
               <v-icon icon="mdi-account-star-outline" size="28" />
               <strong>团队负责人已就绪</strong>
             </div>
-            <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
-            <SessionTreeView v-else-if="viewMode === 'tree'" />
+            <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
+            <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
             <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
           </div>
         </section>
@@ -923,8 +951,8 @@ function sendQuickStart(prompt: string): void {
         <p class="empty-hint">在下方描述任务即可开始使用 Pi。</p>
       </div>
 
-      <SessionView v-if="viewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
-      <SessionTreeView v-else-if="viewMode === 'tree'" />
+      <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
+      <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
       <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
     </div>
     </template>
@@ -932,14 +960,15 @@ function sendQuickStart(prompt: string): void {
     <!-- PlanPanel sits between the message area and the composer (solo only).
          The controller's initial snapshot uses phase "cancelled" with no plan
          as the never-entered sentinel; only hide the panel in that case, a
-         genuinely cancelled plan still renders. -->
+         genuinely cancelled plan still renders. 任务中心打开时隐藏(假设 5)。 -->
     <PlanPanel
-      v-if="soloPlanPhase != null && !(soloPlanPhase === 'cancelled' && soloPlan == null)"
+      v-if="!agentTaskStore.centerOpen && soloPlanPhase != null && !(soloPlanPhase === 'cancelled' && soloPlan == null)"
       class="center-plan-panel"
     />
 
-    <!-- Composer remains visible; in team mode it sends to the Leader. -->
-    <div class="center-composer">
+    <!-- Composer remains visible; in team mode it sends to the Leader.
+         任务中心打开时隐藏(假设 5:任务中心为完整中心视图)。 -->
+    <div v-if="!agentTaskStore.centerOpen" class="center-composer">
       <div
         class="composer-inner"
         :class="{ 'dragging-files': isDraggingFiles }"

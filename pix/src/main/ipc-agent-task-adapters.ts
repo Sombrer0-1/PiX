@@ -19,50 +19,34 @@
 
 import { isFiniteNonNegativeNumber, type IpcMainLike, type WebContentsLike } from "./ipc-plan-adapters.js";
 import type { AgentTaskService } from "./agent-task/agent-task-service.js";
-import type { AgentTaskCommand, AgentTaskCommandDataV142, PixCommandResult } from "../shared/types.js";
+import type { AgentTaskCommand, AgentTaskCommandDataV15, PixCommandResult } from "../shared/types.js";
 
 export type { IpcMainLike, WebContentsLike } from "./ipc-plan-adapters.js";
 
+// 1.5 (P1): the manual-operation commands are gone (delivery catch-up,
+// auto-recovery and retention are main-process automations); the surface is
+// the approval/stop pair plus queries and the diagnostics export.
+// 1.5 (P3/P4): the V15 command union adds the task-center watch/transcript/log
+// commands (watch_task / unwatch_task / get_transcript / get_task_log); S1
+// registers them with the guard, S4 lands watch/unwatch/get_transcript dispatch
+// and S6 lands get_task_log.
 const VALID_AGENT_TASK_COMMAND_TYPES = new Set([
   "cancel",
-  "background",
-  "foreground",
-  "continue_foreground_wait",
   "respond_input",
   "cancel_input",
-  "send_to_session",
-  "clear",
   "get_all",
   "get_active_input_requests",
-  // 1.4.2 (R3) recovery commands
-  "clear_all_terminal",
   "export_diagnostics",
-  "resume",
-  "mark_failed",
-  "get_resume_summary",
+  "watch_task",
+  "unwatch_task",
+  "get_transcript",
+  "get_task_log",
 ]);
 
 function isRequestUserInputResponse(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const response = value as Record<string, unknown>;
   return typeof response.id === "string" && typeof response.answers === "object" && response.answers !== null;
-}
-
-/** Structural guard for ResumeDecision (continue / switch_model). */
-function isResumeDecision(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const decision = value as Record<string, unknown>;
-  if (decision.action === "continue") {
-    return typeof decision.confirmWorkspaceChanges === "boolean";
-  }
-  if (decision.action === "switch_model") {
-    return (
-      typeof decision.provider === "string" &&
-      typeof decision.modelId === "string" &&
-      typeof decision.confirmWorkspaceChanges === "boolean"
-    );
-  }
-  return false;
 }
 
 /** Structural guard with per-type required sub-fields (mirrors isPlanCommand). */
@@ -74,9 +58,6 @@ export function isAgentTaskCommand(cmd: unknown): cmd is AgentTaskCommand {
   const c = cmd as Record<string, unknown>;
   switch (type) {
     case "cancel":
-    case "background":
-    case "foreground":
-    case "continue_foreground_wait":
       return typeof c.taskId === "string" && isFiniteNonNegativeNumber(c.generation);
     case "respond_input":
       return (
@@ -87,30 +68,24 @@ export function isAgentTaskCommand(cmd: unknown): cmd is AgentTaskCommand {
       );
     case "cancel_input":
       return typeof c.taskId === "string" && typeof c.requestId === "string" && isFiniteNonNegativeNumber(c.generation);
-    case "send_to_session":
-      return (
-        typeof c.taskId === "string" &&
-        isFiniteNonNegativeNumber(c.generation) &&
-        typeof c.targetSessionId === "string" &&
-        (c.confirmDuplicate === undefined || typeof c.confirmDuplicate === "boolean")
-      );
-    case "clear":
-      return typeof c.taskId === "string" && isFiniteNonNegativeNumber(c.generation) && typeof c.confirmDataLoss === "boolean";
     case "get_all":
     case "get_active_input_requests":
       return true;
-    case "clear_all_terminal":
-      return (
-        typeof c.confirm === "boolean" &&
-        (c.workspaceId === undefined || typeof c.workspaceId === "string")
-      );
     case "export_diagnostics":
       return typeof c.taskId === "string";
-    case "resume":
-      return typeof c.taskId === "string" && isFiniteNonNegativeNumber(c.generation) && isResumeDecision(c.decision);
-    case "mark_failed":
-    case "get_resume_summary":
-      return typeof c.taskId === "string" && isFiniteNonNegativeNumber(c.generation);
+    case "watch_task":
+    case "unwatch_task":
+    case "get_task_log":
+      return typeof c.taskId === "string";
+    case "get_transcript":
+      // itemIndex 缺省或非负整数；cursor 缺省或 string；limit 缺省或有限正整数。
+      return (
+        typeof c.taskId === "string" &&
+        (c.itemIndex === undefined ||
+          (typeof c.itemIndex === "number" && Number.isInteger(c.itemIndex) && c.itemIndex >= 0)) &&
+        (c.cursor === undefined || typeof c.cursor === "string") &&
+        (c.limit === undefined || (typeof c.limit === "number" && Number.isInteger(c.limit) && c.limit > 0))
+      );
     default:
       return true;
   }
@@ -125,16 +100,10 @@ function agentTaskCommandResult(result: { ok: boolean; reason?: string }): PixCo
 export async function executeAgentTaskCommand(
   service: AgentTaskService,
   cmd: AgentTaskCommand,
-): Promise<PixCommandResult<AgentTaskCommandDataV142<AgentTaskCommand>>> {
+): Promise<PixCommandResult<AgentTaskCommandDataV15<AgentTaskCommand>>> {
   switch (cmd.type) {
     case "cancel":
       return agentTaskCommandResult(await service.cancel(cmd.taskId, cmd.generation, "user_cancel"));
-    case "background":
-      return agentTaskCommandResult(service.background(cmd.taskId, cmd.generation));
-    case "foreground":
-      return agentTaskCommandResult(service.foreground(cmd.taskId, cmd.generation));
-    case "continue_foreground_wait":
-      return agentTaskCommandResult(service.continueForegroundWait(cmd.taskId, cmd.generation));
     case "respond_input": {
       const accepted = service.respondInput(cmd.taskId, cmd.requestId, cmd.generation, cmd.response);
       if (!accepted) {
@@ -157,53 +126,55 @@ export async function executeAgentTaskCommand(
       }
       return { success: true };
     }
-    case "send_to_session":
-      return agentTaskCommandResult(
-        await service.sendResultToSession(cmd.taskId, cmd.generation, cmd.targetSessionId, cmd.confirmDuplicate),
-      );
-    case "clear":
-      return agentTaskCommandResult(await service.clearTask(cmd.taskId, cmd.generation, cmd.confirmDataLoss));
     case "get_all":
       // 1.4.2 (R2): the full remount snapshot (tasks + recoveryIssues + storageStatuses).
       return { success: true, data: service.getAll() };
     case "get_active_input_requests":
       return { success: true, data: service.getActiveInputRequests() };
-    // 1.4.2 (R3) recovery commands
-    case "clear_all_terminal": {
-      const result = await service.clearAllTerminal(cmd.workspaceId, cmd.confirm);
-      if (result.ok) {
-        return { success: true, data: result.data };
-      }
-      return {
-        success: false,
-        code: result.reason ?? "agent_task_command_failed",
-        error: result.reason ?? "Agent task command failed.",
-      };
-    }
     case "export_diagnostics": {
-      const data = await service.getDiagnostics(cmd.taskId);
-      return { success: true, data };
-    }
-    case "resume": {
-      // The service normalizes every known resume failure to {ok:false}; an
-      // unexpected throw must still surface as a structured envelope instead
-      // of rejecting the IPC handler.
       try {
-        return agentTaskCommandResult(await service.resume(cmd.taskId, cmd.generation, cmd.decision));
-      } catch (err: unknown) {
-        const reason = err instanceof Error && err.message !== "" ? err.message : "agent_task_resume_failed";
-        return { success: false, code: reason, error: reason };
-      }
-    }
-    case "mark_failed":
-      return agentTaskCommandResult(await service.markFailed(cmd.taskId, cmd.generation, "user_decision"));
-    case "get_resume_summary": {
-      try {
-        const data = await service.getResumeSummary(cmd.taskId, cmd.generation);
+        const data = await service.getDiagnostics(cmd.taskId);
         return { success: true, data };
       } catch (err: unknown) {
         const reason = err instanceof Error && err.message !== "" ? err.message : "agent_task_command_failed";
         return { success: false, code: reason, error: reason };
+      }
+    }
+    case "watch_task":
+      // 1.5 (P3): the only not_found mapping here - watchTask returns false
+      // for an unknown task (never throws).
+      return service.watchTask(cmd.taskId)
+        ? { success: true }
+        : { success: false, code: "not_found", error: `Agent task not found: ${cmd.taskId}` };
+    case "unwatch_task":
+      // Idempotent: unwatching an unknown task is still success.
+      service.unwatchTask(cmd.taskId);
+      return { success: true };
+    case "get_transcript": {
+      const itemIndex = cmd.itemIndex ?? 0;
+      const limit = Math.min(Math.max(1, cmd.limit ?? 200), 1000);
+      try {
+        return { success: true, data: await service.getTranscriptPage(cmd.taskId, itemIndex, cmd.cursor, limit) };
+      } catch (err) {
+        // 只有任务不存在才是 not_found;I/O 等其它异常保留原始信息,不吞错。
+        const notFound = err instanceof Error && err.message === "not_found";
+        const message = err instanceof Error && err.message !== "" ? err.message : "agent_task_command_failed";
+        return notFound
+          ? { success: false, code: "not_found", error: `Agent task not found: ${cmd.taskId}` }
+          : { success: false, code: "agent_task_command_failed", error: message };
+      }
+    }
+    // 1.5 (P4): get_task_log 与 get_transcript 同构 —— 只有任务不存在才是
+    // not_found;其余异常保留原始 message(空则 agent_task_command_failed)。
+    case "get_task_log": {
+      try {
+        return { success: true, data: await service.getTaskLog(cmd.taskId) };
+      } catch (err) {
+        const notFound = err instanceof Error && err.message === "not_found";
+        const message = err instanceof Error && err.message !== "" ? err.message : "agent_task_command_failed";
+        return notFound
+          ? { success: false, code: "not_found", error: `Agent task not found: ${cmd.taskId}` }
+          : { success: false, code: "agent_task_command_failed", error: message };
       }
     }
     default:
@@ -264,7 +235,13 @@ export function subscribeAgentTaskEventForwarding(
       return;
     }
     if (event.type === "task_file_change") {
-      // main-only: consumed by the Plan deviation adapter inside main.
+      // 1.5 (P4): watched tasks get the file change live; planLink/aggregate
+      // are main-only semantics and are stripped here (the main-side Plan
+      // adapter consumption is unaffected - it subscribes to the service bus,
+      // not this forwarding).
+      if (service.isTaskWatched(event.taskId)) {
+        webContents.send("agent-task-event", { type: "task_file_change", taskId: event.taskId, change: event.change });
+      }
       return;
     }
     // task_state / task_input_dismissed / task_activities / task_output and

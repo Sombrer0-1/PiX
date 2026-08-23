@@ -893,11 +893,12 @@ await run("manual background detaches the group and resolves the single tool awa
 
   const runPromise = h.runner.run({ mode: "single", agentScope: "user", tasks: [{ prompt: "bg" }] }, undefined);
   await waitFor(() => FakeRuntime.instances.length === 1, 20000, "runtime created");
-  const taskId = FakeRuntime.instances[0].spec.taskId;
-  const backgrounded = h.service.background(taskId, 0);
-  assertEqual(backgrounded.ok, true, "manual background accepted");
+  // 1.5 (P1): manual background is gone; the session-switch detach path is the
+  // detach entry point.
+  const detached = h.service.detachForegroundGroupsForSession("session-1");
+  assertEqual(detached.length, 1, "session detach detaches the group");
   const result = await runPromise;
-  assert("kind" in result, "manual background resolves with the handle");
+  assert("kind" in result, "session detach resolves with the handle");
   assertEqual(result.kind, "agent_task_group", "handle kind");
   assertEqual(h.usageSink.length, 0, "backgrounded group writes no usage");
 });

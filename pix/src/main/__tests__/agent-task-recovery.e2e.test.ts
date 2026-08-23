@@ -78,6 +78,7 @@ import { RESUME_INTERRUPTED_TOOL_RESULT_TEXT, RESUME_NOTE_CUSTOM_TYPE } from "..
 import { RESUME_TURN_MESSAGE } from "../agent-task/agent-task-runtime.js";
 import {
   AgentTaskService,
+  __setAgentTaskServiceHooksForTests,
   type AgentTaskServiceEvent,
   type AgentTaskSubmissionContext,
 } from "../agent-task/agent-task-service.js";
@@ -539,7 +540,10 @@ function killProcessTree(child: ChildProcess): Promise<void> {
 }
 
 /** One crash scenario: spawn + kill the child, then reopen the app on the same store. */
-async function crashHarness(timepoint: CrashTimepoint, opts: { taskCount?: number } = {}): Promise<CrashHarness> {
+async function crashHarness(
+  timepoint: CrashTimepoint,
+  opts: { taskCount?: number; autoRecovery?: boolean } = {},
+): Promise<CrashHarness> {
   const root = mkdtempSync(join(tmpdir(), `pix-recovery-e2e-${timepoint}-`));
   const storeRoot = join(root, "store");
   const projectDir = join(root, "project");
@@ -604,6 +608,14 @@ async function crashHarness(timepoint: CrashTimepoint, opts: { taskCount?: numbe
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
   const service = new AgentTaskService({ settings, events, store, runId: `restore-${timepoint}` });
+  // 1.5 (P1): the crash scenarios verify the manual hydration/resume flows -
+  // disable the automatic post-restoreAll recovery pass by default; the
+  // dedicated auto-recovery scenario opts back in.
+  if (!opts.autoRecovery) {
+    __setAgentTaskServiceHooksForTests({ disableAutoRecovery: true });
+  } else {
+    __setAgentTaskServiceHooksForTests({});
+  }
   return {
     root,
     service,
@@ -826,7 +838,11 @@ async function runParent(): Promise<void> {
       await assertRestoreCompleteness(harness, { expectedRestored: 5, expectedInterrupted: 5, timepointLabel: "queued" });
       const snap = harness.service.getAll();
       for (const info of snap.tasks) {
-        assertEqual(info.status, "interrupted", `queued: task ${info.taskId} is interrupted, never running`);
+        assertEqual(
+          info.status,
+          "interrupted",
+          `queued: task ${info.taskId} is interrupted, never running (got ${info.status}${info.failureReason ? `/${info.failureReason}` : ""}${info.errorMessage ? `: ${info.errorMessage}` : ""})`,
+        );
         assertEqual(info.presentation, "background", `queued: task ${info.taskId} presented background after restart`);
         assertEqual(info.stopReason, "app_shutdown", `queued: task ${info.taskId} stopReason app_shutdown`);
         assertEqual(info.autoBackground, undefined, `queued: task ${info.taskId} clears autoBackground`);
@@ -872,6 +888,56 @@ async function runParent(): Promise<void> {
         const notes = transcript.filter((entry) => entry.type === "custom_message" && entry.customType === RESUME_NOTE_CUSTOM_TYPE);
         assertEqual(notes.length, 1, "model: exactly one visible recovery note");
       }
+    } finally {
+      // Stop the scenario's service before deleting its store root, so no
+      // late flush (throttle/checkpoint tails) writes into a removed dir.
+      await harness.service.dispose("app_shutdown").catch(() => {});
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  });
+
+  await run("auto-recovery: killed mid-generation -> restoreAll auto-resumes with no user action", async () => {
+    // 1.5 (P1): the crash happens at the crash-safe model timepoint (the
+    // transcript is materialized and the checkpoint references the real file),
+    // so the automatic recovery pass must resume the task by itself: fixed
+    // decision {continue, confirmWorkspaceChanges:false} - the fingerprint is
+    // unchanged, so no workspace confirmation exists to give.
+    const harness = await crashHarness("model", { autoRecovery: true });
+    try {
+      assertEqual(harness.marker.status, "running", "auto: child killed while the model was generating");
+      const report = await harness.service.restoreAll();
+      assertEqual(report.interrupted, 1, "auto: task hydrated interrupted");
+      assertEqual(report.autoResumed, 1, "auto: the recovery pass resumed it automatically");
+      assertEqual(report.autoFailed, 0, "auto: nothing converged to resume_blocked");
+
+      const resumed = findTask(harness, harness.marker.taskId);
+      assertEqual(resumed.generation, 1, "auto: generation bumped by the automatic resume");
+      assert(
+        resumed.status === "queued" || resumed.status === "running",
+        `auto: resumed task entered queued/running (status=${resumed.status})`,
+      );
+
+      // No user interaction exists anymore: the resumed round runs to its
+      // terminal state on its own.
+      await waitForMs(
+        () => {
+          const current = findTask(harness, harness.marker.taskId);
+          return current.status === "completed" || current.status === "failed" || current.status === "cancelled";
+        },
+        300_000,
+        "auto: auto-resumed task to reach a terminal state",
+      );
+      const completed = findTask(harness, harness.marker.taskId);
+      assertEqual(completed.status, "completed", "auto: auto-resumed task completed");
+      if (completed.status !== "completed") {
+        throw new Error(`auto: task ended ${completed.status} (${completed.failureReason ?? ""} ${completed.errorMessage ?? ""})`);
+      }
+
+      const log = await readProductEventLog(harness);
+      assert(log.includes('"name":"agent_task_resume_requested"'), "auto: agent_task_resume_requested recorded");
+      assert(log.includes('"name":"agent_task_resume_succeeded"'), "auto: agent_task_resume_succeeded recorded");
+      assert(log.includes('"name":"agent_task_completed"'), "auto: agent_task_completed recorded");
+      assert(existsSync(join(harness.projectDir, "model-marker.txt")), "auto: the resumed round produced its marker file");
     } finally {
       // Stop the scenario's service before deleting its store root, so no
       // late flush (throttle/checkpoint tails) writes into a removed dir.

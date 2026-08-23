@@ -619,7 +619,15 @@ interface RecoveryHarness {
  * fresh (or shared) root + fake runtimes, auto-background disabled.
  */
 function makeRecoveryHarness(
-  opts: { storeRoot?: string; maxTaskBytes?: number; maxWorkspaceBytes?: number; reserveBytesOverride?: number; store?: AgentTaskStore } = {},
+  opts: {
+    storeRoot?: string;
+    maxTaskBytes?: number;
+    maxWorkspaceBytes?: number;
+    reserveBytesOverride?: number;
+    store?: AgentTaskStore;
+    autoRecovery?: boolean;
+    retentionOverride?: AgentTaskServiceTestHooks["retentionOverride"];
+  } = {},
 ): RecoveryHarness {
   FakeRuntime.instances = [];
   const settings = new SettingsStore({ cwd: mkdtempSync(join(tmpdir(), "pix-recovery-settings-")) });
@@ -636,12 +644,17 @@ function makeRecoveryHarness(
   const service = new AgentTaskService({ settings, events, store, runId: "recovery-run" });
   const hooks: Partial<AgentTaskServiceTestHooks> = {
     autoBackgroundMsOverride: 0,
+    // 1.5 (P1): this suite targets hydration semantics and the explicit
+    // resume/markFailed flows; the automatic post-restoreAll pass has its own
+    // dedicated tests (opt back in with opts.autoRecovery).
+    ...(opts.autoRecovery ? {} : { disableAutoRecovery: true }),
     runtimeFactory: (spec, input) => {
       const fake = new FakeRuntime(spec);
       fake.input = input;
       return fake as unknown as AgentTaskRuntime;
     },
     ...(opts.reserveBytesOverride !== undefined ? { reserveBytesOverride: opts.reserveBytesOverride } : {}),
+    ...(opts.retentionOverride !== undefined ? { retentionOverride: opts.retentionOverride } : {}),
   };
   __setAgentTaskServiceHooksForTests(hooks);
   return { service, store, storeRoot, settings, events };
@@ -851,7 +864,7 @@ await run("dispose without prepareShutdown never writes a clean marker", async (
   assertEqual(report.interrupted, 1, "emergency-disposed task hydrates interrupted");
 });
 
-await run("clear rewrites the persisted index: cleared tasks never resurrect as recovery-corrupt after restart", async () => {
+await run("retention deletion rewrites the persisted index: deleted tasks never resurrect as recovery-corrupt after restart", async () => {
   const harness = makeRecoveryHarness();
   const handle = await harness.service.createTaskGroup(makeParams("parallel", [makeTask(0), makeTask(1)]), makeContext(harness), "foreground");
   const [taskA, taskB] = handle.tasks.map((task) => task.taskId);
@@ -862,38 +875,55 @@ await run("clear rewrites the persisted index: cleared tasks never resurrect as 
     20000,
     "both tasks completed",
   );
+  // Drain the first harness's flush queue (terminal persistence + its own
+  // default-window retention pass) BEFORE the global test hooks switch to the
+  // tiny retention window: a pass scheduled here but executed later would read
+  // the NEW hooks and race the second harness over the shared store root.
+  // prepareShutdown only freezes non-terminal tasks - both are terminal here -
+  // and its final drain quiesces the queue deterministically.
+  await harness.service.prepareShutdown();
   const ws = workspaceIdOf(PROJECT.physicalPath);
 
-  // clearTask removes exactly that task from the persisted index.
-  const cleared = await harness.service.clearTask(taskA, 0, true);
-  assertEqual(cleared.ok, true, "clearTask ok");
-  const index = await harness.store.readIndex(ws);
-  assert(index !== null, "index exists after the clear");
-  assertEqual(index?.tasks.some((entry) => entry.taskId === taskA), false, "cleared task removed from the index");
-  assertEqual(index?.tasks.length, 1, "the sibling stays in the index");
-
-  // clearAllTerminal removes the last task; the empty entries array is still
-  // written.
-  const bulk = await harness.service.clearAllTerminal(ws, true);
-  assertEqual(bulk.ok, true, "clearAllTerminal ok");
-  const index2 = await harness.store.readIndex(ws);
-  assert(index2 !== null, "empty index still exists after the last task");
-  assertEqual(index2?.tasks.length, 0, "empty entries array written");
+  // 1.5 (P1): a restart with a tiny injected retention window (keep nothing)
+  // deletes exactly the terminal records and rewrites the persisted index -
+  // the retention pass replaces the removed manual clear.
+  const harness2 = makeRecoveryHarness({
+    storeRoot: harness.storeRoot,
+    retentionOverride: { keepCount: 0, keepAgeMs: 0, undeliveredGraceMs: 0 },
+  });
+  const report = await harness2.service.restoreAll();
+  assertEqual(report.restored, 2, "both terminal tasks hydrated before retention");
+  // The retention pass chains onto the persistence flush queue and performs
+  // several sequential fs operations (record delete + index rewrite); the
+  // suite's iteration-budget waitFor drains microtasks too fast for real IO,
+  // so poll on wall-clock instead.
+  const retentionDeadline = Date.now() + 10_000;
+  while (harness2.service.getAll().tasks.length > 0) {
+    if (Date.now() > retentionDeadline) {
+      throw new Error("Timed out waiting for retention removed both terminal tasks");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const index = await harness2.store.readIndex(ws);
+  assert(index !== null, "index exists after the retention deletion");
+  assertEqual(index?.tasks.length, 0, "empty entries array written");
 
   // Restart: no tasks, no recovery issues, corrupted == 0 (the old bug
-  // re-surfaced every cleared task as a migration_failed recovery issue).
-  const harness2 = makeRecoveryHarness({ storeRoot: harness.storeRoot });
-  const report = await harness2.service.restoreAll();
-  assertEqual(report.restored, 0, "no tasks restored after restart");
-  assertEqual(report.corrupted, 0, "no recovery-corrupt records after restart");
-  const snap = harness2.service.getAll();
+  // re-surfaced every deleted task as a migration_failed recovery issue).
+  const harness3 = makeRecoveryHarness({ storeRoot: harness.storeRoot });
+  const report3 = await harness3.service.restoreAll();
+  assertEqual(report3.restored, 0, "no tasks restored after restart");
+  assertEqual(report3.corrupted, 0, "no recovery-corrupt records after restart");
+  const snap = harness3.service.getAll();
   assertEqual(snap.tasks.length, 0, "no tasks after restart");
   assertEqual(snap.recoveryIssues.length, 0, "no recovery issues after restart");
 });
 
-await run("clearTask on a recovery-corrupt record also forgets its index entry", async () => {
-  // A workspace whose task.json is unreadable produces a recovery issue; the
-  // issue-clear path (no in-memory entry) must remove the index entry too.
+await run("recovery-corrupt records persist as read-only diagnostics (no manual clear)", async () => {
+  // A workspace whose task.json is unreadable produces a recovery issue. 1.5
+  // (P1): the issue-clear command is gone and retention never deletes
+  // recovery-corrupt records, so the diagnostic persists read-only across
+  // restarts instead of being silently removable.
   const harness = makeRecoveryHarness();
   const handle = await harness.service.createTaskGroup(makeParams("single", [makeTask(0)]), makeContext(harness), "foreground");
   const taskId = handle.tasks[0].taskId;
@@ -904,18 +934,15 @@ await run("clearTask on a recovery-corrupt record also forgets its index entry",
   const harness2 = makeRecoveryHarness({ storeRoot: harness.storeRoot });
   const report = await harness2.service.restoreAll();
   assertEqual(report.corrupted, 1, "unreadable record surfaces as corrupted");
-  const cleared = await harness2.service.clearTask(taskId, 0, true);
-  assertEqual(cleared.ok, true, "recovery-corrupt task is clearable");
-  const index = await harness2.store.readIndex(ws);
-  assert(index !== null, "index exists after the issue clear");
-  assertEqual(index?.tasks.some((entry) => entry.taskId === taskId), false, "issue-clear removed the index entry");
 
-  // Restart: nothing resurfaces.
+  // Restart again: the same read-only diagnostic resurfaces (nothing deletes
+  // it automatically and no manual command exists).
   const harness3 = makeRecoveryHarness({ storeRoot: harness.storeRoot });
   const report3 = await harness3.service.restoreAll();
-  assertEqual(report3.restored, 0, "no tasks restored");
-  assertEqual(report3.corrupted, 0, "no recovery-corrupt records after the issue clear");
-  assertEqual(harness3.service.getAll().recoveryIssues.length, 0, "no recovery issues after restart");
+  assertEqual(report3.corrupted, 1, "recovery-corrupt record persists across restarts");
+  const issues = harness3.service.getAll().recoveryIssues;
+  assertEqual(issues.length, 1, "the read-only diagnostic stays visible");
+  assertEqual(issues[0].readOnly, true, "the diagnostic stays read-only");
 });
 
 await run("restoreAll: rebuilt groups enable Plan two-phase consumption (terminal chain/parallel groups, interrupted release, resumed completion)", async () => {
@@ -989,20 +1016,14 @@ await run("restoreAll: rebuilt groups enable Plan two-phase consumption (termina
     assertEqual(beforeResume.reason, "group_not_terminal", "group_not_terminal reason");
   }
 
-  // Consumption on a restored group: pending -> consumed -> clearable.
+  // Consumption on a restored group: pending -> consumed.
   await harness2.service.confirmPlanTaskGroupConsumed(chainHandle.groupId, link);
   assertEqual(findTask(harness2, chainTaskId).planLinkState, "consumed", "restored group consumption flips pending -> consumed");
-  const clearConsumed = await harness2.service.clearTask(chainTaskId, 0, true);
-  assertEqual(clearConsumed.ok, true, "consumed restored task clearable");
-  assertEqual(harness2.service.getAll().tasks.some((t) => t.taskId === chainTaskId), false, "consumed restored task removed");
 
-  // Release on a restored interrupted group: pending -> released -> clearable
-  // (previously a permanent pending zombie).
+  // Release on a restored interrupted group: pending -> released (previously
+  // a permanent pending zombie).
   await harness2.service.releasePlanTaskGroup(releaseHandle.groupId, link, "plan_cancelled");
   assertEqual(findTask(harness2, releaseTaskId).planLinkState, "released", "restored release flips pending -> released");
-  const clearReleased = await harness2.service.clearTask(releaseTaskId, 0, true);
-  assertEqual(clearReleased.ok, true, "released restored task clearable");
-  assertEqual(harness2.service.getAll().tasks.some((t) => t.taskId === releaseTaskId), false, "released restored task removed");
 
   // A resumed restored group becomes consumable after completion.
   const resumeResult = await harness2.service.resume(resumeTaskId, 0, { action: "continue", confirmWorkspaceChanges: true });
@@ -1016,8 +1037,6 @@ await run("restoreAll: rebuilt groups enable Plan two-phase consumption (termina
   }
   await harness2.service.confirmPlanTaskGroupConsumed(resumeHandle.groupId, link);
   assertEqual(findTask(harness2, resumeTaskId).planLinkState, "consumed", "resumed restored consumption works");
-  const clearResumed = await harness2.service.clearTask(resumeTaskId, 1, true);
-  assertEqual(clearResumed.ok, true, "consumed resumed task clearable");
 
   rmSync(projectDir, { recursive: true, force: true });
 });
@@ -1177,8 +1196,6 @@ await run("storage limit at creation: failed(storage_limit), index records the f
   assert(issue !== undefined, "storage-failed task surfaces as a recovery issue");
   assertEqual(issue?.code, "migration_failed", "unreadable metadata maps to migration_failed");
   assertEqual(issue?.readOnly, true, "unreadable record is read-only");
-  const cleared = await harness2.service.clearTask(taskId, 0, true);
-  assertEqual(cleared.ok, true, "recovery issue is clearable");
 });
 
 await run("runtime storage limit: oversized output fails the task with storage_limit", async () => {
@@ -2736,6 +2753,7 @@ await run("dispose waits for the prepared queued runtime's dispose (exit cleanup
   const harness2 = makeRecoveryHarness({ storeRoot: harness.storeRoot });
   __setAgentTaskServiceHooksForTests({
     autoBackgroundMsOverride: 0,
+    disableAutoRecovery: true,
     runtimeFactory: (spec, input) => {
       const fake = new FakeRuntime(spec);
       fake.input = input;
@@ -2809,7 +2827,7 @@ await run("service resume: a queued resumed task cancelled before its slot dispo
   rmSync(projectDir, { recursive: true, force: true });
 });
 
-await run("service: mark_failed converts interrupted to failed(user_decision); clear_all_terminal protects pending-link/interrupted; diagnostics metadata-only; summary signals", async () => {
+await run("service: mark_failed converts interrupted to failed(user_decision); diagnostics metadata-only", async () => {
   const projectDir = mkdtempSync(join(tmpdir(), "pix-resume-clear-"));
   const location = makeLocation(projectDir);
   const harness = makeRecoveryHarness();
@@ -2834,19 +2852,9 @@ await run("service: mark_failed converts interrupted to failed(user_decision); c
   const interrupted = findTask(harness2, runningId);
   assertEqual(interrupted.status, "interrupted", "running task hydrates interrupted");
 
-  // clear_all_terminal: only the plain completed task is cleared.
-  const noConfirm = await harness2.service.clearAllTerminal(undefined, false);
-  assertEqual(noConfirm.ok, false, "clear_all_terminal without confirm rejected");
-  const cleared = await harness2.service.clearAllTerminal(workspaceIdOf(projectDir), true);
-  assertEqual(cleared.ok, true, "clear_all_terminal ok");
-  if (cleared.ok) {
-    assertEqual(cleared.data.cleared, 1, "exactly the plain completed task cleared");
-    assert(cleared.data.protectedTaskIds.includes(linkedId), "pending-link task protected");
-    assert(cleared.data.protectedTaskIds.includes(interrupted.taskId), "interrupted task protected");
-  }
-  assertEqual(harness2.service.getAll().tasks.some((t) => t.taskId === plainId), false, "cleared task removed");
-  assertEqual(findTask(harness2, linkedId).status, "completed", "pending-link task stays");
-  assertEqual(findTask(harness2, runningId).status, "interrupted", "interrupted task stays");
+  // 1.5 (P1): clear_all_terminal is gone (retention owns terminal-record
+  // deletion); the pending-link and interrupted protection semantics live in
+  // the retention tests.
 
   // mark_failed on the interrupted task.
   const marked = await harness2.service.markFailed(runningId, 0, "user_decision");
@@ -2869,25 +2877,6 @@ await run("service: mark_failed converts interrupted to failed(user_decision); c
     (err: unknown) => err,
   );
   assert(unknown !== null, "unknown task diagnostics fail");
-
-  // getResumeSummary on a fresh interrupted task.
-  const handle3 = await harness2.service.createTaskGroup(makeParams("single", [makeTask(3)]), makeContext(harness2, { project: location }), "foreground");
-  const freshId = handle3.tasks[0].taskId;
-  await harness2.service.prepareShutdown();
-  const harness3 = makeRecoveryHarness({ storeRoot: harness.storeRoot });
-  await harness3.service.restoreAll();
-  const summary = await harness3.service.getResumeSummary(freshId, 0);
-  assertEqual(summary.taskId, freshId, "summary taskId");
-  assertEqual(summary.generation, 0, "summary generation");
-  assertEqual(summary.openToolCalls.length, 0, "no open calls for a fresh interrupted task");
-  assertEqual(summary.workspaceChanges.length, 0, "no workspace changes for an untouched workspace");
-  assertEqual(summary.modelChanged, false, "model unchanged");
-  assertEqual(summary.environmentChanged, false, "environment available");
-  const staleSummary = await harness3.service.getResumeSummary(freshId, 999).then(
-    () => null,
-    (err: unknown) => err,
-  );
-  assert(staleSummary !== null, "stale generation summary fails");
 
   assertNoUnhandledRejections();
   rmSync(projectDir, { recursive: true, force: true });
@@ -2978,6 +2967,174 @@ await run("restoreAll: generation one-behind checkpoint compensated; ahead check
   assertEqual(issue?.code, "index_corrupt", "index_corrupt code");
   assertEqual(issue?.readOnly, true, "ahead checkpoint is read-only");
 
+  assertNoUnhandledRejections();
+  rmSync(projectDir, { recursive: true, force: true });
+});
+
+// ============================================================================
+// 1.5 (P1): restart auto-recovery (design plan §6.2)
+// ============================================================================
+
+await run("auto-recovery: an untouched-workspace interrupted task resumes automatically", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "pix-auto-resume-"));
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-auto-resume-store-"));
+  const store = new AgentTaskStore({ rootDir: storeRoot, maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 });
+  const spec = makeSpec(projectDir, { items: [makeReadyItem()] });
+  await writeTaskRecord(store, spec, { status: "running" });
+
+  const harness = makeRecoveryHarness({ storeRoot, autoRecovery: true });
+  const report = await harness.service.restoreAll();
+  assertEqual(report.interrupted, 1, "task hydrated interrupted");
+  assertEqual(report.autoResumed, 1, "auto-recovery resumed it");
+  assertEqual(report.autoFailed, 0, "nothing converged to failed");
+  const resumed = findTask(harness, spec.taskId);
+  assertEqual(resumed.generation, 1, "generation bumped by the automatic resume");
+  assert(
+    resumed.status === "queued" || resumed.status === "running",
+    `auto-resumed task entered queued/running (status=${resumed.status})`,
+  );
+  assert(harness.events.records.some((event) => event.name === "agent_task_resume_requested"), "agent_task_resume_requested recorded");
+
+  await harness.service.dispose("app_shutdown").catch(() => {});
+  assertNoUnhandledRejections();
+  rmSync(projectDir, { recursive: true, force: true });
+});
+
+await run("auto-recovery: a missing checkpoint converges to failed(resume_blocked), never lingers interrupted", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "pix-auto-nocp-"));
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-auto-nocp-store-"));
+  const store = new AgentTaskStore({ rootDir: storeRoot, maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 });
+  const spec = makeSpec(projectDir);
+  await writeTaskRecord(store, spec, { status: "running" });
+  rmSync(join(storeRoot, spec.workspaceId, spec.taskId, "checkpoint.json"), { force: true });
+
+  const harness = makeRecoveryHarness({ storeRoot, autoRecovery: true });
+  const report = await harness.service.restoreAll();
+  assertEqual(report.interrupted, 1, "task hydrated interrupted");
+  assertEqual(report.autoResumed, 0, "resume not possible");
+  assertEqual(report.autoFailed, 1, "auto-recovery converged it to failed");
+  const failed = findTask(harness, spec.taskId);
+  assertEqual(failed.status, "failed", "task is failed, not interrupted");
+  assertEqual(failed.failureReason, "resume_blocked", "failure code is resume_blocked (never user_decision)");
+  assert((failed.errorMessage ?? "").includes("checkpoint_unavailable"), "errorMessage carries the concrete resume reason");
+  assert(harness.events.records.some((event) => event.name === "agent_task_failed"), "agent_task_failed recorded");
+
+  await harness.service.dispose("app_shutdown").catch(() => {});
+  assertNoUnhandledRejections();
+  rmSync(projectDir, { recursive: true, force: true });
+});
+
+await run("auto-recovery: workspace fingerprint change is never auto-confirmed -> failed(resume_blocked)", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "pix-auto-changed-"));
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-auto-changed-store-"));
+  const store = new AgentTaskStore({ rootDir: storeRoot, maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 });
+  const spec = makeSpec(projectDir, { items: [makeReadyItem()] });
+  // The checkpoint observed a file hash the (now different) workspace cannot
+  // reproduce; the fixed decision confirmWorkspaceChanges:false must refuse.
+  await writeTaskRecord(store, spec, {
+    status: "running",
+    checkpoint: makeDefaultCheckpoint(spec, {
+      workspaceFingerprint: { isGit: false, observedFileHashes: { "gone-file.txt": "deadbeef".repeat(8) } },
+    }),
+  });
+
+  const harness = makeRecoveryHarness({ storeRoot, autoRecovery: true });
+  const report = await harness.service.restoreAll();
+  assertEqual(report.autoFailed, 1, "changed workspace converges to failed");
+  const failed = findTask(harness, spec.taskId);
+  assertEqual(failed.failureReason, "resume_blocked", "resume_blocked code");
+  assert((failed.errorMessage ?? "").includes("workspace_changed"), "errorMessage names workspace_changed");
+
+  await harness.service.dispose("app_shutdown").catch(() => {});
+  assertNoUnhandledRejections();
+  rmSync(projectDir, { recursive: true, force: true });
+});
+
+await run("workflowOwned survives restarts through the index and exempts the group from retention", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "pix-auto-wf-"));
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-auto-wf-store-"));
+  const store = new AgentTaskStore({ rootDir: storeRoot, maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 });
+  // One workflow-owned terminal task (index entry carries the persisted flag)
+  // and one ordinary terminal task.
+  const wfSpec = makeSpec(projectDir, { groupId: "wf-group" });
+  const plainSpec = makeSpec(projectDir, { groupId: "plain-group" });
+  const wfCheckpoint = makeDefaultCheckpoint(wfSpec);
+  const plainCheckpoint = makeDefaultCheckpoint(plainSpec);
+  for (const [spec, cp] of [
+    [wfSpec, wfCheckpoint],
+    [plainSpec, plainCheckpoint],
+  ] as const) {
+    const info = { ...makeInfo(spec, { status: "completed" }), endedAt: Date.now(), durationMs: 0 };
+    await store.initWorkspace(spec.workspaceId);
+    await store.writeMetadata(spec.workspaceId, spec.taskId, { schemaVersion: 1, spec, initialInfo: makeInfo(spec) });
+    await store.appendEvent(spec.workspaceId, spec.taskId, { type: "state", from: "running", to: "completed", info });
+    await store.writeCheckpoint(spec.workspaceId, spec.taskId, { ...cp, seq: 1 });
+  }
+  await store.writeIndex(wfSpec.workspaceId, {
+    schemaVersion: 1,
+    workspaceId: wfSpec.workspaceId,
+    generation: 1,
+    lastWriterRunId: "test-run",
+    tasks: [
+      {
+        taskId: wfSpec.taskId,
+        workspaceId: wfSpec.workspaceId,
+        parentSessionId: wfSpec.parentSessionId,
+        parentToolCallId: wfSpec.parentToolCallId,
+        groupId: wfSpec.groupId,
+        status: "completed",
+        lastCheckpointSeq: 1,
+        hasUnclosedToolCall: false,
+        updatedAt: Date.now(),
+        schemaVersion: 1,
+        lastWriterRunId: "test-run",
+        workflowOwned: true,
+      },
+      {
+        taskId: plainSpec.taskId,
+        workspaceId: plainSpec.workspaceId,
+        parentSessionId: plainSpec.parentSessionId,
+        parentToolCallId: plainSpec.parentToolCallId,
+        groupId: plainSpec.groupId,
+        status: "completed",
+        lastCheckpointSeq: 1,
+        hasUnclosedToolCall: false,
+        updatedAt: Date.now(),
+        schemaVersion: 1,
+        lastWriterRunId: "test-run",
+      },
+    ],
+  });
+
+  // Restart with every retention window closed: the ordinary terminal record
+  // is reclaimed, the workflow-owned one survives (its lifecycle belongs to
+  // the workflow engine).
+  const harness = makeRecoveryHarness({
+    storeRoot,
+    autoRecovery: true,
+    retentionOverride: { keepCount: 0, keepAgeMs: 0, undeliveredGraceMs: 0 },
+  });
+  const removed: string[] = [];
+  harness.service.onEvent((event) => {
+    if (event.type === "task_removed") {
+      removed.push(event.taskId);
+    }
+  });
+  await harness.service.restoreAll();
+  const deadline = Date.now() + 10_000;
+  while (harness.service.getAll().tasks.length > 1) {
+    if (Date.now() > deadline) {
+      throw new Error("Timed out waiting for the retention pass to reclaim the plain task");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assertEqual(removed.includes(plainSpec.taskId), true, "plain terminal record removed with a task_removed push");
+  assertEqual(removed.includes(wfSpec.taskId), false, "workflow-owned record never removed");
+  const snap = harness.service.getAll();
+  assertEqual(snap.tasks.length, 1, "only the workflow-owned task remains");
+  assertEqual(snap.tasks[0]?.taskId, wfSpec.taskId, "the survivor is the workflow-owned task");
+
+  await harness.service.dispose("app_shutdown").catch(() => {});
   assertNoUnhandledRejections();
   rmSync(projectDir, { recursive: true, force: true });
 });

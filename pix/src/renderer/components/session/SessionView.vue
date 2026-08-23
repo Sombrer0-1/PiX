@@ -401,6 +401,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
               :result="tool.result"
               :args="tool.args"
               :is-error="tool.isError"
+              :tool-call-id="tool.toolCallId"
             />
             <WorkflowRunPanel
               v-else-if="tool.toolName === 'workflow' || tool.toolName === 'ralph'"

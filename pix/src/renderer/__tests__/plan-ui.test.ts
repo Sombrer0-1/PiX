@@ -362,9 +362,9 @@ describe("real mount", () => {
     });
     await flushPromises();
 
-    const panel = w.getComponent(PlanPanel);
+    const panel = w.findComponent(PlanPanel);
     expect(panel.exists()).toBe(true);
-    expect(w.get('[data-test="plan-panel"]').exists()).toBe(true);
+    expect(w.find('[data-test="plan-panel"]').exists()).toBe(true);
     // The step list renders the real PlanStepCard, not a stub.
     expect(w.findAllComponents(PlanStepCard).length).toBe(1);
     expect(w.get('[data-test="plan-title"]').text()).toContain("实现登录");
@@ -398,7 +398,7 @@ describe("real mount", () => {
     await flushPromises();
 
     expect(w.findComponent(PlanPanel).exists()).toBe(true);
-    expect(w.get('[data-test="plan-panel"]').exists()).toBe(true);
+    expect(w.find('[data-test="plan-panel"]').exists()).toBe(true);
     expect(w.get('[data-test="plan-status"]').text()).toBe("已取消");
   });
 });
@@ -666,7 +666,7 @@ describe("three plan indicators", () => {
     // 1. Input-area toggle.
     expect(w.get(".plan-toggle-text").text()).toBe("规划已开启");
     // 2. PlanPanel header (title + status).
-    expect(w.get('[data-test="plan-panel"]').exists()).toBe(true);
+    expect(w.find('[data-test="plan-panel"]').exists()).toBe(true);
     expect(w.get('[data-test="plan-status"]').text()).toBe("待批准");
     // 3. CenterPanel session status text.
     expect(w.get(".status-pill").text()).toContain("待批准");
@@ -709,7 +709,7 @@ describe("abandon confirmation", () => {
     await flushPromises();
 
     await w.get('[data-test="plan-abandon-btn"]').trigger("click");
-    expect(w.get('[data-test="plan-abandon-confirm"]').exists()).toBe(true);
+    expect(w.find('[data-test="plan-abandon-confirm"]').exists()).toBe(true);
 
     // Cancelling the confirm dialog sends nothing.
     await w.get('[data-test="plan-abandon-cancel"]').trigger("click");
@@ -870,7 +870,7 @@ describe("approval flow", () => {
     });
     await flushPromises();
 
-    const generating = w.get('[data-test="plan-generating"]');
+    const generating = w.find('[data-test="plan-generating"]');
     expect(generating.exists()).toBe(true);
     expect(generating.text()).toContain("正在生成计划");
   });
@@ -966,7 +966,7 @@ describe("step list", () => {
     });
     await flushPromises();
 
-    const deviationBox = w.get(".plan-step-deviation");
+    const deviationBox = w.find(".plan-step-deviation");
     expect(deviationBox.exists()).toBe(true);
     expect(deviationBox.text()).toContain("File is outside the declared scope");
     expect(deviationBox.text()).toContain("outside.txt");
@@ -993,7 +993,7 @@ describe("step list", () => {
 describe("error recovery", () => {
   function failedSnapshot(overrides: {
     phase?: PlanRuntimeSnapshot["phase"];
-    code?: string;
+    code?: NonNullable<PlanRuntimeSnapshot["failure"]>["code"];
     failurePhase?: "initial" | "revision";
     message?: string;
     revision?: PlanRuntimeSnapshot["revision"];

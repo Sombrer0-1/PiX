@@ -6,819 +6,116 @@
  *
  * Tool executions are aggregated into a single "work-status" block instead of
  * individual inline blocks. This keeps the chat mainline clean.
+ *
+ * The folding logic itself lives in the framework-free display-blocks
+ * assembler (utils/display-blocks.ts): it is injected with the reactive
+ * displayBlocks array and mutates it in place, so the two views (main chat /
+ * task transcript) share identical folding semantics.
  */
 
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import type { AgentMessage, AgentSessionEvent } from "@/types/rpc";
-import type { ChatMessageAttachment, DisplayBlock, ToolWorkItem } from "@/types/session";
-import { classifyApiError } from "@/utils/api-error";
-
-function nextBlockId(): string {
-  return `block_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-}
-
-interface MessageDisplay {
-  text: string;
-  attachments: ChatMessageAttachment[];
-  noteKind?: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object";
-}
-
-function messageTimestamp(message: AgentMessage): number {
-  return typeof message.timestamp === "number" ? message.timestamp : Date.now();
-}
-
-function attachmentName(path: string): string {
-  return path.split(/[/\\]/).pop() || path;
-}
-
-function attachmentFromPath(path: string): ChatMessageAttachment {
-  return {
-    path,
-    name: attachmentName(path),
-    kind: "file",
-  };
-}
-
-function normalizeAttachment(value: unknown): ChatMessageAttachment | null {
-  if (!isRecord(value) || typeof value.path !== "string") return null;
-  const kind = value.kind === "image" || value.kind === "file" || value.kind === "text" ? value.kind : "file";
-  return {
-    path: value.path,
-    name: typeof value.name === "string" ? value.name : attachmentName(value.path),
-    kind,
-    size: typeof value.size === "number" ? value.size : undefined,
-    content: typeof value.content === "string" ? value.content : undefined,
-  };
-}
-
-function extractContentText(message: AgentMessage): string {
-  const content = message.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((block): block is { type: "text"; text: string } =>
-        block.type === "text" && typeof (block as { text?: unknown }).text === "string")
-      .map((block) => (block as { text: string }).text)
-      .join("");
-  }
-  return "";
-}
-
-/**
- * Turn a steered <teammate-message> (worker report injected into the Leader
- * session) into a compact human-readable note, or null if the text is not a
- * teammate message.
- */
-function parseTeammateMessageNote(text: string): string | null {
-  const trimmed = text.trimStart();
-  if (!trimmed.startsWith("<teammate-message")) return null;
-  const match = trimmed.match(
-    /^<teammate-message\s+from="([^"]*)"(?:\s+role="([^"]*)")?[^>]*>\r?\n?([\s\S]*?)\r?\n?<\/teammate-message>\s*$/,
-  );
-  if (!match) return null;
-  const from = match[1] || "团队成员";
-  const role = match[2];
-  const body = (match[3] ?? "").trim();
-  const roleLabels: Record<string, string> = {
-    planner: "规划",
-    coder: "开发",
-    reviewer: "审查",
-    tester: "测试",
-    researcher: "调研",
-  };
-  const roleLabel = role ? roleLabels[role] ?? role : undefined;
-  const label = roleLabel && role !== from ? `${from}（${roleLabel}）` : from;
-  return `来自 ${label} 的成员汇报：\n${body}`;
-}
-
-/**
- * Produce a one-line summary of an internal <orchestrator-event> prompt so the
- * user sees WHY the leader is suddenly responding, without exposing the full
- * internal coordination payload.
- */
-function summarizeOrchestratorEvent(text: string): string {
-  const events = [...text.matchAll(/^EVENT: (\S+)/gm)].map((m) => m[1]);
-  if (events.length === 0) return "团队协调事件";
-  const workers = [...new Set([...text.matchAll(/^Worker: ([^\n(]+)/gm)].map((m) => m[1].trim()))];
-  const tasks = [...new Set([...text.matchAll(/^Task: "([^"]+)"/gm)].map((m) => m[1]))];
-  const parts = [`团队事件：${[...new Set(events)].join("、")}`];
-  if (workers.length > 0) parts.push(`成员：${workers.join("、")}`);
-  if (tasks.length > 0) parts.push(`任务：${tasks.slice(0, 2).join("；")}`);
-  return parts.join(" · ");
-}
-
-function parseEmbeddedFileBlocks(text: string): { text: string; attachments: ChatMessageAttachment[] } {
-  const attachments: ChatMessageAttachment[] = [];
-  const stripped = text.replace(/<file name="([^"]*)">\r?\n?([\s\S]*?)\r?\n?<\/file>\r?\n?/g, (_match, path, content) => {
-    const filePath = String(path);
-    const body = String(content);
-    attachments.push({
-      path: filePath,
-      name: attachmentName(filePath),
-      kind: body.trim().startsWith("[Image ") || body.trim().startsWith("Image ") ? "image" : "text",
-      content: body,
-    });
-    return "";
-  });
-  return { text: stripped.trim(), attachments };
-}
-
-function mergeAttachments(...groups: ChatMessageAttachment[][]): ChatMessageAttachment[] {
-  const merged = new Map<string, ChatMessageAttachment>();
-  for (const group of groups) {
-    for (const attachment of group) {
-      const key = attachment.path || attachment.name;
-      const existing = merged.get(key);
-      merged.set(key, {
-        ...existing,
-        ...attachment,
-        content: attachment.content ?? existing?.content,
-        size: attachment.size ?? existing?.size,
-      });
-    }
-  }
-  return Array.from(merged.values());
-}
-
-function fingerprintUserMessage(text: string, attachments: ChatMessageAttachment[]): string {
-  const paths = attachments.map((attachment) => attachment.path).sort();
-  return JSON.stringify({ text: text.trim(), paths });
-}
-
-function extractMessageDisplay(message: AgentMessage): MessageDisplay {
-  if (message.role === "custom" && message.customType === "pi.ui_note" && isRecord(message.details)) {
-    return {
-      text: typeof message.details.text === "string" ? message.details.text : "",
-      attachments: [],
-      noteKind: typeof message.details.kind === "string" ? message.details.kind : undefined,
-    };
-  }
-
-  const rawText = extractContentText(message);
-  const parsed = parseEmbeddedFileBlocks(rawText);
-  const metadataAttachments = Array.isArray(message.attachments)
-    ? message.attachments.map(normalizeAttachment).filter((a): a is ChatMessageAttachment => a !== null)
-    : [];
-
-  const displayText = typeof message.displayText === "string" ? message.displayText : undefined;
-  return {
-    text: displayText !== undefined ? displayText : parsed.text,
-    attachments: mergeAttachments(metadataAttachments, parsed.attachments),
-  };
-}
+import type { DisplayBlock } from "@/types/session";
+import { createDisplayBlockAssembler } from "@/utils/display-blocks";
 
 const MAX_EVENTS = 50000;
 const MAX_DISPLAY_BLOCKS = 20000;
 
 export function createSessionStore(id: string, options: { teamLeader?: boolean } = {}) {
   return defineStore(id, () => {
-  const renderTeamLeaderNotes = options.teamLeader === true;
-  const events = ref<AgentSessionEvent[]>([]);
-  const displayBlocks = ref<DisplayBlock[]>([]);
-  const isStreaming = ref(false);
-  const errorMessage = ref<string | null>(null);
-  // Tracks the most recent retryable API error block so the retry button only
-  // renders on the latest error while the agent is idle. Cleared when a new
-  // turn starts or the user sends a new message.
-  const lastRetryableError = ref<{ blockId: string } | null>(null);
+    const events = ref<AgentSessionEvent[]>([]);
+    const displayBlocks = ref<DisplayBlock[]>([]);
+    const isStreaming = ref(false);
+    const errorMessage = ref<string | null>(null);
+    // Mirrors the assembler's internal lastRetryableError (updated after every
+    // assembler call); the assembler is framework-free, so the store re-syncs
+    // the reactive ref instead of passing Vue state into it.
+    const lastRetryableError = ref<{ blockId: string } | null>(null);
 
-  let currentAgentBlockId: string | null = null;
-  let currentWorkStatusId: string | null = null;
-  let currentThinkingBlockId: string | null = null;
-  let legacyVisionStatusId: string | null = null;
-  let visionStatusIds = new Map<string, string>();
-  let optimisticUserMessages: Array<{ blockId: string; fingerprint: string; separatorId: string | null }> = [];
-
-  function removeThinkingBlock(): void {
-    if (!currentThinkingBlockId) return;
-    const blockId = currentThinkingBlockId;
-    displayBlocks.value = displayBlocks.value.filter((block) => block.id !== blockId);
-    currentThinkingBlockId = null;
-  }
-
-  function showThinkingBlock(timestamp = Date.now()): void {
-    if (currentThinkingBlockId) return;
-    const block: DisplayBlock = {
-      id: nextBlockId(),
-      type: "thinking",
-      timestamp,
-    };
-    currentThinkingBlockId = block.id;
-    displayBlocks.value.push(block);
-  }
-
-  function appendTurnSeparator(timestamp = Date.now()): string | null {
-    const last = displayBlocks.value.at(-1);
-    if (!last || last.type === "turn-separator") return null;
-    const id = nextBlockId();
-    displayBlocks.value.push({
-      id,
-      type: "turn-separator",
-      timestamp,
+    const assembler = createDisplayBlockAssembler({
+      teamLeader: options.teamLeader === true,
+      blocks: displayBlocks.value,
     });
-    return id;
-  }
 
-  function appendUserOrNoteMessage(msg: AgentMessage, showLiveThinking = false): boolean {
-    if (msg.role === "user") {
-      const rawText = extractContentText(msg).trimStart();
-      // Internal orchestration turn: show a compact note (so the leader's
-      // upcoming response has visible context) instead of the raw payload,
-      // plus the thinking indicator since a leader turn is starting.
-      if (renderTeamLeaderNotes && rawText.startsWith("<orchestrator-event>")) {
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "note",
-          text: summarizeOrchestratorEvent(rawText),
-          timestamp: messageTimestamp(msg),
-        });
-        if (showLiveThinking) showThinkingBlock(messageTimestamp(msg));
-        return false;
+    function syncLastRetryableError(): void {
+      lastRetryableError.value = assembler.lastRetryableError;
+    }
+
+    function addEvent(event: AgentSessionEvent): void {
+      if (events.value.length >= MAX_EVENTS) {
+        events.value = events.value.slice(-Math.floor(MAX_EVENTS / 2));
       }
-      // Steered worker report: render as a styled note, not a fake "user" bubble.
-      const teammateNote = renderTeamLeaderNotes ? parseTeammateMessageNote(rawText) : null;
-      if (teammateNote) {
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "note",
-          text: teammateNote,
-          timestamp: messageTimestamp(msg),
-        });
-        return false;
+      if (displayBlocks.value.length >= MAX_DISPLAY_BLOCKS) {
+        // Cap in place: the assembler holds the same array reference, so a
+        // reassignment would leave the assembler mutating a detached array.
+        displayBlocks.value.splice(0, displayBlocks.value.length - Math.floor(MAX_DISPLAY_BLOCKS / 2));
       }
-    }
-
-    const display = extractMessageDisplay(msg);
-    if (msg.role === "custom" && display.noteKind && display.noteKind !== "user_command") {
-      if (display.text) {
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "note",
-          text: display.text,
-          timestamp: messageTimestamp(msg),
-        });
-      }
-      return true;
-    }
-
-    if (display.text || display.attachments.length > 0) {
-      closeCurrentWorkStatus(true);
-      if (msg.role === "user") {
-        const fingerprint = fingerprintUserMessage(display.text, display.attachments);
-        const optimistic = optimisticUserMessages.find((item) => item.fingerprint === fingerprint);
-        if (optimistic) {
-          const optimisticBlock = displayBlocks.value.find((block) => block.id === optimistic.blockId);
-          if (optimisticBlock && optimisticBlock.type === "user-message") {
-            optimisticBlock.text = display.text;
-            optimisticBlock.attachments = display.attachments;
-            optimisticBlock.timestamp = messageTimestamp(msg);
-          }
-          optimisticUserMessages = optimisticUserMessages.filter((item) => item.blockId !== optimistic.blockId);
-          return true;
-        }
-        appendTurnSeparator(messageTimestamp(msg));
-      }
-      displayBlocks.value.push({
-        id: nextBlockId(),
-        type: "user-message",
-        text: display.text,
-        attachments: display.attachments,
-        timestamp: messageTimestamp(msg),
-      });
-      return true;
-    }
-    return false;
-  }
-
-  function appendOptimisticUserMessage(text: string, filePaths: string[] = []): string | null {
-    const attachments = filePaths.map(attachmentFromPath);
-    if (!text.trim() && attachments.length === 0) return null;
-
-    // Starting a new turn invalidates the retry affordance on any prior error.
-    lastRetryableError.value = null;
-    const timestamp = Date.now();
-    closeCurrentWorkStatus(true);
-    const separatorId = appendTurnSeparator(timestamp);
-    const block: DisplayBlock = {
-      id: nextBlockId(),
-      type: "user-message",
-      text: text.trim(),
-      attachments,
-      timestamp,
-    };
-    displayBlocks.value.push(block);
-    optimisticUserMessages.push({
-      blockId: block.id,
-      fingerprint: fingerprintUserMessage(text, attachments),
-      separatorId,
-    });
-    return block.id;
-  }
-
-  function failOptimisticUserMessage(blockId: string | null, message: string): void {
-    if (!blockId) return;
-    const optimistic = optimisticUserMessages.find((item) => item.blockId === blockId);
-    if (!optimistic) return;
-
-    const removeIds = new Set([optimistic.blockId]);
-    if (optimistic.separatorId) removeIds.add(optimistic.separatorId);
-    displayBlocks.value = displayBlocks.value.filter((block) => !removeIds.has(block.id));
-    optimisticUserMessages = optimisticUserMessages.filter((item) => item.blockId !== blockId);
-
-    displayBlocks.value.push({
-      id: nextBlockId(),
-      type: "error",
-      message,
-      source: "发送",
-      timestamp: Date.now(),
-    });
-  }
-
-  function showVisionStatus(event: Extract<AgentSessionEvent, { type: "eye_model_start" }>): void {
-    const block: DisplayBlock = {
-      id: nextBlockId(),
-      type: "vision-status",
-      provider: event.provider,
-      modelId: event.modelId,
-      imageCount: event.imageCount,
-      status: "running",
-      timestamp: Date.now(),
-    };
-    if (event.id) {
-      visionStatusIds.set(event.id, block.id);
-    } else {
-      legacyVisionStatusId = block.id;
-    }
-    displayBlocks.value.push(block);
-  }
-
-  function finishVisionStatus(event: Extract<AgentSessionEvent, { type: "eye_model_end" }>): void {
-    const blockId = event.id ? visionStatusIds.get(event.id) : legacyVisionStatusId;
-    const block = blockId
-      ? displayBlocks.value.find((item) => item.id === blockId && item.type === "vision-status")
-      : null;
-    if (block && block.type === "vision-status") {
-      block.status = event.success ? "success" : "error";
-      block.timestamp = Date.now();
-      if (event.id) {
-        visionStatusIds.delete(event.id);
-      } else {
-        legacyVisionStatusId = null;
-      }
-      return;
-    }
-    displayBlocks.value.push({
-      id: nextBlockId(),
-      type: "vision-status",
-      provider: event.provider,
-      modelId: event.modelId,
-      imageCount: event.imageCount,
-      status: event.success ? "success" : "error",
-      timestamp: Date.now(),
-    });
-  }
-
-  function closeCurrentWorkStatus(force = false): void {
-    const ws = currentWorkStatusId
-      ? displayBlocks.value.find((b) => b.id === currentWorkStatusId && b.type === "work-status")
-      : null;
-    if (ws && ws.type === "work-status") {
-      const hasPending = ws.tools.some((tool) => tool.result === null);
-      if (ws.tools.length === 0) {
-        // No tools were executed — remove the empty "thinking" block entirely
-        displayBlocks.value = displayBlocks.value.filter((block) => block.id !== ws.id);
-        currentWorkStatusId = null;
-      } else if (!hasPending || force) {
-        // All tools done, or agent ended (force) — mark as finished
-        ws.isStreaming = false;
-        currentWorkStatusId = null;
-      }
-      // else: tools still pending — keep currentWorkStatusId so we can
-      // find and close this block when tools finish
-    } else {
-      currentWorkStatusId = null;
-    }
-  }
-
-  function createAgentBlock(text: string, isStreamingBlock: boolean, timestamp = Date.now()): string {
-    removeThinkingBlock();
-    closeCurrentWorkStatus();
-    const block: DisplayBlock = {
-      id: nextBlockId(),
-      type: "agent-message",
-      content: text,
-      isStreaming: isStreamingBlock,
-      timestamp,
-    };
-    displayBlocks.value.push(block);
-    return block.id;
-  }
-
-  function ensureWorkStatusBlock(timestamp = Date.now()): Extract<DisplayBlock, { type: "work-status" }> {
-    if (!currentWorkStatusId) {
-      const wsBlock: DisplayBlock = {
-        id: nextBlockId(),
-        type: "work-status",
-        tools: [],
-        isStreaming: true,
-        timestamp,
-      };
-      currentWorkStatusId = wsBlock.id;
-      displayBlocks.value.push(wsBlock);
-    }
-    const ws = displayBlocks.value.find(
-      (b) => b.id === currentWorkStatusId && b.type === "work-status"
-    );
-    if (!ws || ws.type !== "work-status") {
-      throw new Error("创建工作状态块失败");
-    }
-    return ws;
-  }
-
-  function findWorkStatusForTool(toolCallId: string): Extract<DisplayBlock, { type: "work-status" }> | null {
-    for (let i = displayBlocks.value.length - 1; i >= 0; i--) {
-      const block = displayBlocks.value[i];
-      if (block.type === "work-status" && block.tools.some((tool) => tool.toolCallId === toolCallId)) {
-        return block;
-      }
-    }
-    return null;
-  }
-
-  function addEvent(event: AgentSessionEvent): void {
-    if (events.value.length >= MAX_EVENTS) {
-      events.value = events.value.slice(-Math.floor(MAX_EVENTS / 2));
-    }
-    if (displayBlocks.value.length >= MAX_DISPLAY_BLOCKS) {
-      displayBlocks.value = displayBlocks.value.slice(-Math.floor(MAX_DISPLAY_BLOCKS / 2));
-    }
-    events.value.push(event);
-    processEvent(event);
-  }
-
-  function processEvent(event: AgentSessionEvent): void {
-    switch (event.type) {
-      case "agent_start": {
+      events.value.push(event);
+      if (event.type === "agent_start") {
         isStreaming.value = true;
         errorMessage.value = null;
-        lastRetryableError.value = null;
-        break;
-      }
-      case "agent_end": {
+      } else if (event.type === "agent_end") {
         isStreaming.value = false;
-        currentAgentBlockId = null;
-        removeThinkingBlock();
-        closeCurrentWorkStatus(true);
-        break;
       }
-
-      case "message_start": {
-        const msg = event.message;
-        if (msg.role === "user" || msg.role === "custom") {
-          if (msg.role === "custom" && msg.display === false) break;
-          const appended = appendUserOrNoteMessage(msg, true);
-          if (msg.role === "user" && appended) {
-            showThinkingBlock(messageTimestamp(msg));
-          }
-        } else if (msg.role === "assistant") {
-          const text = extractContentText(msg);
-          // Only create agent block when there's real text — skip empty tool-call-only messages
-          if (text) {
-            currentAgentBlockId = createAgentBlock(text, true);
-          }
-        }
-        break;
-      }
-      case "message_update": {
-        const msg = event.message;
-        if (msg.role === "assistant") {
-          const text = extractContentText(msg);
-          if (!text) return;
-          removeThinkingBlock();
-          if (!currentAgentBlockId) {
-            // First text in this response — create the agent block now
-            currentAgentBlockId = createAgentBlock(text, true);
-          } else {
-            const block = displayBlocks.value.find((b) => b.id === currentAgentBlockId);
-            if (block && block.type === "agent-message") {
-              block.content = text;
-            }
-          }
-        }
-        break;
-      }
-      case "message_end": {
-        if (currentAgentBlockId) {
-          const block = displayBlocks.value.find((b) => b.id === currentAgentBlockId);
-          if (block && block.type === "agent-message") {
-            block.isStreaming = false;
-          }
-          currentAgentBlockId = null;
-        }
-        break;
-      }
-
-      // Tool lifecycle — aggregate into a single work-status block
-      case "eye_model_start": {
-        showVisionStatus(event);
-        break;
-      }
-
-      case "eye_model_end": {
-        finishVisionStatus(event);
-        break;
-      }
-
-      case "tool_execution_start": {
-        removeThinkingBlock();
-        ensureWorkStatusBlock().tools.push({
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          args: event.args,
-          result: null,
-          isError: false,
-        });
-        break;
-      }
-      case "tool_execution_update": {
-        const ws = findWorkStatusForTool(event.toolCallId);
-        if (ws && ws.type === "work-status") {
-          const tool = ws.tools.find((t) => t.toolCallId === event.toolCallId);
-          if (tool) tool.result = event.partialResult;
-        }
-        break;
-      }
-      case "tool_execution_end": {
-        const ws = findWorkStatusForTool(event.toolCallId);
-        if (ws && ws.type === "work-status") {
-          const tool = ws.tools.find((t) => t.toolCallId === event.toolCallId);
-          if (tool) {
-            tool.result = event.result;
-            tool.isError = event.isError;
-          }
-          // Finalize if no more pending tools
-          const hasPending = ws.tools.some((t) => t.result === null);
-          if (!hasPending) {
-            ws.isStreaming = false;
-          }
-        }
-        break;
-      }
-      case "file_change": {
-        const ws = findWorkStatusForTool(event.toolCallId);
-        if (ws && ws.type === "work-status") {
-          const tool = ws.tools.find((t) => t.toolCallId === event.toolCallId);
-          if (tool) {
-            tool.fileChange = event.change;
-            tool.diff = { added: event.change.added, removed: event.change.removed };
-          }
-        }
-        break;
-      }
-      case "verification_gate": {
-        break;
-      }
-
-      case "compaction_start": {
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "compaction",
-          reason: event.reason,
-          result: "",
-          aborted: false,
-          timestamp: Date.now(),
-        });
-        break;
-      }
-      case "compaction_end": {
-        const compactionSummary =
-          (event.result && typeof event.result === "object" && "summary" in event.result
-            ? String((event.result as Record<string, unknown>).summary)
-            : undefined) ||
-          event.errorMessage ||
-          "压缩完成";
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "compaction",
-          reason: event.reason,
-          result: compactionSummary,
-          aborted: event.aborted,
-          timestamp: Date.now(),
-        });
-        break;
-      }
-
-      case "auto_retry_start": {
-        displayBlocks.value.push({
-          id: nextBlockId(),
-          type: "retry",
-          success: false,
-          attempt: event.attempt,
-          maxAttempts: event.maxAttempts,
-          delayMs: event.delayMs,
-          timestamp: Date.now(),
-        });
-        break;
-      }
-      case "auto_retry_end": {
-        // On success, show a "retry succeeded" notice. On failure, skip the
-        // block here - the subsequent api_error event surfaces the full error
-        // (status code + retry button) and a second "retry failed" notice
-        // would be redundant.
-        if (event.success) {
-          displayBlocks.value.push({
-            id: nextBlockId(),
-            type: "retry",
-            success: true,
-            attempt: event.attempt,
-            maxAttempts: 0,
-            timestamp: Date.now(),
-          });
-        }
-        break;
-      }
-
-      case "api_error": {
-        const blockId = nextBlockId();
-        displayBlocks.value.push({
-          id: blockId,
-          type: "error",
-          message: event.errorMessage,
-          category: event.category,
-          httpStatus: event.httpStatus,
-          title: event.title,
-          retryable: event.retryable,
-          timestamp: Date.now(),
-        });
-        // Only the latest retryable error (while idle) offers a retry button.
-        lastRetryableError.value = event.retryable ? { blockId } : null;
-        break;
-      }
-
-      case "queue_update": {
-        break;
-      }
-    }
-  }
-
-  function addEvents(newEvents: AgentSessionEvent[]): void {
-    for (const event of newEvents) {
-      addEvent(event);
-    }
-  }
-
-  /**
-   * Load messages from history.
-   * AgentMessage = Message (from pi-ai) | CustomAgentMessages.
-   * - AssistantMessage: content has TextContent | ThinkingContent | ToolCall blocks
-   * - ToolResultMessage: role="toolResult", has toolCallId, toolName, content, isError
-   */
-  function loadMessages(messages: AgentMessage[]): void {
-    clearSession();
-
-    const toolsById = new Map<string, ToolWorkItem>();
-
-    function appendToolCall(block: { type: string; id?: string; name?: string; arguments?: unknown }, timestamp: number): void {
-      const toolCallId = block.id || nextBlockId();
-      const ws = ensureWorkStatusBlock(timestamp);
-      const item: ToolWorkItem = {
-        toolCallId,
-        toolName: block.name || "任务",
-        args: block.arguments,
-        result: null,
-        isError: false,
-      };
-      ws.tools.push(item);
-      toolsById.set(toolCallId, item);
+      assembler.applyEvent(event);
+      syncLastRetryableError();
     }
 
-    function finalizeWorkBlocks(): void {
-      for (const block of displayBlocks.value) {
-        if (block.type === "work-status") {
-          block.isStreaming = false;
-        }
-      }
-      currentWorkStatusId = null;
-    }
-
-    // The retry button belongs on the most recent failed assistant turn, but a
-    // failed turn is not necessarily the last array element: agent-session's
-    // finally block flushes pending bash toolResult messages after it. Track
-    // the last assistant index so trailing tool results do not hide the button.
-    let lastAssistantIndex = -1;
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].role === "assistant") lastAssistantIndex = i;
-    }
-
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-
-      if (msg.role === "user" || msg.role === "custom") {
-        if (msg.role === "custom" && msg.display === false) continue;
-        appendUserOrNoteMessage(msg);
-      } else if (msg.role === "assistant") {
-        const timestamp = messageTimestamp(msg);
-        // A failed assistant turn (stopReason "error") carries its details in
-        // errorMessage, not in content (which is empty). Render it as an error
-        // block so the failure survives reloads / mode switches / restarts.
-        if (msg.stopReason === "error" && typeof msg.errorMessage === "string" && msg.errorMessage) {
-          const classified = classifyApiError(msg.errorMessage);
-          const errorBlockId = nextBlockId();
-          displayBlocks.value.push({
-            id: errorBlockId,
-            type: "error",
-            message: msg.errorMessage,
-            category: classified.category,
-            httpStatus: classified.httpStatus,
-            title: classified.title,
-            retryable: classified.retryable,
-            timestamp,
-          });
-          // Keep the retry affordance for the latest error after a reload: the
-          // solo session persists across mode switches, so retryLastTurn still
-          // works. Match the last *assistant* message (not the last array
-          // element: a failed turn can be followed by flushed bash toolResult
-          // messages). Historical errors render without a button.
-          if (i === lastAssistantIndex && classified.retryable) {
-            lastRetryableError.value = { blockId: errorBlockId };
-          }
-        } else if (Array.isArray(msg.content)) {
-          for (const block of msg.content) {
-            if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
-              createAgentBlock(block.text, false, timestamp);
-            } else if (block.type === "toolCall") {
-              appendToolCall(block as { type: string; id?: string; name?: string; arguments?: unknown }, timestamp);
-            }
-          }
-        } else {
-          const text = extractContentText(msg);
-          if (text) createAgentBlock(text, false, timestamp);
-        }
-      } else if (msg.role === "toolResult") {
-        // Match tool result to pending tool
-        const tr = msg as {
-          role: string; toolCallId: string; toolName: string;
-          content: Array<{ type: string; text?: string }>;
-          isError: boolean;
-          details?: unknown;
-        };
-        const tool = toolsById.get(tr.toolCallId);
-        if (tool) {
-          // The `agent` / `workflow` / `ralph` tools keep the full
-          // { content, details } result shape on replay so their rich renderers
-          // (SubagentToolView / WorkflowRunPanel) can draw from the persisted
-          // details; other tools keep the legacy content-only shape to avoid
-          // replay bloat.
-          tool.result =
-            tr.toolName === "agent" || tr.toolName === "workflow" || tr.toolName === "ralph"
-              ? { content: tr.content, details: tr.details }
-              : tr.content;
-          tool.isError = tr.isError;
-          if (!tool.toolName && tr.toolName) tool.toolName = tr.toolName;
-        }
+    function addEvents(newEvents: AgentSessionEvent[]): void {
+      for (const event of newEvents) {
+        addEvent(event);
       }
     }
 
-    finalizeWorkBlocks();
-  }
+    function appendOptimisticUserMessage(text: string, filePaths: string[] = []): string | null {
+      const blockId = assembler.appendOptimisticUserMessage(text, filePaths);
+      syncLastRetryableError();
+      return blockId;
+    }
 
-  function clearSession(): void {
-    events.value = [];
-    displayBlocks.value = [];
-    isStreaming.value = false;
-    errorMessage.value = null;
-    lastRetryableError.value = null;
-    currentAgentBlockId = null;
-    currentWorkStatusId = null;
-    currentThinkingBlockId = null;
-    legacyVisionStatusId = null;
-    visionStatusIds = new Map();
-    optimisticUserMessages = [];
-  }
+    function failOptimisticUserMessage(blockId: string | null, message: string): void {
+      assembler.failOptimisticUserMessage(blockId, message);
+      syncLastRetryableError();
+    }
 
-  function getRawEventsJson(): string {
-    return JSON.stringify(events.value, null, 2);
-  }
+    /**
+     * Load messages from history. The store keeps the raw AgentMessage[]
+     * public API and shims them into type==="message" entries so the
+     * assembler folds them through the same entry path as disk replay.
+     */
+    function loadMessages(messages: AgentMessage[]): void {
+      clearSession();
+      assembler.loadEntries(messages.map((message) => ({ type: "message", message })));
+      syncLastRetryableError();
+    }
 
-  return {
-    events,
-    displayBlocks,
-    isStreaming,
-    errorMessage,
-    lastRetryableError,
-    addEvent,
-    addEvents,
-    appendOptimisticUserMessage,
-    failOptimisticUserMessage,
-    loadMessages,
-    clearSession,
-    getRawEventsJson,
-  };
+    function clearSession(): void {
+      events.value = [];
+      isStreaming.value = false;
+      errorMessage.value = null;
+      assembler.clear();
+      syncLastRetryableError();
+    }
+
+    function getRawEventsJson(): string {
+      return JSON.stringify(events.value, null, 2);
+    }
+
+    return {
+      events,
+      displayBlocks,
+      isStreaming,
+      errorMessage,
+      lastRetryableError,
+      addEvent,
+      addEvents,
+      appendOptimisticUserMessage,
+      failOptimisticUserMessage,
+      loadMessages,
+      clearSession,
+      getRawEventsJson,
+    };
   });
 }
 

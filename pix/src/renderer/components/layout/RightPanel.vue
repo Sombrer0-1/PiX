@@ -7,8 +7,7 @@ import { useRouter } from "vue-router";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useProjectStore } from "../../stores/project-store";
 import { useTeamStore } from "../../stores/team-store";
-import AgentTaskPanel from "../agent-task/AgentTaskPanel.vue";
-import AgentTaskNotificationCenter from "../agent-task/AgentTaskNotificationCenter.vue";
+import AgentTaskLauncher from "../agent-task/AgentTaskLauncher.vue";
 import TokenStats from "../status/TokenStats.vue";
 import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
 import { deriveSessionTitle } from "@/utils/session-title";
@@ -21,7 +20,6 @@ const teamStore = useTeamStore();
 // ---- Agent tasks ----
 /** WSL 项目隐藏 Shell 后台任务卡片；AgentTask 入口保留（1.4.1 §5.4）。 */
 const isWsl = computed(() => rpc.executionEnvironment.value?.kind === "wsl");
-const currentSessionId = computed(() => rpc.sessionState.value?.sessionId ?? null);
 const agentTaskSessionNames = computed(() => {
   const names: Record<string, string> = {};
   for (const session of projectStore.sessions) {
@@ -404,17 +402,14 @@ watch(() => teamStore.teamMode, () => {
     </div>
 
     <!-- Agent tasks card (app-level tasks; above the Shell background card).
-         WSL projects hide the Shell background card below but keep this entry. -->
+         WSL projects hide the Shell background card below but keep this entry.
+         1.5 (P2): the panel is replaced by the launcher (status line + InputCard
+         + notification center, whose mount point moved inside the launcher). -->
     <div class="info-card">
       <div class="card-title-row">
         <span class="card-title">Agent 任务</span>
       </div>
-      <AgentTaskNotificationCenter />
-      <AgentTaskPanel
-        :current-session-id="currentSessionId"
-        :current-project-physical-path="projectStore.currentProject?.physicalPath ?? null"
-        :session-names="agentTaskSessionNames"
-      />
+      <AgentTaskLauncher :session-names="agentTaskSessionNames" />
     </div>
 
     <!-- Background tasks card (hidden on WSL projects; the agent task entry above stays) -->

@@ -58,7 +58,6 @@ import type {
   AgentTaskInfo,
   AgentTaskItemSpec,
   AgentTaskModelSnapshot,
-  AgentTaskResumeSummary,
   AgentTaskSpec,
   ResumeDecision,
 } from "../../shared/agent-task-types.js";
@@ -230,79 +229,6 @@ export class AgentTaskResumer {
   constructor(opts: { store: AgentTaskStore; runtimeFactory: (spec: AgentTaskSpec, taskSessionDir: string) => AgentTaskRuntime }) {
     this._store = opts.store;
     this._runtimeFactory = opts.runtimeFactory;
-  }
-
-  /**
-   * Resume summary for the user's confirmation UI: the branch-truth open tool
-   * calls, the last finalized assistant entry, model-change and workspace
-   * change/environment signals. Read-only: never repairs, never appends.
-   */
-  async getSummary(task: AgentTaskInfo, checkpoint: TaskCheckpoint): Promise<AgentTaskResumeSummary> {
-    const summary: AgentTaskResumeSummary = {
-      taskId: task.taskId,
-      generation: task.generation,
-      lastFinalizedEntryId: checkpoint.lastFinalizedEntryId,
-      openToolCalls: [],
-      modelChanged: false,
-      environmentChanged: false,
-      workspaceChanges: [],
-    };
-    const read = await this._store.readTask(task.workspaceId, task.taskId);
-    const spec = read.metadata?.spec;
-    if (!spec) {
-      return summary;
-    }
-    if (
-      !Number.isInteger(checkpoint.activeItemIndex) ||
-      checkpoint.activeItemIndex < 0 ||
-      checkpoint.activeItemIndex >= spec.items.length
-    ) {
-      return summary;
-    }
-    const item = spec.items[checkpoint.activeItemIndex];
-    // modelChanged: the effective model differs from the frozen spec model (a
-    // previous switch_model changed it).
-    if (item.resolution === "ready") {
-      const persisted = task.itemSummaries[checkpoint.activeItemIndex]?.model;
-      if (
-        persisted !== undefined &&
-        (persisted.provider !== item.model.provider || persisted.modelId !== item.model.modelId)
-      ) {
-        summary.modelChanged = true;
-      }
-    }
-
-    // Environment + workspace fingerprint comparison (context creation failure
-    // means the distro/root is unavailable: environmentChanged).
-    let context: ProjectExecutionContext | null = null;
-    try {
-      context = await createContextImpl(task.project);
-      if (context !== null && !context.isWsl && !existsSync(context.physicalCwd)) {
-        summary.environmentChanged = true;
-      } else if (context !== null) {
-        summary.workspaceChanges = await this._compareFingerprint(context, checkpoint.workspaceFingerprint);
-      }
-    } catch {
-      summary.environmentChanged = true;
-    } finally {
-      if (context !== null) {
-        await disposeContextImpl(context).catch(() => {});
-      }
-    }
-
-    // Branch-truth open calls: strict scan first; only a valid transcript (or
-    // a tail-corrupt one, whose valid prefix equals the repair result) is
-    // opened - SessionManager.open is never used as the corruption detector.
-    if (checkpoint.sessionFileName !== null && this._isSessionBasename(checkpoint.sessionFileName)) {
-      const inspection = await this._store.inspectSessionTranscript(task.workspaceId, task.taskId, checkpoint.sessionFileName);
-      if (inspection.kind !== "invalid") {
-        const manager = this._openSession(task, checkpoint.sessionFileName);
-        const analysis = analyzeBranch(manager.getBranch(), task.generation);
-        summary.openToolCalls = analysis.openToolCalls;
-        summary.lastFinalizedEntryId = analysis.lastFinalizedEntryId ?? checkpoint.lastFinalizedEntryId;
-      }
-    }
-    return summary;
   }
 
   /**

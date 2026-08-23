@@ -62,7 +62,10 @@ export type AgentTaskFailureReasonV141 =
   | "unknown_agent" | "tool_unavailable" | "project_agent_denied" | "prompt_too_large"
   | "session_start_failed" | "internal_error";
 // 1.4.2 (R2): storage_limit (runtime budget exhaustion) / user_decision (R3 mark_failed).
-export type AgentTaskFailureReason = AgentTaskFailureReasonV141 | "storage_limit" | "user_decision";
+// 1.5 (P1): resume_blocked - the restart auto-recovery pass could not resume an
+// interrupted task (workspace changed / transcript corrupt / model unavailable);
+// the task converges to failed instead of waiting for a user decision.
+export type AgentTaskFailureReason = AgentTaskFailureReasonV141 | "storage_limit" | "user_decision" | "resume_blocked";
 
 export interface AgentTaskActivity { sequence: number; toolCallId: string; toolName: string; status: "running"|"completed"|"failed"; summary?: string; startedAt: number; endedAt?: number; }
 export interface AgentTaskUsage { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number; turns: number; }
@@ -150,6 +153,11 @@ export interface AgentTaskInfo {
   lastCheckpointSeq?: number;
   hasUnclosedToolCall?: boolean;
   stopReason?: AgentTaskStopReason;
+  // 1.5 (P2): workflow children only - the workflow-owned group flag, assigned
+  // from GroupEntry.workflowOwned at creation and read back from the persisted
+  // TaskIndexEntry at hydration (P1 already persisted it there); the task center
+  // renders the workflow badge and hides the stop button for these tasks.
+  workflowOwned?: boolean;
 }
 
 /** 跨 tool result/main/renderer 的 plain-data handle；不得放入 main-only service 文件。 */
@@ -219,13 +227,40 @@ export interface AgentTaskListSnapshot {
 export type ResumeDecision =
   | { action: "continue"; confirmWorkspaceChanges: boolean }
   | { action: "switch_model"; provider: string; modelId: string; confirmWorkspaceChanges: boolean };
-export interface AgentTaskResumeSummary {
-  taskId: string; generation: number; lastFinalizedEntryId?: string;
-  openToolCalls: Array<{ toolCallId: string; toolName: string; startedAt: number }>;
-  modelChanged: boolean; environmentChanged: boolean; workspaceChanges: string[];
-}
 export interface AgentTaskDiagnosticExport { fileName: string; content: string; }
-export interface AgentTaskClearAllResult { cleared: number; protectedTaskIds: string[]; }
+
+/**
+ * get_transcript 的分页返回。entries 为该 item 的 session JSONL 条目
+ * (SessionEntry 的结构化克隆形态;含 type==="message" 与 type==="custom_message"
+ * 且 display!==false 的条目,不含文件头 type==="session" 行)。totalCount 为该
+ * item 文件内成功解析的条目总数(仅计返回集合口径);nextCursor 为 null 表示该
+ * item 已到尾。坏行跳过不计入。
+ */
+export interface AgentTaskTranscriptPage {
+  taskId: string;
+  itemIndex: number;
+  entries: unknown[];
+  totalCount: number;
+  nextCursor: string | null;
+}
+
+/** get_task_log 的单条事件(旧字段 seq/ts/type + payload 平铺)。 */
+export interface AgentTaskLogEvent {
+  seq: number;
+  ts: number;
+  type: string;
+  [key: string]: unknown;
+}
+
+/**
+ * get_task_log 返回:任务事件日志(events.jsonl)的只读快照。
+ * 超过 MAX_TASK_LOG_EVENTS(10000)条时保留最新 10000 条并置 truncated=true。
+ */
+export interface AgentTaskLogSnapshot {
+  taskId: string;
+  events: AgentTaskLogEvent[];
+  truncated: boolean;
+}
 
 export const AGENT_TASK_TRANSITIONS: Record<AgentTaskStatus, readonly AgentTaskStatus[]> = {
   queued: ["running", "cancelled", "interrupted"],
@@ -256,7 +291,7 @@ const AGENT_TASK_FAILURE_REASONS = [
   "invalid_parameters", "max_turns", "api_error", "model_unavailable", "model_not_found",
   "model_ambiguous", "model_auth_unavailable", "unknown_agent", "tool_unavailable",
   "project_agent_denied", "prompt_too_large", "session_start_failed", "internal_error",
-  "storage_limit", "user_decision",
+  "storage_limit", "user_decision", "resume_blocked",
 ] as const;
 // Mirrors the subagent contract's own statuses/usage shape for stored results;
 // kept local so agent-task-types.ts stays a runtime leaf.
@@ -458,6 +493,9 @@ export function isAgentTaskInfo(v: unknown): v is AgentTaskInfo {
   }
   if (v.hasUnclosedToolCall !== undefined && typeof v.hasUnclosedToolCall !== "boolean") return false;
   if (v.stopReason !== undefined && !isOneOf(v.stopReason, AGENT_TASK_STOP_REASONS)) return false;
+  // 1.5 (P2): workflowOwned is optional; when present it must be a boolean
+  // (records persisted before the field existed stay acceptable).
+  if (v.workflowOwned !== undefined && typeof v.workflowOwned !== "boolean") return false;
 
   if (v.planLink !== undefined && !isAgentTaskPlanLink(v.planLink)) return false;
   // planLinkState is "none" exactly when no link is attached; with a link it
