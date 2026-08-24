@@ -74,6 +74,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object";
 }
 
+/** Narrow the unknown assistantMessageEvent carried by message_update. */
+interface AssistantMessageEventLike {
+  type: string;
+  delta?: unknown;
+  content?: unknown;
+}
+
+function isAssistantMessageEvent(value: unknown): value is AssistantMessageEventLike {
+  return isRecord(value) && typeof value.type === "string";
+}
+
 function messageTimestamp(message: AgentMessage): number {
   return typeof message.timestamp === "number" ? message.timestamp : Date.now();
 }
@@ -247,7 +258,10 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
 
   let currentAgentBlockId: string | null = null;
   let currentWorkStatusId: string | null = null;
-  let currentThinkingBlockId: string | null = null;
+  // Latest thinking block that has not been superseded yet. Superseding (first
+  // text / tool call / agent end) clears it; thinking_end deliberately does not,
+  // so the next move can still locate the block.
+  let openThinkingBlockId: string | null = null;
   let legacyVisionStatusId: string | null = null;
   let visionStatusIds = new Map<string, string>();
   let optimisticUserMessages: Array<{ blockId: string; fingerprint: string; separatorId: string | null }> = [];
@@ -267,22 +281,97 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     if (write < blocks.length) blocks.length = write;
   }
 
-  function removeThinkingBlock(): void {
-    if (!currentThinkingBlockId) return;
-    const blockId = currentThinkingBlockId;
-    removeBlocks((block) => block.id !== blockId);
-    currentThinkingBlockId = null;
+  /**
+   * End the open thinking block (thinking_end, or the next move — first text,
+   * tool call, agent end — starting). A non-empty chain-of-thought block stays
+   * in the timeline collapsed (superseded); the empty placeholder is removed
+   * so a model without thinking looks exactly like before.
+   */
+  function supersedeOpenThinking(): void {
+    if (!openThinkingBlockId) return;
+    const blockId = openThinkingBlockId;
+    const block = blocks.find((b) => b.id === blockId && b.type === "thinking");
+    if (block && block.type === "thinking") {
+      block.phase = "ended";
+      block.superseded = true;
+      if (block.content === "") {
+        removeBlocks((item) => item.id !== blockId);
+      }
+    }
+    openThinkingBlockId = null;
   }
 
   function showThinkingBlock(timestamp = Date.now()): void {
-    if (currentThinkingBlockId) return;
+    if (openThinkingBlockId) return;
     const block: DisplayBlock = {
       id: nextBlockId(),
       type: "thinking",
+      content: "",
+      phase: "streaming",
+      superseded: false,
       timestamp,
     };
-    currentThinkingBlockId = block.id;
+    openThinkingBlockId = block.id;
     blocks.push(block);
+  }
+
+  /**
+   * Consume the assistantMessageEvent streamed inside message_update (PiX 1.5).
+   * thinking_start reuses the placeholder block from the user turn; deltas
+   * append to the open block; thinking_end marks it ended but keeps it open so
+   * the next move (text / tool call) supersedes it; toolcall_start supersedes
+   * immediately (it arrives before tool_execution_start — first one wins).
+   * text_start / text_delta are folded by the text branch in message_update.
+   */
+  function applyAssistantMessageEvent(ame: AssistantMessageEventLike, timestamp: number): void {
+    switch (ame.type) {
+      case "thinking_start": {
+        // Adjacent thinking segment (两段思考之间无正文/工具事件): thinking_end
+        // keeps the block open, so an ended open block means a new segment
+        // starts — supersede it first so each segment folds into its own block
+        // (matches the replay path, which folds each thinking block separately).
+        const openBlock = openThinkingBlockId
+          ? blocks.find((b) => b.id === openThinkingBlockId && b.type === "thinking")
+          : null;
+        if (openBlock && openBlock.type === "thinking" && openBlock.phase === "ended") {
+          supersedeOpenThinking();
+        }
+        if (!openThinkingBlockId) showThinkingBlock(timestamp);
+        break;
+      }
+      case "thinking_delta": {
+        if (!openThinkingBlockId) showThinkingBlock(timestamp);
+        const block = openThinkingBlockId
+          ? blocks.find((b) => b.id === openThinkingBlockId && b.type === "thinking")
+          : null;
+        if (block && block.type === "thinking" && typeof ame.delta === "string") {
+          block.content += ame.delta;
+        }
+        break;
+      }
+      case "thinking_end": {
+        const block = openThinkingBlockId
+          ? blocks.find((b) => b.id === openThinkingBlockId && b.type === "thinking")
+          : null;
+        if (block && block.type === "thinking") {
+          // Redacted thinking (Anthropic safety filter) and any provider that
+          // emits no thinking_delta: the final value only arrives here.
+          // Backfill an empty block so it survives into the timeline instead of
+          // being removed at the first output (直播/回放一致).
+          if (block.content === "" && typeof ame.content === "string" && ame.content !== "") {
+            block.content = ame.content;
+          }
+          block.phase = "ended";
+        }
+        // openThinkingBlockId stays set: the next move supersedes (and clears) it.
+        break;
+      }
+      case "toolcall_start":
+        supersedeOpenThinking();
+        break;
+      // text_start / text_delta: the first text folds below via
+      // createAgentBlock, which runs the supersede semantics internally.
+    }
   }
 
   function appendTurnSeparator(timestamp = Date.now()): string | null {
@@ -479,7 +568,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   }
 
   function createAgentBlock(text: string, isStreamingBlock: boolean, timestamp = Date.now()): string {
-    removeThinkingBlock();
+    supersedeOpenThinking();
     closeCurrentWorkStatus();
     const block: DisplayBlock = {
       id: nextBlockId(),
@@ -531,7 +620,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       }
       case "agent_end": {
         currentAgentBlockId = null;
-        removeThinkingBlock();
+        supersedeOpenThinking();
         closeCurrentWorkStatus(true);
         break;
       }
@@ -558,9 +647,16 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         const msg = event.message;
         if (isFoldableRole(msg.role) && foldedMessageKeys.has(foldKeyOf(msg))) break;
         if (msg.role === "assistant") {
+          // Consume the streamed assistantMessageEvent (thinking / tool call
+          // markers) before the text fold: a pure tool turn has no text
+          // content, and the early return below would skip toolcall_start's
+          // supersede.
+          if (isAssistantMessageEvent(event.assistantMessageEvent)) {
+            applyAssistantMessageEvent(event.assistantMessageEvent, messageTimestamp(msg));
+          }
           const text = extractContentText(msg);
           if (!text) return;
-          removeThinkingBlock();
+          supersedeOpenThinking();
           if (!currentAgentBlockId) {
             // First text in this response — create the agent block now
             currentAgentBlockId = createAgentBlock(text, true);
@@ -605,7 +701,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         // start whose tool already exists in any work-status block (e.g. the
         // live replay of a tool that was folded from disk).
         if (findWorkStatusForTool(event.toolCallId)) break;
-        removeThinkingBlock();
+        supersedeOpenThinking();
         ensureWorkStatusBlock().tools.push({
           toolCallId: event.toolCallId,
           toolName: event.toolName,
@@ -859,6 +955,22 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
               createAgentBlock(block.text, false, timestamp);
             } else if (block.type === "toolCall") {
               appendToolCall(block as { type: string; id?: string; name?: string; arguments?: unknown }, timestamp);
+            } else if (block.type === "thinking") {
+              // Fold persisted chain-of-thought in content order. Replay is a
+              // settled turn, so thinking blocks fold collapsed (superseded).
+              // Empty thinking blocks (redacted placeholder notes included)
+              // are skipped — no blank placeholder blocks.
+              const thinking = (block as { thinking?: unknown }).thinking;
+              if (typeof thinking === "string" && thinking !== "") {
+                blocks.push({
+                  id: nextBlockId(),
+                  type: "thinking",
+                  content: thinking,
+                  phase: "ended",
+                  superseded: true,
+                  timestamp,
+                });
+              }
             }
           }
         } else {
@@ -901,7 +1013,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     blocks.splice(0, blocks.length);
     currentAgentBlockId = null;
     currentWorkStatusId = null;
-    currentThinkingBlockId = null;
+    openThinkingBlockId = null;
     legacyVisionStatusId = null;
     visionStatusIds = new Map();
     optimisticUserMessages = [];

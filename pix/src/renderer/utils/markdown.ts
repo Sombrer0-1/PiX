@@ -43,12 +43,12 @@ function sanitizeHref(href: string): string | null {
   }
 }
 
-export function renderMarkdown(text: string): string {
+export function renderMarkdown(text: string, copyButton = true): string {
   if (!text) return "&nbsp;";
   try {
     const result = marked.parse(text, { async: false, renderer: markdownRenderer });
     if (typeof result !== "string") return text;
-    return enhanceCodeBlocks(stripTrailingWhitespace(result));
+    return enhanceCodeBlocks(stripTrailingWhitespace(result), copyButton);
   } catch {
     return escapeHtml(text);
   }
@@ -70,8 +70,11 @@ export const codeCopyIcon =
 export const codeCheckIcon =
   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>';
 
-function enhanceCodeBlocks(html: string): string {
+function enhanceCodeBlocks(html: string, copyButton: boolean): string {
+  const button = copyButton
+    ? `<button class="code-copy-btn" type="button" data-copy-code="true" title="复制代码" aria-label="复制代码">${codeCopyIcon}</button>`
+    : "";
   return html
-    .replace(/<pre><code([^>]*)>/g, `<div class="code-block"><button class="code-copy-btn" type="button" data-copy-code="true" title="复制代码" aria-label="复制代码">${codeCopyIcon}</button><pre><code$1>`)
+    .replace(/<pre><code([^>]*)>/g, `<div class="code-block">${button}<pre><code$1>`)
     .replace(/<\/code><\/pre>/g, "</code></pre></div>");
 }

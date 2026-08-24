@@ -35,6 +35,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
 import { aggregateSubagentUsage, isSubagentDetails } from "../shared/subagent-types.js";
+import { btwValidateQuestion, type BtwAskResult } from "../shared/types.js";
+import { createSideQuestionCoordinator, type SideQuestionCoordinator } from "./btw/side-question.js";
 import type { SubagentExecutionContext, SubagentToolHost } from "./subagent/types.js";
 import { SHELL_BACKGROUND_TOOLS, SubagentRunner } from "./subagent/subagent-runner.js";
 import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "./subagent/subagent-tool.js";
@@ -353,6 +355,12 @@ export class SessionBridge {
 	private _appShuttingDown = false;
 	/** Unsubscribe of the active Solo session's delivery sink (1.4.2). */
 	private _deliverySinkUnsubscribe: (() => void) | null = null;
+	/**
+	 * In-flight side-question (/btw, 1.5.0) coordinator, created lazily on the
+	 * first askSideQuestion. Holds the single AbortController implementing
+	 * "new ask aborts the old"; side questions never emit AgentSessionEvents.
+	 */
+	private _btwCoordinator: SideQuestionCoordinator | null = null;
 
 	constructor(options: SessionBridgeOptions = {}) {
 		this._role = options.role ?? "single";
@@ -3044,5 +3052,29 @@ export class SessionBridge {
 				console.error(`[SessionBridge] Lifecycle listener error (${event}):`, err);
 			}
 		}
+	}
+
+	// =========================================================================
+	// Side questions (/btw, PiX 1.5.0)
+	// =========================================================================
+
+	/** 发起侧问；自动中止上一个在途侧问。不产生任何 AgentSessionEvent。 */
+	async askSideQuestion(question: string): Promise<BtwAskResult> {
+		if (!this.isRunning()) {
+			return { status: "error", errorMessage: "会话未连接" };
+		}
+		const validationError = btwValidateQuestion(question);
+		if (validationError !== null) {
+			return { status: "error", errorMessage: validationError };
+		}
+		// 校验失败不中止在途请求；通过后才委托协调器（由其执行"新 ask 先 abort 旧"）。
+		const coordinator =
+			this._btwCoordinator ?? (this._btwCoordinator = createSideQuestionCoordinator(() => this._getSession()));
+		return coordinator.ask(question);
+	}
+
+	/** 中止在途侧问（若有）。 */
+	cancelSideQuestion(): void {
+		this._btwCoordinator?.cancel();
 	}
 }

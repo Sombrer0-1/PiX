@@ -14,6 +14,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import electronUpdater from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import { resolveProjectLocation } from "./execution-context.js";
+import { createGitStatusService } from "./git/git-status-service.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
 import type {
@@ -35,6 +36,8 @@ import {
   registerAgentTaskIpcHandlers,
   subscribeAgentTaskEventForwarding,
 } from "./ipc-agent-task-adapters.js";
+import { registerBtwIpcHandlers } from "./ipc-btw-adapters.js";
+import { registerGitIpcHandlers } from "./ipc-git-adapters.js";
 import {
   registerPlanIpcHandlers,
   resyncPlanEventForwarding,
@@ -560,6 +563,36 @@ export function registerIpcHandlers(
   // =========================================================================
 
   registerAgentTaskIpcHandlers(ipcMain, agentTaskService);
+
+  // =========================================================================
+  // Git Workdir Commands (PiX 1.5.0; read-only git status + open folder,
+  // design plan §4.3.4)
+  // =========================================================================
+
+  const gitStatusService = createGitStatusService();
+  registerGitIpcHandlers(ipcMain, {
+    getStatus: (location) => gitStatusService.getStatus(location as ProjectLocation),
+    openFolder: async (location) => {
+      // The isProjectLocationLike guard already ran in ipc-git-adapters, so
+      // physicalPath is only read for locations that passed it.
+      const loc = location as ProjectLocation;
+      const result = await shell.openPath(loc.physicalPath);
+      if (result) {
+        console.warn("[ipc] Failed to open project folder:", result);
+        return { success: false, error: result };
+      }
+      return { success: true };
+    },
+  });
+
+  // =========================================================================
+  // Side-question (/btw) Commands (PiX 1.5.0; design plan §4.2.4)
+  // =========================================================================
+
+  registerBtwIpcHandlers(ipcMain, {
+    ask: (question) => singleSessionBridge.askSideQuestion(question),
+    cancel: () => singleSessionBridge.cancelSideQuestion(),
+  });
 
   // =========================================================================
   // Team Commands

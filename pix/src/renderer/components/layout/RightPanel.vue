@@ -10,7 +10,7 @@ import { useTeamStore } from "../../stores/team-store";
 import AgentTaskLauncher from "../agent-task/AgentTaskLauncher.vue";
 import TokenStats from "../status/TokenStats.vue";
 import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
-import { deriveSessionTitle } from "@/utils/session-title";
+import GitWorkdirCard from "../git/GitWorkdirCard.vue";
 import type { McpServerInfo } from "../../../shared/types";
 
 const rpc = useWorkspaceRpc();
@@ -46,54 +46,6 @@ async function handleCompact(): Promise<void> {
   }
 }
 
-const modelDisplay = computed(() => {
-  const model = rpc.sessionState.value?.model;
-  if (!model) return "未设置";
-  return `${model.provider}/${model.id}`;
-});
-
-const thinkingLevel = computed(() => {
-  const level = rpc.sessionState.value?.thinkingLevel || "medium";
-  const labels: Record<string, string> = {
-    off: "关闭",
-    minimal: "轻量",
-    low: "低",
-    medium: "标准",
-    high: "深入",
-    xhigh: "极深",
-  };
-  return labels[level] ?? level;
-});
-const sessionId = computed(() => rpc.sessionState.value?.sessionId || "-");
-const sessionName = computed(() => {
-  const explicitName = rpc.sessionState.value?.sessionName?.trim();
-  if (explicitName) return explicitName;
-  return deriveSessionTitle(teamStore.teamMode ? projectStore.currentTeamSession : projectStore.currentSession);
-});
-const messageCount = computed(() => rpc.sessionState.value?.messageCount || 0);
-const projectPath = computed(() => projectStore.currentProject?.path || "-");
-const logicalCwd = computed(() => {
-  const env = rpc.executionEnvironment.value;
-  if (env) return env.logicalCwd;
-  return projectPath.value;
-});
-const environmentLabel = computed(() => {
-  const env = rpc.executionEnvironment.value;
-  if (!env) return "";
-  if (env.kind === "wsl") return `WSL · ${env.distro}`;
-  return "Windows";
-});
-const environmentTooltip = computed(() => {
-  const env = rpc.executionEnvironment.value;
-  if (!env) return "";
-  if (env.kind === "wsl") {
-    const parts = [`WSL2 · ${env.distro}`, env.logicalCwd];
-    if (env.ready === false) parts.push("未就绪");
-    if (env.diagnostic) parts.push(env.diagnostic);
-    return parts.join("\n");
-  }
-  return `Windows · ${env.logicalCwd}`;
-});
 const goal = computed(() => {
   const currentGoal = rpc.sessionState.value?.goal;
   if (!currentGoal) return undefined;
@@ -238,7 +190,7 @@ watch(() => teamStore.teamMode, () => {
 <template>
   <div class="right-panel">
     <!-- ====================================================================== -->
-    <!-- Solo Mode: protocol requests + full session info -->
+    <!-- Solo Mode: protocol requests + Git workdir card -->
     <!-- ====================================================================== -->
     <!-- Protocol requests (worker permission approvals) must be visible in
          every mode: a request raised while the user is outside team mode
@@ -247,66 +199,9 @@ watch(() => teamStore.teamMode, () => {
          solo mode. -->
     <TeamProtocolPanel v-if="!teamStore.teamMode" />
 
-    <template v-if="teamStore.teamMode">
-      <!-- Leader session info (compact). TeamDashboard already renders worker
-           detail, file changes and protocol requests, so the team-mode
-           inspector stays slim and focuses on the leader session. The
-           TokenStats card below provides leader context usage and the manual
-           compaction control, which TeamDashboard has no equivalent for. -->
-      <div class="info-card">
-        <div class="card-title">会话信息</div>
-        <div class="info-rows">
-          <div class="info-row">
-            <span class="info-label">模型</span>
-            <span class="info-value" :title="modelDisplay">{{ modelDisplay }}</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">思考</span>
-            <span class="info-value">{{ thinkingLevel }}</span>
-          </div>
-          <div class="info-row">
-            <span class="info-label">消息数</span>
-            <span class="info-value">{{ messageCount }}</span>
-          </div>
-        </div>
-      </div>
-
-    </template>
-
-    <!-- ====================================================================== -->
-    <!-- Normal Mode: Full session info -->
-    <!-- ====================================================================== -->
-    <template v-else>
-    <div class="info-card">
-      <div class="card-title">会话信息</div>
-      <div class="info-rows">
-        <div class="info-row">
-          <span class="info-label">模型</span>
-          <span class="info-value" :title="modelDisplay">{{ modelDisplay }}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-label">思考级别</span>
-          <span class="info-value">{{ thinkingLevel }}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-label">会话</span>
-          <span class="info-value" :title="sessionId">{{ sessionName }}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-label">消息数</span>
-          <span class="info-value">{{ messageCount }}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-label">工作目录</span>
-          <span class="info-value mono" :title="logicalCwd">{{ logicalCwd }}</span>
-        </div>
-        <div v-if="environmentLabel" class="info-row">
-          <span class="info-label">环境</span>
-          <span class="info-value" :title="environmentTooltip">{{ environmentLabel }}</span>
-        </div>
-      </div>
-    </div>
-    </template>
+    <!-- Git workdir card (project-level status; replaces the former session
+         info cards in both solo and team modes). -->
+    <GitWorkdirCard />
 
     <!-- Goal card (normal mode only) -->
     <div v-if="goal && !teamStore.teamMode" class="info-card">
@@ -625,11 +520,6 @@ watch(() => teamStore.teamMode, () => {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 55%;
-}
-
-.info-value.mono {
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
 }
 
 .goal-objective {

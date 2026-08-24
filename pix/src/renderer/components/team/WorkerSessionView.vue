@@ -9,6 +9,8 @@
 import { computed, ref, watch, nextTick, onMounted } from "vue";
 import { useTeamStore, type TaggedSessionEvent } from "../../stores/team-store";
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
+import ThinkingBlock from "../session/ThinkingBlock.vue";
+import { collectWorkerThinkingBlocks, type ThinkingBlockData } from "../../utils/worker-thinking";
 
 const teamStore = useTeamStore();
 
@@ -60,6 +62,10 @@ type StreamEntry =
   | { kind: "event"; tagged: TaggedSessionEvent }
   | { kind: "coalesced"; entry: CoalescedEntry };
 
+type TimelineEntry =
+  | StreamEntry
+  | { kind: "thinking"; block: ThinkingBlockData };
+
 const streamEntries = computed<StreamEntry[]>(() => {
   const raw = rawEvents.value;
   const result: StreamEntry[] = [];
@@ -106,6 +112,61 @@ const streamEntries = computed<StreamEntry[]>(() => {
   return result;
 });
 
+/**
+ * Thinking blocks folded from the worker's raw event stream by the shared
+ * display-block assembler (SDD §4.1.5). One assembler instance per agent;
+ * identity-cursor incremental application keeps recomputes cheap, and a slid
+ * or cleared buffer (team-store 200-event cap, team rebuild) triggers a full
+ * replay of the current window.
+ */
+const thinkingBlocks = computed<ThinkingBlockData[]>(() => {
+  const id = focusedId.value;
+  return id ? collectWorkerThinkingBlocks(id, rawEvents.value) : [];
+});
+
+/**
+ * Stable merge: thinking blocks interleave into the streamEntries timeline by
+ * timestamp. On equal timestamps a thinking block goes before a coalesced
+ * entry, while an event entry keeps its existing position (the thinking block
+ * lands after it); ties among thinking blocks keep their own order.
+ */
+const timelineEntries = computed<TimelineEntry[]>(() => {
+  const entries = streamEntries.value;
+  const thinking = thinkingBlocks.value;
+  if (thinking.length === 0) return entries;
+  const result: TimelineEntry[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < entries.length || j < thinking.length) {
+    const entry = entries[i];
+    const block = thinking[j];
+    if (block === undefined) {
+      result.push(entry);
+      i++;
+      continue;
+    }
+    if (entry === undefined) {
+      result.push({ kind: "thinking", block });
+      j++;
+      continue;
+    }
+    const entryTs = entry.kind === "coalesced" ? entry.entry.firstTs : entry.tagged.timestamp;
+    if (block.timestamp < entryTs) {
+      result.push({ kind: "thinking", block });
+      j++;
+    } else if (block.timestamp === entryTs && entry.kind === "coalesced") {
+      // Tie against a coalesced entry: the thinking block goes first.
+      result.push({ kind: "thinking", block });
+      j++;
+    } else {
+      // Thinking block is later, or tied with an event entry (existing order kept).
+      result.push(entry);
+      i++;
+    }
+  }
+  return result;
+});
+
 const workStats = computed(() => {
   let tools = 0;
   let files = 0;
@@ -122,7 +183,7 @@ const workStats = computed(() => {
 });
 
 watch(
-  () => streamEntries.value.length,
+  () => timelineEntries.value.length,
   async () => {
     if (!shouldAutoScroll.value) return;
     await nextTick();
@@ -258,7 +319,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
         </div>
       </div>
 
-      <div v-if="streamEntries.length === 0" class="wsv-empty wsv-empty--inside">
+      <div v-if="timelineEntries.length === 0" class="wsv-empty wsv-empty--inside">
         <v-icon icon="mdi-clock-outline" size="32" color="grey-lighten-1" />
         <p>该成员当前空闲，暂无事件。</p>
       </div>
@@ -269,7 +330,10 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
         class="wsv-stream"
         @scroll="handleScroll"
       >
-        <template v-for="entry in streamEntries" :key="entry.kind === 'event' ? entry.tagged.timestamp : entry.entry.firstTs">
+        <template
+          v-for="entry in timelineEntries"
+          :key="entry.kind === 'event' ? entry.tagged.timestamp : entry.kind === 'coalesced' ? entry.entry.firstTs : entry.block.id"
+        >
           <div
             v-if="entry.kind === 'coalesced'"
             class="wsv-message-block"
@@ -286,6 +350,10 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
             </div>
             <div class="wsv-msg-time">{{ formatTime(entry.entry.lastTs) }}</div>
           </div>
+
+          <!-- Worker thinking blocks reuse the main-session component; the
+               worker has no separate effort tier UI, so effortLabel is omitted. -->
+          <ThinkingBlock v-else-if="entry.kind === 'thinking'" :block="entry.block" />
 
           <template v-else>
             <div v-if="isTurnStart(entry.tagged.event)" class="wsv-turn-sep">

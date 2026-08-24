@@ -11,7 +11,9 @@ import type {
   AgentTaskCommandV15,
   AgentTaskEvent,
   AgentTaskInputRequest,
+  BtwAskResult,
   ExecutionEnvironmentInfo,
+  GitWorkdirSnapshot,
   GuiSettings,
   McpConfigInfo,
   McpResourceContent,
@@ -160,6 +162,14 @@ export interface PixApi {
   teamLeaderMcpGetConfig: () => Promise<McpConfigInfo>;
   teamLeaderMcpListResources: (serverName?: string) => Promise<McpResourceInfo[]>;
   teamLeaderMcpReadResource: (serverName: string | undefined, uri: string) => Promise<McpResourceContent>;
+
+  // Side questions (/btw, PiX 1.5.0)
+  btwAsk: (question: string) => Promise<BtwAskResult>;
+  btwCancel: () => void; // invoke("btw-cancel"), fire-and-forget
+
+  // Git workdir panel (PiX 1.5.0)
+  gitGetStatus: (location: ProjectLocation) => Promise<GitWorkdirSnapshot>;
+  gitOpenFolder: (location: ProjectLocation) => Promise<{ success: boolean; error?: string }>;
 }
 
 const api: PixApi = {
@@ -349,6 +359,14 @@ const api: PixApi = {
   teamLeaderMcpListResources: (serverName?: string) => ipcRenderer.invoke("team-leader-mcp-list-resources", serverName),
   teamLeaderMcpReadResource: (serverName: string | undefined, uri: string) =>
     ipcRenderer.invoke("team-leader-mcp-read-resource", serverName, uri),
+
+  // Side questions (/btw, PiX 1.5.0)
+  btwAsk: (question: string) => ipcRenderer.invoke("btw-ask", question),
+  btwCancel: () => ipcRenderer.invoke("btw-cancel"),
+
+  // Git workdir panel (PiX 1.5.0)
+  gitGetStatus: (location: ProjectLocation) => ipcRenderer.invoke("git-get-status", location),
+  gitOpenFolder: (location: ProjectLocation) => ipcRenderer.invoke("git-open-folder", location),
 };
 
 contextBridge.exposeInMainWorld("pixApi", api);

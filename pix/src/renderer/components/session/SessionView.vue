@@ -12,6 +12,7 @@ import MessageBlock from "./MessageBlock.vue";
 import ErrorBlock from "./ErrorBlock.vue";
 import SubagentToolView from "./SubagentToolView.vue";
 import WorkflowRunPanel from "./WorkflowRunPanel.vue";
+import ThinkingBlock from "./ThinkingBlock.vue";
 import { codeCheckIcon, codeCopyIcon, renderMarkdown } from "@/utils/markdown";
 
 function formatTime(ts: number): string {
@@ -337,14 +338,12 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         ></div>
       </div>
 
-      <!-- Thinking indicator - waits for the first assistant text or tool call -->
-      <div
+      <!-- Thinking process - collapsible chain-of-thought block -->
+      <ThinkingBlock
         v-else-if="block.type === 'thinking'"
-        class="thinking-block"
-      >
-        <span class="thinking-spinner" aria-hidden="true"></span>
-        <span>AI 正在思考...<template v-if="thinkingEffortLabel"> · {{ thinkingEffortLabel }}</template></span>
-      </div>
+        :block="block"
+        :effort-label="thinkingEffortLabel"
+      />
 
       <!-- Vision preprocessing indicator -->
       <div
@@ -583,21 +582,8 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 }
 
 /* ── Thinking indicator ── */
-.thinking-block {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  margin: 0 0 var(--pix-space-lg);
-  padding: 6px 11px;
-  border: 1px solid var(--pix-border-light);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.94);
-  color: var(--pix-accent);
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-medium);
-  animation: block-in 0.16s ease-out;
-}
-
+/* .thinking-block capsule migrated into ThinkingBlock.vue; .thinking-spinner
+   is still used by the vision-status block below. */
 .thinking-spinner {
   width: 12px;
   height: 12px;

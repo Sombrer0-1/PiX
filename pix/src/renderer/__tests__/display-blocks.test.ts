@@ -435,3 +435,333 @@ describe("seam dedup", () => {
     expect(a.blocks).toBe(blocks);
   });
 });
+
+// ============================================================================
+// Thinking blocks (PiX 1.5, S2A — SDD §4.1.2)
+// ============================================================================
+
+describe("thinking blocks (PiX 1.5)", () => {
+  type ThinkingBlock = Extract<DisplayBlock, { type: "thinking" }>;
+
+  function isThinking(block: DisplayBlock): block is ThinkingBlock {
+    return block.type === "thinking";
+  }
+
+  /** Thinking content block as it appears inside an assistant message. */
+  function thinkingBlock(text: string): { type: string; text?: string } {
+    return { type: "thinking", thinking: text } as { type: string; text?: string };
+  }
+
+  /** message_update carrying an assistantMessageEvent (pi-ai stream event). */
+  function updateWithAme(message: AgentMessage, ame: unknown): AgentSessionEvent {
+    return { type: "message_update", message, assistantMessageEvent: ame };
+  }
+
+  /** Pure thinking-stream updates: the partial message carries no text block. */
+  function thinkingUpdates(...ame: unknown[]): AgentSessionEvent[] {
+    return ame.map((e) => updateWithAme(makeMessage({ role: "assistant", content: [], timestamp: 2 }), e));
+  }
+
+  it("reuses the placeholder block for thinking_start and appends deltas in order (占位转正)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    const placeholder = a.blocks.find(isThinking);
+    expect(placeholder?.type).toBe("thinking");
+
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      { type: "thinking_delta", contentIndex: 0, delta: "先 " },
+      { type: "thinking_delta", contentIndex: 0, delta: "思考" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    // The placeholder is promoted in place — still exactly one block, same id.
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].id).toBe(placeholder?.id);
+    expect(thinking[0].content).toBe("先 思考");
+    expect(thinking[0].phase).toBe("streaming");
+    expect(thinking[0].superseded).toBe(false);
+  });
+
+  it("creates a block on the first thinking_delta when no placeholder is open (delta 追加)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: [], timestamp: 2 }),
+      { type: "thinking_delta", contentIndex: 0, delta: "无占位" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe("无占位");
+    expect(thinking[0].phase).toBe("streaming");
+    expect(thinking[0].superseded).toBe(false);
+  });
+
+  it("marks the block ended on thinking_end and supersedes it on the first text (thinking_end 后 supersede)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      { type: "thinking_delta", contentIndex: 0, delta: "思考中" },
+      { type: "thinking_end", contentIndex: 0, content: "思考中" },
+    ));
+
+    const ended = a.blocks.filter(isThinking);
+    expect(ended).toHaveLength(1);
+    expect(ended[0].phase).toBe("ended");
+    // Not superseded yet — the next move decides.
+    expect(ended[0].superseded).toBe(false);
+
+    // First text move supersedes: the block stays in the timeline, collapsed.
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: textBlocks("回答"), timestamp: 2 }),
+      { type: "text_start", contentIndex: 1 },
+    ));
+
+    const after = a.blocks.filter(isThinking);
+    expect(after).toHaveLength(1);
+    expect(after[0].phase).toBe("ended");
+    expect(after[0].superseded).toBe(true);
+    expect(after[0].content).toBe("思考中");
+    expect(a.blocks.some((b) => b.type === "agent-message" && b.content === "回答")).toBe(true);
+  });
+
+  it("removes the empty placeholder when the first text arrives (空占位移除)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    expect(a.blocks.filter(isThinking)).toHaveLength(1);
+
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: "direct answer", timestamp: 2 }),
+      { type: "text_start", contentIndex: 0 },
+    ));
+
+    expect(a.blocks.filter(isThinking)).toHaveLength(0);
+    expect(a.blocks.map((b) => b.type)).toEqual(["user-message", "agent-message"]);
+  });
+
+  it("folds multi-segment thinking into separate blocks (多段思考两块)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      { type: "thinking_delta", contentIndex: 0, delta: "第一段" },
+      { type: "thinking_end", contentIndex: 0, content: "第一段" },
+    ));
+    // Text between the segments supersedes the first block.
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: textBlocks("正文"), timestamp: 2 }),
+      { type: "text_start", contentIndex: 1 },
+    ));
+    // Second segment opens a fresh block.
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 2 },
+      { type: "thinking_delta", contentIndex: 2, delta: "第二段" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(2);
+    expect(thinking[0].content).toBe("第一段");
+    expect(thinking[0].superseded).toBe(true);
+    expect(thinking[1].content).toBe("第二段");
+    expect(thinking[1].superseded).toBe(false);
+    expect(thinking[1].phase).toBe("streaming");
+  });
+
+  it("backfills content from thinking_end when no deltas arrived (redacted 回填)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      // No thinking_delta — the safety filter redacted the segment (Anthropic
+      // redacted_thinking): the final value only arrives on thinking_end.
+      { type: "thinking_end", contentIndex: 0, content: "[Reasoning redacted]" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe("[Reasoning redacted]");
+    expect(thinking[0].phase).toBe("ended");
+    expect(thinking[0].superseded).toBe(false);
+
+    // First text supersedes: the backfilled block stays in the timeline, collapsed.
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: textBlocks("回答"), timestamp: 2 }),
+      { type: "text_start", contentIndex: 1 },
+    ));
+    const after = a.blocks.filter(isThinking);
+    expect(after).toHaveLength(1);
+    expect(after[0].superseded).toBe(true);
+    expect(after[0].content).toBe("[Reasoning redacted]");
+  });
+
+  it("folds adjacent thinking segments into separate blocks (相邻思考段两块)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      { type: "thinking_delta", contentIndex: 0, delta: "A" },
+      { type: "thinking_end", contentIndex: 0, content: "A" },
+      // No text/tool event between the segments — the second thinking_start
+      // must supersede the ended block first, then open a fresh one.
+      { type: "thinking_start", contentIndex: 1 },
+      { type: "thinking_delta", contentIndex: 1, delta: "B" },
+      { type: "thinking_end", contentIndex: 1, content: "B" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(2);
+    expect(thinking[0].content).toBe("A");
+    expect(thinking[0].phase).toBe("ended");
+    expect(thinking[0].superseded).toBe(true);
+    expect(thinking[1].content).toBe("B");
+    expect(thinking[1].phase).toBe("ended");
+    expect(thinking[1].superseded).toBe(false);
+
+    // First text supersedes the second block too.
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: textBlocks("回答"), timestamp: 2 }),
+      { type: "text_start", contentIndex: 2 },
+    ));
+    const after = a.blocks.filter(isThinking);
+    expect(after).toHaveLength(2);
+    expect(after.map((b) => b.content)).toEqual(["A", "B"]);
+    expect(after[1].superseded).toBe(true);
+  });
+
+  it("supersedes via toolcall_start even when the update carries no text (无正文纯工具回合)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "run tool", timestamp: 1 })));
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      { type: "thinking_delta", contentIndex: 0, delta: "工具前思考" },
+      { type: "thinking_end", contentIndex: 0, content: "工具前思考" },
+    ));
+
+    // Pure tool turn: the partial message has only a toolCall block, no text.
+    // The dispatch must run before the text-early-return for the supersede to fire.
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: [toolCallBlock("t1", "bash", { command: "ls" })], timestamp: 2 }),
+      { type: "toolcall_start", contentIndex: 1 },
+    ));
+    a.applyEvent(toolStart("t1"));
+    a.applyEvent(toolEnd("t1", "bash", "ok"));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe("工具前思考");
+    expect(thinking[0].phase).toBe("ended");
+    expect(thinking[0].superseded).toBe(true);
+  });
+
+  it("removes the empty placeholder via toolcall_start in a pure tool turn", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "run tool", timestamp: 1 })));
+    expect(a.blocks.filter(isThinking)).toHaveLength(1);
+
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: [toolCallBlock("t1", "bash", { command: "ls" })], timestamp: 2 }),
+      { type: "toolcall_start", contentIndex: 0 },
+    ));
+
+    expect(a.blocks.filter(isThinking)).toHaveLength(0);
+  });
+
+  it("folds replay thinking content as ended superseded blocks in content order (回放折叠)", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message", timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [
+            thinkingBlock("第一段思考"),
+            ...textBlocks("回答"),
+            thinkingBlock("第二段思考"),
+          ],
+          timestamp: 200,
+        }),
+      },
+    ]);
+
+    // Content order preserved: thinking, text, thinking.
+    expect(a.blocks.map((b) => b.type)).toEqual(["thinking", "agent-message", "thinking"]);
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking[0].content).toBe("第一段思考");
+    expect(thinking[0].phase).toBe("ended");
+    expect(thinking[0].superseded).toBe(true);
+    expect(thinking[0].timestamp).toBe(200); // same source as the text fold
+    expect(thinking[1].content).toBe("第二段思考");
+    expect(thinking[1].superseded).toBe(true);
+  });
+
+  it("skips empty thinking blocks on replay — no blank placeholder blocks", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message", timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [thinkingBlock(""), ...textBlocks("answer")],
+          timestamp: 200,
+        }),
+      },
+    ]);
+
+    expect(a.blocks.map((b) => b.type)).toEqual(["agent-message"]);
+  });
+
+  it("holds the §4.1.2 invariants across a full mixed turn", () => {
+    const a = createDisplayBlockAssembler();
+    const openCount = () => a.blocks.filter((b) => b.type === "thinking" && !b.superseded).length;
+
+    a.applyEvent({ type: "agent_start" });
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    a.applyEvent(msgEnd(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    expect(openCount()).toBe(1); // the placeholder
+
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      { type: "thinking_delta", contentIndex: 0, delta: "一段" },
+      { type: "thinking_end", contentIndex: 0, content: "一段" },
+    ));
+    expect(openCount()).toBe(1);
+
+    // First text supersedes the open block.
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: textBlocks("回答一"), timestamp: 2 }),
+      { type: "text_start", contentIndex: 1 },
+    ));
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: textBlocks("回答一"), timestamp: 2 }),
+      { type: "text_delta", contentIndex: 1, delta: "" },
+    ));
+    expect(openCount()).toBe(0);
+
+    // A later tool turn (no text) must not reopen anything.
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: [toolCallBlock("t1", "bash", {})], timestamp: 2 }),
+      { type: "toolcall_start", contentIndex: 2 },
+    ));
+    a.applyEvent(toolStart("t1"));
+    a.applyEvent(toolEnd("t1", "bash", "ok"));
+    a.applyEvent({ type: "agent_end", messages: [] });
+    expect(openCount()).toBe(0);
+
+    const thinking = a.blocks.filter(isThinking);
+    // Invariant 1: at most one non-superseded thinking block at any point.
+    expect(openCount()).toBeLessThanOrEqual(1);
+    // Invariant 2: superseded blocks always carry content.
+    for (const block of thinking) {
+      if (block.superseded) expect(block.content.length).toBeGreaterThan(0);
+    }
+    // Invariant 3: thinking never leaks into the text bubble — agent-message
+    // content comes from text blocks only.
+    const agent = a.blocks.find((b) => b.type === "agent-message");
+    expect(agent?.type).toBe("agent-message");
+    if (agent?.type === "agent-message") {
+      expect(agent.content).toBe("回答一");
+      expect(agent.content).not.toContain("一段");
+    }
+  });
+});

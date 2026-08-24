@@ -294,7 +294,17 @@ export interface TurnDiffSummary extends DiffSummary {
 export type DisplayBlock =
   | { id: string; type: "user-message"; text: string; attachments?: ChatMessageAttachment[]; timestamp: number }
   | { id: string; type: "agent-message"; content: string; isStreaming: boolean; timestamp: number }
-  | { id: string; type: "thinking"; timestamp: number }
+  | {
+      id: string;
+      type: "thinking";
+      /** 累积的思考纯文本。空串 = 「AI 正在思考...」等待占位（尚未收到 thinking delta）。 */
+      content: string;
+      /** "streaming"=思考 delta 仍可能到达；"ended"=thinking_end / 回放 / 回合终止。 */
+      phase: "streaming" | "ended";
+      /** true = 下一个 move 已开始（首段正文 / 工具调用），视图层据此自动折叠。 */
+      superseded: boolean;
+      timestamp: number;
+    }
   | { id: string; type: "vision-status"; provider: string; modelId: string; imageCount: number; status: "running" | "success" | "error"; timestamp: number }
   | { id: string; type: "work-status"; tools: ToolWorkItem[]; isStreaming: boolean; timestamp: number }
   | { id: string; type: "turn-separator"; timestamp: number }
@@ -1063,3 +1073,28 @@ export type {
   WorkflowEvent,
   WorkflowViewState,
 } from "./workflow-types.js";
+
+// Git panel plain-data types are canonically defined in git-types.ts (leaf
+// module, structural guard included). Re-exported here so preload/renderer
+// keep the single `from "../shared/types"` import path used across the
+// codebase. The leaf exports a runtime value (isProjectLocationLike), so the
+// types and the value are re-exported separately.
+export type {
+  GitChangedFile,
+  GitErrorCode,
+  GitUpstreamInfo,
+  GitWorkdirCounts,
+  GitWorkdirSnapshot,
+} from "./git-types.js";
+export { isProjectLocationLike } from "./git-types.js";
+
+// Side-question (BTW) plain-data types are canonically defined in
+// btw-types.ts (leaf module). Re-exported here so preload/renderer keep the
+// single `from "../shared/types"` import path used across the codebase. The
+// leaf exports runtime values (BTW_MAX_QUESTION_LENGTH, btwValidateQuestion),
+// so the types and the values are re-exported separately.
+export type {
+  BtwAskResult,
+  BtwAskStatus,
+} from "./btw-types.js";
+export { BTW_MAX_QUESTION_LENGTH, btwValidateQuestion } from "./btw-types.js";

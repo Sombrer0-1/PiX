@@ -7,12 +7,14 @@
 import { computed, ref, watch, nextTick, onMounted } from "vue";
 import { useWorkspaceSessionStore } from "../../composables/useWorkspaceSessionStore";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
+import { useBtw } from "../../composables/useBtw";
 import { useProjectStore } from "../../stores/project-store";
 import SessionView from "../session/SessionView.vue";
 import RawOutputViewer from "../session/RawOutputViewer.vue";
 import SessionTreeView from "../session/SessionTreeView.vue";
 import ForkDialog from "../session/ForkDialog.vue";
 import CommandPalette from "../input/CommandPalette.vue";
+import BtwCard from "../input/BtwCard.vue";
 import ModelSelector from "../input/ModelSelector.vue";
 import ThinkingSelector from "../input/ThinkingSelector.vue";
 import ClarificationCard from "../input/ClarificationCard.vue";
@@ -28,11 +30,13 @@ import { usePlanStore } from "../../stores/plan-store";
 import { useWorkflowStore } from "../../stores/workflow-store";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
 import TaskCenterView from "../agent-task/TaskCenterView.vue";
+import { btwValidateQuestion } from "@shared/types.js";
 import type { PlanStatus } from "@shared/types.js";
-import type { RequestUserInputRequest, RequestUserInputQuestion } from "@/types/rpc";
+import type { RequestUserInputRequest, RequestUserInputQuestion, RpcSlashCommand } from "@/types/rpc";
 
 const sessionStore = useWorkspaceSessionStore();
 const rpc = useWorkspaceRpc();
+const btw = useBtw();
 const projectStore = useProjectStore();
 const settingsStore = useSettingsStore();
 const teamStore = useTeamStore();
@@ -148,6 +152,20 @@ const streamingEffortLabel = computed(() => {
   return typeof mapped === "string" ? mapped : level;
 });
 const canUseTeamMode = computed(() => Boolean(projectStore.currentProject && rpc.isConnected.value));
+
+/** 本地 /btw 命令条目（命令面板同款来源标记）。 */
+const btwCommand: RpcSlashCommand = {
+  name: "btw",
+  description: "不打断主流程的快速提问",
+  source: "builtin",
+  sourceInfo: {},
+};
+/** 命令面板条目：solo 模式在列表头部注入本地 /btw 条目（去重）；团队模式不注入。 */
+const paletteCommands = computed(() =>
+  teamStore.teamMode
+    ? rpc.commands.value
+    : [btwCommand, ...rpc.commands.value.filter((command) => command.name !== "btw")],
+);
 
 const composerPlaceholder = computed(() => {
   if (rpc.isStreaming.value) return "AI 正在运行，可输入消息调整方向...";
@@ -657,6 +675,30 @@ async function sendMessage(): Promise<void> {
   if (!text && attachments.value.length === 0) return;
   if (!canSend.value) return;
 
+  // /btw 侧问拦截（仅 solo 模式，大小写敏感；团队模式下按普通文本走既有路径）：
+  // 命中则清空输入框与附件，不进入主消息通道（不 appendOptimisticUserMessage、
+  // 不发送 prompt）。
+  if (!teamStore.teamMode && /^\/btw(\s|$)/.test(text)) {
+    inputText.value = "";
+    attachments.value = [];
+    if (textareaRef.value) {
+      textareaRef.value.value = "";
+      textareaRef.value.style.height = "auto";
+    }
+    const question = text.replace(/^\/btw\s*/, "");
+    // 统一校验口径（trim 后按码点计数），与主进程守卫一致；错误文案即时提示（PRD §5.2）。
+    const validationError = btwValidateQuestion(question);
+    if (validationError !== null) {
+      btw.showUsage(validationError);
+    } else {
+      btw.ask(question);
+    }
+    return;
+  }
+
+  // 正常主消息路径：销毁侧问卡片并中止在途侧问（PRD：发送下一条主消息时销毁）。
+  btw.destroy();
+
   isSending.value = true;
   const originalText = text;
   const originalAttachments = [...attachments.value];
@@ -741,6 +783,11 @@ function onCommandSelected(commandName: string): void {
     }
   }
   showCommandPalette.value = false;
+  textareaRef.value?.focus();
+}
+
+/** 侧问卡片经 Esc/× 关闭（BtwCard emit closed）后归还焦点给主输入框（PRD §5.3）。 */
+function onBtwCardClosed(): void {
   textareaRef.value?.focus();
 }
 
@@ -980,10 +1027,13 @@ function sendQuickStart(prompt: string): void {
         <CommandPalette
           v-if="showCommandPalette"
           :search="searchQuery"
-          :commands="rpc.commands.value"
+          :commands="paletteCommands"
           @select="onCommandSelected"
           @close="showCommandPalette = false"
         />
+
+        <!-- 侧问卡片：绝对定位于 composer 上方，仅卡片激活时渲染；关闭（Esc/×）后归还焦点给主输入框 -->
+        <BtwCard v-if="btw.card.value.kind !== 'idle'" @closed="onBtwCardClosed" />
 
         <!-- Clarification section: summary chips + current question card -->
         <div v-if="pendingUserInput" class="clarification-section">
