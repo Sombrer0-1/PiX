@@ -614,12 +614,21 @@ await run("disposeAll cancels and bounded-disposes every live run; idempotent", 
 
 await run("asarUnpack covers the whole engine directory; worker value-imports stay inside it", async () => {
   const pkg = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
+    scripts?: { "build:main"?: string };
     build?: { asarUnpack?: string[] };
   };
   assertDeepEqual(
     pkg.build?.asarUnpack,
     ["dist/main/main/workflow/engine/**/*"],
     "asarUnpack unpacks workflow/engine/**, not only worker.js",
+  );
+  const enginePkg = JSON.parse(
+    readFileSync(new URL("../workflow/engine/package.json", import.meta.url), "utf8"),
+  ) as { type?: string };
+  assertEqual(enginePkg.type, "module", "unpacked engine package.json declares type module");
+  assert(
+    (pkg.scripts?.["build:main"] ?? "").includes("workflow/engine/package.json"),
+    "build:main copies the engine package.json into dist so packaging can unpack it",
   );
 
   const workerGraph = ["worker.ts", "session.ts", "protocol.ts", "realm.ts", "runtime.ts", "engine.ts", "schema.ts"];

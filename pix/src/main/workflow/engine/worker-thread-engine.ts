@@ -98,7 +98,9 @@ function resolveMaxConcurrentAgents(requested: number | undefined): number {
  * the asar archive, and ESM relative imports from an unpacked file stay on
  * the real filesystem (they do not re-enter the asar). package.json
  * `build.asarUnpack` therefore unpacks the whole `workflow/engine/` directory
- * — not just worker.js — and the entry is redirected there.
+ * — not just worker.js — including a colocated `{"type":"module"}`
+ * package.json so the unpacked `.js` is still treated as ESM, and the entry
+ * is redirected there.
  */
 export function rewriteAsarWorkerPath(entry: string): string {
   return entry.replace(/[\\/]app\.asar[\\/]/, `${sep}app.asar.unpacked${sep}`);
