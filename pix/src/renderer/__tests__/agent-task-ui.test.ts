@@ -1793,6 +1793,81 @@ describe("SubagentToolView terminal fold + deep link", () => {
   });
 });
 
+describe("SubagentToolView running live UI", () => {
+  function makeRunningDetails(): SubagentDetails {
+    const startedAt = Date.now() - 2500;
+    return {
+      schemaVersion: 1,
+      mode: "single",
+      agentScope: "user",
+      results: [
+        {
+          id: "r-run",
+          index: 0,
+          agentName: "general-purpose",
+          agentSource: "built-in",
+          description: "Read handlers",
+          status: "running",
+          finalOutput: "",
+          outputTruncated: false,
+          originalOutputBytes: 0,
+          toolUseCount: 4,
+          activities: [
+            {
+              sequence: 1,
+              toolCallId: "tc-1",
+              toolName: "bash",
+              status: "running",
+              summary: "grep handlers",
+              startedAt,
+            },
+          ],
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 },
+          startedAt,
+          durationMs: 0,
+        },
+      ],
+      startedAt,
+      updatedAt: startedAt,
+      durationMs: 0,
+    };
+  }
+
+  it("running 时点击收起立即隐藏正文", async () => {
+    const pinia = installPinia();
+    wrapper = mount(SubagentToolView, {
+      props: { result: { details: makeRunningDetails() }, args: {}, isError: false },
+      global: { plugins: [pinia, vuetify] },
+    });
+    await nextTick();
+
+    expect(wrapper.find(".subagent-live").exists()).toBe(true);
+    expect(wrapper.get(".subagent-toggle").text()).toContain("收起");
+
+    await wrapper.get(".subagent-header").trigger("click");
+    await nextTick();
+    expect(wrapper.find(".subagent-live").exists()).toBe(false);
+    expect(wrapper.get(".subagent-toggle").text()).toContain("展开");
+
+    await wrapper.get(".subagent-header").trigger("click");
+    await nextTick();
+    expect(wrapper.find(".subagent-live").exists()).toBe(true);
+  });
+
+  it("running 时 header 显示实时工具次数且耗时不是 0ms", async () => {
+    const pinia = installPinia();
+    wrapper = mount(SubagentToolView, {
+      props: { result: { details: makeRunningDetails() }, args: {}, isError: false },
+      global: { plugins: [pinia, vuetify] },
+    });
+    await nextTick();
+
+    const meta = wrapper.get(".subagent-meta").text();
+    expect(meta).toContain("工具 4 次");
+    expect(meta).not.toContain("0ms");
+  });
+});
+
 // ============================================================================
 // RightPanel integration: AgentTask launcher entry, single notification mount
 // ============================================================================

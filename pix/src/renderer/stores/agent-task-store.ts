@@ -303,11 +303,20 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
   }
 
   /** Replace a task's activity list wholesale (bounded throttle merges in main). */
-  function applyActivities(taskId: string, activities: AgentTaskActivity[]): void {
+  function applyActivities(
+    taskId: string,
+    activities: AgentTaskActivity[],
+    extras?: { toolUseCount?: number; durationMs?: number },
+  ): void {
     const idx = tasks.value.findIndex((t) => t.taskId === taskId);
     if (idx < 0) return;
     const next = tasks.value.slice();
-    next[idx] = { ...next[idx], activities };
+    next[idx] = {
+      ...next[idx],
+      activities,
+      ...(extras?.toolUseCount !== undefined ? { toolUseCount: extras.toolUseCount } : {}),
+      ...(extras?.durationMs !== undefined ? { durationMs: extras.durationMs } : {}),
+    };
     tasks.value = next;
   }
 
@@ -383,7 +392,10 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
         }
         break;
       case "task_activities":
-        applyActivities(event.taskId, event.activities);
+        applyActivities(event.taskId, event.activities, {
+          toolUseCount: event.toolUseCount,
+          durationMs: event.durationMs,
+        });
         break;
       case "task_output":
         applyOutput(event.taskId, event.output, event.truncated);

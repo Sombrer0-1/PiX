@@ -42,13 +42,48 @@ import type { ProjectLocation, ThinkingLevel } from "./project-location.js";
 import type { RequestUserInputRequest } from "./types.js";
 
 export const AGENT_TASK_SCHEMA_VERSION = 1 as const;
-export const AGENT_TASK_MAX_RUNNING_SLOTS = 4;
+/** Default concurrent running slots (running + waiting_input) when unset. */
+export const AGENT_TASK_DEFAULT_RUNNING_SLOTS = 4;
+/** Absolute ceiling for the user-configurable concurrent-slot setting. */
+export const AGENT_TASK_MAX_RUNNING_SLOTS = 8;
 export const AGENT_TASK_MAX_ACTIVITIES = 20;
 export const AGENT_TASK_MAX_FINAL_OUTPUT_BYTES = 48 * 1024;
 /** Recent-activity window cap for renderer/replay snapshots (same value as the hard cap). */
 export const AGENT_TASK_MAX_RECENT_ACTIVITIES = 20;
 /** Off by default: foreground agent tools wait for the result. */
 export const DEFAULT_AUTO_BACKGROUND_MS = 0;
+/**
+ * Loose default nested-session turn cap when the agent definition omits
+ * `maxTurns`. Built-in `general-purpose` uses the same number; YAML ceiling
+ * is `MAX_AGENT_TURNS` in coding-agent (higher, so custom agents can raise it).
+ */
+export const DEFAULT_MAX_TURNS = 150;
+
+/** True when `value` is an integer in [1, AGENT_TASK_MAX_RUNNING_SLOTS]. */
+export function isAgentTaskRunningSlots(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value)
+    && value >= 1 && value <= AGENT_TASK_MAX_RUNNING_SLOTS;
+}
+
+/**
+ * Settings sanitizer: keep a legal slot count, otherwise drop to undefined
+ * so an absent/invalid payload does not overwrite a stored value.
+ */
+export function parseAgentTaskMaxConcurrent(value: unknown): number | undefined {
+  return isAgentTaskRunningSlots(value) ? value : undefined;
+}
+
+/**
+ * Runtime clamp: legal integers stay in [1, MAX]; anything else becomes DEFAULT.
+ */
+export function clampAgentTaskRunningSlots(value: unknown): number {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    if (value < 1) return 1;
+    if (value > AGENT_TASK_MAX_RUNNING_SLOTS) return AGENT_TASK_MAX_RUNNING_SLOTS;
+    return value;
+  }
+  return AGENT_TASK_DEFAULT_RUNNING_SLOTS;
+}
 
 export type AgentTaskExecutionMode = "approval" | "unattended" | "read-only";
 export type AgentTaskStatus =

@@ -1,7 +1,8 @@
 /**
  * App-level agent task runtime (design plan §4.5, 1.4.1).
  *
- * Owns the global FIFO scheduler (max 4 running+waiting_input slots), the
+ * Owns the global FIFO scheduler (default 4 running+waiting_input slots,
+ * user-configurable up to 8), the
  * per-task input router (taskId+requestId+generation triple validation),
  * foreground auto-background timers, group detach semantics, Plan link
  * consumption and the bounded shutdown path. One `AgentTaskService` exists per
@@ -77,6 +78,8 @@ import {
   AGENT_TASK_MAX_RECENT_ACTIVITIES,
   AGENT_TASK_SCHEMA_VERSION,
   DEFAULT_AUTO_BACKGROUND_MS,
+  clampAgentTaskRunningSlots,
+  DEFAULT_MAX_TURNS,
   type AgentTaskActivity,
   type AgentTaskDiagnosticExport,
   type AgentTaskFailureReason,
@@ -116,7 +119,7 @@ import {
 import type { AgentSessionEvent as SharedAgentSessionEvent, RequestUserInputResponse } from "../../shared/types.js";
 
 export const MAX_PARALLEL_TASKS = 8;
-export const DEFAULT_MAX_TURNS = 50;
+export { DEFAULT_MAX_TURNS };
 export const MAX_DELEGATED_PROMPT_BYTES = 64 * 1024;
 export const AUTO_BACKGROUND_WARNING_LEAD_MS = 10_000;
 /** Byte headroom reserved at creation/queue time for the task's transcript and logs (PRD C5). */
@@ -182,7 +185,7 @@ export type AgentTaskServiceEventV141 =
   | { type: "task_state"; task: AgentTaskInfo }
   | { type: "task_input"; request: AgentTaskInputRequest }
   | { type: "task_input_dismissed"; taskId: string; requestId: string; generation: number; reason: string }
-  | { type: "task_activities"; taskId: string; activities: AgentTaskActivity[] }
+  | { type: "task_activities"; taskId: string; activities: AgentTaskActivity[]; toolUseCount?: number; durationMs?: number }
   | { type: "task_output"; taskId: string; output: string; truncated: boolean }
   | { type: "task_file_change"; taskId: string; planLink?: AgentTaskPlanLink; change: FileChangeSummary; aggregate: TurnDiffSummary }; // main-only
 // 1.4.2 (R2): storage_status / recovery_issue join the service event union.
@@ -475,10 +478,29 @@ export class AgentTaskService {
       onSettled: (settle) => this._onInputSettled(settle),
     });
     this._scheduler.onSlotFree((taskId) => this._startTask(taskId));
+    this._scheduler.setMaxSlots(this._readMaxConcurrentSlots());
     this._resumer = new AgentTaskResumer({
       store: this._store,
       runtimeFactory: (spec, taskSessionDir) => this._createRuntime(spec, taskSessionDir),
     });
+  }
+
+  /** Current AgentTask running-slot ceiling (1–8). */
+  getMaxConcurrentSlots(): number {
+    return this._scheduler.maxSlots;
+  }
+
+  /**
+   * Re-read `agentTaskMaxConcurrent` from settings and apply it. Raising the
+   * cap grants queued tasks immediately; lowering it only stops new grants.
+   */
+  syncMaxConcurrentSlotsFromSettings(): void {
+    this._scheduler.setMaxSlots(this._readMaxConcurrentSlots());
+  }
+
+  private _readMaxConcurrentSlots(): number {
+    const raw = (this._settings as unknown as { get: (key: string) => unknown }).get("agentTaskMaxConcurrent");
+    return clampAgentTaskRunningSlots(raw);
   }
 
   // =========================================================================
@@ -1848,6 +1870,14 @@ export class AgentTaskService {
         if (entry.info.activities.length > AGENT_TASK_MAX_RECENT_ACTIVITIES) {
           entry.info.activities = entry.info.activities.slice(-AGENT_TASK_MAX_RECENT_ACTIVITIES);
         }
+        if (event.activity.status === "running") {
+          entry.info.toolUseCount += 1;
+        }
+        const now = this._now();
+        if (entry.info.startedAt !== undefined) {
+          entry.info.durationMs = Math.max(0, now - entry.info.startedAt);
+        }
+        entry.info.updatedAt = now;
         entry.throttle.pendingActivities.push(event.activity);
         this._scheduleThrottleFlush(taskId);
         // 1.4.2: the log is the recovery source; appends are never throttled.
@@ -3506,9 +3536,20 @@ export class AgentTaskService {
     entry.throttle.pendingActivities = [];
     entry.throttle.pendingOutput = undefined;
     entry.throttle.pendingTranscript = [];
-    entry.throttle.lastEmitAt = this._now();
+    const now = this._now();
+    entry.throttle.lastEmitAt = now;
+    if (entry.info.startedAt !== undefined && !isTerminalStatus(entry.info.status)) {
+      entry.info.durationMs = Math.max(0, now - entry.info.startedAt);
+      entry.info.updatedAt = now;
+    }
     if (activities.length > 0) {
-      this._emitServiceEvent({ type: "task_activities", taskId, activities });
+      this._emitServiceEvent({
+        type: "task_activities",
+        taskId,
+        activities,
+        toolUseCount: entry.info.toolUseCount,
+        durationMs: entry.info.durationMs,
+      });
     }
     if (output) {
       this._emitServiceEvent({ type: "task_output", taskId, output: output.text, truncated: output.truncated });

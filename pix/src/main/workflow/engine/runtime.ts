@@ -48,7 +48,8 @@ const DEFERRED_AGENT_OPTIONS = new Set(["effort", "isolation", "agentType"]);
 const SUPPORTED_OPTION_LIST = "label, phase, schema, provider, model, retry, maxTurns";
 const MAX_AGENT_RETRY = 2;
 const MAX_REPORTED_FAILURES = 32;
-const MAX_CHILD_MAX_TURNS = 50;
+/** Matches coding-agent MAX_AGENT_TURNS so agent({ maxTurns }) can use the loose default. */
+const MAX_CHILD_MAX_TURNS = 200;
 const RETRYABLE_FAILURE_REASONS = new Set(["max_turns", "invalid_parameters", "api_error"]);
 
 interface AgentHookOptions {

@@ -219,6 +219,13 @@ export class SettingsStore {
         this.store.set("autoBackgroundMs", settings.autoBackgroundMs);
       }
     }
+    if (Object.hasOwn(settings, "agentTaskMaxConcurrent")) {
+      if (settings.agentTaskMaxConcurrent === undefined) {
+        this.store.delete("agentTaskMaxConcurrent");
+      } else {
+        this.store.set("agentTaskMaxConcurrent", settings.agentTaskMaxConcurrent);
+      }
+    }
   }
 
   addRecentProject(path: string, name: string): void {

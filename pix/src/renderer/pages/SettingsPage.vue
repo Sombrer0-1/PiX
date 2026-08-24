@@ -11,6 +11,7 @@ import { useSettingsStore } from "../stores/settings-store";
 import { useAuthStore } from "../stores/auth-store";
 import { useWorkspaceRpc } from "../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
+import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, AGENT_TASK_MAX_RUNNING_SLOTS } from "@shared/agent-task-types.js";
 import McpSettings from "../components/settings/McpSettings.vue";
 import CustomProviders from "../components/settings/CustomProviders.vue";
 
@@ -66,6 +67,10 @@ const enableProductAnalytics = ref(false);
 // 1.4.1: auto-background threshold for foreground agent tasks (ms);
 // 0 = off. Hydrated from the store on mount, which defaults absent to 0.
 const autoBackgroundMs = ref(0);
+const agentTaskMaxConcurrent = ref(AGENT_TASK_DEFAULT_RUNNING_SLOTS);
+const agentTaskConcurrentTicks: Record<number, string> = {
+  1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8",
+};
 
 const shellPath = ref("");
 const shellCommandPrefix = ref("");
@@ -267,6 +272,7 @@ onMounted(async () => {
   planThinkingLevel.value = settingsStore.settings.planThinkingLevel ?? "";
   enableProductAnalytics.value = settingsStore.settings.enableProductAnalytics ?? false;
   autoBackgroundMs.value = settingsStore.autoBackgroundMs;
+  agentTaskMaxConcurrent.value = settingsStore.agentTaskMaxConcurrent;
   wslEnabled.value = settingsStore.settings.wsl?.enabled ?? false;
   wslDistro.value = settingsStore.settings.wsl?.distro ?? "";
   wslDefaultCwd.value = settingsStore.settings.wsl?.defaultCwd || "/home";
@@ -363,6 +369,7 @@ async function saveSettings(): Promise<void> {
       enableProductAnalytics: enableProductAnalytics.value,
       // 1.4.1: auto-background threshold; 0 = off.
       autoBackgroundMs: autoBackgroundMs.value,
+      agentTaskMaxConcurrent: agentTaskMaxConcurrent.value,
       wsl: {
         enabled: wslEnabled.value,
         distro: wslDistro.value,
@@ -539,7 +546,7 @@ async function downloadAndInstall(): Promise<void> {
         <!-- ============ 规划 ============ -->
         <div v-show="activeSection === 'plan'" class="section-panel">
           <h2 class="section-title">规划</h2>
-          <p class="section-desc">规划模式的模型、匿名使用数据与自动后台设置。</p>
+          <p class="section-desc">规划模式的模型、匿名使用数据、自动后台与子 Agent 并发。</p>
           <div class="form-fields">
             <v-select
               v-model="planModelKey"
@@ -583,6 +590,22 @@ async function downloadAndInstall(): Promise<void> {
               hint="超过该时长后，任务在面板中显示为后台，但父会话仍等待结果。选择「关闭」则始终以前台展示。真正转后台（立即返回、完成后自动回传）仅在明确设置 run_in_background 或在任务面板手动转后台时发生。"
               persistent-hint
               class="mb-4"
+            />
+            <v-divider class="my-4" />
+            <v-slider
+              v-model="agentTaskMaxConcurrent"
+              data-test="agent-task-max-concurrent-slider"
+              :min="1"
+              :max="AGENT_TASK_MAX_RUNNING_SLOTS"
+              :step="1"
+              show-ticks="always"
+              :ticks="agentTaskConcurrentTicks"
+              tick-size="4"
+              thumb-label="always"
+              label="子 Agent 并发上限"
+              hint="同时处于 running / waiting_input 的子任务数。超出的排队等待。默认 4，最高 8。"
+              persistent-hint
+              class="mb-4 concurrent-slot-slider"
             />
           </div>
         </div>
@@ -1094,6 +1117,10 @@ async function downloadAndInstall(): Promise<void> {
 
 .settings-content :deep(.v-input) {
   color: var(--pix-text-primary);
+}
+
+.concurrent-slot-slider {
+  padding-top: var(--pix-space-sm);
 }
 
 /* ── High-contrast settings text ──

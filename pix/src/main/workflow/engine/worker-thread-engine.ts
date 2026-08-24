@@ -11,7 +11,7 @@ import { availableParallelism } from "node:os";
 import * as vm from "node:vm";
 import { sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AGENT_TASK_MAX_RUNNING_SLOTS } from "../../../shared/agent-task-types.js";
+import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, AGENT_TASK_MAX_RUNNING_SLOTS } from "../../../shared/agent-task-types.js";
 import { WorkflowRunId } from "../../../shared/workflow-types.js";
 import { WorkflowEngine, WorkflowError } from "./engine.js";
 import { WORKFLOW_APP_SHUTDOWN_CANCEL_REASON } from "./child-types.js";
@@ -82,14 +82,16 @@ function resolveMaxTotalAgents(requested: number | undefined, ceiling: number): 
 /**
  * Resolve the per-run concurrency ceiling: 0 (the default) auto-resolves off
  * the machine's parallelism, and the RESOLVED value is always clamped into
- * [1, AGENT_TASK_MAX_RUNNING_SLOTS] — workflow children share the AgentTask
- * scheduler's four running slots, so a higher ceiling would only queue.
+ * [1, slotCap] — workflow children share the AgentTask scheduler's running
+ * slots, so a higher ceiling would only queue. slotCap itself is clamped to
+ * [1, AGENT_TASK_MAX_RUNNING_SLOTS].
  */
-function resolveMaxConcurrentAgents(requested: number | undefined): number {
+export function resolveMaxConcurrentAgents(requested: number | undefined, slotCap: number = AGENT_TASK_DEFAULT_RUNNING_SLOTS): number {
+  const cap = Math.min(AGENT_TASK_MAX_RUNNING_SLOTS, Math.max(1, Math.floor(slotCap)));
   if (requested === undefined || requested === 0) {
-    return Math.min(AGENT_TASK_MAX_RUNNING_SLOTS, Math.max(1, availableParallelism() - 2));
+    return Math.min(cap, Math.max(1, availableParallelism() - 2));
   }
-  return Math.min(AGENT_TASK_MAX_RUNNING_SLOTS, Math.max(1, Math.floor(requested)));
+  return Math.min(cap, Math.max(1, Math.floor(requested)));
 }
 
 /**
@@ -142,6 +144,7 @@ export function resolveWorkerEntry(): string | URL {
 export class WorkerThreadWorkflowEngine extends WorkflowEngine {
   private readonly config: ResolvedConfig;
   private readonly live = new Map<WorkflowRunId, WorkerRun>();
+  private readonly getRunningSlotCap: (() => number) | undefined;
 
   constructor(
     private readonly spawner: WorkflowChildSpawner,
@@ -149,6 +152,7 @@ export class WorkerThreadWorkflowEngine extends WorkflowEngine {
   ) {
     super(config);
     this.config = defaultConfig(config);
+    this.getRunningSlotCap = config?.getRunningSlotCap;
   }
 
   /**
@@ -170,7 +174,10 @@ export class WorkerThreadWorkflowEngine extends WorkflowEngine {
     const id = WorkflowRunId(randomUUID());
     const info = { id, meta };
     const limits: WorkerLimits = {
-      maxConcurrentAgents: resolveMaxConcurrentAgents(this.config.maxConcurrentAgents),
+      maxConcurrentAgents: resolveMaxConcurrentAgents(
+        this.config.maxConcurrentAgents,
+        this.getRunningSlotCap?.() ?? AGENT_TASK_DEFAULT_RUNNING_SLOTS,
+      ),
       maxTotalAgents,
       maxItemsPerCall: this.config.maxItemsPerCall,
       syncTimeoutMs: this.config.syncTimeoutMs,

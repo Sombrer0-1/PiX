@@ -53,7 +53,9 @@ export interface WorkflowRun {
 }
 
 export interface WorkflowEngineConfig {
-  maxConcurrentAgents?: number; // 0 = auto; resolved value must be in [1, 4]
+  maxConcurrentAgents?: number; // 0 = auto; resolved value clamped to the live running-slot cap
+  /** Live AgentTask running-slot cap used as the clamp for maxConcurrentAgents. */
+  getRunningSlotCap?: () => number;
   maxTotalAgents?: number;      // default 1000
   maxItemsPerCall?: number;     // default 4096
   syncTimeoutMs?: number;       // default 5000

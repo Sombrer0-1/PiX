@@ -43,8 +43,8 @@ import {
   type SubagentSingleResult,
   type SubagentUsage,
 } from "../../shared/subagent-types.js";
-import type { FileChangeSummary, TurnDiffSummary } from "@earendil-works/pi-coding-agent";
-import type { AgentTaskGroupHandle, AgentTaskInfo } from "../../shared/agent-task-types.js";
+import { MAX_AGENT_TURNS as MAX_DEFINITION_AGENT_TURNS, type FileChangeSummary, type TurnDiffSummary } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_TURNS, type AgentTaskGroupHandle, type AgentTaskInfo } from "../../shared/agent-task-types.js";
 import type { AgentTaskService, AgentTaskSubmissionContext } from "../agent-task/agent-task-service.js";
 import type {
   SubagentExecutionContext,
@@ -58,8 +58,8 @@ import type {
 // the facade itself holds no FIFO/session/backend machinery.
 export const MAX_PARALLEL_TASKS = SUBAGENT_MAX_RESULTS;
 export const MAX_ACTIVE_SUBAGENTS = 4;
-export const DEFAULT_MAX_TURNS = 50;
-export const MAX_AGENT_TURNS = DEFAULT_MAX_TURNS;
+export { DEFAULT_MAX_TURNS };
+export const MAX_AGENT_TURNS = MAX_DEFINITION_AGENT_TURNS;
 export const NESTED_STARTUP_TIMEOUT_MS = 30_000;
 export const ABORT_TIMEOUT_MS = 5_000;
 export const NESTED_CLEANUP_TIMEOUT_MS = 2_000;
@@ -260,7 +260,7 @@ export class SubagentRunner {
         this._applyTaskState(runState, event.task);
         runState.emitProgress(false);
       } else if (event.type === "task_activities" && runState.groupTaskIds.includes(event.taskId)) {
-        this._applyLiveActivities(runState, event.taskId, event.activities);
+        this._applyLiveActivities(runState, event.taskId, event.activities, event.toolUseCount, event.durationMs);
         runState.emitProgress(false);
       } else if (event.type === "task_output" && runState.groupTaskIds.includes(event.taskId)) {
         this._applyLiveOutput(runState, event.taskId, event.output, event.truncated);
@@ -400,7 +400,13 @@ export class SubagentRunner {
     return [idx];
   }
 
-  private _applyLiveActivities(runState: RunState, taskId: string, activities: AgentTaskInfo["activities"]): void {
+  private _applyLiveActivities(
+    runState: RunState,
+    taskId: string,
+    activities: AgentTaskInfo["activities"],
+    toolUseCount?: number,
+    durationMs?: number,
+  ): void {
     const sliced = activities.slice(-MAX_RECENT_ACTIVITIES) as SubagentActivity[];
     for (const index of this._indexesForGroupTask(runState, taskId)) {
       const result = runState.details.results[index];
@@ -408,6 +414,12 @@ export class SubagentRunner {
         continue;
       }
       result.activities = sliced;
+      if (toolUseCount !== undefined) {
+        result.toolUseCount = toolUseCount;
+      }
+      if (durationMs !== undefined) {
+        result.durationMs = durationMs;
+      }
     }
   }
 

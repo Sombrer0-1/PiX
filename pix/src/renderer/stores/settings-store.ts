@@ -7,7 +7,7 @@
 
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import { DEFAULT_AUTO_BACKGROUND_MS } from "@shared/agent-task-types.js";
+import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, DEFAULT_AUTO_BACKGROUND_MS } from "@shared/agent-task-types.js";
 import type { GuiSettings, WslDistroInfo, WslSettings } from "@/types/session";
 import type { PixApi } from "../../main/preload";
 
@@ -142,6 +142,9 @@ export const useSettingsStore = defineStore("settings", () => {
     // 1.4.1: auto-background threshold for foreground agent tasks;
     // 0 = off (default), absent = consumer default (0).
     autoBackgroundMs: computed<number>(() => settings.value.autoBackgroundMs ?? DEFAULT_AUTO_BACKGROUND_MS),
+    agentTaskMaxConcurrent: computed<number>(
+      () => settings.value.agentTaskMaxConcurrent ?? AGENT_TASK_DEFAULT_RUNNING_SLOTS,
+    ),
     wslDistros,
     wslDiagnostic,
     wslDistrosLoaded,

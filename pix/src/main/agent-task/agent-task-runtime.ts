@@ -95,14 +95,15 @@ import {
   STRUCTURED_OUTPUT_TOOL_NAME,
 } from "../workflow/structured-output-tool.js";
 import type { AgentTaskInputRouter } from "./agent-task-input.js";
-import type {
-  AgentTaskActivity,
-  AgentTaskFailureReason,
-  AgentTaskItemSpec,
-  AgentTaskModelSnapshot,
-  AgentTaskSpec,
-  AgentTaskUsage,
-  ResumeDecision,
+import {
+  DEFAULT_MAX_TURNS,
+  type AgentTaskActivity,
+  type AgentTaskFailureReason,
+  type AgentTaskItemSpec,
+  type AgentTaskModelSnapshot,
+  type AgentTaskSpec,
+  type AgentTaskUsage,
+  type ResumeDecision,
 } from "../../shared/agent-task-types.js";
 import type {
   OpenToolCall,
@@ -122,7 +123,7 @@ import {
 } from "../../shared/subagent-types.js";
 import type { RequestUserInputRequest, RequestUserInputResponse } from "../../shared/types.js";
 
-export const DEFAULT_MAX_TURNS = 50;
+export { DEFAULT_MAX_TURNS };
 export const MAX_AGENT_TURNS = MAX_DEFINITION_AGENT_TURNS;
 export const NESTED_STARTUP_TIMEOUT_MS = 30_000;
 export const ABORT_TIMEOUT_MS = 5_000;

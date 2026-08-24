@@ -24,7 +24,7 @@ export interface AgentFrontmatter {
 	tools?: string | string[];
 	disallowedTools?: string | string[];
 	model?: string; // "inherit"、"provider/modelId" 或唯一裸 model id
-	maxTurns?: number; // 1..100
+	maxTurns?: number; // 1..MAX_AGENT_TURNS
 	color?: string; // v1 解析保留，renderer 不直接当 CSS 值使用
 }
 
@@ -70,14 +70,14 @@ export const MAX_AGENT_DESCRIPTION_LENGTH = 1024;
 export const MAX_AGENT_DEFINITION_BYTES = 64 * 1024;
 export const MAX_AGENTS_PER_SOURCE = 128;
 export const MAX_AVAILABLE_AGENTS_PROMPT_BYTES = 32 * 1024;
-export const MAX_AGENT_TURNS = 100;
+export const MAX_AGENT_TURNS = 200;
 
 const AGENT_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /**
  * Built-in agents. `general-purpose` has no tool allowlist (all registered
- * tools after bindExtensions), inherits the parent active model and runs at
- * most 50 turns.
+ * tools after bindExtensions), inherits the parent active model and defaults
+ * to 150 turns (YAML ceiling is MAX_AGENT_TURNS so custom agents can raise it).
  */
 export const BUILTIN_AGENTS: readonly AgentDefinition[] = Object.freeze([
 	Object.freeze({
@@ -89,7 +89,7 @@ export const BUILTIN_AGENTS: readonly AgentDefinition[] = Object.freeze([
 			"If the task cannot be completed, report what blocked it. " +
 			"Conclude with a concise summary of what you did and the outcome.",
 		model: "inherit",
-		maxTurns: 50,
+		maxTurns: 150,
 		source: "built-in",
 	}),
 ]);

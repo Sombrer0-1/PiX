@@ -509,6 +509,11 @@ describe("event idempotency", () => {
     const newer: AgentTaskActivity[] = [...activities, { sequence: 2, toolCallId: "tc-2", toolName: "read", status: "running", startedAt: 3 }];
     emit({ type: "task_activities", taskId: "task-1", activities: newer });
     expect(store.tasks[0].activities).toEqual(newer);
+    expect(store.tasks[0].toolUseCount).toBe(0);
+
+    emit({ type: "task_activities", taskId: "task-1", activities: newer, toolUseCount: 2, durationMs: 40 });
+    expect(store.tasks[0].toolUseCount).toBe(2);
+    expect(store.tasks[0].durationMs).toBe(40);
   });
 
   it("replaces the output wholesale; repeated pushes are idempotent", () => {

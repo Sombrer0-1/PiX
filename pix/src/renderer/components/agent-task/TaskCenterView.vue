@@ -31,6 +31,7 @@ import { computed, ref, watch } from "vue";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
 import { useProjectStore } from "../../stores/project-store";
 import { useTeamStore } from "../../stores/team-store";
+import { useLiveNow } from "../../composables/useLiveNow";
 import TaskDetailPanel from "./TaskDetailPanel.vue";
 import type {
   AgentTaskDiagnosticExport,
@@ -47,6 +48,17 @@ const props = defineProps<{
 const store = useAgentTaskStore();
 const projectStore = useProjectStore();
 const teamStore = useTeamStore();
+
+const nowMs = useLiveNow(
+  computed(() => store.tasks.some((task) => task.status === "running" || task.status === "waiting_input")),
+);
+
+function liveDurationMs(task: AgentTaskInfo): number {
+  if ((task.status === "running" || task.status === "waiting_input") && task.startedAt !== undefined) {
+    return Math.max(0, nowMs.value - task.startedAt);
+  }
+  return task.durationMs;
+}
 
 type CenterView = "running" | "history";
 type TaskScope = "session" | "all";
@@ -416,7 +428,7 @@ function downloadDiagnostics(exportData: AgentTaskDiagnosticExport): void {
                 </div>
                 <div class="task-center-row-meta">
                   <span data-test="task-center-source" :title="task.parentSessionId">来源 {{ sourceLabel(task) }}</span>
-                  <span data-test="task-center-duration">用时 {{ formatDuration(task.durationMs) }}</span>
+                  <span data-test="task-center-duration">用时 {{ formatDuration(liveDurationMs(task)) }}</span>
                   <span data-test="task-center-model">模型 {{ modelLabel(task) }}</span>
                   <span data-test="task-center-cost">费用 {{ formatCost(task.usage.cost) }}</span>
                   <span v-if="task.status === 'queued'" class="queue-hint" data-test="task-center-queue">
@@ -473,7 +485,7 @@ function downloadDiagnostics(exportData: AgentTaskDiagnosticExport): void {
                 </div>
                 <div class="task-center-row-meta">
                   <span data-test="task-center-source" :title="task.parentSessionId">来源 {{ sourceLabel(task) }}</span>
-                  <span data-test="task-center-duration">用时 {{ formatDuration(task.durationMs) }}</span>
+                  <span data-test="task-center-duration">用时 {{ formatDuration(liveDurationMs(task)) }}</span>
                   <span data-test="task-center-model">模型 {{ modelLabel(task) }}</span>
                   <span data-test="task-center-cost">费用 {{ formatCost(task.usage.cost) }}</span>
                 </div>
@@ -517,7 +529,7 @@ function downloadDiagnostics(exportData: AgentTaskDiagnosticExport): void {
                 </div>
                 <div class="task-center-row-meta">
                   <span data-test="task-center-source" :title="task.parentSessionId">来源 {{ sourceLabel(task) }}</span>
-                  <span data-test="task-center-duration">用时 {{ formatDuration(task.durationMs) }}</span>
+                  <span data-test="task-center-duration">用时 {{ formatDuration(liveDurationMs(task)) }}</span>
                   <span data-test="task-center-model">模型 {{ modelLabel(task) }}</span>
                   <span data-test="task-center-cost">费用 {{ formatCost(task.usage.cost) }}</span>
                   <span v-if="task.hasUnclosedToolCall" class="unclosed-hint" data-test="task-center-unclosed-hint">

@@ -2166,6 +2166,7 @@ export class SessionBridge {
 				// call for workflow runs.
 				const workflowEngine = new WorkerThreadWorkflowEngine(
 					createAgentTaskChildSpawner(this._agentTaskService!),
+					{ getRunningSlotCap: () => this._agentTaskService!.getMaxConcurrentSlots() },
 				);
 				const workflowRecorder = createWorkflowRecorder({
 					append: (data) => {

@@ -139,7 +139,7 @@ describe("loadAgentsFromDir", () => {
 		writeAgent(agentsDir, "long-desc.md", `name: long-desc\ndescription: ${"x".repeat(1025)}`);
 		writeAgent(agentsDir, "empty-model.md", 'name: empty-model\ndescription: M\nmodel: ""');
 		writeAgent(agentsDir, "bad-turns.md", "name: bad-turns\ndescription: T\nmaxTurns: 0");
-		writeAgent(agentsDir, "big-turns.md", "name: big-turns\ndescription: T\nmaxTurns: 101");
+		writeAgent(agentsDir, "big-turns.md", "name: big-turns\ndescription: T\nmaxTurns: 201");
 		writeAgent(agentsDir, "float-turns.md", "name: float-turns\ndescription: T\nmaxTurns: 1.5");
 		writeAgent(agentsDir, "empty-color.md", 'name: empty-color\ndescription: C\ncolor: ""');
 		writeAgent(
@@ -288,14 +288,14 @@ describe("loadAgents", () => {
 });
 
 describe("BUILTIN_AGENTS", () => {
-	it("contains general-purpose with inherit model, all tools and 50 max turns", () => {
+	it("contains general-purpose with inherit model, all tools and 150 max turns", () => {
 		expect(BUILTIN_AGENTS).toHaveLength(1);
 		const agent = BUILTIN_AGENTS[0];
 		expect(agent?.name).toBe("general-purpose");
 		expect(agent?.source).toBe("built-in");
 		expect(agent?.model).toBe("inherit");
 		expect(agent?.tools).toBeUndefined();
-		expect(agent?.maxTurns).toBe(50);
+		expect(agent?.maxTurns).toBe(150);
 		expect(agent?.filePath).toBeUndefined();
 		expect(agent?.systemPrompt.length).toBeGreaterThan(0);
 		expect(agent?.description.length).toBeGreaterThan(0);

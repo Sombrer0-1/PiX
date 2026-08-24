@@ -16,11 +16,16 @@
 import { createHash } from "crypto";
 import {
   AGENT_TASK_SCHEMA_VERSION,
+  AGENT_TASK_DEFAULT_RUNNING_SLOTS,
   AGENT_TASK_MAX_RUNNING_SLOTS,
+  clampAgentTaskRunningSlots,
+  isAgentTaskRunningSlots,
+  parseAgentTaskMaxConcurrent,
   AGENT_TASK_MAX_ACTIVITIES,
   AGENT_TASK_MAX_FINAL_OUTPUT_BYTES,
   AGENT_TASK_MAX_RECENT_ACTIVITIES,
   DEFAULT_AUTO_BACKGROUND_MS,
+  DEFAULT_MAX_TURNS,
   AGENT_TASK_TRANSITIONS,
   isAgentTaskInfo,
   isAgentTaskGroupHandle,
@@ -206,11 +211,20 @@ function makeActivities(count: number): unknown[] {
 
 run("constants", async () => {
   assertEqual(AGENT_TASK_SCHEMA_VERSION, 1, "schema version is 1");
-  assertEqual(AGENT_TASK_MAX_RUNNING_SLOTS, 4, "max running slots is 4");
+  assertEqual(AGENT_TASK_DEFAULT_RUNNING_SLOTS, 4, "default running slots is 4");
+  assertEqual(AGENT_TASK_MAX_RUNNING_SLOTS, 8, "max running slots is 8");
+  assert(isAgentTaskRunningSlots(1) && isAgentTaskRunningSlots(8), "1 and 8 are legal slot counts");
+  assert(!isAgentTaskRunningSlots(0) && !isAgentTaskRunningSlots(9) && !isAgentTaskRunningSlots(1.5), "0/9/1.5 are illegal");
+  assertEqual(parseAgentTaskMaxConcurrent(8), 8, "parse keeps 8");
+  assertEqual(parseAgentTaskMaxConcurrent(9), undefined, "parse drops 9");
+  assertEqual(clampAgentTaskRunningSlots(undefined), 4, "clamp undefined to default");
+  assertEqual(clampAgentTaskRunningSlots(0), 1, "clamp 0 to 1");
+  assertEqual(clampAgentTaskRunningSlots(99), 8, "clamp 99 to ceiling");
   assertEqual(AGENT_TASK_MAX_ACTIVITIES, 20, "max activities is 20");
   assertEqual(AGENT_TASK_MAX_FINAL_OUTPUT_BYTES, 48 * 1024, "max final output is 48 KiB");
   assertEqual(AGENT_TASK_MAX_RECENT_ACTIVITIES, 20, "max recent activities is 20");
   assertEqual(DEFAULT_AUTO_BACKGROUND_MS, 0, "default auto-background is off");
+  assertEqual(DEFAULT_MAX_TURNS, 150, "loose default maxTurns is 150");
 });
 
 run("transition table", async () => {

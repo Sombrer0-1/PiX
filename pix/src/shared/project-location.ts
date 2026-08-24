@@ -20,6 +20,8 @@
  * ref. GuiSettings shape changes so far: the §4.3 additions (`schemaVersion`,
  * `wsl`), the 1.4.0 additions (`planModel`, `planThinkingLevel`,
  * `enableProductAnalytics`) and the 1.4.1 addition (`autoBackgroundMs`).
+ * `agentTaskMaxConcurrent` is optional; absent means the consumer default
+ * (AGENT_TASK_DEFAULT_RUNNING_SLOTS = 4).
  * Migrations are per-version and never write the optional fields: an absent
  * `autoBackgroundMs` means the consumer default (0 = off).
  */
@@ -128,4 +130,9 @@ export interface GuiSettings {
    * panel presentation; it does not release the parent tool await.
    */
   autoBackgroundMs?: number;
+  /**
+   * Concurrent AgentTask running slots (running + waiting_input).
+   * Integer 1–8; absent = AGENT_TASK_DEFAULT_RUNNING_SLOTS (4).
+   */
+  agentTaskMaxConcurrent?: number;
 }

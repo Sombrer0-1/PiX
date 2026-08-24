@@ -56,7 +56,7 @@ import type { ChildHandle, ChildResult, ChildStartRequest, WorkerInit, WorkerLim
 import { SCHEMA_CHILD_DEFAULT_MAX_TURNS } from "../workflow/engine/child-types.js";
 import type { WorkflowChildSpawner } from "../workflow/child-spawner.js";
 import { workerSpawnEnv } from "../workflow/engine/host.js";
-import { rewriteAsarWorkerPath, resolveWorkerEntry, WorkerThreadWorkflowEngine } from "../workflow/engine/worker-thread-engine.js";
+import { rewriteAsarWorkerPath, resolveWorkerEntry, resolveMaxConcurrentAgents, WorkerThreadWorkflowEngine } from "../workflow/engine/worker-thread-engine.js";
 
 // ============================================================================
 // Test harness (matches workflow-session.test.ts style)
@@ -643,6 +643,16 @@ await run("asarUnpack covers the whole engine directory; worker value-imports st
       );
     }
   }
+});
+
+await run("maxConcurrentAgents clamps to the live slot cap", async () => {
+  assertEqual(resolveMaxConcurrentAgents(8, 4), 4, "requested 8 with cap 4 becomes 4");
+  assertEqual(resolveMaxConcurrentAgents(8, 8), 8, "requested 8 with cap 8 stays 8");
+  assertEqual(resolveMaxConcurrentAgents(1, 8), 1, "requested 1 with cap 8 stays 1");
+  const autoAtFour = resolveMaxConcurrentAgents(0, 4);
+  assert(autoAtFour >= 1 && autoAtFour <= 4, `auto with cap 4 is in [1,4] (got ${autoAtFour})`);
+  const autoAtEight = resolveMaxConcurrentAgents(undefined, 8);
+  assert(autoAtEight >= 1 && autoAtEight <= 8, `auto with cap 8 is in [1,8] (got ${autoAtEight})`);
 });
 
 await run("worker path resolution: asar rewrite and the unbuilt entry", async () => {

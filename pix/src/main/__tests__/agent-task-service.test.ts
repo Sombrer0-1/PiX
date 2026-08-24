@@ -1500,6 +1500,51 @@ async function testEventThrottle(): Promise<void> {
   assert(taskInfo.activities.length <= AGENT_TASK_MAX_RECENT_ACTIVITIES, "activities stay within the bound");
 }
 
+async function testLiveToolUseCount(): Promise<void> {
+  const harness = makeHarness({ autoBackgroundMsOverride: 0 });
+  const context = makeContext(harness);
+  const events = eventsOf(harness);
+  const handle = await harness.service.createTaskGroup(makeParams("single", [makeTask(0)]), context, "foreground");
+  const taskId = handle.tasks[0].taskId;
+  const fake = FakeRuntime.instances[0];
+  await waitForStatus(harness, taskId, "running");
+
+  fake.emitActivity({
+    sequence: 1,
+    toolCallId: "call-live-1",
+    toolName: "read",
+    status: "running",
+    summary: "src/main.ts",
+    startedAt: Date.now(),
+  });
+  fake.emitActivity({
+    sequence: 2,
+    toolCallId: "call-live-1",
+    toolName: "read",
+    status: "completed",
+    summary: "src/main.ts",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+  });
+  fake.emitActivity({
+    sequence: 3,
+    toolCallId: "call-live-2",
+    toolName: "grep",
+    status: "running",
+    summary: "DEFAULT_MAX_TURNS",
+    startedAt: Date.now(),
+  });
+
+  const info = findTask(harness, taskId);
+  assertEqual(info.toolUseCount, 2, "running activities increment toolUseCount; completions do not");
+  const activityEvents = byType(events, "task_activities") as Array<{
+    activities: AgentTaskActivity[];
+    toolUseCount?: number;
+  }>;
+  assert(activityEvents.length >= 1, "live activities were forwarded");
+  assertEqual(activityEvents[0].toolUseCount, 1, "first flush carries the live toolUseCount");
+}
+
 // ============================================================================
 // Runner
 // ============================================================================
@@ -1524,6 +1569,7 @@ async function main(): Promise<void> {
   await run("shutdown input request never rewrites the frozen preShutdownStatus", testShutdownInputRequestFreeze);
   await run("product events (§6.3 agent_task_*)", testProductEvents);
   await run("event throttle: bounded merge of activities/output", testEventThrottle);
+  await run("live toolUseCount increments on running activities", testLiveToolUseCount);
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) {

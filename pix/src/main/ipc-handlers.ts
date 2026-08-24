@@ -28,6 +28,7 @@ import type {
   WslSettings,
 } from "../shared/types.js";
 import type { AgentTaskService } from "./agent-task/agent-task-service.js";
+import { parseAgentTaskMaxConcurrent } from "../shared/agent-task-types.js";
 // Plan/agent-task command registration and dispatch live in pure modules that
 // do not import electron at the top level, so plan-ipc.test.ts and
 // agent-task-ipc.test.ts exercise the REAL handlers with a fake adapter
@@ -73,6 +74,7 @@ const SETTING_KEYS = new Set([
   "planThinkingLevel",
   "enableProductAnalytics",
   "autoBackgroundMs",
+  "agentTaskMaxConcurrent",
 ]);
 
 const AUTO_BACKGROUND_MS_VALUES = new Set<number>([0, 60_000, 120_000, 300_000]);
@@ -247,6 +249,17 @@ function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSetting
       sanitized.autoBackgroundMs = undefined;
     } else if (typeof value === "number" && AUTO_BACKGROUND_MS_VALUES.has(value)) {
       sanitized.autoBackgroundMs = value;
+    }
+  }
+  if (Object.hasOwn(settings, "agentTaskMaxConcurrent")) {
+    const value = settings.agentTaskMaxConcurrent;
+    if (value === undefined) {
+      sanitized.agentTaskMaxConcurrent = undefined;
+    } else {
+      const parsed = parseAgentTaskMaxConcurrent(value);
+      if (parsed !== undefined) {
+        sanitized.agentTaskMaxConcurrent = parsed;
+      }
     }
   }
 
@@ -689,6 +702,7 @@ export function registerIpcHandlers(
     const nextSettings = settingsStore.getAll();
     singleSessionBridge.updateGuiSettings(nextSettings);
     teamLeaderSessionBridge.updateGuiSettings(nextSettings);
+    agentTaskService.syncMaxConcurrentSlotsFromSettings();
     return { success: true };
   });
 

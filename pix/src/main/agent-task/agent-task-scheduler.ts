@@ -1,9 +1,10 @@
 /**
  * Global FIFO scheduler for app-level agent tasks (design plan §3, §4.5).
  *
- * At most AGENT_TASK_MAX_RUNNING_SLOTS (4) tasks occupy a running slot at the
- * same time; `running` and `waiting_input` both hold a slot, `queued` tasks do
- * not. Every runnable task spec is enqueued independently - parallel children
+ * At most `maxSlots` tasks occupy a running slot at the same time (default
+ * AGENT_TASK_DEFAULT_RUNNING_SLOTS, ceiling AGENT_TASK_MAX_RUNNING_SLOTS);
+ * `running` and `waiting_input` both hold a slot, `queued` tasks do not.
+ * Every runnable task spec is enqueued independently - parallel children
  * each take their own slot, a chain occupies exactly one.
  *
  * Owned by AgentTaskService. The scheduler itself has no notion of task
@@ -14,13 +15,20 @@
  * that actually held a slot and reached a terminal state. Aborting a queued
  * task removes the waiter immediately so it never consumes a future slot.
  *
+ * Raising maxSlots immediately grants queued waiters up to the new cap.
+ * Lowering it never preempts a running task: new grants stop until
+ * activeCount falls to the new cap.
+ *
  * All operations are synchronous, which eliminates the same-tick grant/abort
  * race of an async semaphore: a grant and the listener that starts the task
  * happen inside one call stack, so a dequeue can never observe a half-granted
  * waiter.
  */
 
-import { AGENT_TASK_MAX_RUNNING_SLOTS } from "../../shared/agent-task-types.js";
+import {
+  AGENT_TASK_DEFAULT_RUNNING_SLOTS,
+  clampAgentTaskRunningSlots,
+} from "../../shared/agent-task-types.js";
 
 /** One queued task waiting for a slot. */
 interface Waiter {
@@ -29,12 +37,31 @@ interface Waiter {
 
 export class AgentTaskScheduler {
   private _activeCount = 0;
+  private _maxSlots: number;
   private readonly _waiters: Waiter[] = [];
   private readonly _slotFreeListeners = new Set<(taskId: string) => void>();
+
+  constructor(maxSlots: number = AGENT_TASK_DEFAULT_RUNNING_SLOTS) {
+    this._maxSlots = clampAgentTaskRunningSlots(maxSlots);
+  }
 
   /** Number of tasks currently holding a slot (running + waiting_input). */
   get activeCount(): number {
     return this._activeCount;
+  }
+
+  /** Current grant ceiling (1–AGENT_TASK_MAX_RUNNING_SLOTS). */
+  get maxSlots(): number {
+    return this._maxSlots;
+  }
+
+  /**
+   * Update the grant ceiling. Raising it fills the queue immediately;
+   * lowering it only stops new grants until occupancy drains.
+   */
+  setMaxSlots(next: number): void {
+    this._maxSlots = clampAgentTaskRunningSlots(next);
+    this._fillFromQueue();
   }
 
   /**
@@ -57,7 +84,7 @@ export class AgentTaskScheduler {
    * for this taskId.
    */
   enqueue(taskId: string): boolean {
-    if (this._activeCount < AGENT_TASK_MAX_RUNNING_SLOTS) {
+    if (this._activeCount < this._maxSlots) {
       this._activeCount++;
       this._grant(taskId);
       return true;
@@ -84,15 +111,11 @@ export class AgentTaskScheduler {
    * Free one running slot and grant it to the next queued task, if any. Must
    * be called exactly once per task that held a slot and reached a terminal
    * state. The granted waiter takes over the freed slot, so activeCount stays
-   * constant across a release-with-waiter.
+   * constant across a release-with-waiter when occupancy is already at cap.
    */
   release(): void {
     this._activeCount = Math.max(0, this._activeCount - 1);
-    const next = this._waiters.shift();
-    if (next) {
-      this._activeCount++;
-      this._grant(next.taskId);
-    }
+    this._fillFromQueue();
   }
 
   /**
@@ -102,6 +125,16 @@ export class AgentTaskScheduler {
   getQueuePosition(taskId: string): number | undefined {
     const index = this._waiters.findIndex((waiter) => waiter.taskId === taskId);
     return index === -1 ? undefined : index + 1;
+  }
+
+  /** Grant queued waiters until occupancy hits the current ceiling. */
+  private _fillFromQueue(): void {
+    while (this._waiters.length > 0 && this._activeCount < this._maxSlots) {
+      const next = this._waiters.shift();
+      if (next === undefined) break;
+      this._activeCount++;
+      this._grant(next.taskId);
+    }
   }
 
   private _grant(taskId: string): void {

@@ -16,6 +16,7 @@
  */
 import { computed, ref } from "vue";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
+import { useLiveNow } from "../../composables/useLiveNow";
 import { AGENT_TASK_MAX_ACTIVITIES } from "@shared/agent-task-types.js";
 import type { AgentTaskDiagnosticExport, AgentTaskInfo, AgentTaskRecoveryIssue } from "@shared/agent-task-types.js";
 
@@ -26,6 +27,17 @@ const props = defineProps<{
 }>();
 
 const store = useAgentTaskStore();
+
+const nowMs = useLiveNow(
+  computed(() => props.task.status === "running" || props.task.status === "waiting_input"),
+);
+
+function liveDurationMs(task: AgentTaskInfo): number {
+  if ((task.status === "running" || task.status === "waiting_input") && task.startedAt !== undefined) {
+    return Math.max(0, nowMs.value - task.startedAt);
+  }
+  return task.durationMs;
+}
 
 const outputExpanded = ref(false);
 const busyKey = ref<string | null>(null);
@@ -306,7 +318,7 @@ function downloadDiagnostics(exportData: AgentTaskDiagnosticExport): void {
       <span>费用 {{ formatCost(task.usage.cost) }}</span>
       <span>{{ task.usage.turns }} 轮</span>
       <span>工具 {{ task.toolUseCount }} 次</span>
-      <span>用时 {{ formatDuration(task.durationMs) }}</span>
+      <span>用时 {{ formatDuration(liveDurationMs(task)) }}</span>
     </div>
 
     <!-- Plan link -->

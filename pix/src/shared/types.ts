@@ -946,7 +946,7 @@ export type AgentTaskCommand = AgentTaskCommandV15;
 export type AgentTaskEventV141 =
   | { type: "task_state"; task: AgentTaskInfo }
   | { type: "task_input_dismissed"; taskId: string; requestId: string; generation: number; reason: string }
-  | { type: "task_activities"; taskId: string; activities: AgentTaskActivity[] }
+  | { type: "task_activities"; taskId: string; activities: AgentTaskActivity[]; toolUseCount?: number; durationMs?: number }
   | { type: "task_output"; taskId: string; output: string; truncated: boolean };
 // 1.4.2 (R2): storage_status / recovery_issue join the renderable event union.
 export type AgentTaskEventV142 = AgentTaskEventV141

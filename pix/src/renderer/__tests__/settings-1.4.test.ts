@@ -376,6 +376,40 @@ describe("settings store (1.4.1 autoBackgroundMs)", () => {
   });
 });
 
+describe("settings store (agentTaskMaxConcurrent)", () => {
+  it("defaults agentTaskMaxConcurrent to 4 when absent", async () => {
+    const store = useSettingsStore();
+    getSettingsMock.mockResolvedValue({ theme: "light", recentProjects: [] });
+
+    await store.load();
+
+    expect(store.agentTaskMaxConcurrent).toBe(4);
+  });
+
+  it("mirrors agentTaskMaxConcurrent from load()", async () => {
+    const store = useSettingsStore();
+    getSettingsMock.mockResolvedValue({
+      theme: "light",
+      recentProjects: [],
+      agentTaskMaxConcurrent: 8,
+    });
+
+    await store.load();
+
+    expect(store.agentTaskMaxConcurrent).toBe(8);
+  });
+
+  it("persists agentTaskMaxConcurrent through save() and updates the mirror", async () => {
+    const store = useSettingsStore();
+    await store.load();
+
+    await store.save({ agentTaskMaxConcurrent: 6 });
+
+    expect(setSettingsMock).toHaveBeenCalledWith({ agentTaskMaxConcurrent: 6 });
+    expect(store.agentTaskMaxConcurrent).toBe(6);
+  });
+});
+
 // ============================================================================
 // SettingsPage auto-background control (1.4.1, real mount)
 // ============================================================================
@@ -438,6 +472,102 @@ describe("SettingsPage auto background (1.4.1)", () => {
     await saveBtn().trigger("click");
     await flushPromises();
     expect(lastSetSettingsCall().autoBackgroundMs).toBe(0);
+  });
+});
+
+describe("SettingsPage concurrent slots slider", () => {
+  it("defaults to 4 and is a 1–8 discrete slider", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+
+    const slider = page.getComponent('[data-test="agent-task-max-concurrent-slider"]') as VueWrapper<{
+      $props: { min: number; max: number; step: number; modelValue: number };
+    }>;
+    expect(slider.props("min")).toBe(1);
+    expect(slider.props("max")).toBe(8);
+    expect(slider.props("step")).toBe(1);
+    expect(slider.props("modelValue")).toBe(4);
+  });
+
+  it("hydrates a persisted cap on mount", async () => {
+    getSettingsMock.mockResolvedValue({
+      theme: "light",
+      recentProjects: [],
+      agentTaskMaxConcurrent: 8,
+    });
+
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+
+    const slider = page.getComponent('[data-test="agent-task-max-concurrent-slider"]') as VueWrapper<{
+      $props: { modelValue: number };
+    }>;
+    expect(slider.props("modelValue")).toBe(8);
+  });
+
+  it("saves the chosen cap", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+
+    const slider = page.getComponent('[data-test="agent-task-max-concurrent-slider"]') as VueWrapper;
+    await slider.vm.$emit("update:modelValue", 6);
+    await flushPromises();
+
+    const saveBtn = page.find(".settings-actions button.v-btn");
+    await saveBtn.trigger("click");
+    await flushPromises();
+    expect(lastSetSettingsCall().agentTaskMaxConcurrent).toBe(6);
+  });
+});
+
+describe("SettingsPage concurrent slots slider", () => {
+  it("defaults to 4 and is a 1–8 discrete slider", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+
+    const slider = page.getComponent('[data-test="agent-task-max-concurrent-slider"]') as VueWrapper<{
+      $props: { min: number; max: number; step: number; modelValue: number };
+    }>;
+    expect(slider.props("min")).toBe(1);
+    expect(slider.props("max")).toBe(8);
+    expect(slider.props("step")).toBe(1);
+    expect(slider.props("modelValue")).toBe(4);
+  });
+
+  it("hydrates a persisted cap on mount", async () => {
+    getSettingsMock.mockResolvedValue({
+      theme: "light",
+      recentProjects: [],
+      agentTaskMaxConcurrent: 8,
+    });
+
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+
+    const slider = page.getComponent('[data-test="agent-task-max-concurrent-slider"]') as VueWrapper<{
+      $props: { modelValue: number };
+    }>;
+    expect(slider.props("modelValue")).toBe(8);
+  });
+
+  it("saves the chosen cap", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+
+    const slider = page.getComponent('[data-test="agent-task-max-concurrent-slider"]') as VueWrapper;
+    await slider.vm.$emit("update:modelValue", 6);
+    await flushPromises();
+
+    const saveBtn = page.find(".settings-actions button.v-btn");
+    await saveBtn.trigger("click");
+    await flushPromises();
+    expect(lastSetSettingsCall().agentTaskMaxConcurrent).toBe(6);
   });
 });
 
@@ -514,6 +644,22 @@ describe("main SettingsStore migration (1.4.1)", () => {
 
     store.setMany({ autoBackgroundMs: undefined });
     expect(store.get("autoBackgroundMs")).toBeUndefined();
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("setMany persists, overwrites and clears agentTaskMaxConcurrent", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pix-settings-concurrent-"));
+    const store = new SettingsStore({ cwd });
+
+    store.setMany({ agentTaskMaxConcurrent: 8 });
+    expect(store.get("agentTaskMaxConcurrent")).toBe(8);
+
+    store.setMany({ agentTaskMaxConcurrent: 1 });
+    expect(store.get("agentTaskMaxConcurrent")).toBe(1);
+
+    store.setMany({ agentTaskMaxConcurrent: undefined });
+    expect(store.get("agentTaskMaxConcurrent")).toBeUndefined();
 
     rmSync(cwd, { recursive: true, force: true });
   });

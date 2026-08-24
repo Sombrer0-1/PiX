@@ -30,6 +30,7 @@ import type {
   SubagentStatus,
 } from "@shared/subagent-types.js";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
+import { useLiveNow } from "../../composables/useLiveNow";
 import { renderMarkdown } from "@/utils/markdown";
 
 const props = defineProps<{
@@ -45,7 +46,9 @@ const props = defineProps<{
 
 const taskStore = useAgentTaskStore();
 
+/** User collapse wins even while a child is running. */
 const expanded = ref(false);
+const userCollapsed = ref(false);
 
 // ── Parse (fixed order, plan 4.10) ──
 
@@ -189,9 +192,13 @@ const overallStatus = computed<SubagentStatus>(() => {
 
 const hasRunning = computed(() => results.value.some((r) => r.status === "running"));
 
-/** Body stays open while anything is running so activity and streaming text
- *  are always visible without interaction. */
-const bodyOpen = computed(() => expanded.value || hasRunning.value);
+const nowMs = useLiveNow(hasRunning);
+
+/** Body defaults open while running, but a user collapse is honoured immediately. */
+const bodyOpen = computed(() => {
+  if (userCollapsed.value) return false;
+  return expanded.value || hasRunning.value;
+});
 
 const completedCount = computed(() => results.value.filter((r) => r.status === "completed").length);
 
@@ -270,7 +277,7 @@ const headerSummary = computed(() => {
 
 const singleMeta = computed(() => {
   if (isMulti.value || !firstResult.value) return "";
-  return `工具 ${firstResult.value.toolUseCount} 次 · ${formatDuration(firstResult.value.durationMs)}`;
+  return `工具 ${firstResult.value.toolUseCount} 次 · ${formatDuration(liveDurationMs(firstResult.value))}`;
 });
 
 const overallStatusLabel = computed(() => statusLabel(overallStatus.value));
@@ -385,7 +392,27 @@ function activityStatusClass(activity: SubagentActivity): string {
 }
 
 function toggleBody(): void {
-  expanded.value = !expanded.value;
+  if (bodyOpen.value) {
+    userCollapsed.value = true;
+    expanded.value = false;
+  } else {
+    userCollapsed.value = false;
+    expanded.value = true;
+  }
+}
+
+function isLiveStatus(status: SubagentStatus): boolean {
+  return status === "running" || status === "queued";
+}
+
+function liveDurationMs(item: SubagentSingleResult): number {
+  if (isLiveStatus(item.status)) {
+    const start = item.startedAt ?? details.value?.startedAt;
+    if (typeof start === "number") {
+      return Math.max(0, nowMs.value - start);
+    }
+  }
+  return item.durationMs;
 }
 </script>
 
@@ -472,7 +499,7 @@ function toggleBody(): void {
               <span v-if="item.step" class="subagent-item-step">第 {{ item.step }} 步</span>
               <span class="subagent-item-name">{{ item.agentName }}</span>
               <span class="subagent-source">{{ sourceLabel(item.agentSource) }}</span>
-              <span class="subagent-item-meta">工具 {{ item.toolUseCount }} 次 · {{ formatDuration(item.durationMs) }}</span>
+              <span class="subagent-item-meta">工具 {{ item.toolUseCount }} 次 · {{ formatDuration(liveDurationMs(item)) }}</span>
               <span v-if="item.model" class="subagent-item-model" :title="item.model">{{ item.model }}</span>
             </div>
             <div v-if="item.status === 'running'" class="subagent-live" aria-live="polite">
