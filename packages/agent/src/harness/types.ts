@@ -1,5 +1,5 @@
 import type { ImageContent, Model, SimpleStreamOptions, TextContent, Transport } from "@earendil-works/pi-ai";
-import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
+import type { AgentEvent, AgentMessage, AgentTool, CustomMessageContext, QueueMode, ThinkingLevel } from "../index.ts";
 import type { Session } from "./session/session.ts";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
@@ -388,6 +388,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionTreeEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
+	context?: CustomMessageContext;
 }
 
 export interface LabelEntry extends SessionTreeEntryBase {

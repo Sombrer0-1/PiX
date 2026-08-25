@@ -39,6 +39,8 @@ export interface BashExecutionMessage {
 	excludeFromContext?: boolean;
 }
 
+export type CustomMessageContext = "user" | "internal";
+
 /**
  * Message type for extension-injected messages via sendMessage().
  * These are custom messages that extensions can inject into the conversation.
@@ -49,6 +51,8 @@ export interface CustomMessage<T = unknown> {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
+	/** Internal messages are model-visible runtime signals, not user requests. */
+	context?: CustomMessageContext;
 	timestamp: number;
 }
 
@@ -113,7 +117,7 @@ export function createCompactionSummaryMessage(
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
-		summary: summary,
+		summary,
 		tokensBefore,
 		timestamp: new Date(timestamp).getTime(),
 	};
@@ -126,6 +130,7 @@ export function createCustomMessage(
 	display: boolean,
 	details: unknown | undefined,
 	timestamp: string,
+	context?: CustomMessageContext,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -133,8 +138,90 @@ export function createCustomMessage(
 		content,
 		display,
 		details,
+		...(context === undefined ? {} : { context }),
 		timestamp: new Date(timestamp).getTime(),
 	};
+}
+
+/**
+ * Pre-protocol customType values persisted without context:"internal".
+ * Keep this list identical to pix INTERNAL_CUSTOM_MESSAGE_TYPES. A drift test
+ * in pix/src/renderer/__tests__/display-blocks.test.ts asserts both sides.
+ */
+export const LEGACY_INTERNAL_CUSTOM_TYPES = new Set([
+	"pix-agent-task-result",
+	"pix-plan-context",
+	"pix-plan-retry",
+	"pix-team-notification",
+]);
+
+/**
+ * Detect current and pre-protocol internal custom messages. The legacy
+ * customType fallback keeps already persisted sessions model-visible as
+ * internal notifications after a reload.
+ */
+export function isInternalCustomMessage(message: Pick<CustomMessage, "customType" | "context">): boolean {
+	return message.context === "internal" || LEGACY_INTERNAL_CUSTOM_TYPES.has(message.customType);
+}
+
+function escapeXmlAttribute(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/"/g, "&quot;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/'/g, "&apos;");
+}
+
+function wrapInternalContent(
+	customType: string,
+	content: string | (TextContent | ImageContent)[],
+): (TextContent | ImageContent)[] {
+	const prefix = `<internal-message custom-type="${escapeXmlAttribute(customType)}">\n`;
+	const suffix = "\n</internal-message>";
+	if (typeof content === "string") {
+		return [{ type: "text", text: prefix + content + suffix }];
+	}
+	return [{ type: "text", text: prefix }, ...content, { type: "text", text: suffix }];
+}
+
+function contentText(content: string | (TextContent | ImageContent)[]): string {
+	if (typeof content === "string") return content;
+	return content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("");
+}
+
+/** Legacy roots: opening tag paired with its closing tag, both required. */
+const LEGACY_INTERNAL_NOTIFICATION_TAGS: ReadonlyArray<readonly [string, string]> = [
+	["</internal-message>", "<internal-message"],
+	["</task-notification>", "<task-notification"],
+	["</team-notification>", "<team-notification"],
+	["</plan-notification>", "<plan-notification"],
+	["</workflow-result>", "<workflow-result"],
+	["</orchestrator-event>", "<orchestrator-event"],
+	["</teammate-message>", "<teammate-message"],
+	["</worker-summary>", "<worker-summary"],
+];
+
+/**
+ * Detect legacy runtime notification text stored as a user message. A text
+ * only matches when the WHOLE message is a single closed envelope: it starts
+ * with a reserved opening tag (followed by whitespace or ">") and ends with
+ * that tag's closing tag. A user message that merely mentions the format, or
+ * one that carries extra text before/after the example, is never wrapped as an
+ * internal notification.
+ */
+function isLegacyInternalNotificationText(text: string): boolean {
+	const trimmed = text.trim();
+	if (trimmed.length === 0) return false;
+	const lower = trimmed.toLowerCase();
+	return LEGACY_INTERNAL_NOTIFICATION_TAGS.some(([closing, opening]) => {
+		if (!lower.startsWith(opening) || !lower.endsWith(closing)) return false;
+		const afterOpening = lower[opening.length];
+		return afterOpening === undefined || afterOpening === ">" || afterOpening === "\n" || afterOpening === " " || afterOpening === "\t";
+	});
 }
 
 /**
@@ -163,7 +250,11 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					if (m.customType === "pi.ui_note") {
 						return undefined;
 					}
-					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
+					const content = isInternalCustomMessage(m)
+						? wrapInternalContent(m.customType, m.content)
+						: typeof m.content === "string"
+							? [{ type: "text" as const, text: m.content }]
+							: m.content;
 					return {
 						role: "user",
 						content,
@@ -185,6 +276,13 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "user":
+					if (isLegacyInternalNotificationText(contentText(m.content))) {
+						return {
+							...m,
+							content: wrapInternalContent("legacy-runtime-notification", m.content),
+						};
+					}
+					return m;
 				case "assistant":
 				case "toolResult":
 					return m;

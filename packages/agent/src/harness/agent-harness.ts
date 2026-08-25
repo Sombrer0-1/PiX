@@ -495,7 +495,7 @@ export class AgentHarness<
 			} else if (write.type === "custom") {
 				await this.session.appendCustomEntry(write.customType, write.data);
 			} else if (write.type === "custom_message") {
-				await this.session.appendCustomMessageEntry(write.customType, write.content, write.display, write.details);
+				await this.session.appendCustomMessageEntry(write.customType, write.content, write.display, write.details, write.context);
 			} else if (write.type === "label") {
 				await this.session.appendLabel(write.targetId, write.label);
 			} else if (write.type === "session_info") {

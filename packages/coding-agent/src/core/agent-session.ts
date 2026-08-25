@@ -99,7 +99,7 @@ import {
 	type ThreadGoal,
 	type UpdateGoalOptions,
 } from "./goal-runtime.ts";
-import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import type { BashExecutionMessage, CustomMessage, CustomMessageContext } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import {
@@ -782,6 +782,7 @@ export class AgentSession {
 					event.message.content,
 					event.message.display,
 					event.message.details,
+					event.message.context,
 				);
 			} else if (
 				event.message.role === "user" ||
@@ -1427,6 +1428,23 @@ export class AgentSession {
 		}
 	}
 
+	/** True while a turn is streaming or compaction is rewriting session context. */
+	private _isBusy(): boolean {
+		return this.isStreaming || this.isCompacting;
+	}
+
+	/** Queue a user turn until compaction finishes instead of racing session state. */
+	private _queueDuringCompaction(
+		text: string,
+		options?: QueueDisplayOptions & { streamingBehavior?: "steer" | "followUp" },
+	): void {
+		if (options?.streamingBehavior === "steer") {
+			void this._queueSteer(text, options);
+			return;
+		}
+		void this._queueFollowUp(text, options);
+	}
+
 	/**
 	 * Manually retry the last failed turn.
 	 *
@@ -1480,56 +1498,57 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
-		if (!msg) {
-			return false;
-		}
 
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return true;
-		}
+		if (msg) {
+			if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
+				return true;
+			}
 
-		if (msg.stopReason === "error" && this._retryAttempt > 0) {
-			this._emit({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this._retryAttempt,
-				finalError: msg.errorMessage,
-			});
-			this._retryAttempt = 0;
-		}
-
-		if (await this._checkCompaction(msg)) {
-			return true;
-		}
-
-		// Surface API errors before any continuation logic (queued messages,
-		// verification gates, goal continuation) so the api_error badge and retry
-		// affordance appear consistently in both normal and goal-driven sessions.
-		// In goal mode, _prepareGoalContinuationIfNeeded queues a no-backoff
-		// follow-up and returns true; hasQueuedMessages and
-		// _prepareVerificationContinuationIfNeeded can also return true earlier.
-		// All of them suppress the api_error on the first API error if this block
-		// is placed after them. Retry and compaction (above) are recovery paths
-		// that own the turn when they succeed, so api_error fires only when no
-		// recovery happened. Context-overflow errors are owned by the compaction
-		// flow (compaction_end) and are not re-emitted here.
-		if (msg.stopReason === "error" && msg.errorMessage) {
-			const contextWindow = this.model?.contextWindow ?? 0;
-			if (!isContextOverflow(msg, contextWindow)) {
-				const classified = classifyApiError(msg.errorMessage);
+			if (msg.stopReason === "error" && this._retryAttempt > 0) {
 				this._emit({
-					type: "api_error",
-					errorMessage: msg.errorMessage,
-					category: classified.category,
-					httpStatus: classified.httpStatus,
-					title: classified.title,
-					retryable: classified.retryable,
+					type: "auto_retry_end",
+					success: false,
+					attempt: this._retryAttempt,
+					finalError: msg.errorMessage,
 				});
+				this._retryAttempt = 0;
+			}
+
+			if (await this._checkCompaction(msg)) {
+				return true;
+			}
+
+			// Surface API errors before any continuation logic (queued messages,
+			// verification gates, goal continuation) so the api_error badge and retry
+			// affordance appear consistently in both normal and goal-driven sessions.
+			// In goal mode, _prepareGoalContinuationIfNeeded queues a no-backoff
+			// follow-up and returns true; hasQueuedMessages and
+			// _prepareVerificationContinuationIfNeeded can also return true earlier.
+			// All of them suppress the api_error on the first API error if this block
+			// is placed after them. Retry and compaction (above) are recovery paths
+			// that own the turn when they succeed, so api_error fires only when no
+			// recovery happened. Context-overflow errors are owned by the compaction
+			// flow (compaction_end) and are not re-emitted here.
+			if (msg.stopReason === "error" && msg.errorMessage) {
+				const contextWindow = this.model?.contextWindow ?? 0;
+				if (!isContextOverflow(msg, contextWindow)) {
+					const classified = classifyApiError(msg.errorMessage);
+					this._emit({
+						type: "api_error",
+						errorMessage: msg.errorMessage,
+						category: classified.category,
+						httpStatus: classified.httpStatus,
+						title: classified.title,
+						retryable: classified.retryable,
+					});
+				}
 			}
 		}
 
-		// The agent loop drains both queues before emitting agent_end. Any messages
-		// here were queued by agent_end extension handlers and need a continuation.
+		// The loop skips follow-up drain when stopReason is error/aborted, and
+		// agent_end handlers can also enqueue after the loop returns. Continue so
+		// those messages (including internal task-result notifications) are not
+		// stranded in the queue after the parent turn fails.
 		if (this.agent.hasQueuedMessages()) {
 			return true;
 		}
@@ -1603,7 +1622,7 @@ export class AgentSession {
 	}
 
 	async continueActiveGoalIfIdle(): Promise<void> {
-		if (this.isStreaming) return;
+		if (this._isBusy()) return;
 		const goal = this.goal;
 		if (!goal || goal.status !== "active") return;
 		this._assertGoalContinuationReady();
@@ -1780,8 +1799,18 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
-			// If streaming, queue via steer() or followUp() based on option
-			if (this.isStreaming) {
+			// If streaming or compacting, queue instead of racing session rewrite.
+			if (this._isBusy()) {
+				if (this.isCompacting) {
+					this._queueDuringCompaction(expandedText, {
+						images: currentImages,
+						displayText: options?.displayText,
+						attachments: options?.attachments,
+						streamingBehavior: options?.streamingBehavior,
+					});
+					preflightResult?.(true);
+					return;
+				}
 				if (!options?.streamingBehavior) {
 					throw new Error(
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -1876,6 +1905,7 @@ export class AgentSession {
 						content: msg.content,
 						display: msg.display,
 						details: msg.details,
+						...(msg.context === undefined ? {} : { context: msg.context }),
 						timestamp: Date.now(),
 					});
 				}
@@ -2115,7 +2145,9 @@ export class AgentSession {
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
 	 */
 	async sendCustomMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details"> & {
+			context?: CustomMessageContext;
+		},
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		const appMessage = {
@@ -2124,6 +2156,7 @@ export class AgentSession {
 			content: message.content,
 			display: message.display,
 			details: message.details,
+			...(message.context === undefined ? {} : { context: message.context }),
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
@@ -2134,6 +2167,12 @@ export class AgentSession {
 			} else {
 				this.agent.steer(appMessage);
 			}
+		} else if (this.isCompacting) {
+			if (options?.deliverAs === "steer") {
+				this.agent.steer(appMessage);
+			} else {
+				this.agent.followUp(appMessage);
+			}
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
 		} else {
@@ -2143,6 +2182,7 @@ export class AgentSession {
 				message.content,
 				message.display,
 				message.details,
+				message.context,
 			);
 			this._emit({ type: "message_start", message: appMessage });
 			this._emit({ type: "message_end", message: appMessage });
@@ -2228,6 +2268,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this.abortCompaction();
 		this.agent.abort();
 		await this.agent.waitForIdle();
 	}
@@ -2864,12 +2905,7 @@ export class AgentSession {
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 
 			if (willRetry) {
-				const messages = this.agent.state.messages;
-				const lastMsg = messages[messages.length - 1];
-				if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-					this.agent.state.messages = messages.slice(0, -1);
-				}
-				return true;
+				return this._prepareOverflowResume();
 			}
 
 			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
@@ -2892,6 +2928,44 @@ export class AgentSession {
 		} finally {
 			this._autoCompactionAbortController = undefined;
 		}
+	}
+
+	/**
+	 * After overflow compaction, resume the failed turn on the compacted transcript.
+	 * Matches Claude Code / Codex: compact then keep working in the same query.
+	 */
+	private _prepareOverflowResume(): boolean {
+		const messages = this.agent.state.messages;
+		const lastMsg = messages[messages.length - 1];
+		if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
+			this.agent.state.messages = messages.slice(0, -1);
+		}
+
+		const last = this.agent.state.messages[this.agent.state.messages.length - 1];
+		if (!last) {
+			return false;
+		}
+		if (last.role === "assistant") {
+			if (this.agent.hasQueuedMessages()) {
+				return true;
+			}
+			this.agent.followUp(this._createOverflowResumeMessage());
+			return true;
+		}
+		return true;
+	}
+
+	private _createOverflowResumeMessage(): CustomMessage {
+		return {
+			role: "custom",
+			customType: "pi.compaction_resume",
+			content:
+				"Context was compacted after a context-overflow error. Continue the interrupted work from the compacted transcript without waiting for new user input. Audit the current conversation and repository state, then finish the remaining work.",
+			display: false,
+			context: "internal",
+			details: { kind: "overflow_resume" },
+			timestamp: Date.now(),
+		};
 	}
 
 	/**

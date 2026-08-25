@@ -25,6 +25,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
 import type { ProjectExecutionContext } from "./execution-context.js";
+import {
+  formatInternalNotification,
+  INTERNAL_CUSTOM_MESSAGE_TYPES,
+} from "../shared/internal-notification.js";
 import type {
 	TeamState,
 	TeammateInfo,
@@ -206,7 +210,9 @@ export class TeamManager {
     });
     this._leaderSession = session;
     this._setLeaderTurnActive(false);
-    this._leaderWakeInFlight = false;
+    // Do not clear `_leaderWakeInFlight` here. A process may still be awaiting
+    // prompt(); forcing the flag false lets the new session schedule a second
+    // concurrent process. The in-flight finally block releases the flag.
     if (this._orchestratorRetryTimer) {
       clearTimeout(this._orchestratorRetryTimer);
       this._orchestratorRetryTimer = null;
@@ -647,6 +653,10 @@ export class TeamManager {
     }
 
     if (wasPaused) {
+      // Events enqueued after the abort (user Stop) carry the pre-pause epoch;
+      // retag them to the resumed epoch so the canRetry guard does not drop
+      // them as stale on their first delivery failure.
+      this._orchestratorEvents.retag(this._runtimeEpoch);
       // Re-engage the leader for work paused by an abort or restored from a
       // snapshot, and flush any messages/events deferred during the pause.
       this._reengageLeaderAfterResume(team);
@@ -1092,8 +1102,11 @@ export class TeamManager {
         // This turn delivered content to the leader; record it so the
         // turn-outcome handler does not emit a duplicate orphan-turn wake.
         senderWorker!.sentLeaderMessageThisTurn = true;
-        const leaderBusy = this._leaderTurnActive || (this._leaderSession?.isStreaming ?? false);
-        if (this._leaderSession && leaderBusy) {
+        // Only steer into a live stream. `_leaderTurnActive` can stay true after
+        // the turn has stopped streaming (agent_end not yet observed); persist-
+        // steering in that window writes a stale notification that abort cannot
+        // clear. Queue a wake instead so the message is delivered as a turn.
+        if (this._leaderSession?.isStreaming) {
           this._steerLeaderWithRetry(summaryText, msg);
         } else {
           this._wakeLeaderForMessage(msg);
@@ -1141,7 +1154,21 @@ export class TeamManager {
       if (sourceMessage) this._wakeLeaderForMessage(sourceMessage);
       return;
     }
-    void session.steer(text).catch((err) => {
+    const internalContent = sourceMessage
+      ? this._formatTeamMessageNotification(sourceMessage, text)
+      : text;
+    const delivery = session.sendCustomMessage
+      ? session.sendCustomMessage(
+        {
+          customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TEAM_NOTIFICATION,
+          content: internalContent,
+          display: false,
+          context: "internal",
+        },
+        { deliverAs: "steer" },
+      )
+      : session.steer(text);
+    void delivery.catch((err) => {
       const maxAttempts = 3;
       if (attempt + 1 >= maxAttempts) {
         console.warn("[TeamManager] Failed to steer worker summary into leader after retries:", err);
@@ -1155,6 +1182,29 @@ export class TeamManager {
         this._steerLeaderWithRetry(text, sourceMessage, attempt + 1, runtimeEpoch);
       }, delayMs);
       this._steerRetryTimers.add(timer);
+    });
+  }
+
+  private _formatTeamMessageNotification(message: TeamMessage, fallbackText: string): string {
+    const team = this._team;
+    const worker = team?.workers.get(message.fromAgentId);
+    const workerName = worker?.info.name ?? parseAgentId(message.fromAgentId)?.agentName ?? message.fromAgentId;
+    const actionable = new Set<MessageKind>([
+      "question",
+      "proposal",
+      "objection",
+      "review_request",
+      "fix_request",
+      "blocked",
+    ]);
+    return formatInternalNotification({
+      notificationId: `team-message:${message.id}`,
+      source: "team",
+      kind: message.kind,
+      agentName: workerName,
+      status: "received",
+      requiresAction: actionable.has(message.kind),
+      result: message.text || fallbackText,
     });
   }
 
@@ -3610,9 +3660,9 @@ export class TeamManager {
    * If the Leader is idle, processes immediately. If busy, queues for agent_end.
    */
   private _wakeLeaderForOrchestration(event: OrchestrationEvent): void {
-    if (!this.isRuntimeActive() || !this._leaderSession) {
+    if (!this._team) {
       this.logTeamDebug("orchestrator.wake.skipped", {
-        reason: !this._team ? "no_team" : this._executionState !== "active" ? "runtime_paused" : "no_leader_session",
+        reason: "no_team",
         event,
       });
       return;
@@ -3623,6 +3673,15 @@ export class TeamManager {
       runtimeEpoch: event.runtimeEpoch ?? this._runtimeEpoch,
     };
     const accepted = this._orchestratorEvents.enqueue(queuedEvent);
+    if (!this.isRuntimeActive() || !this._leaderSession) {
+      this.logTeamDebug("orchestrator.event.queued_without_dispatch", {
+        event: queuedEvent,
+        accepted,
+        queueLength: this._orchestratorEvents.length,
+        reason: this._executionState !== "active" ? "runtime_paused" : "no_leader_session",
+      });
+      return;
+    }
     this.logTeamDebug("orchestrator.event.enqueued", {
       event: queuedEvent,
       accepted,

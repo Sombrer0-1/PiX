@@ -1236,12 +1236,14 @@ await run("session delivery sink: registered on activate, followUp/triggerTurn, 
     const session = b._session!;
 
     const sendOptions: Array<{ triggerTurn?: boolean; deliverAs?: string }> = [];
+    const sentMessages: Array<{ customType: string; context?: string }> = [];
     const originalSend = session.sendCustomMessage.bind(session);
     session.sendCustomMessage = async (message, options) => {
       sendOptions.push({
         triggerTurn: options?.triggerTurn,
         deliverAs: options?.deliverAs,
       });
+      sentMessages.push({ customType: message.customType, context: message.context });
       // Persist without starting a model turn so this wiring test stays offline.
       await originalSend(message, { triggerTurn: false });
     };
@@ -1291,6 +1293,21 @@ await run("session delivery sink: registered on activate, followUp/triggerTurn, 
     assert(
       typeof custom!.content === "string" && custom!.content.includes(taskId),
       "delivery message carries the task id",
+    );
+    assertEqual(custom!.display, false, "delivery message is hidden from the main chat");
+    assertEqual(sentMessages[0]?.context, "internal", "delivery message carries internal context");
+    assert(
+      typeof custom!.content === "string" &&
+        custom!.content.startsWith("<task-notification ") &&
+        custom!.content.endsWith("</task-notification>"),
+      "delivery message uses a closed task notification envelope",
+    );
+    assert(
+      typeof custom!.content === "string" &&
+        custom!.content.includes(`group-id="`) &&
+        custom!.content.includes('status="running"') &&
+        custom!.content.includes("<usage"),
+      "delivery envelope carries group, status, and usage metadata",
     );
 
     // A different (unopened) session id is still rejected by the service.

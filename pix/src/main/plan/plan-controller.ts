@@ -954,7 +954,7 @@ export class PlanController {
     ].join("\n");
     this._armExecutionTurn();
     await this._ctx.getSession().sendCustomMessage(
-      { customType: "pix-plan-context", content, display: false },
+      { customType: PLAN_CONTEXT_MESSAGE_TYPE, content, display: false, context: "internal" },
       { triggerTurn: true },
     );
   }
@@ -1373,6 +1373,7 @@ export class PlanController {
         customType: PLAN_CONTEXT_MESSAGE_TYPE,
         content: serializePlanGenerationContext(generation.generationId, generation.concise),
         display: false,
+        context: "internal",
       },
       { triggerTurn: false },
     );
@@ -1426,7 +1427,7 @@ export class PlanController {
       );
     }
     await this._ctx.getSession().sendCustomMessage(
-      { customType: PLAN_RETRY_MESSAGE_TYPE, content: parts.join("\n"), display: false },
+      { customType: PLAN_RETRY_MESSAGE_TYPE, content: parts.join("\n"), display: false, context: "internal" },
       { triggerTurn: true },
     );
   }
@@ -1688,7 +1689,7 @@ export class PlanController {
     ].join("\n");
     this._armExecutionTurn();
     await this._ctx.getSession().sendCustomMessage(
-      { customType: "pix-plan-context", content, display: false },
+      { customType: PLAN_CONTEXT_MESSAGE_TYPE, content, display: false, context: "internal" },
       { triggerTurn: true },
     );
   }
@@ -1756,7 +1757,7 @@ export class PlanController {
       ].join("\n");
       this._armExecutionTurn();
       await this._ctx.getSession().sendCustomMessage(
-        { customType: "pix-plan-context", content, display: false },
+        { customType: PLAN_CONTEXT_MESSAGE_TYPE, content, display: false, context: "internal" },
         { triggerTurn: true },
       );
     } catch (err) {

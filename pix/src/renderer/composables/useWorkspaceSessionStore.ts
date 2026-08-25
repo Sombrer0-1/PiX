@@ -21,8 +21,12 @@ export function useWorkspaceSessionStore() {
     lastRetryableError: computed(() => activeStore.value.lastRetryableError),
     addEvent: (event: AgentSessionEvent): void => activeStore.value.addEvent(event),
     addEvents: (events: AgentSessionEvent[]): void => activeStore.value.addEvents(events),
-    appendOptimisticUserMessage: (text: string, filePaths?: string[]): string | null =>
-      activeStore.value.appendOptimisticUserMessage(text, filePaths),
+    appendOptimisticUserMessage: (
+      text: string,
+      filePaths?: string[],
+      clipboardImages?: Array<{ mimeType: string }>,
+    ): string | null =>
+      activeStore.value.appendOptimisticUserMessage(text, filePaths, clipboardImages),
     failOptimisticUserMessage: (blockId: string | null, message: string): void =>
       activeStore.value.failOptimisticUserMessage(blockId, message),
     loadMessages: (messages: AgentMessage[]): void => activeStore.value.loadMessages(messages),

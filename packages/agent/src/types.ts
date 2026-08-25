@@ -43,6 +43,9 @@ export type ToolExecutionMode = "sequential" | "parallel";
  */
 export type QueueMode = "all" | "one-at-a-time";
 
+/** Semantic context for custom messages crossing an Agent runtime boundary. */
+export type CustomMessageContext = "user" | "internal";
+
 /** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 

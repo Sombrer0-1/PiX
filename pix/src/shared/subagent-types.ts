@@ -115,6 +115,9 @@ export interface SubagentDetails {
   schemaVersion: typeof SUBAGENT_DETAILS_SCHEMA_VERSION;
   mode: SubagentMode;
   agentScope: SubagentAgentScope;
+  /** App-level task identity when the result came through AgentTaskService. */
+  taskId?: string;
+  groupId?: string;
   results: SubagentSingleResult[];
   startedAt: number;
   updatedAt: number;
@@ -274,6 +277,8 @@ export function isSubagentDetails(value: unknown): value is SubagentDetails {
   if (value.schemaVersion !== SUBAGENT_DETAILS_SCHEMA_VERSION) return false;
   if (!isOneOf(value.mode, SUBAGENT_MODES)) return false;
   if (!isOneOf(value.agentScope, SUBAGENT_AGENT_SCOPES)) return false;
+  if (value.taskId !== undefined && typeof value.taskId !== "string") return false;
+  if (value.groupId !== undefined && typeof value.groupId !== "string") return false;
   if (!Array.isArray(value.results)) return false;
   if (value.results.length > SUBAGENT_MAX_RESULTS) return false;
   if (!value.results.every(isSubagentSingleResult)) return false;

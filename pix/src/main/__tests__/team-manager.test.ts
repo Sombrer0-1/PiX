@@ -675,6 +675,29 @@ console.log("\n=== TeamTaskList Tests ===\n");
   assertEqual(scheduled.length, 0, "Stale wake does not schedule another prompt");
 }
 
+// Test 17b1: retag rewrites pending events so the canRetry guard accepts them after resume
+{
+  const queue = new OrchestrationEventQueue();
+  queue.enqueue({ type: "team_message", sourceId: "during-pause", runtimeEpoch: 3 });
+  queue.retag(4);
+  assertEqual(queue.snapshot()[0]?.runtimeEpoch, 4, "retag rewrites the pending event epoch");
+  const scheduled: number[] = [];
+  const result = await processOrchestrationWakeQueue({
+    queue,
+    session: {
+      isStreaming: false,
+      prompt: async () => { throw new Error("busy"); },
+    },
+    canProcess: () => true,
+    canRetry: (events) => events.every((event) => event.runtimeEpoch === 4),
+    buildPrompt: () => "retagged",
+    scheduleRetry: (delayMs) => scheduled.push(delayMs),
+  });
+  assertEqual(result.retried, true, "A retagged event is retried instead of dropped");
+  assertEqual(queue.hasPending, true, "The retagged event stays queued");
+  assertEqual(queue.snapshot()[0]?.runtimeEpoch, 4, "The retagged event keeps the new epoch on requeue");
+}
+
 // Test 17c: automatic review/fix follow-ups have a bounded generation
 {
   assertEqual(MAX_COORDINATION_GENERATION, 3, "Coordination generation has a bounded safety limit");
@@ -964,6 +987,11 @@ interface TeamManagerTestAccess {
   _isWsl: boolean;
   _runtimeEnvironmentOverride: Partial<RuntimeEnvironmentContext> | undefined;
   _team: TeamData | null;
+  _executionState: "active" | "paused";
+  _runtimeEpoch: number;
+  _orchestratorEvents: OrchestrationEventQueue;
+  _leaderTurnActive: boolean;
+  _wakeLeaderForOrchestration: (event: OrchestrationEvent) => void;
 }
 
 /** Minimal AgentSession stub for the worker bootstrap path (no live model). */
@@ -998,6 +1026,103 @@ function buildWslContext(physicalCwd: string, backend: ExecutionBackend): Projec
     runtimeEnvironmentOverride: { platform: "linux", osName: "WSL2 (Ubuntu-22.04)" },
     isWsl: true,
   };
+}
+
+// Test S8.0: orchestration events survive a temporary missing Leader session.
+{
+  const now = Date.now();
+  const manager = new TeamManager();
+  const access = manager as unknown as TeamManagerTestAccess;
+  access._team = {
+    name: "delivery",
+    status: "active",
+    leadAgentId: "leader@delivery",
+    workers: new Map(),
+    bus: new TeamMessageBus(),
+    taskList: new TeamTaskList(),
+    protocolManager: new TeamProtocolManager(),
+    createdAt: now,
+  };
+  access._executionState = "active";
+  access._runtimeEpoch = 3;
+
+  access._wakeLeaderForOrchestration({
+    type: "task_completed",
+    sourceId: "task-1:completed",
+    runtimeEpoch: 3,
+    taskId: "task-1",
+    result: "done",
+  });
+  assertEqual(access._orchestratorEvents.length, 1, "worker event is queued without a Leader session");
+
+  const notifications: string[] = [];
+  const leader = {
+    ...createFakeWorkerSession(),
+    isStreaming: false,
+    sendCustomMessage: async (message: { content: string }) => {
+      notifications.push(message.content);
+    },
+  } as unknown as AgentSession;
+  manager.setLeaderSession(leader);
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assertEqual(access._orchestratorEvents.length, 0, "queued event drains after the Leader session returns");
+  assert(
+    notifications[0]?.startsWith("<team-notification ") === true,
+    "orchestration delivery uses an internal team notification envelope",
+  );
+  await manager.dispose();
+}
+
+// Test S8.0b: a not-streaming but still-marked-active leader turn wakes instead of persist-steering.
+{
+  const now = Date.now();
+  const manager = new TeamManager();
+  const access = manager as unknown as TeamManagerTestAccess;
+  access._team = {
+    name: "steer",
+    status: "active",
+    leadAgentId: "leader::steer",
+    workers: new Map([
+      ["coder::steer", {
+        info: {
+          agentId: "coder::steer",
+          name: "coder",
+          role: "coder",
+          status: "idle",
+          createdAt: now,
+          statusChangedAt: now,
+        },
+        session: null,
+        mcpAdapter: null,
+        lifecycleAbortController: null,
+        workAbortController: null,
+        runner: null,
+        messageHistory: [],
+      }],
+    ]),
+    bus: new TeamMessageBus(),
+    taskList: new TeamTaskList(),
+    protocolManager: new TeamProtocolManager(),
+    createdAt: now,
+  };
+  access._executionState = "active";
+  access._runtimeEpoch = 1;
+
+  const persisted: string[] = [];
+  const leader = {
+    ...createFakeWorkerSession(),
+    isStreaming: false,
+    sendCustomMessage: async (message: { content: string }, options?: { deliverAs?: string }) => {
+      if (options?.deliverAs === "steer") persisted.push(message.content);
+    },
+  } as unknown as AgentSession;
+  manager.setLeaderSession(leader);
+  access._leaderTurnActive = true;
+  await manager.sendTeamMessage("coder::steer", "leader::steer", "worker finished", "done", "task_result");
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assertEqual(persisted.length, 0, "not-streaming leader turn does not persist-steer");
+  assertEqual(access._orchestratorEvents.length, 1, "not-streaming leader turn queues a wake instead");
+  await manager.dispose();
 }
 
 // Test S8.1: initialize stores _executionBackend / _physicalCwd / _logicalCwd / _isWsl

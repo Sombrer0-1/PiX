@@ -1272,7 +1272,9 @@ await run("tool: run_in_background=true resolves to a group handle details (neve
   assertEqual(result.details.kind, "agent_task_group", "handle kind");
   assertEqual(result.details.tasks.length, 1, "single task in the handle");
   const contentText = result.content.map((c) => (c.type === "text" ? c.text : "")).join("");
-  assert(contentText.includes("background"), "content announces the background start");
+  assert(contentText.startsWith('<subagent-result mode="single"'), "content uses the subagent result envelope");
+  assert(contentText.includes('status="backgrounded"'), "content announces the background status");
+  assert(contentText.includes('requires-action="false"'), "background handle marks no immediate action");
   assert(contentText.includes(result.details.groupId), "content carries the group id");
 });
 
@@ -1296,7 +1298,10 @@ await run("tool: foreground parallel final content and bounded onUpdate progress
   assert(isSubagentDetails(parallel.details), "parallel foreground details pass the guard");
   assertEqual(parallel.details.mode, "parallel", "parallel mode");
   const contentText = parallel.content.map((c) => (c.type === "text" ? c.text : "")).join("");
-  assert(contentText.startsWith("2/2 subagent tasks succeeded."), "N/M succeeded summary");
+  assert(contentText.startsWith('<subagent-result mode="parallel"'), "parallel content uses the subagent result envelope");
+  assert(contentText.includes('status="completed"'), "parallel content carries each child status");
+  assert(contentText.includes('index="0"') && contentText.includes('index="1"'), "parallel content carries item indexes");
+  assert(contentText.endsWith("</subagent-result>"), "parallel content closes the envelope");
   assert(updates.length >= 1, "onUpdate called during progress");
   for (const update of updates) {
     assert(utf8ByteLength(update.content) < 1000, "onUpdate content is a single bounded status line");

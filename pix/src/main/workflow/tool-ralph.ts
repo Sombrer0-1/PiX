@@ -623,11 +623,14 @@ export function createRalphToolDefinition(
       // Publish the durable run record and subscribe the live fold.
       host.recorder.start(run, toolCallId, RALPH_TOOL_NAME);
 
-      const unsubscribes = subscribeRunUpdates(host, run, onUpdate);
+      let unsubscribes: Array<() => void> = [];
 
       let result: WorkflowResult | undefined;
       let terminal: RalphTerminalResult | undefined;
       try {
+        // Subscribe inside the try so a synchronous throw still hits dispose /
+        // recorder.abandon instead of leaving a hanging run record.
+        unsubscribes = subscribeRunUpdates(host, run, onUpdate);
         result = await run.result;
         const errorMessage = stopReasonError(result);
         if (errorMessage !== undefined) {

@@ -39,8 +39,8 @@ export interface ChildStartRequest {
   maxTurns?: number;
 }
 
-/** Default maxTurns for workflow schema children when the script omits opts.maxTurns. */
-export const SCHEMA_CHILD_DEFAULT_MAX_TURNS = 12;
+/** Default maxTurns for workflow schema children when the script omits opts.maxTurns. Same as ordinary subagents (DEFAULT_MAX_TURNS). */
+export const SCHEMA_CHILD_DEFAULT_MAX_TURNS = 150;
 
 /** Default `agent()` retry count when `opts.schema` is set and `opts.retry` is omitted. */
 export const DEFAULT_SCHEMA_CHILD_RETRY = 1;

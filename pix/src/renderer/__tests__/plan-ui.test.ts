@@ -535,7 +535,7 @@ describe("armed submit", () => {
     // No ordinary prompt/steer is sent alongside.
     expect(rpcMock.state.sendCommandAsync).not.toHaveBeenCalled();
     // The optimistic user message carries text + paths; input cleared.
-    expect(sessionMock.state.appendOptimisticUserMessage).toHaveBeenCalledWith("add tests", ["C:/proj/src/a.ts"]);
+    expect(sessionMock.state.appendOptimisticUserMessage).toHaveBeenCalledWith("add tests", ["C:/proj/src/a.ts"], []);
     expect((w.get(".composer-textarea").element as HTMLTextAreaElement).value).toBe("");
   });
 
@@ -602,7 +602,7 @@ describe("armed submit", () => {
       filePaths: ["C:/proj/src/a.ts"],
       images: undefined,
     });
-    expect(sessionMock.state.appendOptimisticUserMessage).toHaveBeenCalledWith("", ["C:/proj/src/a.ts"]);
+    expect(sessionMock.state.appendOptimisticUserMessage).toHaveBeenCalledWith("", ["C:/proj/src/a.ts"], []);
   });
 
   it("sends enter_planning only once under rapid double submit", async () => {

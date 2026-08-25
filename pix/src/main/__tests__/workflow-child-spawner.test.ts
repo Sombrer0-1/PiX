@@ -353,7 +353,7 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): Harness {
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
   const service = new AgentTaskService({
-    settings: { cwd } as never,
+    settings: { cwd, get: () => undefined } as never,
     events,
     store,
     runId: "test-run-1",

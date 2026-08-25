@@ -1,5 +1,5 @@
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
-import type { AgentMessage } from "../types.ts";
+import type { AgentMessage, CustomMessageContext } from "../types.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -34,6 +34,7 @@ export interface CustomMessage<T = unknown> {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
+	context?: CustomMessageContext;
 	timestamp: number;
 }
 
@@ -106,6 +107,7 @@ export function createCustomMessage(
 	display: boolean,
 	details: unknown | undefined,
 	timestamp: string,
+	context?: CustomMessageContext,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -113,8 +115,69 @@ export function createCustomMessage(
 		content,
 		display,
 		details,
+		...(context === undefined ? {} : { context }),
 		timestamp: new Date(timestamp).getTime(),
 	};
+}
+
+function escapeXmlAttribute(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/"/g, "&quot;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/'/g, "&apos;");
+}
+
+function wrapInternalContent(
+	customType: string,
+	content: string | (TextContent | ImageContent)[],
+): (TextContent | ImageContent)[] {
+	const prefix = `<internal-message custom-type="${escapeXmlAttribute(customType)}">\n`;
+	const suffix = "\n</internal-message>";
+	if (typeof content === "string") {
+		return [{ type: "text", text: prefix + content + suffix }];
+	}
+	return [{ type: "text", text: prefix }, ...content, { type: "text", text: suffix }];
+}
+
+function contentText(content: string | (TextContent | ImageContent)[]): string {
+	if (typeof content === "string") return content;
+	return content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("");
+}
+
+/** Legacy roots: opening tag paired with its closing tag, both required. */
+const LEGACY_INTERNAL_NOTIFICATION_TAGS: ReadonlyArray<readonly [string, string]> = [
+  ["</internal-message>", "<internal-message"],
+  ["</task-notification>", "<task-notification"],
+  ["</team-notification>", "<team-notification"],
+  ["</plan-notification>", "<plan-notification"],
+  ["</workflow-result>", "<workflow-result"],
+  ["</orchestrator-event>", "<orchestrator-event"],
+  ["</teammate-message>", "<teammate-message"],
+  ["</worker-summary>", "<worker-summary"],
+];
+
+/**
+ * Detect legacy runtime notification text stored as a user message. A text
+ * only matches when the WHOLE message is a single closed envelope: it starts
+ * with a reserved opening tag (followed by whitespace or ">") and ends with
+ * that tag's closing tag. A user message that merely mentions the format, or
+ * one that carries extra text before/after the example, is never wrapped as an
+ * internal notification.
+ */
+function isLegacyInternalNotificationText(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return false;
+  const lower = trimmed.toLowerCase();
+  return LEGACY_INTERNAL_NOTIFICATION_TAGS.some(([closing, opening]) => {
+    if (!lower.startsWith(opening) || !lower.endsWith(closing)) return false;
+    const afterOpening = lower[opening.length];
+    return afterOpening === undefined || afterOpening === ">" || afterOpening === "\n" || afterOpening === " " || afterOpening === "\t";
+  });
 }
 
 export function convertToLlm(messages: AgentMessage[]): Message[] {
@@ -131,7 +194,11 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "custom": {
-					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
+					const content = m.context === "internal"
+						? wrapInternalContent(m.customType, m.content)
+						: typeof m.content === "string"
+							? [{ type: "text" as const, text: m.content }]
+							: m.content;
 					return {
 						role: "user",
 						content,
@@ -153,6 +220,13 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "user":
+					if (isLegacyInternalNotificationText(contentText(m.content))) {
+						return {
+							...m,
+							content: wrapInternalContent("legacy-runtime-notification", m.content),
+						};
+					}
+					return m;
 				case "assistant":
 				case "toolResult":
 					return m;

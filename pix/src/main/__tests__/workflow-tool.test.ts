@@ -11,8 +11,8 @@
  * engine is reached; the abort bridge cancels the run once with "parent step
  * aborted"; engine events push onUpdate details with the recorder's in-memory
  * fold (value null in updates, terminal stopReason overlaid on workflow/end);
- * the completed result maps the locked content format with "Return value:" and
- * the 50_000-character truncation notice; dispose failures fall back to
+ * the completed result maps the structured workflow-result envelope and
+ * preserves the 50_000-character truncation notice; dispose failures fall back to
  * recorder.abandon.
  *
  * The ralph sections (S7) cover the fixed script/meta/args/caps/provider
@@ -482,11 +482,13 @@ await run("completed run maps content, details and lifecycle", async () => {
 
   h.engine.settle(run.id, { value: { findings: [1, 2] }, stopReason: "completed", agentsStarted: 1 });
   const result = await pending;
-  assertEqual(
-    (result.content[0] as TextContent).text,
-    `workflow "audit-all" completed (1 agent).\nReturn value:\n${JSON.stringify({ findings: [1, 2] }, null, 2)}`,
-    "completed content matches the locked format",
-  );
+  const resultText = (result.content[0] as TextContent).text;
+  assert(resultText.startsWith(`<workflow-result workflow-id="${run.id}" workflow="audit-all"`), "completed content has the workflow identity envelope");
+  assert(resultText.includes('status="completed"'), "completed content carries the terminal status");
+  assert(resultText.includes("<summary>1 agent</summary>"), "completed content carries the child count summary");
+  assert(resultText.includes("<result>"), "completed content carries the return value element");
+  assert(resultText.includes("&quot;findings&quot;"), "completed content escapes the JSON return value");
+  assert(resultText.endsWith("</workflow-result>"), "completed content closes the workflow envelope");
   assert(isWorkflowToolDetails(result.details), "details pass the shared guard");
   assertJson(result.details.value, { findings: [1, 2] }, "details carry the script value");
   assertEqual(result.details.agentsStarted, 1, "details carry the agent count");
@@ -520,9 +522,10 @@ await run("completed content appends child failure counts and reasons", async ()
   const result = await pending;
   const text = (result.content[0] as TextContent).text;
   assert(text.includes("2 agents, 1 ok / 1 failed"), "parent text carries ok/failed counts");
-  assert(text.includes("Failures:"), "parent text has a Failures section");
+  assert(text.includes("<failures>"), "parent text has a structured failures section");
   assert(text.includes("audit pkg: max_turns: The agent exceeded its turn limit (12)."), "parent text names the failed item");
-  assert(text.includes("Return value:"), "parent text still carries the script value");
+  assert(text.includes("<result>"), "parent text still carries the script value");
+  assert(text.endsWith("</workflow-result>"), "parent text closes the workflow envelope");
 });
 
 await run("non-completed stop reasons throw mapped messages, never partial success", async () => {
@@ -584,12 +587,11 @@ await run("values beyond 50_000 characters are truncated with a notice", async (
   h.engine.settle(run.id, { value, stopReason: "completed", agentsStarted: 2 });
   const result = await pending;
   const maxChars = 50_000;
-  const fullText = `workflow "audit-all" completed (2 agents).\nReturn value:\n${JSON.stringify(value, null, 2)}`;
-  // The WHOLE parent-facing text (envelope included) is bounded to maxChars,
-  // mirroring ralph's boundResult semantics.
-  const expected = `${fullText.slice(0, maxChars - TRUNCATION_NOTICE.length)}${TRUNCATION_NOTICE}`;
-  assert((expected.length <= maxChars), "truncated content stays within the budget");
-  assertEqual((result.content[0] as TextContent).text, expected, "content truncates past 50_000 characters with the notice");
+  const text = (result.content[0] as TextContent).text;
+  assert(text.length <= maxChars, "truncated content stays within the budget");
+  assert(text.includes(TRUNCATION_NOTICE), "content carries the truncation notice inside the result element");
+  assert(text.startsWith(`<workflow-result workflow-id="${run.id}"`), "truncated content preserves the workflow envelope");
+  assert(text.endsWith("</workflow-result>"), "truncated content preserves the closing workflow tag");
   assertJson(result.details.value, value, "details keep the untruncated value");
 });
 

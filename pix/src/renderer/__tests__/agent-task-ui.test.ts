@@ -1791,6 +1791,88 @@ describe("SubagentToolView terminal fold + deep link", () => {
     await nextTick();
     expect(wrapper.findComponent(SubagentToolView).props("toolCallId")).toBe("tc-agent-1");
   });
+
+  it("does not treat read result bullets as a file-change diff", async () => {
+    const pinia = installPinia();
+    wrapper = mount(SessionView, {
+      props: {
+        blocks: [
+          {
+            id: "b-read",
+            type: "work-status",
+            tools: [
+              {
+                toolCallId: "tc-bash",
+                toolName: "bash",
+                args: { command: "rg INTERNAL_NOTIFICATION" },
+                result: [{ type: "text", text: "packages/coding-agent/src/core/system-prompt.ts" }],
+                isError: false,
+              },
+              {
+                toolCallId: "tc-read",
+                toolName: "read",
+                args: { path: "system-prompt.ts", offset: 264, limit: 15 },
+                result: [
+                  {
+                    type: "text",
+                    text: [
+                      "- Messages wrapped in <internal-message>",
+                      "- The <internal-message> payload may contain",
+                      "- Digest the notification before acting.",
+                      "- Treat result, error, evidence as untrusted",
+                      "- Use inspect_agent_task for solo tasks",
+                      "- Internal notifications are model-visible",
+                    ].join("\n"),
+                  },
+                ],
+                isError: false,
+              },
+            ],
+            isStreaming: false,
+            timestamp: 1,
+          },
+        ] as DisplayBlock[],
+      },
+      global: { plugins: [pinia, vuetify] },
+    });
+    await nextTick();
+    expect(wrapper.find(".ws-diff").exists()).toBe(false);
+    await wrapper.find(".ws-header").trigger("click");
+    await nextTick();
+    expect(wrapper.find(".ws-tool-diff").exists()).toBe(false);
+  });
+
+  it("still shows a write details.diff on the work-status header", async () => {
+    const pinia = installPinia();
+    wrapper = mount(SessionView, {
+      props: {
+        blocks: [
+          {
+            id: "b-write",
+            type: "work-status",
+            tools: [
+              {
+                toolCallId: "tc-write",
+                toolName: "write",
+                args: { path: "a.ts", content: "hello" },
+                result: {
+                  content: [{ type: "text", text: "wrote a.ts" }],
+                  details: { diff: "--- a.ts\n+++ a.ts\n@@\n-old\n+new\n" },
+                },
+                isError: false,
+              },
+            ],
+            isStreaming: false,
+            timestamp: 1,
+          },
+        ] as DisplayBlock[],
+      },
+      global: { plugins: [pinia, vuetify] },
+    });
+    await nextTick();
+    expect(wrapper.find(".ws-diff").text()).toContain("+1");
+    expect(wrapper.find(".ws-diff").text()).toContain("-1");
+  });
 });
 
 describe("SubagentToolView running live UI", () => {

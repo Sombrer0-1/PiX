@@ -141,6 +141,8 @@ const canSend = computed(() =>
   !isSending.value
 );
 const isStreaming = computed(() => rpc.isStreaming.value);
+const isCompacting = computed(() => rpc.sessionState.value?.isCompacting === true);
+const isBusy = computed(() => isStreaming.value || isCompacting.value);
 /** 实际发出的思考档位（映射后值）；off 或无映射时为空。 */
 const streamingEffortLabel = computed(() => {
   const level = rpc.sessionState.value?.thinkingLevel;
@@ -168,6 +170,7 @@ const paletteCommands = computed(() =>
 );
 
 const composerPlaceholder = computed(() => {
+  if (isCompacting.value) return "正在压缩上下文，消息将在压缩后发送...";
   if (rpc.isStreaming.value) return "AI 正在运行，可输入消息调整方向...";
   if (teamStore.teamMode && teamStore.isTeamActive) {
     return "向团队负责人发送任务，由其规划并分派...";
@@ -211,15 +214,16 @@ const planEntryBlocked = computed(() => {
 
 /** 仅空闲且 armed 的 Solo composer 提交才走 enter_planning（一次）。 */
 const shouldEnterPlanning = computed(
-  () => planArmed.value && !teamStore.teamMode && !isStreaming.value && !planEntryBlocked.value,
+  () => planArmed.value && !teamStore.teamMode && !isBusy.value && !planEntryBlocked.value,
 );
 
 const planToggleDisabled = computed(
-  () => teamStore.teamMode || isStreaming.value || planEntryBlocked.value || !rpc.isConnected.value,
+  () => teamStore.teamMode || isBusy.value || planEntryBlocked.value || !rpc.isConnected.value,
 );
 
 const planToggleDisableReason = computed(() => {
   if (teamStore.teamMode) return "团队模式不支持规划";
+  if (isCompacting.value) return "压缩中不可切换规划";
   if (isStreaming.value) return "运行中不可切换规划";
   if (soloPlanPhase.value === "planning_failed") return "规划失败，请先重试或放弃";
   if (planEntryBlocked.value) return "计划进行中，请先批准或放弃";
@@ -728,7 +732,7 @@ async function sendMessage(): Promise<void> {
 
   let optimisticBlockId: string | null = null;
   try {
-    optimisticBlockId = sessionStore.appendOptimisticUserMessage(text, allFilePaths);
+    optimisticBlockId = sessionStore.appendOptimisticUserMessage(text, filePaths, clipboardImages);
     // Armed solo submit with an empty requestText (attachment-only) must NOT
     // enter planning: the controller rejects empty_request, so it falls back
     // to the ordinary prompt path (§4.9: first armed submit requires
@@ -746,7 +750,7 @@ async function sendMessage(): Promise<void> {
         throw new Error(result.error || "进入规划失败");
       }
     } else {
-      const commandType = isStreaming.value ? "steer" : "prompt";
+      const commandType = isStreaming.value ? "steer" : isCompacting.value ? "follow_up" : "prompt";
       void rpc.sendCommandAsync({ type: commandType, message: text, filePaths: allFilePaths, images: allImages }).catch((error) => {
         sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
       });
@@ -1160,12 +1164,12 @@ function sendQuickStart(prompt: string): void {
           </div>
           <div class="composer-right">
             <button
-              v-if="isStreaming"
+              v-if="isBusy"
               class="composer-action-btn primary-action"
               type="button"
               :disabled="!canSend"
-              title="发送引导消息"
-              aria-label="发送引导消息"
+              :title="isCompacting ? '排队到压缩完成后发送' : '发送引导消息'"
+              :aria-label="isCompacting ? '排队到压缩完成后发送' : '发送引导消息'"
               @click="sendMessage"
             >
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1174,11 +1178,11 @@ function sendQuickStart(prompt: string): void {
               </svg>
             </button>
             <button
-              v-if="isStreaming"
+              v-if="isBusy"
               class="composer-action-btn stop-action"
               type="button"
-              title="停止"
-              aria-label="停止"
+              :title="isCompacting ? '取消压缩' : '停止'"
+              :aria-label="isCompacting ? '取消压缩' : '停止'"
               @click="stopAgent"
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">

@@ -150,6 +150,7 @@ function makeModel(provider = "faux", id = "faux-model"): Model<Api> {
 interface CustomMessageRecord {
   customType: string;
   content: string;
+  context?: "internal";
   triggerTurn?: boolean;
 }
 
@@ -192,12 +193,13 @@ class FakeSession {
   }
 
   async sendCustomMessage(
-    message: { customType: string; content: string; display: boolean },
+    message: { customType: string; content: string; display: boolean; context?: "internal" },
     options?: { triggerTurn?: boolean },
   ): Promise<void> {
     this.customMessages.push({
       customType: message.customType,
       content: typeof message.content === "string" ? message.content : "",
+      context: message.context,
       triggerTurn: options?.triggerTurn,
     });
   }
@@ -401,6 +403,7 @@ await run("enterPlanning: one visible user turn with requestText, never duplicat
   assertEqual(h.promptCalls[0].filePaths?.length, 1, "attachments flow through promptPlanningRequest");
   assertEqual(h.session.customMessages.length, 1, "generation context injected once");
   assertEqual(h.session.customMessages[0].customType, "pix-plan-context", "generation context uses pix-plan-context");
+  assertEqual(h.session.customMessages[0].context, "internal", "generation context is marked internal");
   assertEqual(h.session.customMessages[0].triggerTurn, false, "generation context does not trigger a turn");
   assert(
     typeof result.generationId === "string" && h.session.customMessages[0].content.includes(result.generationId),
@@ -446,6 +449,10 @@ await run("generation failure: settle without submit -> invalid_plan; three ops 
     h.session.customMessages.map((m) => m.customType),
     "pix-plan-retry",
     "retry uses the pix-plan-retry CustomMessage",
+  );
+  assert(
+    h.session.customMessages.some((m) => m.customType === "pix-plan-retry" && m.context === "internal"),
+    "retry CustomMessage is marked internal",
   );
   assert(
     h.session.customMessages.some((m) => m.triggerTurn === true),

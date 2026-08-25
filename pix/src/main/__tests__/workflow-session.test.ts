@@ -329,7 +329,7 @@ await run("agent({schema}) accepts nested string/array nodes (ralph reportSchema
   }, "structured report returned");
   const start = host.ofType(WorkerToHostType.ChildStart)[0];
   assertEqual(start?.request.label, "Ralph round 1", "ralph round label forwarded");
-  assertEqual(start?.request.maxTurns, SCHEMA_CHILD_DEFAULT_MAX_TURNS, "schema child defaults to the short maxTurns");
+  assertEqual(start?.request.maxTurns, SCHEMA_CHILD_DEFAULT_MAX_TURNS, "schema child defaults to the shared maxTurns");
   host.close();
 });
 

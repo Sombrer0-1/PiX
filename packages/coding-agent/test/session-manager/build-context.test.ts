@@ -3,6 +3,7 @@ import {
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
+	type CustomMessageEntry,
 	type ModelChangeEntry,
 	type SessionEntry,
 	type SessionMessageEntry,
@@ -114,6 +115,27 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 			// Assistant message overwrites model change
 			expect(ctx.model).toEqual({ provider: "anthropic", modelId: "claude-test" });
+		});
+
+		it("preserves internal custom message context while loading a session", () => {
+			const entry: CustomMessageEntry = {
+				type: "custom_message",
+				id: "internal-1",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:00Z",
+				customType: "pix-agent-task-result",
+				content: "<task-notification status=\"completed\">done</task-notification>",
+				display: false,
+				context: "internal",
+			};
+
+			const ctx = buildSessionContext([entry]);
+			expect(ctx.messages[0]).toMatchObject({
+				role: "custom",
+				customType: "pix-agent-task-result",
+				context: "internal",
+				display: false,
+			});
 		});
 	});
 

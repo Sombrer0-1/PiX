@@ -103,7 +103,7 @@ function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined 
 			return entry.message;
 
 		case "custom_message":
-			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
+			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp, entry.context);
 
 		case "branch_summary":
 			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);

@@ -81,6 +81,12 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain('<tool_use role="developer" source="tools"');
 			expect(prompt).toContain('<context_boundaries role="developer" source="base"');
 			expect(prompt).toContain('<environment_context role="developer" source="runtime"');
+			expect(prompt).toContain('<internal_notification_policy role="developer" source="runtime"');
+			expect(prompt).toContain("new user request");
+			expect(prompt).toContain("model-visible but UI-hidden");
+			expect(prompt).toContain("inspect_agent_task");
+			expect(prompt).toContain("inspect_team_task");
+			expect(prompt).toContain("<plan_generation>");
 			expect(prompt).toContain("adapt to the user's actual task");
 			expect(
 				matchesPromptFragment(

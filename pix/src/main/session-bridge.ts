@@ -40,6 +40,7 @@ import { createSideQuestionCoordinator, type SideQuestionCoordinator } from "./b
 import type { SubagentExecutionContext, SubagentToolHost } from "./subagent/types.js";
 import { SHELL_BACKGROUND_TOOLS, SubagentRunner } from "./subagent/subagent-runner.js";
 import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "./subagent/subagent-tool.js";
+import { createInspectAgentTaskTool } from "./subagent/inspect-agent-task.js";
 import { PlanController } from "./plan/plan-controller.js";
 import type {
   PlanControllerContext,
@@ -65,6 +66,10 @@ import { createWorkflowToolDefinition, type WorkflowToolHost } from "./workflow/
 import type { AgentTaskDeliveryContent, AgentTaskService, AgentTaskSubmissionContext } from "./agent-task/agent-task-service.js";
 import { workspaceIdOf } from "./agent-task/agent-task-identity.js";
 import type { AgentTaskPlanLink } from "../shared/agent-task-types.js";
+import {
+  formatInternalNotification,
+  INTERNAL_CUSTOM_MESSAGE_TYPES,
+} from "../shared/internal-notification.js";
 import type { PlanDeviation, PlanStep } from "../shared/plan-types.js";
 import { PRODUCT_EVENT_SCHEMA_VERSION, type ProductEvent, type ProductEventName } from "../shared/product-events.js";
 import { WORKFLOW_RECORD_CUSTOM_TYPE } from "../shared/workflow-types.js";
@@ -2156,6 +2161,13 @@ export class SessionBridge {
 					getTaskService: () => this._agentTaskService!,
 					getSubmissionContext: (toolCallId: string) => runner.assembleSubmissionContext(toolCallId),
 				};
+				const inspectAgentTaskTool = this._agentTaskService
+					? createInspectAgentTaskTool({
+						service: this._agentTaskService,
+						workspaceId: workspaceIdOf(cwd),
+						getParentSessionId: () => parentSessionRef?.sessionId ?? "",
+					})
+					: undefined;
 
 				// Solo workflow engine + recorder (PiX 1.4.3): the engine borrows
 				// this generation's app-level AgentTaskService through the
@@ -2306,6 +2318,7 @@ export class SessionBridge {
 					// definition itself is a full ToolDefinition.
 					customTools: [
 						createSubagentToolDefinition(host) as ToolDefinition,
+						...(inspectAgentTaskTool ? [inspectAgentTaskTool as ToolDefinition] : []),
 						createSubmitUserPlanTool({ controller: planController }) as ToolDefinition,
 						createUpdatePlanStepTool({ controller: planController }) as ToolDefinition,
 						createWorkflowToolDefinition(workflowHost) as ToolDefinition,
@@ -2436,14 +2449,13 @@ export class SessionBridge {
 	private async _activateSession(session: AgentSession): Promise<void> {
 		this._session = session;
 		this._setupEventSubscription(session);
-		// 1.4.2 (R4): the active Solo session becomes the delivery sink for
-		// send_to_session (design plan §4.5); closed on _closeCurrentSession.
-		this._registerDeliverySink(session);
 		try {
 			await this._bindExtensions();
 		} catch (err) {
 			// Activation (bind) failure: dispose the created runner/session/MCP,
 			// close this generation's input queue and clear bridge fields.
+			this._deliverySinkUnsubscribe?.();
+			this._deliverySinkUnsubscribe = null;
 			this._session = null;
 			this._unsubscribe?.();
 			this._unsubscribe = null;
@@ -2473,6 +2485,10 @@ export class SessionBridge {
 		// merges into the in-memory mirror (dedup), so later same-instance
 		// resync re-pushes keep the restored runs instead of wiping them.
 		this._generation?.workflowRecorder.restore(session.sessionManager.getEntries());
+		// 1.4.2 (R4): register only after the session, extensions, Plan state,
+		// and workflow state are restored. Catch-up delivery can trigger a
+		// parent turn, so it must not race activation.
+		this._registerDeliverySink(session);
 		this._emitLifecycle("ready");
 	}
 
@@ -2638,9 +2654,11 @@ export class SessionBridge {
 				const streaming = current.isStreaming;
 				await current.sendCustomMessage(
 					{
-						customType: "pix-agent-task-result",
+						customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TASK_RESULT,
 						content: this._formatDeliveryContent(content),
-						display: true,
+						display: false,
+						details: content,
+						context: "internal",
 					},
 					streaming ? { deliverAs: "followUp" } : { triggerTurn: true },
 				);
@@ -2648,27 +2666,32 @@ export class SessionBridge {
 		);
 	}
 
-	/** Human-readable chat text for one delivered task result. */
+	/** Bounded model-facing envelope for one delivered task result. */
 	private _formatDeliveryContent(content: AgentTaskDeliveryContent): string {
-		const lines = [
-			"A background subagent task finished.",
-			`Task ID: ${content.taskId}`,
-			`Group ID: ${content.groupId}`,
-			`Status: ${content.status}`,
-		];
-		if (content.planLink) {
-			lines.push(`Plan step ${content.planLink.stepId} (plan ${content.planLink.planId}, version ${content.planLink.version}).`);
-		}
-		if (content.summary !== "") {
-			lines.push(content.summary);
-		}
-		if (content.errorMessage) {
-			lines.push(content.errorMessage);
-		}
-		if (content.finalOutput !== "") {
-			lines.push(content.finalOutput);
-		}
-		return lines.join("\n");
+		return formatInternalNotification({
+			notificationId: `task-result:${content.taskId}:${content.groupId}`,
+			source: "agent-task",
+			kind: "task-result",
+			taskId: content.taskId,
+			groupId: content.groupId,
+			status: content.status,
+			requiresAction: content.status !== "completed" || Boolean(content.errorMessage),
+			result: content.finalOutput || content.summary,
+			error: content.errorMessage,
+			usage: content.usage,
+			planLink: content.planLink,
+			items: content.items.map((item) => ({
+				id: item.id,
+				index: item.index,
+				step: item.step,
+				agentName: item.agentName,
+				agentSource: item.agentSource,
+				status: item.status,
+				...(content.items.length > 1 ? { result: item.finalOutput } : {}),
+				error: item.errorMessage,
+				usage: item.usage,
+			})),
+		});
 	}
 
 	/** Self-contained single-task prompt for a delegated plan step. */

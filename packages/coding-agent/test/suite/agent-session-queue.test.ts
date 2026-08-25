@@ -442,4 +442,35 @@ describe("AgentSession queue characterization", () => {
 
 		expect(getUserTexts(harness)).toEqual(["hello", "conflict report"]);
 	});
+
+	it("continues a follow-up queued while the parent turn ends in error", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		let sawFollowUp = false;
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" }),
+			(context) => {
+				sawFollowUp = context.messages.some(
+					(message) =>
+						message.role === "user" &&
+						typeof message.content !== "string" &&
+						message.content.some((part) => part.type === "text" && part.text === "task result after error"),
+				);
+				return fauxAssistantMessage("handled follow-up");
+			},
+		]);
+
+		await waitForToolStart;
+		await harness.session.sendCustomMessage(
+			{ customType: "queue-test", content: "task result after error", display: false, details: {} },
+			{ deliverAs: "followUp" },
+		);
+		releaseToolExecution();
+		await promptPromise;
+
+		expect(sawFollowUp).toBe(true);
+	});
 });

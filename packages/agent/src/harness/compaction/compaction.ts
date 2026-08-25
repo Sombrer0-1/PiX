@@ -68,6 +68,7 @@ function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined 
 			entry.display,
 			entry.details,
 			entry.timestamp,
+			entry.context,
 		);
 	}
 	if (entry.type === "branch_summary") {

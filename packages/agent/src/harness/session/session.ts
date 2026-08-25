@@ -1,5 +1,5 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import type { AgentMessage } from "../../types.ts";
+import type { AgentMessage, CustomMessageContext } from "../../types.ts";
 import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.ts";
 import type {
 	ActiveToolsChangeEntry,
@@ -51,6 +51,7 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 					entry.display,
 					entry.details,
 					entry.timestamp,
+					entry.context,
 				),
 			);
 		} else if (entry.type === "branch_summary" && entry.summary) {
@@ -206,6 +207,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		context?: CustomMessageContext,
 	): Promise<string> {
 		return this.appendTypedEntry({
 			type: "custom_message",
@@ -216,6 +218,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 			content,
 			display,
 			details,
+			context,
 		} satisfies CustomMessageEntry<T>);
 	}
 

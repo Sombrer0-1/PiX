@@ -23,6 +23,7 @@
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
 import type { ChatMessageAttachment, DisplayBlock, ToolWorkItem } from "@/types/session";
 import { classifyApiError } from "@/utils/api-error";
+import { isInternalCustomMessageType } from "@shared/internal-notification";
 
 // ============================================================================
 // Public contract (Plan 4.7)
@@ -49,8 +50,12 @@ export interface DisplayBlockAssembler {
    */
   loadEntries(entries: unknown[]): void;
   clear(): void;
-  /** 乐观用户消息(任务 transcript 不使用)。 */
-  appendOptimisticUserMessage(text: string, filePaths?: string[]): string | null;
+  /** 乐观用户消息(任务 transcript 不使用)。clipboardImages 的 path 必须与主进程一致。 */
+  appendOptimisticUserMessage(
+    text: string,
+    filePaths?: string[],
+    clipboardImages?: Array<{ mimeType: string }>,
+  ): string | null;
   failOptimisticUserMessage(blockId: string | null, message: string): void;
   /** 最新可重试 API 错误块(渲染端决定是否给重试按钮)。 */
   readonly lastRetryableError: { blockId: string } | null;
@@ -101,6 +106,16 @@ function attachmentFromPath(path: string): ChatMessageAttachment {
   };
 }
 
+/** Same path/name convention as SessionBridge._preparePromptInput. */
+function clipboardImageAttachment(index: number, mimeType: string): ChatMessageAttachment {
+  const ext = mimeType.split("/")[1] || "png";
+  return {
+    path: `clipboard-image-${index + 1}`,
+    name: `clipboard-image-${index + 1}.${ext}`,
+    kind: "image",
+  };
+}
+
 function normalizeAttachment(value: unknown): ChatMessageAttachment | null {
   if (!isRecord(value) || typeof value.path !== "string") return null;
   const kind = value.kind === "image" || value.kind === "file" || value.kind === "text" ? value.kind : "file";
@@ -126,10 +141,46 @@ function extractContentText(message: AgentMessage): string {
   return "";
 }
 
+function isInternalCustomMessage(message: AgentMessage): boolean {
+  return message.role === "custom" && (
+    message.context === "internal" ||
+    isInternalCustomMessageType(message.customType)
+  );
+}
+
 /**
- * Turn a steered <teammate-message> (worker report injected into the Leader
- * session) into a compact human-readable note, or null if the text is not a
- * teammate message.
+ * Legacy internal-notification roots: opening tag paired with its required
+ * closing tag. A text only matches when the WHOLE message is a single closed
+ * envelope (starts with the opening tag, ends with the closing tag), so a user
+ * message that merely mentions a reserved prefix (e.g. a pasted XML sample or
+ * protocol discussion) is never silently hidden.
+ */
+const LEGACY_INTERNAL_NOTIFICATION_TAGS: ReadonlyArray<readonly [string, string]> = [
+  ["</internal-message>", "<internal-message"],
+  ["</task-notification>", "<task-notification"],
+  ["</team-notification>", "<team-notification"],
+  ["</plan-notification>", "<plan-notification"],
+  ["</workflow-result>", "<workflow-result"],
+  ["</orchestrator-event>", "<orchestrator-event"],
+  ["</teammate-message>", "<teammate-message"],
+  ["</worker-summary>", "<worker-summary"],
+];
+
+function isLegacyInternalNotificationText(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return false;
+  const lower = trimmed.toLowerCase();
+  return LEGACY_INTERNAL_NOTIFICATION_TAGS.some(([closing, opening]) => {
+    if (!lower.startsWith(opening) || !lower.endsWith(closing)) return false;
+    const afterOpening = lower[opening.length];
+    return afterOpening === undefined || afterOpening === ">" || afterOpening === "\n" || afterOpening === " " || afterOpening === "\t";
+  });
+}
+
+/**
+ * Compact note for a steered <teammate-message>. Unreachable for closed
+ * envelopes: `isLegacyInternalNotificationText` returns first and hides them.
+ * Kept so a future non-envelope teammate payload can reuse the formatter.
  */
 function parseTeammateMessageNote(text: string): string | null {
   const trimmed = text.trimStart();
@@ -154,9 +205,9 @@ function parseTeammateMessageNote(text: string): string | null {
 }
 
 /**
- * Produce a one-line summary of an internal <orchestrator-event> prompt so the
- * user sees WHY the leader is suddenly responding, without exposing the full
- * internal coordination payload.
+ * One-line summary of an <orchestrator-event> prompt. Unreachable for closed
+ * envelopes: the legacy-root check hides them before this branch. Kept for a
+ * future non-envelope wake payload.
  */
 function summarizeOrchestratorEvent(text: string): string {
   const events = [...text.matchAll(/^EVENT: (\S+)/gm)].map((m) => m[1]);
@@ -248,6 +299,7 @@ function customMessageFromEntry(entry: Record<string, unknown>): AgentMessage {
     content: entry.content as AgentMessage["content"],
     display: entry.display !== false,
     details: entry.details,
+    ...(entry.context === "internal" ? { context: "internal" } : {}),
     timestamp: Number.isFinite(entryTimestamp) ? entryTimestamp : Date.now(),
   };
 }
@@ -387,11 +439,19 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   }
 
   function appendUserOrNoteMessage(msg: AgentMessage, showLiveThinking = false): boolean {
+    const rawText = extractContentText(msg).trimStart();
+    // Older sessions may have stored an internal envelope under a generic
+    // custom type. Reserved envelope roots are runtime signals regardless of
+    // the message role or custom type.
+    if ((msg.role === "user" || msg.role === "custom") && isLegacyInternalNotificationText(rawText)) {
+      return false;
+    }
     if (msg.role === "user") {
-      const rawText = extractContentText(msg).trimStart();
-      // Internal orchestration turn: show a compact note (so the leader's
-      // upcoming response has visible context) instead of the raw payload,
-      // plus the thinking indicator since a leader turn is starting.
+      // Older sessions stored team/runtime signals as ordinary user messages.
+      // They are compatibility payloads, not user-authored chat, so do not
+      // resurrect them as bubbles or notes after a reload.
+      // Unreachable for closed <orchestrator-event> envelopes (legacy hide
+      // above). Left so a non-closed wake payload can still render a note.
       if (renderTeamLeaderNotes && rawText.startsWith("<orchestrator-event>")) {
         blocks.push({
           id: nextBlockId(),
@@ -457,8 +517,15 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     return false;
   }
 
-  function appendOptimisticUserMessage(text: string, filePaths: string[] = []): string | null {
-    const attachments = filePaths.map(attachmentFromPath);
+  function appendOptimisticUserMessage(
+    text: string,
+    filePaths: string[] = [],
+    clipboardImages: Array<{ mimeType: string }> = [],
+  ): string | null {
+    const attachments = [
+      ...filePaths.map(attachmentFromPath),
+      ...clipboardImages.map((image, index) => clipboardImageAttachment(index, image.mimeType)),
+    ];
     if (!text.trim() && attachments.length === 0) return null;
 
     // Starting a new turn invalidates the retry affordance on any prior error.
@@ -629,6 +696,10 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         const msg = event.message;
         if (isFoldableRole(msg.role) && foldedMessageKeys.has(foldKeyOf(msg))) break;
         if (msg.role === "user" || msg.role === "custom") {
+          if (isInternalCustomMessage(msg)) {
+            if (isFoldableRole(msg.role)) foldedMessageKeys.add(foldKeyOf(msg));
+            break;
+          }
           if (msg.role === "custom" && msg.display === false) break;
           const appended = appendUserOrNoteMessage(msg, true);
           if (msg.role === "user" && appended) {
@@ -840,8 +911,15 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
 
   /** Fold a type==="custom_message" entry into a note block (Plan 4.7). */
   function foldCustomMessageEntry(entry: Record<string, unknown>): void {
-    if (entry.display === false) return;
     const msg = customMessageFromEntry(entry);
+    if (
+      isInternalCustomMessage(msg) ||
+      entry.display === false ||
+      isLegacyInternalNotificationText(extractContentText(msg))
+    ) {
+      foldedMessageKeys.add(foldKeyOf(msg));
+      return;
+    }
     const display = extractMessageDisplay(msg);
     if (display.text) {
       blocks.push({
@@ -918,6 +996,10 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
 
       const msg = message;
       if (msg.role === "user" || msg.role === "custom") {
+        if (isInternalCustomMessage(msg)) {
+          if (isFoldableRole(msg.role)) foldedMessageKeys.add(foldKeyOf(msg));
+          continue;
+        }
         if (msg.role === "custom" && msg.display === false) {
           if (isFoldableRole(msg.role)) foldedMessageKeys.add(foldKeyOf(msg));
           continue;

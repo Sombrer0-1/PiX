@@ -169,6 +169,105 @@ describe("AgentSession compaction characterization", () => {
 		expect(getStreamCallCount()).toBe(1);
 	});
 
+	it("queues prompt and custom triggerTurn while auto-compaction is in flight", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						return await new Promise<{ cancel: true }>((resolve) => {
+							event.signal.addEventListener("abort", () => resolve({ cancel: true }), { once: true });
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+
+		const compactPromise = (
+			harness.session as unknown as SessionWithCompactionInternals
+		)._runAutoCompaction("threshold", false);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(harness.session.isCompacting).toBe(true);
+
+		const promptSpy = vi.spyOn(harness.session.agent, "prompt");
+		await harness.session.prompt("queued while compacting");
+		await harness.session.sendCustomMessage(
+			{
+				customType: "test",
+				content: [{ type: "text", text: "custom during compact" }],
+				display: false,
+			},
+			{ triggerTurn: true },
+		);
+
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+
+		harness.session.abortCompaction();
+		await compactPromise;
+	});
+
+	it("aborts in-flight auto-compaction from abort()", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						return await new Promise<{ cancel: true }>((resolve) => {
+							event.signal.addEventListener("abort", () => resolve({ cancel: true }), { once: true });
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+
+		const compactPromise = (
+			harness.session as unknown as SessionWithCompactionInternals
+		)._runAutoCompaction("overflow", true);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await harness.session.abort();
+
+		await expect(compactPromise).resolves.toBe(false);
+		expect(harness.session.isCompacting).toBe(false);
+	});
+
+	it("resumes after overflow compaction when the rebuilt transcript ends on an assistant", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "overflow compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("first");
+		await harness.session.prompt("second");
+
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const followUpSpy = vi.spyOn(harness.session.agent, "followUp");
+		await expect(sessionInternals._runAutoCompaction("overflow", true)).resolves.toBe(true);
+		expect(followUpSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				role: "custom",
+				customType: "pi.compaction_resume",
+				context: "internal",
+				display: false,
+			}),
+		);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+	});
+
 	it("cancels in-progress manual compaction when abortCompaction is called", async () => {
 		const harness = await createHarness({
 			extensionFactories: [

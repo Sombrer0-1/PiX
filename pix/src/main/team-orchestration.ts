@@ -1,4 +1,8 @@
 import type { MessageKind, TeammateInfo, TeammateRole, TeamTask, TeamTaskStatus, TeamTaskType } from "../shared/types.js";
+import {
+  formatInternalNotification,
+  INTERNAL_CUSTOM_MESSAGE_TYPES,
+} from "../shared/internal-notification.js";
 import { parseAgentId } from "./team-utils.js";
 
 export interface OrchestrationEvent {
@@ -129,6 +133,20 @@ export class OrchestrationEventQueue {
     }
   }
 
+  /**
+   * Rewrite the runtime epoch of every pending event to the given value.
+   * Used on resume: events enqueued while the runtime was paused (after an
+   * abort) carry the pre-pause epoch and would otherwise be dropped as stale
+   * by the canRetry guard on their first delivery failure.
+   */
+  retag(runtimeEpoch: number): void {
+    for (let i = 0; i < this._events.length; i++) {
+      this._events[i] = { ...this._events[i], runtimeEpoch };
+    }
+    this._eventKeys.clear();
+    for (const event of this._events) this._eventKeys.add(orchestrationEventKey(event));
+  }
+
   snapshot(): OrchestrationEvent[] {
     return this._events.map((event) => ({ ...event }));
   }
@@ -137,6 +155,15 @@ export class OrchestrationEventQueue {
 export interface OrchestrationWakeSession {
   isStreaming: boolean;
   prompt(text: string, options?: { expandPromptTemplates?: boolean }): Promise<unknown>;
+  sendCustomMessage?: (
+    message: {
+      customType: string;
+      content: string;
+      display: boolean;
+      context?: "internal";
+    },
+    options?: { triggerTurn?: boolean },
+  ) => Promise<unknown>;
 }
 
 export interface OrchestrationWakeProcessResult {
@@ -179,7 +206,30 @@ export async function processOrchestrationWakeQueue(options: {
     const events = queue.takeAll();
     try {
       const prompt = buildPrompt(events);
-      await session.prompt(prompt, { expandPromptTemplates: false });
+      if (session.sendCustomMessage) {
+        await session.sendCustomMessage(
+          {
+            customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TEAM_NOTIFICATION,
+            content: formatInternalNotification({
+              notificationId: `team-orchestration:${events
+                .map((event) => event.sourceId ?? event.taskId ?? event.type)
+                .join(",")}`,
+              source: "team",
+              kind: "orchestration",
+              status: "pending",
+              requiresAction: true,
+              result: prompt,
+            }),
+            display: false,
+            context: "internal",
+          },
+          { triggerTurn: true },
+        );
+      } else {
+        // Kept for isolated queue tests and non-Pi adapters. Production
+        // AgentSession instances always provide sendCustomMessage.
+        await session.prompt(prompt, { expandPromptTemplates: false });
+      }
       queue.ack(events);
       result.prompted++;
     } catch (error) {

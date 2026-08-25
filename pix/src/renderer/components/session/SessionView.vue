@@ -145,17 +145,13 @@ function diffSummaryFromArgs(toolName: string, args: unknown): DiffSummary {
 }
 
 function diffSummaryFromResult(result: unknown): DiffSummary {
-  // Tool details carry the authoritative post-execution diff. This matters for
-  // write-overwrite calls, where args only show the new content and cannot know
-  // how many old lines were removed.
+  // Only an explicit details.diff is a file change. Scanning the whole result
+  // text as a unified diff mislabels read/bash output whose lines happen to
+  // start with "-" (markdown bullets, rg matches, source comments).
   if (isRecord(result) && isRecord(result.details) && typeof result.details.diff === "string") {
     const fromDetails = countUnifiedDiff(result.details.diff);
     if (hasDiff(fromDetails)) return fromDetails;
   }
-
-  // Fallback: parse unified diff from result text.
-  const fromResultText = countUnifiedDiff(resultText(result));
-  if (hasDiff(fromResultText)) return fromResultText;
 
   return { added: 0, removed: 0 };
 }

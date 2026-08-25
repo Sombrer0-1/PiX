@@ -181,7 +181,7 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { CreateGoalOptions, ThreadGoal, ThreadGoalStatus, UpdateGoalOptions } from "./core/goal-runtime.ts";
-export { convertToLlm } from "./core/messages.ts";
+export { convertToLlm, LEGACY_INTERNAL_CUSTOM_TYPES, isInternalCustomMessage } from "./core/messages.ts";
 export {
 	createReadonlyModelRegistry,
 	ModelRegistry,

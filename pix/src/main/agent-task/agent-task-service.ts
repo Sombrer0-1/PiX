@@ -132,6 +132,10 @@ const EVENT_THROTTLE_MS = 100;
 export const MAX_PENDING_TRANSCRIPTS = 1000;
 /** 1.5 (P4): getTaskLog event cap - the snapshot keeps the newest 10000 and sets truncated. */
 export const MAX_TASK_LOG_EVENTS = 10000;
+/** Bound on delivery retries after a sink failure (see _scheduleDeliveryRetry). */
+export const MAX_DELIVERY_RETRIES = 3;
+/** Base delay before the first delivery retry; doubles per attempt. */
+export const DELIVERY_RETRY_DELAY_MS = 500;
 
 // ============================================================================
 // Public contract (design plan §4.5, 1.4.1)
@@ -201,6 +205,18 @@ export type AgentTaskServiceEvent =
   | { type: "task_transcript"; taskId: string; itemIndex: number; event: SharedAgentSessionEvent };
 
 /** Main-only delivery content (1.4.2 named contract, design plan §4.5). */
+export interface AgentTaskDeliveryItem {
+  id: string;
+  index: number;
+  step?: number;
+  agentName: string;
+  agentSource: string;
+  status: SubagentSingleResult["status"];
+  finalOutput: string;
+  errorMessage?: string;
+  usage: AgentTaskUsage;
+}
+
 export interface AgentTaskDelivery {
   taskId: string;
   groupId: string;
@@ -210,6 +226,7 @@ export interface AgentTaskDelivery {
   finalOutput: string;
   errorMessage?: string;
   usage: AgentTaskUsage;
+  items: AgentTaskDeliveryItem[];
 }
 export type AgentTaskDeliveryContent = AgentTaskDelivery;
 
@@ -453,6 +470,10 @@ export class AgentTaskService {
   private readonly _groups = new Map<string, GroupEntry>();
   private readonly _listeners = new Set<(event: AgentTaskServiceEvent) => void>();
   private readonly _deliverySinks = new Map<string, DeliverySinkEntry>();
+  /** Prevent auto-delivery catch-up and terminal callbacks from racing. */
+  private readonly _deliveryInFlight = new Set<string>();
+  /** Bounded delivery retry timers: key -> (attempts remaining, timer). */
+  private readonly _deliveryRetries = new Map<string, { attempts: number; timer: NodeJS.Timeout }>();
   private readonly _inFlight = new Set<Promise<unknown>>();
   private readonly _recoveryIssues = new Map<string, AgentTaskRecoveryIssue>();
   private readonly _storageStatuses = new Map<string, AgentTaskStorageStatus>();
@@ -740,6 +761,11 @@ export class AgentTaskService {
     if (entry.info.deliveredSessionIds.includes(targetSessionId) && confirmDuplicate !== true) {
       return { ok: false, reason: "duplicate_delivery" };
     }
+    const deliveryKey = `${taskId}:${generation}:${targetSessionId}`;
+    if (this._deliveryInFlight.has(deliveryKey)) {
+      return { ok: false, reason: "delivery_in_progress" };
+    }
+    this._deliveryInFlight.add(deliveryKey);
     const content: AgentTaskDeliveryContent = {
       taskId: entry.info.taskId,
       groupId: entry.info.groupId,
@@ -749,19 +775,92 @@ export class AgentTaskService {
       finalOutput: entry.info.finalOutput,
       errorMessage: entry.info.errorMessage,
       usage: { ...entry.info.usage },
+      items: entry.info.results.map((result) => ({
+        id: result.id,
+        index: result.index,
+        step: result.step,
+        agentName: result.agentName,
+        agentSource: result.agentSource,
+        status: result.status,
+        finalOutput: result.finalOutput,
+        errorMessage: result.errorMessage,
+        usage: { ...result.usage },
+      })),
     };
     try {
       await sink.sink(content);
     } catch (error) {
+      this._deliveryInFlight.delete(deliveryKey);
       const message = error instanceof Error && error.message !== "" ? error.message : "delivery_failed";
+      this._scheduleDeliveryRetry(deliveryKey, entry.info.taskId, entry.info.generation, targetSessionId, message);
       return { ok: false, reason: message };
     }
+    this._deliveryInFlight.delete(deliveryKey);
+    this._cancelDeliveryRetry(deliveryKey);
     entry.info.deliveredSessionIds.push(targetSessionId);
     entry.info.updatedAt = this._now();
     entry.persist.pendingEvents.push({ type: "delivery", targetSessionId, deliveredAt: this._now() });
     this._schedulePersist(taskId);
     this._emitTaskState(taskId);
     return { ok: true };
+  }
+
+  /**
+   * Bounded retry for a sink failure. The most common race: the parent turn
+   * was just started by an orchestration wake, so the sink's triggerTurn hits
+   * "Agent is already processing". The retry backoff gives the wake turn time
+   * to finish; deliveredSessionIds is untouched until a flight succeeds.
+   */
+  private _scheduleDeliveryRetry(
+    deliveryKey: string,
+    taskId: string,
+    generation: number,
+    targetSessionId: string,
+    reason: string,
+  ): void {
+    if (this._deliveryRetries.has(deliveryKey)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this._deliveryRetries.delete(deliveryKey);
+      void this._deliveryRetryAttempt(deliveryKey, taskId, generation, targetSessionId, 1);
+    }, DELIVERY_RETRY_DELAY_MS);
+    this._deliveryRetries.set(deliveryKey, { attempts: MAX_DELIVERY_RETRIES, timer });
+    console.warn(`[AgentTaskService] delivery failed (${reason}); will retry: ${deliveryKey}`);
+  }
+
+  private async _deliveryRetryAttempt(
+    deliveryKey: string,
+    taskId: string,
+    generation: number,
+    targetSessionId: string,
+    attempt: number,
+  ): Promise<void> {
+    const result = await this.sendResultToSession(taskId, generation, targetSessionId);
+    if (result.ok) {
+      return;
+    }
+    if (this._deliveryRetries.has(deliveryKey)) {
+      // Another flight already holds the retry scheduling.
+      return;
+    }
+    if (attempt >= MAX_DELIVERY_RETRIES) {
+      console.warn(`[AgentTaskService] delivery retry exhausted (${result.reason}); giving up: ${deliveryKey}`);
+      return;
+    }
+    const timer = setTimeout(() => {
+      this._deliveryRetries.delete(deliveryKey);
+      void this._deliveryRetryAttempt(deliveryKey, taskId, generation, targetSessionId, attempt + 1);
+    }, DELIVERY_RETRY_DELAY_MS * attempt);
+    this._deliveryRetries.set(deliveryKey, { attempts: MAX_DELIVERY_RETRIES - attempt, timer });
+  }
+
+  private _cancelDeliveryRetry(deliveryKey: string): void {
+    const record = this._deliveryRetries.get(deliveryKey);
+    if (record) {
+      clearTimeout(record.timer);
+      this._deliveryRetries.delete(deliveryKey);
+    }
   }
 
   /**
@@ -3188,6 +3287,8 @@ export class AgentTaskService {
       schemaVersion: SUBAGENT_DETAILS_SCHEMA_VERSION,
       mode: group.mode,
       agentScope: group.agentScope,
+      taskId: infos.length === 1 ? infos[0]?.taskId : undefined,
+      groupId: group.groupId,
       results,
       startedAt: group.createdAt,
       updatedAt: infos.reduce((max, info) => Math.max(max, info.updatedAt), group.createdAt),
@@ -3365,7 +3466,12 @@ export class AgentTaskService {
     for (const entry of this._tasks.values()) {
       if (!this._isAutoDeliverable(entry, sessionId, workspaceId)) continue;
       void this.sendResultToSession(entry.info.taskId, entry.info.generation, sessionId).then((result) => {
-        if (!result.ok && result.reason !== "target_session_not_open" && result.reason !== "duplicate_delivery") {
+        if (
+          !result.ok &&
+          result.reason !== "target_session_not_open" &&
+          result.reason !== "duplicate_delivery" &&
+          result.reason !== "delivery_in_progress"
+        ) {
           console.warn("[AgentTaskService] delivery catch-up failed:", result.reason);
         }
       });
@@ -3393,7 +3499,12 @@ export class AgentTaskService {
       return;
     }
     void this.sendResultToSession(entry.info.taskId, entry.info.generation, entry.info.parentSessionId).then((result) => {
-      if (!result.ok && result.reason !== "target_session_not_open" && result.reason !== "duplicate_delivery") {
+      if (
+        !result.ok &&
+        result.reason !== "target_session_not_open" &&
+        result.reason !== "duplicate_delivery" &&
+        result.reason !== "delivery_in_progress"
+      ) {
         console.warn("[AgentTaskService] auto-delivery failed:", result.reason);
       }
     });

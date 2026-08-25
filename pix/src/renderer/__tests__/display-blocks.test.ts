@@ -12,6 +12,11 @@
 
 import { describe, expect, it } from "vitest";
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
+import { INTERNAL_CUSTOM_MESSAGE_TYPES, formatInternalNotification } from "@shared/internal-notification";
+// Imported from the coding-agent source (its only top-level imports are
+// type-only) rather than the package name: the dist barrel may be stale, and
+// the drift check must compare live sources on both sides.
+import { LEGACY_INTERNAL_CUSTOM_TYPES } from "../../../../packages/coding-agent/src/core/messages.ts";
 import type { DisplayBlock } from "@/types/session";
 import { createDisplayBlockAssembler } from "../utils/display-blocks";
 
@@ -128,14 +133,13 @@ describe("live event folding", () => {
     expect(a.blocks[0]).toMatchObject({ provider: "p", modelId: "m", status: "success", imageCount: 2 });
   });
 
-  it("merges a steered teammate-message into a note when teamLeader is enabled", () => {
+  it("keeps legacy teammate notifications out of the main chat", () => {
     const a = createDisplayBlockAssembler({ teamLeader: true });
     const note = '<teammate-message from="coder" role="tester">\nchecked the tests\n</teammate-message>';
     a.applyEvent(msgStart(makeMessage({ role: "user", content: note, timestamp: 5 })));
     a.applyEvent(msgEnd(makeMessage({ role: "user", content: note, timestamp: 5 })));
 
-    expect(a.blocks.map((b) => b.type)).toEqual(["note"]);
-    expect(a.blocks[0]).toMatchObject({ type: "note" });
+    expect(a.blocks).toEqual([]);
   });
 
   it("does not expose streaming/api-error session state (assembler-local only)", () => {
@@ -157,6 +161,79 @@ describe("live event folding", () => {
 // ============================================================================
 
 describe("loadEntries", () => {
+  it("hides internal custom messages in both live and replay paths", () => {
+    const a = createDisplayBlockAssembler();
+    const message = makeMessage({
+      role: "custom",
+      customType: "pix-agent-task-result",
+      content: '<task-notification status="completed"><result>done</result></task-notification>',
+      display: false,
+      context: "internal",
+      timestamp: 42,
+    });
+
+    a.applyEvents([msgStart(message), msgEnd(message)]);
+    expect(a.blocks).toEqual([]);
+
+    a.loadEntries([
+      {
+        type: "custom_message",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        customType: "pix-agent-task-result",
+        content: "done",
+        display: false,
+        context: "internal",
+        details: { taskId: "task-1" },
+      },
+    ]);
+    expect(a.blocks).toEqual([]);
+  });
+
+  it("hides legacy internal notification text stored as a user message", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "user",
+          content: '<task-notification task-id="task-1"><result>done</result></task-notification>',
+        }),
+      },
+    ]);
+
+    expect(a.blocks).toEqual([]);
+  });
+
+  it("still renders a user message that merely mentions a reserved prefix", () => {
+    const a = createDisplayBlockAssembler();
+    const text = "See this format: <task-notification>please review this</task-notification> — what does it mean?";
+    a.applyEvents([
+      msgStart(makeMessage({ role: "user", content: text, timestamp: 9 })),
+      msgEnd(makeMessage({ role: "user", content: text, timestamp: 9 })),
+    ]);
+    expect(a.blocks.map((b) => b.type)).toContain("user-message");
+    const user = a.blocks.find((b) => b.type === "user-message");
+    if (user && user.type === "user-message") {
+      expect(user.text).toContain("please review this");
+    }
+  });
+
+  it("hides legacy notification roots stored under a generic custom type", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "custom_message",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        customType: "legacy-extension-type",
+        content: '<team-notification source="team"><result>worker report</result></team-notification>',
+        display: true,
+      },
+    ]);
+
+    expect(a.blocks).toEqual([]);
+  });
+
   it("folds message entries in order and matches toolResult to pending tools", () => {
     const a = createDisplayBlockAssembler();
     a.loadEntries([
@@ -282,6 +359,91 @@ describe("loadEntries", () => {
   });
 });
 
+describe("internal notification protocol", () => {
+  it("escapes fields and preserves a closed envelope under truncation", () => {
+    const notification = formatInternalNotification(
+      {
+        notificationId: 'notice"><1',
+        source: "agent-task",
+        kind: "task-result",
+        taskId: "task<&",
+        groupId: "group-1",
+        agentName: "coder",
+        status: "completed",
+        requiresAction: false,
+        result: "结果 ".repeat(20_000),
+        items: [
+          {
+            id: "item-1",
+            index: 0,
+            agentName: "coder",
+            status: "completed",
+            result: "done & checked",
+          },
+        ],
+      },
+      1_024,
+    );
+
+    expect(notification.startsWith("<task-notification ")).toBe(true);
+    expect(notification).toContain('notification-id="notice&quot;&gt;&lt;1"');
+    expect(notification).toContain('result-truncated="true"');
+    expect(notification).toContain("</task-notification>");
+    expect(notification).not.toContain("notice\"><1");
+  });
+
+  it("keeps result-truncated true after the compaction pass reduces long result bodies", () => {
+    // A single long result plus one long item exceeds the first-pass budget
+    // (result 4 KiB + item 4 KiB > maxBytes), forcing the second (compaction)
+    // render pass: both the top-level result and the long item result must
+    // still report truncated instead of recomputing from the shortened text.
+    const notification = formatInternalNotification(
+      {
+        notificationId: "compact-check",
+        source: "agent-task",
+        kind: "task-result",
+        taskId: "task-1",
+        groupId: "group-1",
+        status: "completed",
+        requiresAction: false,
+        result: "A".repeat(50_000),
+        items: [
+          { id: "item-1", index: 0, agentName: "coder", status: "completed", result: "B".repeat(50_000) },
+        ],
+      },
+      4_096,
+    );
+
+    expect(notification.startsWith("<task-notification ")).toBe(true);
+    expect(notification).toContain("<items>");
+    expect(notification.match(/result-truncated="true"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+    expect(notification).not.toContain('result-truncated="false"');
+    expect(notification).toContain("</task-notification>");
+  });
+
+  it("keeps result-truncated true when a 1024-byte budget forces compact of a 100k result", () => {
+    const notification = formatInternalNotification(
+      {
+        notificationId: "t",
+        source: "agent-task",
+        kind: "k",
+        result: "A".repeat(100_000),
+      },
+      1_024,
+    );
+    expect(notification).toContain('result-truncated="true"');
+    expect(notification).not.toContain('result-truncated="false"');
+  });
+
+  it("keeps the pix protocol customTypes identical to the coding-agent legacy set", () => {
+    // Sorted-array equality is bidirectional: a rename, removal, or addition on
+    // either side fails here, so restored sessions keep being wrapped.
+    expect([...LEGACY_INTERNAL_CUSTOM_TYPES].sort()).toEqual(
+      Object.values(INTERNAL_CUSTOM_MESSAGE_TYPES).sort(),
+    );
+  });
+});
+
 // ============================================================================
 // Optimistic user messages
 // ============================================================================
@@ -318,6 +480,33 @@ describe("optimistic user messages", () => {
     const a = createDisplayBlockAssembler();
     expect(a.appendOptimisticUserMessage("   ")).toBeNull();
     expect(a.blocks).toHaveLength(0);
+  });
+
+  it("merges a clipboard-image optimistic message with the real prompt", () => {
+    const a = createDisplayBlockAssembler();
+    const blockId = a.appendOptimisticUserMessage("see this", [], [{ mimeType: "image/png" }]);
+    expect(blockId).not.toBeNull();
+    const optimistic = a.blocks[0];
+    expect(optimistic.type).toBe("user-message");
+    if (optimistic.type === "user-message") {
+      expect(optimistic.attachments).toEqual([
+        { path: "clipboard-image-1", name: "clipboard-image-1.png", kind: "image" },
+      ]);
+    }
+
+    a.applyEvent(msgStart(makeMessage({
+      role: "user",
+      content: "see this",
+      timestamp: 900,
+      attachments: [{ path: "clipboard-image-1", name: "clipboard-image-1.png", kind: "image" }],
+    })));
+    expect(a.blocks.filter((b) => b.type === "user-message")).toHaveLength(1);
+    const merged = a.blocks.find((b) => b.id === blockId);
+    expect(merged).toBeDefined();
+    if (merged && merged.type === "user-message") {
+      expect(merged.timestamp).toBe(900);
+      expect(merged.attachments).toHaveLength(1);
+    }
   });
 });
 

@@ -68,8 +68,12 @@ export function createSessionStore(id: string, options: { teamLeader?: boolean }
       }
     }
 
-    function appendOptimisticUserMessage(text: string, filePaths: string[] = []): string | null {
-      const blockId = assembler.appendOptimisticUserMessage(text, filePaths);
+    function appendOptimisticUserMessage(
+      text: string,
+      filePaths: string[] = [],
+      clipboardImages: Array<{ mimeType: string }> = [],
+    ): string | null {
+      const blockId = assembler.appendOptimisticUserMessage(text, filePaths, clipboardImages);
       syncLastRetryableError();
       return blockId;
     }
