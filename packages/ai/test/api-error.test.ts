@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { classifyApiError } from "../src/utils/api-error.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { classifyApiError, extractApiErrorInfo, extractRetryAfterMs } from "../src/utils/api-error.ts";
 
 describe("classifyApiError", () => {
 	describe("HTTP status code extraction", () => {
@@ -169,5 +169,82 @@ describe("classifyApiError", () => {
 			const raw = "529 status code (no body)";
 			expect(classifyApiError(raw).rawMessage).toBe(raw);
 		});
+	});
+});
+
+describe("extractRetryAfterMs", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("parses retry-after-ms from Headers and records", () => {
+		expect(extractRetryAfterMs(new Headers({ "retry-after-ms": "1500" }))).toBe(1500);
+		expect(extractRetryAfterMs({ "retry-after-ms": "1500" })).toBe(1500);
+	});
+
+	it("parses retry-after integer seconds from Headers and records", () => {
+		expect(extractRetryAfterMs(new Headers({ "retry-after": "7" }))).toBe(7000);
+		expect(extractRetryAfterMs({ "retry-after": "7" })).toBe(7000);
+	});
+
+	it("parses retry-after HTTP-date from Headers and records", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-05-13T00:00:00Z"));
+		const date = new Date(Date.now() + 45_000).toUTCString();
+		expect(extractRetryAfterMs(new Headers({ "retry-after": date }))).toBe(45_000);
+		expect(extractRetryAfterMs({ "retry-after": date })).toBe(45_000);
+	});
+
+	it("returns undefined for missing, NaN, and negative values", () => {
+		expect(extractRetryAfterMs(undefined)).toBeUndefined();
+		expect(extractRetryAfterMs({})).toBeUndefined();
+		expect(extractRetryAfterMs(new Headers())).toBeUndefined();
+		expect(extractRetryAfterMs({ "retry-after-ms": "abc" })).toBeUndefined();
+		expect(extractRetryAfterMs({ "retry-after": "not-a-delay" })).toBeUndefined();
+		expect(extractRetryAfterMs({ "retry-after-ms": "-1" })).toBeUndefined();
+		expect(extractRetryAfterMs({ "retry-after": "-2" })).toBeUndefined();
+
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-05-13T00:00:00Z"));
+		const past = new Date(Date.now() - 5_000).toUTCString();
+		expect(extractRetryAfterMs({ "retry-after": past })).toBeUndefined();
+	});
+
+	it("returns undefined for empty retry-after and fractional seconds", () => {
+		expect(extractRetryAfterMs({ "retry-after": "" })).toBeUndefined();
+		expect(extractRetryAfterMs(new Headers({ "retry-after": "" }))).toBeUndefined();
+		expect(extractRetryAfterMs({ "retry-after": "2.5" })).toBeUndefined();
+	});
+
+	it("does not fall through to retry-after when retry-after-ms is a finite negative", () => {
+		expect(extractRetryAfterMs({ "retry-after-ms": "-100", "retry-after": "3" })).toBeUndefined();
+	});
+
+	it("reads header records case-insensitively", () => {
+		expect(extractRetryAfterMs({ "Retry-After-Ms": "250" })).toBe(250);
+		expect(extractRetryAfterMs({ "Retry-After": "3" })).toBe(3000);
+	});
+});
+
+describe("extractApiErrorInfo", () => {
+	it("extracts status, retryAfterMs, and requestId from an SDK-like error", () => {
+		const error = {
+			status: 429,
+			headers: { "retry-after": "7" },
+			requestID: "req_123",
+		};
+		expect(extractApiErrorInfo(error)).toEqual({
+			status: 429,
+			retryAfterMs: 7000,
+			requestId: "req_123",
+		});
+	});
+
+	it("returns undefined for a plain Error", () => {
+		expect(extractApiErrorInfo(new Error("fetch failed"))).toBeUndefined();
+	});
+
+	it("omits non-HTTP status 0 so callers can fall back to message matching", () => {
+		expect(extractApiErrorInfo({ status: 0, message: "fetch failed" })).toBeUndefined();
 	});
 });

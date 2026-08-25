@@ -33,6 +33,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
+import { extractRetryAfterMs } from "../utils/api-error.ts";
 import {
 	appendAssistantMessageDiagnostic,
 	createAssistantMessageDiagnostic,
@@ -119,7 +120,19 @@ function isRetryableError(status: number, errorText: string): boolean {
 	return /rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused/i.test(errorText);
 }
 
-function getRetryAfterDelayMs(headers: Headers): number | undefined {
+function capRetryDelayMs(delayMs: number, options?: StreamOptions): number {
+	const maxRetryDelayMs = options?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
+	return maxRetryDelayMs > 0 ? Math.min(delayMs, maxRetryDelayMs) : delayMs;
+}
+
+/**
+ * Request-level Retry-After for Codex SSE retries.
+ * Kept equivalent to the pre-extraction local parser: empty retry-after is 0ms,
+ * fractional seconds are accepted, and a finite retry-after-ms (including negative)
+ * short-circuits retry-after. Do not reuse extractRetryAfterMs here — that helper
+ * is the turn-level parser (empty/NaN/negative → undefined, integer seconds only).
+ */
+function toCodexRetryAfterDelayMs(headers: Headers): number | undefined {
 	const retryAfterMs = headers.get("retry-after-ms");
 	if (retryAfterMs !== null) {
 		const millis = Number(retryAfterMs);
@@ -144,11 +157,6 @@ function getRetryAfterDelayMs(headers: Headers): number | undefined {
 	}
 
 	return undefined;
-}
-
-function capRetryDelayMs(delayMs: number, options?: StreamOptions): number {
-	const maxRetryDelayMs = options?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
-	return maxRetryDelayMs > 0 ? Math.min(delayMs, maxRetryDelayMs) : delayMs;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -331,12 +339,18 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					);
 
 					if (response.ok) {
+						delete output.apiError;
 						break;
 					}
 
 					const errorText = await response.text();
+					const extractedRetryAfterMs = extractRetryAfterMs(response.headers);
+					output.apiError = { status: response.status };
+					if (extractedRetryAfterMs !== undefined) {
+						output.apiError.retryAfterMs = extractedRetryAfterMs;
+					}
+					const retryAfterDelayMs = toCodexRetryAfterDelayMs(response.headers);
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
-						const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
 						const delayMs =
 							retryAfterDelayMs === undefined
 								? BASE_DELAY_MS * 2 ** attempt
@@ -362,6 +376,10 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						}
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
+					// Transport/network failures are not HTTP responses; drop any
+					// Retry-After captured from an earlier 429 so turn-level retry
+					// does not treat a later stream death as another rate limit.
+					delete output.apiError;
 					// Network errors are retryable
 					if (attempt < maxRetries && !lastError.message.includes("usage limit")) {
 						const delayMs = BASE_DELAY_MS * 2 ** attempt;

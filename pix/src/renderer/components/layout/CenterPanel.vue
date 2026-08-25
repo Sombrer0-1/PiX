@@ -101,6 +101,12 @@ async function retryLastTurn(): Promise<void> {
   });
 }
 
+async function cancelRetry(): Promise<void> {
+  void rpc.abortRetry().catch((error) => {
+    console.error("[CenterPanel] abort retry failed:", error instanceof Error ? error.message : error);
+  });
+}
+
 // Composer state
 const inputText = ref("");
 const searchQuery = ref("");
@@ -977,7 +983,7 @@ function sendQuickStart(prompt: string): void {
               <v-icon icon="mdi-account-star-outline" size="28" />
               <strong>团队负责人已就绪</strong>
             </div>
-            <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
+            <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
             <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
             <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
           </div>
@@ -1002,7 +1008,7 @@ function sendQuickStart(prompt: string): void {
         <p class="empty-hint">在下方描述任务即可开始使用 Pi。</p>
       </div>
 
-      <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" />
+      <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
       <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
       <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
     </div>

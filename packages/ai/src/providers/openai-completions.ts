@@ -29,6 +29,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { extractApiErrorInfo } from "../utils/api-error.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -414,6 +415,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.apiError = extractApiErrorInfo(error);
 			// Surface provider/relay error body for diagnosis (503/400 etc.). The OpenAI SDK
 			// exposes the parsed body as `error.error`; OpenRouter nests extra detail under
 			// `error.error.metadata.raw`. Append whichever is present so the user can see why

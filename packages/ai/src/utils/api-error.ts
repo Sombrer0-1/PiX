@@ -1,3 +1,5 @@
+import type { ApiErrorInfo } from "../types.ts";
+
 /**
  * API error classification.
  *
@@ -121,4 +123,102 @@ export function classifyApiError(errorMessage: string): ClassifiedApiError {
 	// errors in practice are transient; a rare non-retryable 4xx will simply
 	// fail again on retry, which is a tolerable edge case.
 	return { category: "unknown", httpStatus, title: "请求失败", retryable: true, rawMessage };
+}
+
+function readHeader(headers: unknown, name: string): string | undefined {
+	if (headers === null || headers === undefined || typeof headers !== "object") {
+		return undefined;
+	}
+
+	if ("get" in headers && typeof headers.get === "function") {
+		const value = (headers as { get: (key: string) => unknown }).get(name);
+		return typeof value === "string" ? value : undefined;
+	}
+
+	const target = name.toLowerCase();
+	for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+		if (key.toLowerCase() === target && typeof value === "string") {
+			return value;
+		}
+	}
+	return undefined;
+}
+
+function parseRetryAfterHeader(retryAfter: string | undefined): number | undefined {
+	if (retryAfter === undefined || retryAfter.trim() === "") {
+		return undefined;
+	}
+
+	const seconds = Number(retryAfter);
+	// Integer seconds only. Fractional values ("2.5") and HTTP-dates both parse as
+	// finite numbers; HTTP-dates are NaN via Number() and fall through to Date.parse.
+	// Fractions are rejected so turn-level parsing stays conservative; Codex request-
+	// level retry restores the historical Number()*1000 path in toCodexRetryAfterDelayMs.
+	if (Number.isFinite(seconds) && Number.isInteger(seconds)) {
+		const millis = seconds * 1000;
+		return millis < 0 ? undefined : millis;
+	}
+
+	const date = Date.parse(retryAfter);
+	if (!Number.isNaN(date)) {
+		const millis = date - Date.now();
+		return millis < 0 ? undefined : millis;
+	}
+
+	return undefined;
+}
+
+/** Parse Retry-After style delays from Headers instances or header records. */
+export function extractRetryAfterMs(headers: unknown): number | undefined {
+	const retryAfterMs = readHeader(headers, "retry-after-ms");
+	if (retryAfterMs !== undefined && retryAfterMs.trim() !== "") {
+		const millis = Number(retryAfterMs);
+		// A finite retry-after-ms, including negative, short-circuits retry-after.
+		if (Number.isFinite(millis)) {
+			return millis < 0 ? undefined : millis;
+		}
+	}
+	return parseRetryAfterHeader(readHeader(headers, "retry-after"));
+}
+
+/** Extract ApiErrorInfo from thrown SDK errors (duck-typed: { status, headers, requestID }). */
+export function extractApiErrorInfo(error: unknown): ApiErrorInfo | undefined {
+	if (typeof error !== "object" || error === null) {
+		return undefined;
+	}
+
+	const candidate = error as {
+		status?: unknown;
+		headers?: unknown;
+		requestID?: unknown;
+		request_id?: unknown;
+	};
+
+	const info: ApiErrorInfo = {};
+	// Only persist recognizable HTTP statuses. Relays sometimes surface status 0
+	// for a connection failure; treating that as structured would skip the
+	// message-pattern fallback in AgentSession.
+	if (
+		typeof candidate.status === "number" &&
+		Number.isFinite(candidate.status) &&
+		candidate.status >= 400 &&
+		candidate.status <= 599
+	) {
+		info.status = candidate.status;
+	}
+
+	const retryAfterMs = extractRetryAfterMs(candidate.headers);
+	if (retryAfterMs !== undefined) {
+		info.retryAfterMs = retryAfterMs;
+	}
+
+	const requestId = candidate.requestID ?? candidate.request_id;
+	if (typeof requestId === "string" && requestId.length > 0) {
+		info.requestId = requestId;
+	}
+
+	if (info.status === undefined && info.retryAfterMs === undefined && info.requestId === undefined) {
+		return undefined;
+	}
+	return info;
 }

@@ -1529,6 +1529,12 @@ describe("openai-codex streaming", () => {
 			() => ({ "content-type": "application/json", "retry-after": new Date(Date.now() + 45_000).toUTCString() }),
 			45_000,
 		],
+		["fractional retry-after seconds", () => ({ "content-type": "application/json", "retry-after": "2.5" }), 2500],
+		[
+			"negative retry-after-ms short-circuits retry-after",
+			() => ({ "content-type": "application/json", "retry-after-ms": "-100", "retry-after": "3" }),
+			0,
+		],
 	] as const)("uses %s for SSE retries", async (_name, makeHeaders, expectedDelay) => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-05-13T00:00:00Z"));
@@ -1593,6 +1599,7 @@ describe("openai-codex streaming", () => {
 		const result = await resultPromise;
 		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
 		expect(codexRequests).toBe(2);
+		expect(result.apiError).toBeUndefined();
 	});
 
 	it("uses exponential backoff across repeated SSE retries without retry headers", async () => {
@@ -1670,5 +1677,71 @@ describe("openai-codex streaming", () => {
 		const result = await resultPromise;
 		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
 		expect(codexRequests).toBe(4);
+	});
+
+	it("treats a negative Retry-After as a 0ms SSE delay", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-05-13T00:00:00Z"));
+		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+		const token = mockToken();
+		const encoder = new TextEncoder();
+		const sse = buildSSEPayload({ status: "completed" });
+		let codexRequests = 0;
+
+		const fetchMock = vi.fn(async (input: string | URL) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url !== "https://chatgpt.com/backend-api/codex/responses") {
+				throw new Error(`Unexpected URL: ${url}`);
+			}
+
+			codexRequests++;
+			if (codexRequests === 1) {
+				return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded", message: "rate limited" } }), {
+					status: 429,
+					headers: { "content-type": "application/json", "retry-after-ms": "-100" },
+				});
+			}
+
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(encoder.encode(sse));
+						controller.close();
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const resultPromise = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			maxRetries: 1,
+		}).result();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 0);
+
+		await vi.advanceTimersToNextTimerAsync();
+		const result = await resultPromise;
+		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
+		expect(codexRequests).toBe(2);
 	});
 });

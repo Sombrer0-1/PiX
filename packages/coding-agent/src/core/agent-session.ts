@@ -39,6 +39,7 @@ import { theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { getShellConfig, killTrackedDetachedChildren } from "../utils/shell.ts";
+import { computeRetryDelayMs } from "../utils/retry-backoff.ts";
 import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
@@ -196,7 +197,15 @@ export type AgentSessionEvent =
 			willRetry: boolean;
 			errorMessage?: string;
 	  }
-	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
+	| {
+			type: "auto_retry_start";
+			attempt: number;
+			maxAttempts: number;
+			delayMs: number;
+			errorMessage: string;
+			retryAfterMs?: number;
+			category?: ApiErrorCategory;
+	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| {
 			type: "api_error";
@@ -205,6 +214,8 @@ export type AgentSessionEvent =
 			httpStatus?: number;
 			title: string;
 			retryable: boolean;
+			autoRetried?: number;
+			retryAfterMs?: number;
 	  };
 
 /** Listener function for agent session events */
@@ -372,6 +383,10 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
  * ordinary errors.
  */
 const OVERFLOW_RECOVERY_MARGIN = 4096;
+
+// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, premature stream endings, HTTP/2 closed before response, terminated, retry delay exceeded
+const RETRYABLE_MESSAGE_PATTERN =
+	/overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
 
 // ============================================================================
 // AgentSession Class
@@ -835,7 +850,14 @@ export class AgentSession {
 		for (let i = event.messages.length - 1; i >= 0; i--) {
 			const message = event.messages[i];
 			if (message.role === "assistant") {
-				return this._isRetryableError(message as AssistantMessage);
+				const assistant = message as AssistantMessage;
+				if (!this._isRetryableError(assistant)) {
+					return false;
+				}
+				// Match _prepareRetry: a Retry-After above the provider cap aborts
+				// auto-retry without consuming an attempt. agent_end.willRetry must
+				// not claim a retry that will not run.
+				return this._computeRetryBackoff(assistant).action === "wait";
 			}
 		}
 		return false;
@@ -1504,6 +1526,8 @@ export class AgentSession {
 				return true;
 			}
 
+			const autoRetried = this._retryAttempt;
+
 			if (msg.stopReason === "error" && this._retryAttempt > 0) {
 				this._emit({
 					type: "auto_retry_end",
@@ -1537,9 +1561,11 @@ export class AgentSession {
 						type: "api_error",
 						errorMessage: msg.errorMessage,
 						category: classified.category,
-						httpStatus: classified.httpStatus,
+						httpStatus: msg.apiError?.status ?? classified.httpStatus,
 						title: classified.title,
 						retryable: classified.retryable,
+						autoRetried,
+						retryAfterMs: msg.apiError?.retryAfterMs,
 					});
 				}
 			}
@@ -3402,10 +3428,26 @@ export class AgentSession {
 
 		const err = message.errorMessage;
 		if (this._isNonRetryableProviderLimitError(err)) return false;
-		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, premature stream endings, HTTP/2 closed before response, terminated, retry delay exceeded
-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i.test(
-			err,
-		);
+
+		// Structured status wins when available (provider metadata first, then
+		// string-extracted status); falls back to message-pattern matching for
+		// providers/errors without a recognizable HTTP status.
+		const status = message.apiError?.status ?? classifyApiError(err).httpStatus;
+		if (status !== undefined && status >= 400 && status <= 599) {
+			return status === 408 || status === 429 || status >= 500;
+		}
+		return RETRYABLE_MESSAGE_PATTERN.test(err);
+	}
+
+	private _computeRetryBackoff(message: AssistantMessage) {
+		const settings = this.settingsManager.getRetrySettings();
+		return computeRetryDelayMs({
+			attempt: this._retryAttempt + 1,
+			baseDelayMs: settings.baseDelayMs,
+			maxBackoffMs: settings.maxBackoffMs,
+			retryAfterMs: message.apiError?.retryAfterMs,
+			serverDelayCapMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		});
 	}
 
 	/**
@@ -3418,6 +3460,12 @@ export class AgentSession {
 			return false;
 		}
 
+		const retryAfterMs = message.apiError?.retryAfterMs;
+		const backoff = this._computeRetryBackoff(message);
+		if (backoff.action === "give_up") {
+			return false;
+		}
+
 		this._retryAttempt++;
 
 		if (this._retryAttempt > settings.maxRetries) {
@@ -3426,7 +3474,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = backoff.delayMs;
 
 		this._emit({
 			type: "auto_retry_start",
@@ -3434,11 +3482,17 @@ export class AgentSession {
 			maxAttempts: settings.maxRetries,
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
+			...(backoff.usedRetryAfter && retryAfterMs !== undefined ? { retryAfterMs } : {}),
+			category: classifyApiError(message.errorMessage || "Unknown error").category,
 		});
 
 		// Remove error message from agent state (keep in session for history)
 		const messages = this.agent.state.messages;
-		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+		const removedFailedTurn =
+			messages.length > 0 && messages[messages.length - 1].role === "assistant"
+				? (messages[messages.length - 1] as AssistantMessage)
+				: undefined;
+		if (removedFailedTurn) {
 			this.agent.state.messages = messages.slice(0, -1);
 		}
 
@@ -3447,13 +3501,18 @@ export class AgentSession {
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
-			// Aborted during sleep - emit end event so UI can clean up
-			const attempt = this._retryAttempt;
-			this._retryAttempt = 0;
+			// Restore the sliced error turn so retryLastTurn can find it. Keep
+			// _retryAttempt so api_error.autoRetried reflects waits already spent.
+			if (removedFailedTurn) {
+				const current = this.agent.state.messages;
+				if (current[current.length - 1] !== removedFailedTurn) {
+					this.agent.state.messages = [...current, removedFailedTurn];
+				}
+			}
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
-				attempt,
+				attempt: this._retryAttempt,
 				finalError: "Retry cancelled",
 			});
 			return false;

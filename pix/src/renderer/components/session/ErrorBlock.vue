@@ -18,6 +18,8 @@ const props = defineProps<{
   retryable?: boolean;
   /** Whether the retry button should be active on this block right now. */
   canRetry?: boolean;
+  autoRetried?: number;
+  retryAfterMs?: number;
 }>();
 
 const emit = defineEmits<{ retry: [] }>();
@@ -42,14 +44,31 @@ const badgeText = computed(() => {
 });
 
 const hint = computed(() => {
+  const parts: string[] = [];
   switch (props.category) {
     case "auth":
-      return "API key 无效或已过期，请在设置中检查认证配置。";
+      parts.push("API key 无效或已过期，请在设置中检查认证配置。");
+      break;
     case "quota":
-      return "账户配额或余额不足，请前往服务商账户查看用量与套餐。";
-    default:
-      return null;
+      parts.push("账户配额或余额不足，请前往服务商账户查看用量与套餐。");
+      break;
   }
+  if (
+    props.autoRetried !== undefined &&
+    props.autoRetried > 0 &&
+    (props.category === "overloaded" || props.category === "rate_limit")
+  ) {
+    parts.push(`已自动重试 ${props.autoRetried} 次仍失败，可稍后重试或切换模型。`);
+  }
+  // Shown when auto-retry stopped because Retry-After exceeded the provider cap
+  // (api_error.retryAfterMs is set and no auto-retry ran). Live events always
+  // carry this together with autoRetried === 0; replay only has the persisted
+  // retryAfterMs, so treat a long wait as the same give-up signal.
+  if (props.retryAfterMs !== undefined && (props.autoRetried === 0 || props.autoRetried === undefined)) {
+    const seconds = Math.ceil(props.retryAfterMs / 1000);
+    parts.push(`服务器建议等待约 ${seconds}s 后再重试`);
+  }
+  return parts.length > 0 ? parts.join(" ") : null;
 });
 
 const showRetry = computed(() => props.retryable === true && props.canRetry === true);

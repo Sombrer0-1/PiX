@@ -916,6 +916,9 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
     case "retry":
       await bridge.retry();
       return null;
+    case "abort_retry":
+      bridge.abortRetry();
+      return null;
     case "respond_user_input":
       bridge.respondUserInput(cmd.response);
       return null;

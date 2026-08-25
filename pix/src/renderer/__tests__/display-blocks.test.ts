@@ -18,7 +18,7 @@ import { INTERNAL_CUSTOM_MESSAGE_TYPES, formatInternalNotification } from "@shar
 // the drift check must compare live sources on both sides.
 import { LEGACY_INTERNAL_CUSTOM_TYPES } from "../../../../packages/coding-agent/src/core/messages.ts";
 import type { DisplayBlock } from "@/types/session";
-import { createDisplayBlockAssembler } from "../utils/display-blocks";
+import { createDisplayBlockAssembler, remainingSeconds } from "../utils/display-blocks";
 
 // ============================================================================
 // Fixtures
@@ -109,7 +109,13 @@ describe("live event folding", () => {
       { type: "api_error", errorMessage: "rate limited", category: "rate_limit", httpStatus: 429, title: "请求限流", retryable: true },
     ]);
 
-    expect(a.blocks.map((b) => b.type)).toEqual(["compaction", "compaction", "retry", "retry", "error"]);
+    expect(a.blocks.map((b) => b.type)).toEqual(["compaction", "compaction", "retry", "error"]);
+    const retry = a.blocks[2];
+    expect(retry.type).toBe("retry");
+    if (retry.type === "retry") {
+      expect(retry.success).toBe(true);
+      expect(retry.delayMs).toBeUndefined();
+    }
     const error = a.blocks[a.blocks.length - 1];
     expect(a.lastRetryableError).toEqual({ blockId: error.id });
 
@@ -122,6 +128,80 @@ describe("live event folding", () => {
     expect(a.lastRetryableError).not.toBeNull();
     a.applyEvent({ type: "agent_start" });
     expect(a.lastRetryableError).toBeNull();
+  });
+
+  it("stores auto_retry_start category, truncated errorSummary and retryAfterMs on the retry block",
+    () => {
+      const a = createDisplayBlockAssembler();
+      const longError = `${"e".repeat(130)} extra`;
+      a.applyEvent({
+        type: "auto_retry_start",
+        attempt: 2,
+        maxAttempts: 3,
+        delayMs: 4000,
+        errorMessage: longError,
+        category: "rate_limit",
+        retryAfterMs: 3000,
+      });
+
+      expect(a.blocks).toHaveLength(1);
+      const retry = a.blocks[0];
+      expect(retry.type).toBe("retry");
+      if (retry.type === "retry") {
+        expect(retry.success).toBe(false);
+        expect(retry.attempt).toBe(2);
+        expect(retry.maxAttempts).toBe(3);
+        expect(retry.delayMs).toBe(4000);
+        expect(retry.category).toBe("rate_limit");
+        expect(retry.retryAfterMs).toBe(3000);
+        expect(retry.errorSummary).toBe(`${"e".repeat(120)}...`);
+        expect(retry.errorSummary?.length).toBe(123);
+      }
+    },
+  );
+
+  it("clears delayMs on the in-flight retry block when auto_retry_end fires", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent({
+      type: "auto_retry_start",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 5000,
+      errorMessage: "boom",
+    });
+    a.applyEvent({ type: "auto_retry_end", success: false, attempt: 1, finalError: "Retry cancelled" });
+
+    const retry = a.blocks[0];
+    expect(retry.type).toBe("retry");
+    if (retry.type === "retry") {
+      expect(retry.success).toBe(false);
+      expect(retry.delayMs).toBeUndefined();
+    }
+  });
+
+  it("stores api_error autoRetried and retryAfterMs on the error block", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent({
+      type: "api_error",
+      errorMessage: "529 overloaded",
+      category: "overloaded",
+      httpStatus: 529,
+      title: "服务过载",
+      retryable: true,
+      autoRetried: 3,
+      retryAfterMs: 120000,
+    });
+
+    expect(a.blocks).toHaveLength(1);
+    const error = a.blocks[0];
+    expect(error.type).toBe("error");
+    if (error.type === "error") {
+      expect(error.autoRetried).toBe(3);
+      expect(error.retryAfterMs).toBe(120000);
+      expect(error.category).toBe("overloaded");
+      expect(error.retryable).toBe(true);
+    }
+    expect(a.lastRetryableError).toEqual({ blockId: error.id });
   });
 
   it("folds vision-status blocks for eye_model events", () => {
@@ -325,6 +405,30 @@ describe("loadEntries", () => {
     // The flush trailing toolResult must not hide the error block's retry affordance.
     expect(a.blocks.map((b) => b.type)).toEqual(["error"]);
     expect(a.lastRetryableError).toEqual({ blockId: a.blocks[0].id });
+  });
+
+  it("replays structured apiError.status and retryAfterMs onto the error block", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message", timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [{ type: "text", text: "" }],
+          timestamp: 100,
+          stopReason: "error",
+          errorMessage: "upstream failed",
+          apiError: { status: 429, retryAfterMs: 120000 },
+        }),
+      },
+    ]);
+    expect(a.blocks).toHaveLength(1);
+    const error = a.blocks[0];
+    expect(error.type).toBe("error");
+    if (error.type === "error") {
+      expect(error.httpStatus).toBe(429);
+      expect(error.retryAfterMs).toBe(120000);
+    }
   });
 
   it("keeps the agent/workflow/ralph result shape on replay", () => {
@@ -952,5 +1056,25 @@ describe("thinking blocks (PiX 1.5)", () => {
       expect(agent.content).toBe("回答一");
       expect(agent.content).not.toContain("一段");
     }
+  });
+});
+
+// ============================================================================
+// remainingSeconds (retry countdown)
+// ============================================================================
+
+describe("remainingSeconds", () => {
+  it("returns the ceiling of leftover seconds before the deadline", () => {
+    expect(remainingSeconds(1_000, 4_000, 1_001)).toBe(4);
+    expect(remainingSeconds(1_000, 4_000, 3_500)).toBe(2);
+  });
+
+  it("returns 0 at the deadline", () => {
+    expect(remainingSeconds(1_000, 4_000, 5_000)).toBe(0);
+  });
+
+  it("returns 0 after the deadline", () => {
+    expect(remainingSeconds(1_000, 4_000, 5_001)).toBe(0);
+    expect(remainingSeconds(1_000, 4_000, 9_000)).toBe(0);
   });
 });

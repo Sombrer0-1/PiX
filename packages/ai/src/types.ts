@@ -276,6 +276,16 @@ export interface Usage {
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
 
+/** Structured provider error metadata captured when an HTTP error response is available. */
+export interface ApiErrorInfo {
+	/** HTTP status code from the failed response, when known. */
+	status?: number;
+	/** Server-requested retry delay in milliseconds parsed from Retry-After style headers. */
+	retryAfterMs?: number;
+	/** Provider request identifier for debugging. */
+	requestId?: string;
+}
+
 export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
@@ -291,6 +301,7 @@ export interface AssistantMessage {
 	responseModel?: string; // Concrete `chunk.model` when different from the requested `model` (e.g. OpenRouter `auto` -> `anthropic/...`)
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
+	apiError?: ApiErrorInfo;
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;

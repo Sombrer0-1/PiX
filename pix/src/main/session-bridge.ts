@@ -595,6 +595,11 @@ export class SessionBridge {
 		await this._getSession().retryLastTurn();
 	}
 
+	/** Cancel an in-progress auto-retry wait without aborting the session. */
+	abortRetry(): void {
+		this._getSession().abortRetry();
+	}
+
 	async newSession(parentSession?: string): Promise<CommandResult> {
 		const previousSessionFile = this._session?.sessionFile;
 		const sessionDir = this._sessionManager?.getSessionDir();
@@ -1259,6 +1264,8 @@ export class SessionBridge {
 			thinkingLevel: session.thinkingLevel,
 			isStreaming: session.isStreaming,
 			isCompacting: this._isCompacting,
+			isRetrying: session.isRetrying,
+			retryAttempt: session.retryAttempt,
 			executionMode: session.settingsManager.getExecutionMode(),
 			steeringMode: session.steeringMode,
 			followUpMode: session.followUpMode,

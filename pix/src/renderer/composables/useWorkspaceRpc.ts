@@ -52,6 +52,7 @@ export function useWorkspaceRpc() {
     sendPrompt: (message: string, filePaths?: string[], images?: ClipboardImage[]): Promise<void> =>
       activeRpc.value.sendPrompt(message, filePaths, images),
     abort: (): Promise<void> => activeRpc.value.abort(),
+    abortRetry: (): Promise<void> => activeRpc.value.abortRetry(),
     newSession: (): Promise<{ cancelled: boolean } | null> => activeRpc.value.newSession(),
     switchSession: (sessionPath: string): Promise<{ cancelled: boolean } | null> => activeRpc.value.switchSession(sessionPath),
     getMessages: (): Promise<unknown[] | null> => activeRpc.value.getMessages(),

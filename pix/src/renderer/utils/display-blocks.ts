@@ -304,6 +304,19 @@ function customMessageFromEntry(entry: Record<string, unknown>): AgentMessage {
   };
 }
 
+const ERROR_SUMMARY_MAX_CHARS = 120;
+
+function truncateErrorSummary(message: string, maxChars = ERROR_SUMMARY_MAX_CHARS): string {
+  const chars = Array.from(message);
+  if (chars.length <= maxChars) return message;
+  return `${chars.slice(0, maxChars).join("")}...`;
+}
+
+/** Seconds remaining until timestamp+delayMs, floored at 0. */
+export function remainingSeconds(timestamp: number, delayMs: number, now: number): number {
+  return Math.max(0, Math.ceil((timestamp + delayMs - now) / 1000));
+}
+
 export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOptions = {}): DisplayBlockAssembler {
   const renderTeamLeaderNotes = options.teamLeader === true;
   const blocks = options.blocks ?? [];
@@ -858,16 +871,32 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           attempt: event.attempt,
           maxAttempts: event.maxAttempts,
           delayMs: event.delayMs,
+          category: event.category,
+          errorSummary: truncateErrorSummary(event.errorMessage),
+          retryAfterMs: event.retryAfterMs,
           timestamp: Date.now(),
         });
         break;
       }
       case "auto_retry_end": {
-        // On success, show a "retry succeeded" notice. On failure, skip the
-        // block here - the subsequent api_error event surfaces the full error
-        // (status code + retry button) and a second "retry failed" notice
-        // would be redundant.
-        if (event.success) {
+        // Settle the in-flight retry block so its cancel button cannot abort a
+        // later turn's sleep. Success rewrites that block in place (keeps one
+        // notice); failure/cancel only drops delayMs so RetryNotice hides cancel.
+        let settled = false;
+        for (let i = blocks.length - 1; i >= 0; i--) {
+          const block = blocks[i];
+          if (block.type === "retry" && !block.success && block.delayMs !== undefined) {
+            if (event.success) {
+              block.success = true;
+              block.attempt = event.attempt;
+              block.maxAttempts = 0;
+            }
+            block.delayMs = undefined;
+            settled = true;
+            break;
+          }
+        }
+        if (event.success && !settled) {
           blocks.push({
             id: nextBlockId(),
             type: "retry",
@@ -890,6 +919,8 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           httpStatus: event.httpStatus,
           title: event.title,
           retryable: event.retryable,
+          autoRetried: event.autoRetried,
+          retryAfterMs: event.retryAfterMs,
           timestamp: Date.now(),
         });
         // Only the latest retryable error (while idle) offers a retry button.
@@ -1012,15 +1043,20 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         // block so the failure survives reloads / mode switches / restarts.
         if (msg.stopReason === "error" && typeof msg.errorMessage === "string" && msg.errorMessage) {
           const classified = classifyApiError(msg.errorMessage);
+          const apiError = isRecord(msg.apiError) ? msg.apiError : undefined;
+          const structuredStatus = typeof apiError?.status === "number" ? apiError.status : undefined;
+          const structuredRetryAfterMs =
+            typeof apiError?.retryAfterMs === "number" ? apiError.retryAfterMs : undefined;
           const errorBlockId = nextBlockId();
           blocks.push({
             id: errorBlockId,
             type: "error",
             message: msg.errorMessage,
             category: classified.category,
-            httpStatus: classified.httpStatus,
+            httpStatus: structuredStatus ?? classified.httpStatus,
             title: classified.title,
             retryable: classified.retryable,
+            retryAfterMs: structuredRetryAfterMs,
             timestamp,
           });
           // Keep the retry affordance for the latest error after a reload: the

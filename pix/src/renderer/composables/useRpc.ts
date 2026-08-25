@@ -311,6 +311,10 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     await sendCommand({ type: "abort" });
   }
 
+  async function abortRetry(): Promise<void> {
+    await sendCommand({ type: "abort_retry" });
+  }
+
   async function newSession(): Promise<{ cancelled: boolean } | null> {
     const result = await sendCommand<{ cancelled: boolean }>({ type: "new_session" });
     if (result && !result.cancelled) await refreshSessionData();
@@ -507,6 +511,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     sendCommandAsync,
     sendPrompt,
     abort,
+    abortRetry,
     newSession,
     switchSession,
     getMessages,

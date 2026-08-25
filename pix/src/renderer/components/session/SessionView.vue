@@ -10,6 +10,7 @@ import type { DisplayBlock, ToolWorkItem } from "@/types/session";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import MessageBlock from "./MessageBlock.vue";
 import ErrorBlock from "./ErrorBlock.vue";
+import RetryNotice from "./RetryNotice.vue";
 import SubagentToolView from "./SubagentToolView.vue";
 import WorkflowRunPanel from "./WorkflowRunPanel.vue";
 import ThinkingBlock from "./ThinkingBlock.vue";
@@ -190,7 +191,7 @@ const props = defineProps<{
   activeRetryBlockId?: string | null;
 }>();
 
-const emit = defineEmits<{ retry: [] }>();
+const emit = defineEmits<{ retry: []; cancel: [] }>();
 
 const rpc = useWorkspaceRpc();
 /** 实际发出的思考档位（thinkingLevelMap 映射后的值，如 max/high）；off 或无映射时为空。 */
@@ -442,6 +443,8 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         :title="block.title"
         :retryable="block.retryable"
         :can-retry="block.id === activeRetryBlockId"
+        :auto-retried="block.autoRetried"
+        :retry-after-ms="block.retryAfterMs"
         @retry="emit('retry')"
       />
 
@@ -453,11 +456,21 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
       </div>
 
       <!-- Retry Notice -->
-      <div v-else-if="block.type === 'retry'" class="notice-block" :class="{ 'notice-error': !block.success }">
-        <span v-if="block.success">重试成功 (第 {{ block.attempt }} 次)</span>
-        <span v-else-if="block.delayMs !== undefined">正在重试... (第 {{ block.attempt }}/{{ block.maxAttempts }} 次)</span>
-        <span v-else>重试失败，已尝试 {{ block.attempt }} 次</span>
+      <div v-else-if="block.type === 'retry' && block.success" class="notice-block">
+        <span>重试成功 (第 {{ block.attempt }} 次)</span>
       </div>
+      <RetryNotice
+        v-else-if="block.type === 'retry'"
+        :success="false"
+        :attempt="block.attempt"
+        :max-attempts="block.maxAttempts"
+        :delay-ms="block.delayMs"
+        :timestamp="block.timestamp"
+        :category="block.category"
+        :error-summary="block.errorSummary"
+        :retry-after-ms="block.retryAfterMs"
+        @cancel="emit('cancel')"
+      />
 
       <div v-else-if="block.type === 'note'" class="notice-block">
         <span>{{ block.text }}</span>

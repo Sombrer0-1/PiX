@@ -48,6 +48,7 @@ export type RpcCommand =
   | { id?: string; type: "follow_up"; message: string; filePaths?: string[]; images?: ClipboardImage[] }
   | { id?: string; type: "abort" }
   | { id?: string; type: "retry" }
+  | { id?: string; type: "abort_retry" }
   | { id?: string; type: "respond_user_input"; response: RequestUserInputResponse }
   | { id?: string; type: "new_session"; parentSession?: string }
   // State
@@ -119,6 +120,8 @@ export interface RpcSessionState {
   thinkingLevel: ThinkingLevel;
   isStreaming: boolean;
   isCompacting: boolean;
+  isRetrying?: boolean;
+  retryAttempt?: number;
   executionMode: "approval" | "unattended" | "read-only";
   steeringMode: "all" | "one-at-a-time";
   followUpMode: "all" | "one-at-a-time";
@@ -233,7 +236,7 @@ export type AgentSessionEvent =
   | { type: "eye_model_start"; id?: string; provider: string; modelId: string; imageCount: number }
   | { type: "eye_model_end"; id?: string; provider: string; modelId: string; imageCount: number; success: boolean; errorMessage?: string }
   | { type: "goal_update"; goal: ThreadGoal | undefined }
-  | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
+  | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string; retryAfterMs?: number; category?: ApiErrorCategory }
   | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
   | {
       type: "api_error";
@@ -242,6 +245,8 @@ export type AgentSessionEvent =
       httpStatus?: number;
       title: string;
       retryable: boolean;
+      autoRetried?: number;
+      retryAfterMs?: number;
     };
 
 export interface AgentMessage {
@@ -308,9 +313,9 @@ export type DisplayBlock =
   | { id: string; type: "vision-status"; provider: string; modelId: string; imageCount: number; status: "running" | "success" | "error"; timestamp: number }
   | { id: string; type: "work-status"; tools: ToolWorkItem[]; isStreaming: boolean; timestamp: number }
   | { id: string; type: "turn-separator"; timestamp: number }
-  | { id: string; type: "error"; message: string; source?: string; category?: ApiErrorCategory; httpStatus?: number; title?: string; retryable?: boolean; timestamp: number }
+  | { id: string; type: "error"; message: string; source?: string; category?: ApiErrorCategory; httpStatus?: number; title?: string; retryable?: boolean; autoRetried?: number; retryAfterMs?: number; timestamp: number }
   | { id: string; type: "compaction"; reason: string; result: string; aborted: boolean; timestamp: number }
-  | { id: string; type: "retry"; success: boolean; attempt: number; maxAttempts: number; delayMs?: number; timestamp: number }
+  | { id: string; type: "retry"; success: boolean; attempt: number; maxAttempts: number; delayMs?: number; category?: ApiErrorCategory; errorSummary?: string; retryAfterMs?: number; timestamp: number }
   | { id: string; type: "note"; text: string; timestamp: number }
   | { id: string; type: "status"; status: "running" | "idle" | "error" | "compacting"; timestamp: number };
 
