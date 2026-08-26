@@ -670,7 +670,8 @@ run("isAgentTaskGroupHandle", async () => {
 
 // ============================================================================
 // isAgentTaskItemSpec: ready/rejected variants + the optional workflow
-// outputSchema (absent legal; present must be a plain object)
+// outputSchema (absent legal; present must be a plain object) and the
+// optional appendSystemPrompt (absent legal; present must be a string).
 // ============================================================================
 
 run("isAgentTaskItemSpec", async () => {
@@ -710,12 +711,26 @@ run("isAgentTaskItemSpec", async () => {
   assert(!isAgentTaskItemSpec({ ...ready, outputSchema: ["a"] }), "array outputSchema rejected");
   assert(!isAgentTaskItemSpec({ ...ready, outputSchema: null }), "null outputSchema rejected");
   assert(isAgentTaskItemSpec({ ...ready, outputSchema: undefined }), "explicit undefined outputSchema is absent (legal)");
+  assert(
+    isAgentTaskItemSpec({ ...ready, appendSystemPrompt: "## Workflow artifacts" }),
+    "ready item with string appendSystemPrompt passes",
+  );
+  assert(
+    isAgentTaskItemSpec({ ...ready, appendSystemPrompt: undefined }),
+    "explicit undefined appendSystemPrompt is absent (legal)",
+  );
+  assert(!isAgentTaskItemSpec({ ...ready, appendSystemPrompt: 42 }), "numeric appendSystemPrompt rejected");
+  assert(!isAgentTaskItemSpec({ ...ready, appendSystemPrompt: { text: "x" } }), "object appendSystemPrompt rejected");
+  assert(
+    isAgentTaskItemSpec({ ...ready, extraUnknown: true }),
+    "unknown fields ignored so old snapshots restore",
+  );
   assert(!isAgentTaskItemSpec({ resolution: "ready", index: 0, prompt: "p", description: "d", maxTurns: 40 }), "missing agent rejected");
   assert(!isAgentTaskItemSpec({ ...ready, resolution: "bogus" }), "unknown resolution rejected");
   assert(!isAgentTaskItemSpec({ ...rejected, failureReason: "bogus" }), "unknown rejected failureReason rejected");
   assert(!isAgentTaskItemSpec({ ...rejected, errorMessage: 42 }), "non-string rejected errorMessage rejected");
 
-  // The workflow extras outputSchema is plain data: JSON round-trip preserves it.
+  // The workflow extras outputSchema / appendSystemPrompt are plain data: JSON round-trip preserves them.
   const withSchema = { ...ready, outputSchema: { type: "object", required: ["answer"] } };
   const roundTripped = JSON.parse(JSON.stringify(withSchema)) as unknown;
   assert(isAgentTaskItemSpec(roundTripped), "ready item with outputSchema survives JSON round-trip");
@@ -723,6 +738,14 @@ run("isAgentTaskItemSpec", async () => {
     JSON.stringify(roundTripped),
     JSON.stringify(withSchema),
     "round-trip preserves the exact outputSchema shape",
+  );
+  const withAppend = { ...ready, appendSystemPrompt: "## Workflow artifacts\n### reviews\n```json\n{\"a\":1}\n```" };
+  const appendRoundTripped = JSON.parse(JSON.stringify(withAppend)) as unknown;
+  assert(isAgentTaskItemSpec(appendRoundTripped), "ready item with appendSystemPrompt survives JSON round-trip");
+  assertEqual(
+    JSON.stringify(appendRoundTripped),
+    JSON.stringify(withAppend),
+    "round-trip preserves the exact appendSystemPrompt string",
   );
 
   // A workflow ready item (outputSchema) inside a stored info's itemSummaries

@@ -37,6 +37,14 @@ export interface ChildStartRequest {
   providerDefault?: string;
   /** Nested-session turn cap; schema children default to SCHEMA_CHILD_DEFAULT_MAX_TURNS. */
   maxTurns?: number;
+  /** Materialized JSON values, not disk paths. */
+  artifacts?: WorkflowArtifactPayload[];
+}
+
+/** One named artifact cloned onto a child start (JSON data, not a disk path). */
+export interface WorkflowArtifactPayload {
+  name: string;
+  value: unknown;
 }
 
 /** Default maxTurns for workflow schema children when the script omits opts.maxTurns. Same as ordinary subagents (DEFAULT_MAX_TURNS). */
@@ -59,6 +67,23 @@ export interface ChildResult {
 /** The host-side seam the worker session calls into. */
 export interface ChildPort {
   startAgent(request: ChildStartRequest): Promise<ChildHandle>;
+}
+
+/**
+ * Host-backed child-result cache injected into {@link WorkflowExecution}.
+ * `undefined` from lookup is a miss; a hit value is the `agent()` return
+ * (structured or text). Store size/IO failures are swallowed and logged
+ * host-side and must never kill the script.
+ */
+/** A cache hit: the stored agent() return, plus the spawn taskId when the file has one. */
+export interface CacheLookupHit {
+  value: unknown;
+  childId?: string;
+}
+
+export interface CachePort {
+  lookup(key: string): Promise<CacheLookupHit | undefined>;
+  store(key: string, value: unknown, childId?: string): Promise<void>;
 }
 
 /** A live child handle; `result` rejects only on infrastructure failure. */

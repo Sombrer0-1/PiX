@@ -183,6 +183,7 @@ for (let round = 1; round <= args.maxRounds; round += 1) {
     label: 'Ralph round ' + round,
     phase: 'Fresh-agent rounds',
     schema: reportSchema,
+    cache: false,
   })
   if (rawReport === null) {
     return { status: 'round-failed', roundsStarted: round, lastReport: previous ?? null }

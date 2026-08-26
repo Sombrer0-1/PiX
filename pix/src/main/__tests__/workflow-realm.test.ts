@@ -1,20 +1,28 @@
 /**
- * materializeFromRealm / renderThrown / MaterializeError tests (S1).
+ * materializeFromRealm / materializeFromRealmWithStats / renderThrown /
+ * MaterializeError tests (S0).
  *
  * Independently verifies pix/src/main/workflow/engine/realm.ts against the
- * locked rejection list: root undefined returns as-is; non-finite numbers,
- * bigint, function, symbol, nested undefined, circular references, sparse
- * arrays, non-index array properties, symbol keys and exotic prototypes all
- * throw MaterializeError with the offending path; `__proto__` keys are
- * written as own data properties via defineProperty (no prototype
- * pollution); getters run normally and throwing reads wrap into
- * MaterializeError with a rendered reason; renderThrown is total (stack >
- * message > String > fixed label). Does not depend on any other module.
+ * locked JSON-omit semantics: root undefined returns as-is (omitted 0);
+ * nested object undefined omits the key; nested array undefined (index in
+ * array) becomes null; non-finite numbers, bigint, function, symbol,
+ * circular references, sparse arrays, non-index array properties, symbol
+ * keys and exotic prototypes all throw MaterializeError with the offending
+ * path; `__proto__` keys are written as own data properties via
+ * defineProperty (no prototype pollution); getters run normally and throwing
+ * reads wrap into MaterializeError with a rendered reason; renderThrown is
+ * total (stack > message > String > fixed label). Does not depend on any
+ * other module.
  *
  * Run with: npm exec tsx -- src/main/__tests__/workflow-realm.test.ts
  */
 
-import { MaterializeError, materializeFromRealm, renderThrown } from "../workflow/engine/realm.js";
+import {
+  MaterializeError,
+  materializeFromRealm,
+  materializeFromRealmWithStats,
+  renderThrown,
+} from "../workflow/engine/realm.js";
 
 // ============================================================================
 // Test harness (matches plan-types.test.ts style)
@@ -89,6 +97,9 @@ function rejectsMaterialize(value: unknown, message: string, pathPart?: string):
 
 await run("root undefined returns as-is", async () => {
   assertEqual(materializeFromRealm(undefined), undefined, "root undefined returned unchanged");
+  const stats = materializeFromRealmWithStats(undefined);
+  assertEqual(stats.value, undefined, "WithStats root undefined value unchanged");
+  assertEqual(stats.omitted, 0, "WithStats root undefined omitted is 0");
 });
 
 await run("scalars pass through unchanged", async () => {
@@ -130,12 +141,38 @@ await run("non-finite numbers are rejected", async () => {
   rejectsMaterialize({ a: NaN }, "nested NaN rejected", "value.a");
 });
 
-await run("bigint / function / symbol / nested undefined are rejected", async () => {
+await run("bigint / function / symbol are rejected", async () => {
   rejectsMaterialize(1n, "bigint rejected", "value");
   rejectsMaterialize(() => 1, "function rejected", "value");
   rejectsMaterialize(Symbol("x"), "symbol rejected", "value");
-  rejectsMaterialize({ a: { b: undefined } }, "nested undefined rejected", "value.a.b");
-  rejectsMaterialize([1, undefined], "undefined array element rejected", "value[1]");
+});
+
+await run("nested object undefined is omitted; array undefined becomes null", async () => {
+  const objectOut = materializeFromRealm({ a: { b: undefined }, c: 1 }) as { a: Record<string, unknown>; c: number };
+  assertEqual(Object.prototype.hasOwnProperty.call(objectOut.a, "b"), false, "nested object undefined key omitted");
+  assertEqual(objectOut.c, 1, "sibling object key kept");
+  assertEqual(JSON.stringify(objectOut), '{"a":{},"c":1}', "omitted object field matches JSON.stringify");
+
+  const arrayOut = materializeFromRealm([1, undefined]) as unknown[];
+  assertEqual(arrayOut.length, 2, "array length preserved");
+  assertEqual(arrayOut[0], 1, "defined array element kept");
+  assertEqual(arrayOut[1], null, "array undefined element written as null");
+  assertEqual(JSON.stringify(arrayOut), "[1,null]", "array undefined matches JSON.stringify");
+
+  const mixedInput = {
+    keep: "yes",
+    drop: undefined,
+    nested: { alsoDrop: undefined, stay: 2 },
+    list: [undefined, 3, undefined],
+  };
+  const mixed = materializeFromRealmWithStats(mixedInput);
+  assertEqual(JSON.stringify(mixed.value), '{"keep":"yes","nested":{"stay":2},"list":[null,3,null]}', "mixed omit/null value");
+  assertEqual(mixed.omitted, 4, "omitted counts object fields and array undefined elements");
+  assertEqual(
+    JSON.stringify(materializeFromRealm(mixedInput)),
+    JSON.stringify(mixed.value),
+    "materializeFromRealm equals WithStats.value",
+  );
 });
 
 await run("circular references are rejected", async () => {

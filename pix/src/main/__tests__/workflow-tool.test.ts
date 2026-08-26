@@ -25,6 +25,7 @@
  * Run with: npm exec tsx -- src/main/__tests__/workflow-tool.test.ts
  */
 
+import { readFileSync } from "node:fs";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { TextContent } from "@earendil-works/pi-ai";
 import {
@@ -324,6 +325,7 @@ function makeHarness(options?: { getParentRef?: (toolCallId: string) => Workflow
   const parentRef: WorkflowParentRef = {
     sessionId: "session-1",
     toolCallId: "call-1",
+    workspaceId: "ws-test",
     getSubmissionContext: () => ({}) as AgentTaskSubmissionContext,
   };
   const getParentRef = options?.getParentRef ?? (() => parentRef);
@@ -356,6 +358,7 @@ function makeRalphHarness(config?: RalphToolConfig): RalphHarness {
   const parentRef: WorkflowParentRef = {
     sessionId: "session-1",
     toolCallId: "call-1",
+    workspaceId: "ws-test",
     getSubmissionContext: () => ({}) as AgentTaskSubmissionContext,
   };
   const tool = createRalphToolDefinition({ engine, recorder, getParentRef: () => parentRef }, config);
@@ -480,14 +483,23 @@ await run("completed run maps content, details and lifecycle", async () => {
   assertEqual(updates[3]!.details.view.stopReason, "completed", "end update overlays the terminal stopReason");
   assertEqual(updates[3]!.details.view.status, "completed", "end update derives the terminal status");
 
-  h.engine.settle(run.id, { value: { findings: [1, 2] }, stopReason: "completed", agentsStarted: 1 });
+  h.engine.settle(run.id, {
+    value: { findings: [1, 2] },
+    stopReason: "completed",
+    agentsStarted: 1,
+    sources: [{ label: "audit", childId: "task-1" }],
+  });
   const result = await pending;
   const resultText = (result.content[0] as TextContent).text;
   assert(resultText.startsWith(`<workflow-result workflow-id="${run.id}" workflow="audit-all"`), "completed content has the workflow identity envelope");
   assert(resultText.includes('status="completed"'), "completed content carries the terminal status");
   assert(resultText.includes("<summary>1 agent</summary>"), "completed content carries the child count summary");
+  assert(resultText.includes("<sources>"), "completed content carries sources in the prefix");
+  assert(resultText.includes('child-id="task-1"'), "completed sources list the spawn childId");
   assert(resultText.includes("<result>"), "completed content carries the return value element");
   assert(resultText.includes("&quot;findings&quot;"), "completed content escapes the JSON return value");
+  assert(!resultText.includes("<salvage"), "completed path has no salvage");
+  assert(!("salvage" in result.details), "completed details do not carry salvage");
   assert(resultText.endsWith("</workflow-result>"), "completed content closes the workflow envelope");
   assert(isWorkflowToolDetails(result.details), "details pass the shared guard");
   assertJson(result.details.value, { findings: [1, 2] }, "details carry the script value");
@@ -506,6 +518,32 @@ await run("completed run maps content, details and lifecycle", async () => {
   assertEqual(h.recorder.abandons.length, 1, "abandon runs as the fallback after finish");
   assertEqual(h.recorder.abandons[0], run.id, "abandon targets the run");
   assertEqual(h.engine.cancels.length, 0, "no cancel on the success path");
+});
+
+await run("completed all-hit envelope lists sources and child-replayed", async () => {
+  const h = makeHarness();
+  const pending = executeTool(h.tool, { script: SCRIPT, meta: META });
+  const run = h.engine.runs[0]!;
+  h.engine.settle(run.id, {
+    value: { reviews: ["ok"] },
+    stopReason: "completed",
+    agentsStarted: 0,
+    childStats: { completed: 0, failed: 0, cancelled: 0, replayed: 2 },
+    sources: [
+      { label: "review:auth", childId: "tsk_auth" },
+      { label: "review:pay", childId: "tsk_pay" },
+    ],
+  });
+  const result = await pending;
+  const text = (result.content[0] as TextContent).text;
+  assert(text.includes('agents-started="0"'), "hit run does not inflate agents-started");
+  assert(text.includes('child-replayed="2"'), "hit run renders child-replayed");
+  assert(text.includes("2 replayed"), "summary names replayed");
+  assert(text.includes("<sources>"), "hit run prefix includes sources");
+  assert(text.includes('label="review:auth"'), "sources include the auth label");
+  assert(text.includes('child-id="tsk_auth"'), "sources include the auth childId");
+  assert(text.includes('child-id="tsk_pay"'), "sources include the pay childId");
+  assert(text.indexOf("<sources>") < text.indexOf("<result>"), "sources sit in the prefix before result");
 });
 
 await run("completed content appends child failure counts and reasons", async () => {
@@ -528,17 +566,28 @@ await run("completed content appends child failure counts and reasons", async ()
   assert(text.endsWith("</workflow-result>"), "parent text closes the workflow envelope");
 });
 
-await run("non-completed stop reasons throw mapped messages, never partial success", async () => {
+function assertSalvageEnvelope(error: unknown, message: string): string {
+  assert(error instanceof Error, `${message}: rejects with Error`);
+  const text = (error as Error).message;
+  assert(text.length <= 50_000, `${message}: envelope stays within 50k`);
+  assert(text.includes("<error>"), `${message}: envelope contains <error>`);
+  assert(text.includes("<salvage"), `${message}: envelope contains <salvage>`);
+  assert(text.includes("<result>null</result>"), `${message}: envelope contains <result>null`);
+  assert(!text.includes("&quot;partial&quot;"), `${message}: envelope does not put a partial value in <result>`);
+  return text;
+}
+
+await run("non-completed stop reasons throw a salvage envelope after dispose+finish", async () => {
   const h = makeHarness();
   let pending = executeTool(h.tool, { script: SCRIPT, meta: META });
   const run = h.engine.runs[0]!;
   // A cancelled run with a partial value is still a failure.
   h.engine.settle(run.id, { value: { partial: true }, stopReason: "cancelled", error: "parent step aborted", agentsStarted: 0 });
   const cancelError = await assertRejects(pending, "cancelled run rejects");
-  assert(
-    cancelError instanceof Error && (cancelError as Error).message === "workflow run was cancelled (parent step aborted)",
-    "cancelled message maps the reason",
-  );
+  const cancelText = assertSalvageEnvelope(cancelError, "cancelled");
+  assert(cancelText.includes('status="cancelled"'), "cancelled envelope status");
+  assert(cancelText.includes("workflow run was cancelled (parent step aborted)"), "cancelled <error> maps the reason");
+  assert(cancelText.includes('child-completed="0"'), "empty fold counts completed as 0");
   assertJson(h.recorder.finishes, [{ runId: run.id, stopReason: "cancelled" }], "finish records cancelled");
   assertEqual(h.engine.disposed, 1, "dispose ran on the cancelled path");
 
@@ -547,10 +596,9 @@ await run("non-completed stop reasons throw mapped messages, never partial succe
   const run2 = h.engine.runs[1]!;
   h.engine.settle(run2.id, { value: { partial: true }, stopReason: "error", error: "AGENT_START: agent failed to start", agentsStarted: 0 });
   const errorError = await assertRejects(pending2, "error run rejects");
-  assert(
-    errorError instanceof Error && (errorError as Error).message === "workflow run failed: AGENT_START: agent failed to start",
-    "error message maps the reason",
-  );
+  const errorText = assertSalvageEnvelope(errorError, "error");
+  assert(errorText.includes('status="error"'), "error envelope status");
+  assert(errorText.includes("workflow run failed: AGENT_START: agent failed to start"), "error <error> maps the reason");
   assertJson(h.recorder.finishes.at(-1), { runId: run2.id, stopReason: "error" }, "finish records error");
 
   // An error without a message falls back to the generic text.
@@ -558,10 +606,8 @@ await run("non-completed stop reasons throw mapped messages, never partial succe
   const run3 = h.engine.runs[2]!;
   h.engine.settle(run3.id, { value: null, stopReason: "error", agentsStarted: 0 });
   const bareError = await assertRejects(pending3, "bare error run rejects");
-  assert(
-    bareError instanceof Error && (bareError as Error).message === "workflow run failed: unknown error",
-    "bare error falls back to unknown error",
-  );
+  const bareText = assertSalvageEnvelope(bareError, "bare error");
+  assert(bareText.includes("workflow run failed: unknown error"), "bare error falls back to unknown error");
 });
 
 await run("abort signal cancels the run once with parent step aborted", async () => {
@@ -572,10 +618,9 @@ await run("abort signal cancels the run once with parent step aborted", async ()
   controller.abort();
   assertJson(h.engine.cancels, ["parent step aborted"], "the abort bridge cancels with the locked reason, exactly once");
   const error = await assertRejects(pending, "aborted run rejects");
-  assert(
-    error instanceof Error && (error as Error).message === "workflow run was cancelled (parent step aborted)",
-    "the run reports the parent-step-aborted reason",
-  );
+  const text = assertSalvageEnvelope(error, "aborted");
+  assert(text.includes('status="cancelled"'), "aborted envelope status");
+  assert(text.includes("workflow run was cancelled (parent step aborted)"), "the run reports the parent-step-aborted reason");
   assertJson(h.recorder.finishes, [{ runId: run.id, stopReason: "cancelled" }], "finish records cancelled");
 });
 
@@ -593,6 +638,198 @@ await run("values beyond 50_000 characters are truncated with a notice", async (
   assert(text.startsWith(`<workflow-result workflow-id="${run.id}"`), "truncated content preserves the workflow envelope");
   assert(text.endsWith("</workflow-result>"), "truncated content preserves the closing workflow tag");
   assertJson(result.details.value, value, "details keep the untruncated value");
+});
+
+await run("error envelope salvage lists completed child-id values from the fold", async () => {
+  const h = makeHarness();
+  const pending = executeTool(h.tool, { script: SCRIPT, meta: META });
+  const run = h.engine.runs[0]!;
+  h.engine.fire(
+    "workflow/agent-start",
+    { id: run.id, meta: META },
+    { seq: 1, label: "review:auth", phase: "scan", childId: "tsk_auth" },
+  );
+  h.engine.fire(
+    "workflow/agent-end",
+    { id: run.id, meta: META },
+    { seq: 1, label: "review:auth", phase: "scan", childId: "tsk_auth", outcome: "completed" },
+  );
+  h.engine.fire(
+    "workflow/agent-start",
+    { id: run.id, meta: META },
+    { seq: 2, label: "review:db", phase: "scan", childId: "tsk_db" },
+  );
+  h.engine.fire(
+    "workflow/agent-end",
+    { id: run.id, meta: META },
+    { seq: 2, label: "review:db", phase: "scan", childId: "tsk_db", outcome: "completed" },
+  );
+  h.engine.settle(run.id, {
+    value: { partial: true },
+    stopReason: "error",
+    error: "RESULT_UNSERIALIZABLE",
+    agentsStarted: 2,
+    childStats: { completed: 2, failed: 0, cancelled: 0 },
+  });
+  const thrown = await assertRejects(pending, "error run with completed members rejects");
+  const text = assertSalvageEnvelope(thrown, "salvage fixture");
+  assert(text.includes('child-id="tsk_auth"'), "salvage lists the first completed child-id");
+  assert(text.includes('child-id="tsk_db"'), "salvage lists the second completed child-id");
+  assert(text.includes('label="review:auth"'), "salvage lists the first completed label");
+  assert(text.includes('child-completed="2"'), "error envelope child-completed matches childStats");
+  assert(text.includes("2 child results are still on disk"), "salvage hint counts completed children");
+  assertEqual(h.engine.disposed, 1, "dispose ran before the envelope throw");
+  assertJson(h.recorder.finishes, [{ runId: run.id, stopReason: "error" }], "finish ran before the envelope throw");
+});
+
+await run("cancel envelope child-completed comes from fold, not 0", async () => {
+  const h = makeHarness();
+  const pending = executeTool(h.tool, { script: SCRIPT, meta: META });
+  const run = h.engine.runs[0]!;
+  h.engine.fire(
+    "workflow/agent-start",
+    { id: run.id, meta: META },
+    { seq: 1, label: "review:auth", phase: "scan", childId: "tsk_auth" },
+  );
+  h.engine.fire(
+    "workflow/agent-end",
+    { id: run.id, meta: META },
+    { seq: 1, label: "review:auth", phase: "scan", childId: "tsk_auth", outcome: "completed" },
+  );
+  h.engine.fire(
+    "workflow/agent-start",
+    { id: run.id, meta: META },
+    { seq: 2, label: "review:payments", phase: "scan", childId: "tsk_pay" },
+  );
+  h.engine.fire(
+    "workflow/agent-end",
+    { id: run.id, meta: META },
+    { seq: 2, label: "review:payments", phase: "scan", childId: "tsk_pay", outcome: "completed" },
+  );
+  // host.cancelledResult drops childStats/failures; counts must come from the fold.
+  h.engine.settle(run.id, {
+    value: { partial: true },
+    stopReason: "cancelled",
+    error: "parent step aborted",
+    agentsStarted: 2,
+  });
+  const thrown = await assertRejects(pending, "cancelled run with completed members rejects");
+  const text = assertSalvageEnvelope(thrown, "cancel fold counts");
+  assert(text.includes('child-completed="2"'), "cancel child-completed is counted from the fold, not 0");
+  assert(text.includes('child-id="tsk_auth"'), "cancel salvage includes the first child-id");
+  assert(text.includes('child-id="tsk_pay"'), "cancel salvage includes the second child-id");
+  assert(text.includes('agents-started="2"'), "cancel agents-started still comes from the result");
+});
+
+await run("throw-path envelope truncates salvage to stay within 50k", async () => {
+  const h = makeHarness();
+  const pending = executeTool(h.tool, { script: SCRIPT, meta: META });
+  const run = h.engine.runs[0]!;
+  const longId = `tsk_${"x".repeat(400)}`;
+  const firstId = `${longId}_1`;
+  const lastId = `${longId}_150`;
+  for (let seq = 1; seq <= 150; seq++) {
+    const childId = `${longId}_${seq}`;
+    h.engine.fire(
+      "workflow/agent-start",
+      { id: run.id, meta: META },
+      { seq, label: `review:${seq}`, phase: "scan", childId },
+    );
+    h.engine.fire(
+      "workflow/agent-end",
+      { id: run.id, meta: META },
+      { seq, label: `review:${seq}`, phase: "scan", childId, outcome: "completed" },
+    );
+  }
+  h.engine.settle(run.id, {
+    value: null,
+    stopReason: "error",
+    error: "RESULT_UNSERIALIZABLE",
+    agentsStarted: 80,
+    childStats: { completed: 80, failed: 0, cancelled: 0 },
+  });
+  const thrown = await assertRejects(pending, "oversized salvage envelope rejects");
+  const text = assertSalvageEnvelope(thrown, "truncated salvage");
+  assert(text.includes(`child-id="${firstId}"`), "truncation keeps salvage children from the start");
+  assert(!text.includes(`child-id="${lastId}"`), "truncation drops salvage children from the end");
+  assert(text.includes("<error>"), "truncated envelope still has <error>");
+  assert(text.includes("<result>null</result>"), "truncated envelope still has <result>null");
+  assert(text.includes('child-completed="80"'), "childStats.completed wins over a larger fold count");
+});
+
+await run("throw-path envelope bounds a huge result.error and keeps salvage/result", async () => {
+  const h = makeHarness();
+  const pending = executeTool(h.tool, { script: SCRIPT, meta: META });
+  const run = h.engine.runs[0]!;
+  h.engine.fire(
+    "workflow/agent-start",
+    { id: run.id, meta: META },
+    { seq: 1, label: "review:auth", phase: "scan", childId: "tsk_auth" },
+  );
+  h.engine.fire(
+    "workflow/agent-end",
+    { id: run.id, meta: META },
+    { seq: 1, label: "review:auth", phase: "scan", childId: "tsk_auth", outcome: "completed" },
+  );
+  h.engine.settle(run.id, {
+    value: { partial: true },
+    stopReason: "error",
+    error: "x".repeat(60_000),
+    agentsStarted: 1,
+    childStats: { completed: 1, failed: 0, cancelled: 0 },
+  });
+  const thrown = await assertRejects(pending, "huge result.error still rejects with an envelope");
+  const text = assertSalvageEnvelope(thrown, "huge error");
+  assert(text.length <= 50_000, "huge error envelope stays within 50k");
+  assert(text.includes("<salvage"), "huge error still emits salvage");
+  assert(text.includes('child-id="tsk_auth"'), "huge error salvage keeps the completed child-id");
+  assert(text.includes("<result>null</result>"), "huge error still closes with result null");
+  assert(text.includes("</error>"), "huge error still closes the error element");
+});
+
+await run("DESCRIPTION replaces the checkpoint sentence with salvage guidance", async () => {
+  const h = makeHarness();
+  assert(
+    !h.tool.description.includes("A finished workflow script is not checkpointed"),
+    "DESCRIPTION no longer has the checkpoint sentence",
+  );
+  assert(
+    h.tool.description.includes("If the tool fails, read <salvage> child-id values and use inspect_agent_task"),
+    "DESCRIPTION tells the model to read salvage child-id values",
+  );
+  assert(
+    h.tool.description.includes("put(") && h.tool.description.includes("get(") && h.tool.description.includes("ref("),
+    "DESCRIPTION documents put/get/ref",
+  );
+  assert(
+    h.tool.description.includes("cache") && h.tool.description.includes("cache: false"),
+    "DESCRIPTION documents cache on by default and cache: false",
+  );
+  assert(
+    h.tool.description.includes("boolean, default true"),
+    "DESCRIPTION says cache is on by default",
+  );
+  assert(
+    h.tool.description.includes("Cache hits require the child") &&
+      h.tool.description.includes("byte-identical") &&
+      h.tool.description.includes("shrink the script `return`") &&
+      h.tool.description.includes("concatenated into child prompts") &&
+      h.tool.description.includes("Do not shadow hook names") &&
+      h.tool.description.includes("<sources>") &&
+      h.tool.description.includes("inspect_agent_task") &&
+      h.tool.description.includes("childId?"),
+    "DESCRIPTION fences cache identity, truncation-vs-prompt edits, hook-name shadowing, sources inspect, and settled childId",
+  );
+  const runtimeSource = readFileSync(new URL("../workflow/engine/runtime.ts", import.meta.url), "utf8");
+  const oversizedAssign = runtimeSource.match(
+    /if \(result\.failureReason === "prompt_too_large"\) \{[\s\S]*?message = `([^`]+)`;/,
+  );
+  assert(oversizedAssign !== null, "runtime has the prompt_too_large message assignment");
+  const oversizedMessage = oversizedAssign?.[1] ?? "";
+  assert(
+    !oversizedMessage.includes("put(") && !oversizedMessage.includes("ref("),
+    "runtime oversized message does not mention put( or ref(",
+  );
 });
 
 await run("dispose failure falls back to recorder.abandon", async () => {
@@ -623,6 +860,7 @@ await run("ralph: fixed script, meta, caps and provider reach the engine; comple
   const request = h.engine.requests[0]!;
   assert(request.script.includes("reportSchema"), "request carries the fixed ralph script");
   assert(request.script.includes("args.maxRounds"), "the script reads the round cap from args");
+  assert(request.script.includes("cache: false"), "the fixed script passes cache: false");
   assertJson(
     request.meta,
     {

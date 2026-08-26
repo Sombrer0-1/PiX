@@ -28,7 +28,9 @@
  */
 
 import { readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import type {
   WorkflowAgentEndInfo,
@@ -55,6 +57,8 @@ import type { HostToWorkerMessage, WorkerToHostMessage } from "../workflow/engin
 import type { ChildHandle, ChildResult, ChildStartRequest, WorkerInit, WorkerLimits } from "../workflow/engine/child-types.js";
 import { SCHEMA_CHILD_DEFAULT_MAX_TURNS } from "../workflow/engine/child-types.js";
 import type { WorkflowChildSpawner } from "../workflow/child-spawner.js";
+import { WorkflowChildCache } from "../workflow/child-cache.js";
+import { workflowCacheKey, workflowCacheScopeId } from "../workflow/engine/child-cache-key.js";
 import { workerSpawnEnv } from "../workflow/engine/host.js";
 import { rewriteAsarWorkerPath, resolveWorkerEntry, resolveMaxConcurrentAgents, WorkerThreadWorkflowEngine } from "../workflow/engine/worker-thread-engine.js";
 
@@ -129,6 +133,7 @@ function parentRef(toolCallId = "tc-1"): WorkflowParentRef {
   return {
     sessionId: "sess-1",
     toolCallId,
+    workspaceId: "ws-test",
     getSubmissionContext: () => ({}) as never,
   };
 }
@@ -422,7 +427,10 @@ await run("end to end: phase/log/agents complete and workflow/end carries no val
   assertEqual(ends.length, 3, "three agent-ends");
   assert(ends.every((agent) => agent.outcome === "completed"), "every outcome completed");
   assertEqual(events[events.length - 1], "end", "workflow/end is last");
-  assertDeepEqual(endPayload, { stopReason: "completed", agentsStarted: 3, childStats: { completed: 3, failed: 0, cancelled: 0 } }, "end payload carries outcome data only");
+  assertEqual(endPayload?.stopReason, "completed", "end payload carries stopReason");
+  assertEqual(endPayload?.agentsStarted, 3, "end payload carries agentsStarted");
+  assertDeepEqual(endPayload?.childStats, { completed: 3, failed: 0, cancelled: 0 }, "end payload carries childStats");
+  assertEqual(endPayload?.sources?.length, 3, "end payload carries sources for completed children");
   assert(!("value" in (endPayload ?? {})), "workflow/end never carries the value");
   assertDeepEqual(
     fake.children.map((child) => child.request.prompt),
@@ -904,6 +912,7 @@ function integrationParentRef(toolCallId = "tc-int"): WorkflowParentRef {
   return {
     sessionId: "sess-int",
     toolCallId,
+    workspaceId: "ws-test",
     getSubmissionContext: () => ({ parentSessionId: "sess-int", parentToolCallId: toolCallId }) as unknown as AgentTaskSubmissionContext,
   };
 }
@@ -1094,6 +1103,223 @@ await run("integration: subagentProvider and label reach createTaskGroup", async
   assertEqual(result.stopReason, "completed", "run completed");
   assertEqual(fake.createCalls[0]?.params.tasks[0].subagent_type, "auditor", "runDefault mapped the agent type");
   assertEqual(fake.createCalls[0]?.params.tasks[0].description, "Ralph round 1", "explicit label became the task description");
+});
+
+// ============================================================================
+// S11 ChildCache acceptance: tmp WorkflowChildCache + fake spawner.
+// Hit: no start/end, agentsStarted excludes hits, replayed counts.
+// Miss: ChildStart. Failed oversized synthesize does not write cache.
+// ============================================================================
+
+const REVIEW_NAMES = ["auth", "api", "db", "ui", "cli", "net", "fs", "rpc", "log", "cfg"] as const;
+const OVERSIZED_X = "x".repeat(70_000);
+const OVERSIZED_Y = "y".repeat(70_000);
+
+function reviewPrompt(name: string, variant = ""): string {
+  return `review ${name}${variant}`;
+}
+
+function reviewLabel(name: string): string {
+  return `review:${name}`;
+}
+
+function tenReviewScript(opts: {
+  synth?: string;
+  changed?: string;
+  cacheFalse?: boolean;
+}): string {
+  const cacheOpt = opts.cacheFalse === true ? ", cache: false" : "";
+  const thunks = REVIEW_NAMES.map((name) => {
+    const prompt = reviewPrompt(name, name === opts.changed ? "-changed" : "");
+    return `() => agent(${JSON.stringify(prompt)}, { label: ${JSON.stringify(reviewLabel(name))}${cacheOpt} })`;
+  });
+  const body = [`const reviews = await parallel([${thunks.join(", ")}])`];
+  if (opts.synth !== undefined) {
+    body.push(
+      `const synth = await settled(${JSON.stringify(opts.synth)}, { label: "synthesize"${cacheOpt} })`,
+      "return { reviews, synthOk: synth.ok }",
+    );
+  } else {
+    body.push("return { reviews }");
+  }
+  return body.join("\n");
+}
+
+function cacheAutoReply(request: ChildStartRequest): ChildResult {
+  if (request.prompt.length > 65536) {
+    return {
+      output: [{ type: "text", text: "" }],
+      stopReason: "failed",
+      failureReason: "prompt_too_large",
+      error: "The delegated prompt exceeds 65536 bytes.",
+    };
+  }
+  return text(`ok:${request.label ?? request.prompt}`);
+}
+
+async function waitForReviewStores(cache: WorkflowChildCache, scopeId: string): Promise<void> {
+  const keys = REVIEW_NAMES.map((name) => workflowCacheKey(reviewPrompt(name), {}));
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const hits = await Promise.all(keys.map((key) => cache.lookup(scopeId, key)));
+    if (hits.every((hit) => hit !== undefined)) return;
+    await sleep(10);
+  }
+  throw new Error("timed out waiting for the ten review cache stores");
+}
+
+await run("S11 ChildCache: same meta.name hit/miss, change name, cache:false", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pix-workflow-engine-cache-"));
+  try {
+    const cache = new WorkflowChildCache({ rootDir: root });
+    const fake = createFakeSpawner({ autoReply: cacheAutoReply });
+    const engine = new WorkerThreadWorkflowEngine(fake.spawner, {
+      cache,
+      maxConcurrentAgents: 10,
+      getRunningSlotCap: () => 10,
+    });
+    const logs: string[] = [];
+    const starts: WorkflowAgentInfo[] = [];
+    const ends: WorkflowAgentEndInfo[] = [];
+    engine.on("workflow/log", (_info, message) => {
+      logs.push(message);
+    });
+    engine.on("workflow/agent-start", (_info, agent) => {
+      starts.push(agent);
+    });
+    engine.on("workflow/agent-end", (_info, agent) => {
+      ends.push(agent);
+    });
+
+    const cacheParent = parentRef();
+    const auditMeta = meta("audit-cache");
+    const scopeId = workflowCacheScopeId(cacheParent.workspaceId, cacheParent.sessionId, auditMeta.name);
+    const expectedReviews = REVIEW_NAMES.map((name) => `ok:${reviewLabel(name)}`);
+
+    const runCached = async (script: string, name: string): Promise<WorkflowResult> => {
+      logs.length = 0;
+      starts.length = 0;
+      ends.length = 0;
+      const live = engine.start({ script, meta: meta(name), parent: cacheParent });
+      const result = await live.result;
+      await live.dispose();
+      return result;
+    };
+
+    // --- run1: ten reviews + oversized synthesize writes cache for the ten ---
+    const run1 = await runCached(tenReviewScript({ synth: OVERSIZED_X }), "audit-cache");
+    assertEqual(run1.stopReason, "completed", "run1 completed (oversized synth does not kill the script)");
+    assertDeepEqual((run1.value as { reviews: string[] }).reviews, expectedReviews, "run1 ten reviews resolved");
+    assertEqual((run1.value as { synthOk: boolean }).synthOk, false, "run1 oversized synth failed");
+    assertEqual(run1.agentsStarted, 11, "run1 agentsStarted is 11 (ten reviews + synth)");
+    assertEqual(run1.childStats?.replayed, undefined, "run1 has no replayed");
+    assertEqual(starts.length, 11, "run1 miss path emits 11 agent-starts");
+    assertEqual(ends.length, 11, "run1 miss path emits 11 agent-ends");
+    assertEqual(
+      ends.filter((agent) => agent.outcome === "completed").length,
+      10,
+      "run1 ten reviews completed",
+    );
+    assertEqual(
+      ends.filter((agent) => agent.outcome === "failed" && agent.label === "synthesize").length,
+      1,
+      "run1 synthesize failed with a paired end",
+    );
+    assertEqual(fake.children.length, 11, "run1 spawned 11 children");
+    await waitForReviewStores(cache, scopeId);
+    assertEqual(
+      await cache.lookup(scopeId, workflowCacheKey(OVERSIZED_X, {})),
+      undefined,
+      "failed oversized synthesize does not write cache",
+    );
+
+    // --- run2: change the synthesize segment => 10 cache hits + 1 real spawn ---
+    const run2 = await runCached(tenReviewScript({ synth: OVERSIZED_Y }), "audit-cache");
+    assertEqual(run2.stopReason, "completed", "run2 completed");
+    assertDeepEqual((run2.value as { reviews: string[] }).reviews, expectedReviews, "run2 reviews replay from cache");
+    assertEqual(run2.agentsStarted, 1, "run2 agentsStarted excludes the ten hits");
+    assertEqual(run2.childStats?.replayed, 10, "run2 replayed is 10");
+    assertEqual(run2.sources?.length, 10, "run2 sources are the ten cached reviews (failed synthesize is not a source)");
+    assertEqual(
+      run2.sources?.filter((source) => source.label.startsWith("review:")).length,
+      10,
+      "run2 sources include the ten cached reviews",
+    );
+    assertEqual(starts.length, 1, "run2 hit path has no start for the ten reviews");
+    assertEqual(ends.length, 1, "run2 hit path has no end for the ten reviews");
+    assertEqual(starts[0]?.label, "synthesize", "run2 only the changed synthesize spawns");
+    assertEqual(fake.children.length, 12, "run2 added exactly one spawn");
+    assertEqual(
+      REVIEW_NAMES.filter((name) => logs.includes(`cache hit: ${reviewLabel(name)}`)).length,
+      10,
+      "run2 logs cache hit: <label> for each review",
+    );
+
+    // --- run3: change one review prompt => only that misses, others hit ---
+    const run3 = await runCached(tenReviewScript({ changed: "auth" }), "audit-cache");
+    assertEqual(run3.stopReason, "completed", "run3 completed");
+    assertEqual(run3.agentsStarted, 1, "run3 agentsStarted is the one changed review");
+    assertEqual(run3.childStats?.replayed, 9, "run3 replayed is 9");
+    assertEqual(starts.length, 1, "run3 only the changed review has start");
+    assertEqual(ends.length, 1, "run3 only the changed review has end");
+    assertEqual(starts[0]?.label, "review:auth", "run3 miss is the changed review");
+    assertEqual(fake.children.length, 13, "run3 added exactly one spawn");
+    const run3Hits = REVIEW_NAMES.filter(
+      (name) => name !== "auth" && logs.includes(`cache hit: ${reviewLabel(name)}`),
+    );
+    assertEqual(run3Hits.length, 9, "run3 logs cache hit for the nine unchanged reviews");
+    assert(
+      !logs.includes("cache hit: review:auth"),
+      "run3 changed review is not a hit",
+    );
+    assertDeepEqual(
+      (run3.value as { reviews: string[] }).reviews,
+      expectedReviews,
+      "run3 still returns ten review values (nine replayed, one fresh with the same label)",
+    );
+
+    // --- run4: change meta.name => miss ---
+    const otherScope = workflowCacheScopeId(cacheParent.workspaceId, cacheParent.sessionId, "audit-other");
+    const run4 = await runCached(tenReviewScript({}), "audit-other");
+    assertEqual(run4.stopReason, "completed", "run4 completed");
+    assertEqual(run4.agentsStarted, 10, "run4 different meta.name misses all ten");
+    assertEqual(run4.childStats?.replayed, undefined, "run4 has no replayed");
+    assertEqual(starts.length, 10, "run4 miss path emits 10 agent-starts");
+    assertEqual(ends.length, 10, "run4 miss path emits 10 agent-ends");
+    assertEqual(fake.children.length, 23, "run4 spawned all ten");
+    assertEqual(
+      logs.filter((line) => line.startsWith("cache hit:")).length,
+      0,
+      "run4 change meta.name produces no cache hits",
+    );
+    await waitForReviewStores(cache, otherScope);
+    assertEqual(
+      (await cache.lookup(otherScope, workflowCacheKey(reviewPrompt("auth"), {})))?.value,
+      "ok:review:auth",
+      "run4 stores under the new meta.name scope",
+    );
+    assertEqual(
+      (await cache.lookup(scopeId, workflowCacheKey(reviewPrompt("auth"), {})))?.value,
+      "ok:review:auth",
+      "run4 does not clobber the original meta.name scope",
+    );
+
+    // --- run5: cache:false => all spawn ---
+    const run5 = await runCached(tenReviewScript({ cacheFalse: true }), "audit-cache");
+    assertEqual(run5.stopReason, "completed", "run5 completed");
+    assertEqual(run5.agentsStarted, 10, "run5 cache:false spawns all ten despite a warm cache");
+    assertEqual(run5.childStats?.replayed, undefined, "run5 cache:false does not set replayed");
+    assertEqual(starts.length, 10, "run5 cache:false emits start for every child");
+    assertEqual(ends.length, 10, "run5 cache:false emits end for every child");
+    assertEqual(fake.children.length, 33, "run5 spawned all ten");
+    assertEqual(
+      logs.filter((line) => line.startsWith("cache hit:")).length,
+      0,
+      "run5 cache:false produces no cache hits",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  }
 });
 
 // ============================================================================

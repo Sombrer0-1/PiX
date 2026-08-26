@@ -18,6 +18,12 @@ export class MaterializeError extends Error {
   }
 }
 
+export interface MaterializeStatsResult {
+  value: unknown;
+  /** omitted object fields + array undefined elements written as null */
+  omitted: number;
+}
+
 /**
  * Render a thrown value to failure text without ever throwing: prefer the
  * `stack` (host or realm — a realm error's `stack` is a plain string read),
@@ -56,8 +62,9 @@ function hasPlainPrototype(value: object): boolean {
 
 /**
  * Copy `value` (typically from the vm realm) into plain host JSON data. Root
- * `undefined` is returned unchanged; nested `undefined` and values JSON
- * cannot represent losslessly fail with the offending path. Property
+ * `undefined` is returned unchanged; nested object `undefined` is omitted and
+ * nested array `undefined` becomes `null`, matching JSON.stringify. Values
+ * JSON cannot represent losslessly fail with the offending path. Property
  * accessors run normally, and a throwing read is wrapped with its rendered
  * failure.
  *
@@ -68,9 +75,18 @@ function hasPlainPrototype(value: object): boolean {
  *   arrays, exotic prototypes, or property reads that throw.
  */
 export function materializeFromRealm(value: unknown, root = "value"): unknown {
-  if (value === undefined) return undefined;
+  return materializeFromRealmWithStats(value, root).value;
+}
+
+/**
+ * Same walk as {@link materializeFromRealm}, plus a count of omitted object
+ * fields and array `undefined` elements rewritten as `null`.
+ */
+export function materializeFromRealmWithStats(value: unknown, root = "value"): MaterializeStatsResult {
+  if (value === undefined) return { value: undefined, omitted: 0 };
+  const stats = { omitted: 0 };
   try {
-    return materialize(value, root, new Set());
+    return { value: materialize(value, root, new Set(), stats), omitted: stats.omitted };
   } catch (error: unknown) {
     if (error instanceof MaterializeError) throw error;
     // A property read ran script code that threw; total-ize it so callers can
@@ -79,7 +95,12 @@ export function materializeFromRealm(value: unknown, root = "value"): unknown {
   }
 }
 
-function materialize(value: unknown, path: string, seen: Set<object>): unknown {
+function materialize(
+  value: unknown,
+  path: string,
+  seen: Set<object>,
+  stats: { omitted: number },
+): unknown {
   switch (typeof value) {
     case "boolean":
     case "string":
@@ -104,18 +125,29 @@ function materialize(value: unknown, path: string, seen: Set<object>): unknown {
   if (seen.has(objectValue)) throw new MaterializeError(path, "circular references are not JSON data");
   seen.add(objectValue);
   try {
-    if (Array.isArray(objectValue)) return materializeArray(objectValue, path, seen);
-    return materializeObject(objectValue, path, seen);
+    if (Array.isArray(objectValue)) return materializeArray(objectValue, path, seen, stats);
+    return materializeObject(objectValue, path, seen, stats);
   } finally {
     seen.delete(objectValue);
   }
 }
 
-function materializeArray(value: unknown[], path: string, seen: Set<object>): unknown[] {
+function materializeArray(
+  value: unknown[],
+  path: string,
+  seen: Set<object>,
+  stats: { omitted: number },
+): unknown[] {
   const out: unknown[] = [];
   for (let index = 0; index < value.length; index++) {
     if (!(index in value)) throw new MaterializeError(`${path}[${index}]`, "sparse arrays are not JSON data");
-    out.push(materialize(value[index], `${path}[${index}]`, seen));
+    const element = value[index];
+    if (element === undefined) {
+      stats.omitted++;
+      out.push(null);
+      continue;
+    }
+    out.push(materialize(element, `${path}[${index}]`, seen, stats));
   }
   // Own enumerable props beyond the indices (e.g. `arr.total = 3`) would be
   // silently dropped by JSON — reject them instead. The index form must be
@@ -134,7 +166,12 @@ function materializeArray(value: unknown[], path: string, seen: Set<object>): un
   return out;
 }
 
-function materializeObject(value: object, path: string, seen: Set<object>): Record<string, unknown> {
+function materializeObject(
+  value: object,
+  path: string,
+  seen: Set<object>,
+  stats: { omitted: number },
+): Record<string, unknown> {
   if (!hasPlainPrototype(value)) {
     throw new MaterializeError(path, "only plain objects and arrays are JSON data (exotic prototype)");
   }
@@ -145,10 +182,15 @@ function materializeObject(value: object, path: string, seen: Set<object>): Reco
   // Object.keys = own enumerable string keys, matching JSON.stringify's
   // property selection exactly (non-enumerable props never reach JSON output).
   for (const key of Object.keys(value)) {
+    const field = (value as Record<string, unknown>)[key];
+    if (field === undefined) {
+      stats.omitted++;
+      continue;
+    }
     // defineProperty, never assignment: a "__proto__" key must become an OWN
     // data property of the copy, not a prototype mutation.
     Object.defineProperty(out, key, {
-      value: materialize((value as Record<string, unknown>)[key], `${path}.${key}`, seen),
+      value: materialize(field, `${path}.${key}`, seen, stats),
       enumerable: true,
       writable: true,
       configurable: true,

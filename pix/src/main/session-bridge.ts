@@ -53,6 +53,7 @@ import type {
 } from "./plan/plan-controller.js";
 import { detectFileDeviation, type PlanPathContext } from "./plan/plan-deviation.js";
 import { createSubmitUserPlanTool, createUpdatePlanStepTool } from "./plan/plan-tools.js";
+import { WorkflowChildCache } from "./workflow/child-cache.js";
 import { createAgentTaskChildSpawner } from "./workflow/child-spawner.js";
 import { WorkerThreadWorkflowEngine } from "./workflow/engine/index.js";
 import {
@@ -2185,7 +2186,10 @@ export class SessionBridge {
 				// call for workflow runs.
 				const workflowEngine = new WorkerThreadWorkflowEngine(
 					createAgentTaskChildSpawner(this._agentTaskService!),
-					{ getRunningSlotCap: () => this._agentTaskService!.getMaxConcurrentSlots() },
+					{
+						getRunningSlotCap: () => this._agentTaskService!.getMaxConcurrentSlots(),
+						cache: new WorkflowChildCache({ rootDir: join(getAgentDir(), "workflow-cache") }),
+					},
 				);
 				const workflowRecorder = createWorkflowRecorder({
 					append: (data) => {
@@ -2210,6 +2214,7 @@ export class SessionBridge {
 						return {
 							sessionId: parentSessionRef.sessionId,
 							toolCallId,
+							workspaceId: workspaceIdOf(cwd),
 							getSubmissionContext: () => runner.assembleSubmissionContext(toolCallId),
 						};
 					},

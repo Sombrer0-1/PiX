@@ -19,6 +19,8 @@ import { renderThrown } from "./realm.js";
 import { WorkflowExecution } from "./runtime.js";
 import type { ExecutionObserver } from "./runtime.js";
 import type {
+  CacheLookupHit,
+  CachePort,
   ChildHandle,
   ChildPort,
   ChildResult,
@@ -31,6 +33,12 @@ interface PendingChild {
   started: Deferred<string>;
   settled: Deferred<ChildResult>;
   disposed: Deferred<void>;
+}
+
+/** One in-flight cache RPC; its own callId space, never mixed with PendingChild. */
+interface PendingCache {
+  lookup?: Deferred<CacheLookupHit | undefined>;
+  store?: Deferred<void>;
 }
 
 /** A tiny Promise.withResolvers stand-in (the project targets ES2022 libs). */
@@ -80,10 +88,14 @@ class RpcChildHandle implements ChildHandle {
  * The worker-side child-RPC bridge ({@link ChildPort}): allocates callIds,
  * posts the start/dispose RPCs, and owns the per-call pending book-keeping
  * the session's message handler settles via the `onChild*` entry points.
+ * Cache lookup/store is a second RPC (own callId counter + pending Map);
+ * it never shares PendingChild or goes through startAgent.
  */
-class ChildRpcBridge implements ChildPort {
+class ChildRpcBridge implements ChildPort, CachePort {
   private nextCallId = 0;
   private readonly pending = new Map<number, PendingChild>();
+  private nextCacheCallId = 0;
+  private readonly pendingCache = new Map<number, PendingCache>();
 
   constructor(private readonly post: Post) {}
 
@@ -135,6 +147,58 @@ class ChildRpcBridge implements ChildPort {
     this.pending.delete(callId);
     entry?.disposed.resolve();
   }
+
+  async lookup(key: string): Promise<CacheLookupHit | undefined> {
+    this.nextCacheCallId += 1;
+    const callId = this.nextCacheCallId;
+    const lookup = deferred<CacheLookupHit | undefined>();
+    // Containment: a cancelled run may drop the lookup waiter — the pending
+    // promise must not surface as an unhandled rejection and kill the worker.
+    lookup.promise.catch(() => {
+      /* consumed: unconsumed cache lookup after cancel */
+    });
+    this.pendingCache.set(callId, { lookup });
+    this.post(WorkerToHostType.CacheLookup, { callId, key });
+    return lookup.promise;
+  }
+
+  async store(key: string, value: unknown, childId?: string): Promise<void> {
+    this.nextCacheCallId += 1;
+    const callId = this.nextCacheCallId;
+    const store = deferred<void>();
+    store.promise.catch(() => {
+      /* consumed: unconsumed cache store after cancel */
+    });
+    this.pendingCache.set(callId, { store });
+    this.post(WorkerToHostType.CacheStore, {
+      callId,
+      key,
+      value,
+      ...typeof childId === "string" && childId.length > 0 ? { childId } : {},
+    });
+    return store.promise;
+  }
+
+  /** The host answered a lookup; undefined (miss) when `hit` is false. */
+  onCacheLookupResult(callId: number, hit: boolean, value?: unknown, childId?: string): void {
+    const entry = this.pendingCache.get(callId);
+    this.pendingCache.delete(callId);
+    if (!hit) {
+      entry?.lookup?.resolve(undefined);
+      return;
+    }
+    entry?.lookup?.resolve({
+      value,
+      ...typeof childId === "string" && childId.length > 0 ? { childId } : {},
+    });
+  }
+
+  /** The host acked a store (failures are swallowed host-side). */
+  onCacheStored(callId: number): void {
+    const entry = this.pendingCache.get(callId);
+    this.pendingCache.delete(callId);
+    entry?.store?.resolve();
+  }
 }
 
 /**
@@ -183,7 +247,7 @@ export async function runWorkerSession(port: MessagePort, init: WorkerInit): Pro
 
   let execution: WorkflowExecution;
   try {
-    execution = new WorkflowExecution(init.meta, init.body, init.args, init.limits, observer, children, init.runDefault);
+    execution = new WorkflowExecution(init.meta, init.body, init.args, init.limits, observer, children, init.runDefault, children);
   } catch (error: unknown) {
     post(WorkerToHostType.Result, {
       result: { value: null, stopReason: "error", error: renderThrown(error), agentsStarted: 0 },
@@ -217,6 +281,12 @@ export async function runWorkerSession(port: MessagePort, init: WorkerInit): Pro
         break;
       case HostToWorkerType.ChildDisposed:
         children.onChildDisposed(message.callId);
+        break;
+      case HostToWorkerType.CacheLookupResult:
+        children.onCacheLookupResult(message.callId, message.hit, message.value, message.childId);
+        break;
+      case HostToWorkerType.CacheStored:
+        children.onCacheStored(message.callId);
         break;
       default:
         // The exhaustive host-to-worker union: an unknown tag is a protocol

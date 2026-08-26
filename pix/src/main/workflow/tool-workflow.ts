@@ -9,9 +9,9 @@
  * Locked behavior:
  * - executionMode "sequential": the run never overlaps other tools in a turn.
  * - Errors BEFORE start (missing session, META_INVALID / SCRIPT_PARSE /
- *   INVALID_ARGUMENT) and non-"completed" outcomes THROW (isError) - the
- *   agent tool's business-failure-as-success pattern does not apply here, and
- *   a partial value is never treated as success.
+ *   INVALID_ARGUMENT) THROW short errors. After start, non-"completed"
+ *   outcomes THROW a salvage envelope (isError) AFTER dispose + recorder.finish
+ *   so the fold is final; a partial value is never treated as success.
  * - Imports only the engine seam + runtime types + recorder + shared
  *   vocabulary: never host.ts / worker.ts / protocol.ts, never Vue/ipc/Pinia.
  * - Live onUpdate details carry the recorder's in-memory fold (same algorithm
@@ -32,6 +32,7 @@ import {
 import type {
   WorkflowResult,
   WorkflowRunId,
+  WorkflowSalvage,
   WorkflowStopReason,
   WorkflowToolDetails,
   WorkflowViewState,
@@ -134,14 +135,16 @@ const DESCRIPTION = [
   "return out.filter(Boolean);",
   "",
   "Script-body hooks:",
-  "- `agent(prompt, opts?): Promise<any>` - run one subagent to completion. Without `opts.schema` it resolves to the child's final text; with `opts.schema` (an object-rooted JSON Schema using ONLY type/properties/required/additionalProperties/items/enum/const/oneOf; every node including the root MUST declare `type`; the root MUST be type:\"object\"; enum/const/oneOf may only appear on a node that already has `type` — a bare {enum:[...]} is rejected; nested nodes may be object, string, array, number, integer, or boolean; no pattern/format/numeric bounds) it resolves to the validated object. Resolves `null` when the child fails (filter with `.filter(Boolean)` and compare length to the input). Other opts: `label` (display), `phase` (progress group), independent `provider`/`model` LLM target overrides (`provider` is an agent definition name such as general-purpose, NOT an LLM vendor; `model` is a model id; either may be provided alone), `retry` (0-2; default 1 when `schema` is set, else 0; retries max_turns / missing structured submit / api_error and counts against the total-agent cap), `maxTurns` (1-200 nested LLM turns per child, not the workflow script; omit it unless you need a tighter cap — schema and non-schema children both default to 150). Anything else (`effort`/`isolation`/`agentType`) is rejected loudly.",
-  "- `settled(prompt, opts?): Promise<{ok:true,value}|{ok:false,reason,message,stopReason}>` - same as agent() but never collapses a failure to null, so you can tell a real failure from a legitimate JSON null.",
-  "- `stats(): {completed, failed, cancelled}` - running child-attempt counts (every retry is one attempt).",
+  "- `agent(prompt, opts?): Promise<any>` - run one subagent to completion. Without `opts.schema` it resolves to the child's final text; with `opts.schema` (an object-rooted JSON Schema using ONLY type/properties/required/additionalProperties/items/enum/const/oneOf; every node including the root MUST declare `type`; the root MUST be type:\"object\"; enum/const/oneOf may only appear on a node that already has `type` — a bare {enum:[...]} is rejected; nested nodes may be object, string, array, number, integer, or boolean; no pattern/format/numeric bounds) it resolves to the validated object. Resolves `null` when the child fails (filter with `.filter(Boolean)` and compare length to the input). Other opts: `label` (display), `phase` (progress group), independent `provider`/`model` LLM target overrides (`provider` is an agent definition name such as general-purpose, NOT an LLM vendor; `model` is a model id; either may be provided alone), `retry` (0-2; default 1 when `schema` is set, else 0; retries max_turns / missing structured submit / api_error and counts against the total-agent cap), `maxTurns` (1-200 nested LLM turns per child, not the workflow script; omit it unless you need a tighter cap — schema and non-schema children both default to 150), `cache` (boolean, default true; a completed child is reused for the same prompt and opts under this session and meta.name; pass `cache: false` to skip lookup and store; cache identity is prompt+schema/provider/model/maxTurns only — artifacts/put payloads are not part of the key, so changing put() data for the same prompt requires `cache: false` or a new meta.name), `artifacts` (array of `{name}` refs from put()/ref(); injected as child system context, not counted against the 64KB user-prompt cap). Anything else (`effort`/`isolation`/`agentType`) is rejected loudly.",
+  "- `settled(prompt, opts?): Promise<{ok:true,value,childId?}|{ok:false,reason,message,stopReason}>` - same as agent() but never collapses a failure to null, so you can tell a real failure from a legitimate JSON null. Same cache default as agent(); `cache: false` skips lookup and store. Same `artifacts` option as agent(). `childId` is the spawn taskId when known (including cache hits that stored one); omitted on legacy cache files and on failures.",
+  "- `stats(): {completed, failed, cancelled, replayed?}` - running child-attempt counts (every retry is one attempt; cache hits increment replayed and are omitted when 0).",
   "- `pipeline(items, ...stages, opts?): Promise<any[]>` - run each item through the stages independently with NO barrier between stages (prefer this for multi-stage work). Each stage receives `(prev, item, index)`. An ordinary stage throw drops that ITEM to `null` and skips its remaining stages. Optional last argument `{ retry: 0-2 }` re-runs only items that resolved `null` (successes are not restarted).",
   "- `parallel(thunks, opts?): Promise<any[]>` - run zero-argument functions concurrently and await ALL of them (a barrier; use only when a stage genuinely needs every prior result together). A throwing thunk resolves to `null`. Optional second argument `{ retry: 0-2 }` re-runs only thunks that resolved `null`.",
   "- `phase(title)` - start a progress phase; `log(message)` - narrate progress; `args` - the tool call's `args` input, verbatim.",
+  "- `put(name, value): {name}` - store a JSON-serializable value in this run's in-memory artifact map (synchronous; not written to disk). `get(name)` returns the stored value or `null` when missing. `ref(name)` returns a frozen `{name}` handle to an already-stored artifact (unknown name throws). Names match `[a-zA-Z0-9._-]{1,64}`. Illegal name, more than 256 artifacts, or more than 8MiB stored throws. Pass refs as `agent(prompt, { artifacts: [ref] })` so the child receives the payload instead of inlining it into the prompt (render over 1MiB throws before spawn).",
   "",
-  "Keep schema tasks small (few fields; issues as string arrays). Do not pass a small maxTurns for investigation or multi-file work — schema children already default to 150. Consume results only after filtering nulls and checking `out.length === items.length` or `stats().failed === 0`. Prefer `pipeline(items, stage, { retry: 1 })` so only failed items re-run. A finished workflow script is not checkpointed: to continue only failures after the tool returns, pass those labels/files into a new call.",
+  "Keep schema tasks small (few fields; issues as string arrays). Do not pass a small maxTurns for investigation or multi-file work — schema children already default to 150. Consume results only after filtering nulls and checking `out.length === items.length` or `stats().failed === 0`. Prefer `pipeline(items, stage, { retry: 1 })` so only failed items re-run. If the tool fails, read <salvage> child-id values and use inspect_agent_task. Do not rewrite the whole script and blindly rerun. Keep child schemas small; never inline full child reports into the next agent() prompt — oversized prompts fail that child (reason: prompt_too_large) without killing siblings.",
+  "Cache hits require the child `agent()` / `settled()` prompt to be byte-identical (plus schema/provider/model/maxTurns). `label`, `phase`, and the script `return` value are not part of the key. If the parent `<workflow-result>` is truncated (`… [truncated]`), shrink the script `return` (counts and short issue strings only); do not edit notes, comments, or wording concatenated into child prompts — that changes the prompt, misses the cache, and re-runs every child. Do not shadow hook names (`agent`, `settled`, `stats`, `pipeline`, `parallel`, `phase`, `log`, `put`, `get`, `ref`, `args`). On a completed truncated run, read `<sources>` child-id values (prefix, not inside `<result>`) and use inspect_agent_task; rerunning the same prompts will cache-hit and truncate again. Split large file lists across shards instead of one 150-turn child.",
   "",
   "Misused hooks (bad arguments, unknown options, unsupported schemas, tripped caps) throw errors that ALWAYS kill the script - they never dissolve into a per-item `null`.",
   "",
@@ -186,6 +189,32 @@ function stopReasonError(result: WorkflowResult): string | undefined {
   }
 }
 
+const SOURCES_PREFIX_BUDGET = 8_192;
+
+function renderSourcesBlock(sources: NonNullable<WorkflowResult["sources"]>, truncated: boolean): string {
+  if (sources.length === 0 && !truncated) return "";
+  const attrs = truncated ? ' truncated="true"' : "";
+  const children = sources
+    .map((source) => `<child label="${escapeXml(source.label)}" child-id="${escapeXml(source.childId)}"/>`)
+    .join("");
+  return `<sources${attrs}>${children}</sources>`;
+}
+
+/** Fit sources into the prefix budget by dropping from the end. */
+function boundSourcesBlock(sources: NonNullable<WorkflowResult["sources"]>, budget: number): string {
+  if (sources.length === 0 || budget <= 0) return "";
+  let kept = sources;
+  let truncated = false;
+  let block = renderSourcesBlock(kept, truncated);
+  while (kept.length > 0 && block.length > budget) {
+    kept = kept.slice(0, -1);
+    truncated = true;
+    block = renderSourcesBlock(kept, truncated);
+  }
+  if (block.length > budget) return "";
+  return block;
+}
+
 /** Render one bounded, model-facing workflow result envelope. */
 function renderResult(runId: WorkflowRunId, name: string, result: WorkflowResult, maxChars: number): string {
   const rendered = JSON.stringify(result.value, null, 2) ?? "null";
@@ -194,9 +223,10 @@ function renderResult(runId: WorkflowRunId, name: string, result: WorkflowResult
   const failed = stats?.failed ?? 0;
   const cancelled = stats?.cancelled ?? 0;
   const ok = stats?.completed ?? 0;
+  const replayed = stats?.replayed ?? 0;
   const countLabel =
-    failed > 0 || cancelled > 0
-      ? `${started} agent${started === 1 ? "" : "s"}, ${ok} ok / ${failed} failed${cancelled > 0 ? ` / ${cancelled} cancelled` : ""}`
+    failed > 0 || cancelled > 0 || replayed > 0
+      ? `${started} agent${started === 1 ? "" : "s"}, ${ok} ok / ${failed} failed${cancelled > 0 ? ` / ${cancelled} cancelled` : ""}${replayed > 0 ? ` / ${replayed} replayed` : ""}`
       : `${started} agent${started === 1 ? "" : "s"}`;
   const failures = result.failures ?? [];
   const failureText = failures
@@ -213,24 +243,152 @@ function renderResult(runId: WorkflowRunId, name: string, result: WorkflowResult
       ? ""
       : `<failures>${boundEscapedXmlText(failureText, 8_192)}</failures>`;
   const requiresAction = result.stopReason !== "completed" || failed > 0 || cancelled > 0;
-  const prefix = [
-    `<workflow-result ${[
-      `workflow-id="${escapeXml(runId)}"`,
-      `workflow="${escapeXml(name)}"`,
-      `status="${escapeXml(result.stopReason)}"`,
-      `agents-started="${started}"`,
-      `child-completed="${ok}"`,
-      `child-failed="${failed}"`,
-      `child-cancelled="${cancelled}"`,
-      `requires-action="${requiresAction}"`,
-    ].join(" ")}>`,
-    `<summary>${escapeXml(countLabel)}</summary>`,
-    failureBlock,
-    "<result>",
-  ].join("");
+  const attrs = [
+    `workflow-id="${escapeXml(runId)}"`,
+    `workflow="${escapeXml(name)}"`,
+    `status="${escapeXml(result.stopReason)}"`,
+    `agents-started="${started}"`,
+    `child-completed="${ok}"`,
+    `child-failed="${failed}"`,
+    `child-cancelled="${cancelled}"`,
+    ...replayed > 0 ? [`child-replayed="${replayed}"`] : [],
+    `requires-action="${requiresAction}"`,
+  ].join(" ");
+  const open = `<workflow-result ${attrs}>`;
+  const summary = `<summary>${escapeXml(countLabel)}</summary>`;
   const suffix = "</result></workflow-result>";
+  const prefixWithoutSources = [open, summary, failureBlock, "<result>"].join("");
+  const sourcesBudget = Math.min(
+    SOURCES_PREFIX_BUDGET,
+    Math.max(0, maxChars - prefixWithoutSources.length - suffix.length),
+  );
+  const sourcesBlock = boundSourcesBlock(result.sources ?? [], sourcesBudget);
+  const prefix = [open, summary, failureBlock, sourcesBlock, "<result>"].join("");
   const resultBudget = Math.max(0, maxChars - prefix.length - suffix.length);
   return `${prefix}${boundEscapedXmlText(rendered, resultBudget)}${suffix}`;
+}
+
+const SALVAGE_HINT =
+  "child results are still on disk. Use inspect_agent_task on the childId list; do not rewrite the whole script and blindly rerun. Rerunning the same meta.name in this session reuses completed children via cache.";
+
+/** Completed members from the recorder fold; empty salvage is still emitted. */
+function deriveSalvage(view: WorkflowViewState | undefined): WorkflowSalvage {
+  const completed = (view?.members ?? [])
+    .filter((member) => member.outcome === "completed")
+    .map((member) => ({ seq: member.seq, label: member.label, childId: member.childId }));
+  return {
+    completed,
+    hint: `${completed.length} ${SALVAGE_HINT}`,
+  };
+}
+
+/** Count fold outcomes when the result dropped childStats (cancel rewrite). */
+function resolveChildCounts(
+  result: WorkflowResult,
+  view: WorkflowViewState | undefined,
+): { completed: number; failed: number; cancelled: number } {
+  if (result.childStats !== undefined) {
+    return {
+      completed: result.childStats.completed,
+      failed: result.childStats.failed,
+      cancelled: result.childStats.cancelled,
+    };
+  }
+  let completed = 0;
+  let failed = 0;
+  let cancelled = 0;
+  for (const member of view?.members ?? []) {
+    if (member.outcome === "completed") completed++;
+    else if (member.outcome === "failed") failed++;
+    else if (member.outcome === "cancelled") cancelled++;
+  }
+  return { completed, failed, cancelled };
+}
+
+/**
+ * Failure/cancel envelope thrown AFTER dispose + finish. Must not reuse
+ * renderResult: cancel rewrite drops childStats/failures, renderResult omits
+ * result.error, and renderResult would put a partial value in <result>.
+ */
+function renderFailureEnvelope(
+  runId: WorkflowRunId,
+  name: string,
+  result: WorkflowResult,
+  salvage: WorkflowSalvage,
+  view: WorkflowViewState | undefined,
+  maxChars: number,
+): string {
+  const started = result.agentsStarted;
+  const stats = resolveChildCounts(result, view);
+  const ok = stats.completed;
+  const failed = stats.failed;
+  const cancelled = stats.cancelled;
+  const countLabel = `${started} agent${started === 1 ? "" : "s"}, ${ok} ok / ${failed} failed${cancelled > 0 ? ` / ${cancelled} cancelled` : ""}`;
+  const rawErrorText = stopReasonError(result) ?? result.error ?? "unknown error";
+  const failures = result.failures ?? [];
+  const failureText = failures
+    .map((failure) => {
+      const detail =
+        failure.message !== undefined && failure.message.length > 0
+          ? `${failure.reason}: ${failure.message}`
+          : failure.reason;
+      return `${failure.label}: ${detail}`;
+    })
+    .join("\n");
+  const failureBlock =
+    failureText.length === 0 ? "" : `<failures>${boundEscapedXmlText(failureText, 8_192)}</failures>`;
+  const attrs = [
+    `workflow-id="${escapeXml(runId)}"`,
+    `workflow="${escapeXml(name)}"`,
+    `status="${escapeXml(result.stopReason)}"`,
+    `agents-started="${started}"`,
+    `child-completed="${ok}"`,
+    `child-failed="${failed}"`,
+    `child-cancelled="${cancelled}"`,
+    `requires-action="true"`,
+  ].join(" ");
+  const childXmls = salvage.completed.map(
+    (child) =>
+      `<child seq="${escapeXml(String(child.seq))}" label="${escapeXml(child.label)}" child-id="${escapeXml(child.childId)}"/>`,
+  );
+
+  const assemble = (errorEscaped: string, hintEscaped: string, children: string[]): string =>
+    [
+      `<workflow-result ${attrs}>`,
+      `<summary>${escapeXml(countLabel)}</summary>`,
+      `<error>${errorEscaped}</error>`,
+      failureBlock,
+      `<salvage hint="${hintEscaped}">`,
+      children.join(""),
+      "</salvage>",
+      "<result>null</result>",
+      "</workflow-result>",
+    ].join("");
+
+  // Bound <error> before assembly so a huge result.error cannot push the
+  // envelope past maxChars and force a hard slice that drops </salvage>
+  // and <result>null. Same 8192 cap as <failures>.
+  const errorEscaped = boundEscapedXmlText(rawErrorText, 8_192);
+
+  let children = childXmls;
+  let envelope = assemble(errorEscaped, escapeXml(salvage.hint), children);
+  if (envelope.length <= maxChars) return envelope;
+
+  while (children.length > 0 && envelope.length > maxChars) {
+    children = children.slice(0, -1);
+    envelope = assemble(errorEscaped, escapeXml(salvage.hint), children);
+  }
+  if (envelope.length <= maxChars) return envelope;
+
+  const emptyHintSkeleton = assemble(errorEscaped, "", []);
+  const hintBudget = maxChars - emptyHintSkeleton.length;
+  if (hintBudget > 0) {
+    envelope = assemble(errorEscaped, boundEscapedXmlText(salvage.hint, hintBudget), []);
+    if (envelope.length <= maxChars) return envelope;
+  }
+
+  if (maxChars <= TRUNCATION_NOTICE.length) return TRUNCATION_NOTICE.slice(0, maxChars);
+  return `${envelope.slice(0, maxChars - TRUNCATION_NOTICE.length)}${TRUNCATION_NOTICE}`;
 }
 
 /** Extra payload only the workflow/end event carries. */
@@ -376,7 +534,8 @@ function completedDetails(
  * section 4.7). The execute lifecycle is shared with the ralph tool: parent
  * ref, start (synchronous failures throw), recorder.start, abort bridge,
  * observe-only event updates, await result, dispose + finish with abandon as
- * the fallback, and a throw for every non-"completed" stop reason.
+ * the fallback, and a salvage-envelope throw for every non-"completed" stop
+ * reason after that teardown.
  */
 export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefinition<typeof WorkflowParams, WorkflowToolDetails> {
   return {
@@ -445,14 +604,9 @@ export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefini
         // Subscribe inside the try so a synchronous throw still hits dispose /
         // recorder.abandon instead of leaving a hanging run record.
         unsubscribes = subscribeRunUpdates(host, run, onUpdate);
+        // run.result never rejects; non-"completed" is thrown AFTER dispose
+        // + finish so the fold already has run-end and paired members.
         result = await run.result;
-        const errorMessage = stopReasonError(result);
-        if (errorMessage !== undefined) {
-          // A non-"completed" stop reason means the script did not finish
-          // cleanly: report the reason, never treat a partial value as
-          // success.
-          throw new Error(errorMessage);
-        }
       } finally {
         signal?.removeEventListener("abort", onAbort);
         try {
@@ -472,13 +626,16 @@ export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefini
           host.recorder.abandon(run.id);
         }
       }
-      // Success path only: dispose() has flushed the host's stranded
-      // agent-end synthesis and finish() has appended the run-end record, so
-      // the fold is FINAL here. Computing the details snapshot after teardown
-      // keeps a member whose ending landed after workflow/end (a discarded
-      // script promise racing the exit sweep) from being frozen as running in
-      // the persisted panel state.
+      // dispose() has flushed stranded agent-end synthesis and finish() has
+      // appended the run-end record, so the fold is FINAL here. Failure throws
+      // the salvage envelope after that teardown; completed snapshots details
+      // after teardown so a late member ending is not frozen as running.
       const settled = result as WorkflowResult;
+      if (settled.stopReason !== "completed") {
+        const view = host.recorder.getSnapshot().find((item) => item.runId === run.id);
+        const salvage = deriveSalvage(view);
+        throw new Error(renderFailureEnvelope(run.id, run.meta.name, settled, salvage, view, MAX_RESULT_CHARS));
+      }
       const content = textContent(renderResult(run.id, run.meta.name, settled, MAX_RESULT_CHARS));
       return { content: [content], details: completedDetails(run, toolCallId, settled, host.recorder) };
     },

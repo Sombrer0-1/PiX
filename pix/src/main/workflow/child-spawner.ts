@@ -27,6 +27,7 @@
 import { WorkflowError } from "./engine/engine.js";
 import { WORKFLOW_APP_SHUTDOWN_CANCEL_REASON } from "./engine/child-types.js";
 import type { ChildHandle, ChildResult, ChildStartRequest } from "./engine/child-types.js";
+import { renderWorkflowArtifacts } from "./engine/artifact-render.js";
 import type { AgentTaskStopReason } from "../../shared/agent-task-types.js";
 import type { WorkflowParentRef } from "./engine/runtime-types.js";
 import type { AgentTaskService, WorkflowTaskExtra } from "../agent-task/agent-task-service.js";
@@ -76,6 +77,10 @@ function defaultLabel(prompt: string): string {
   return line.length <= 48 ? line : `${line.slice(0, 47)}…`;
 }
 
+/** Host defense: worker already prechecked the same render budget in startAgent. */
+const MAX_ARTIFACT_INJECT_BYTES = 1024 * 1024;
+const UTF8 = new TextEncoder();
+
 /** Preflight failure reasons that surface as child-failed (AGENT_START). */
 const PREFLIGHT_FAILURE_REASONS = new Set<SubagentFailureReason | undefined>([
   "unknown_agent",
@@ -90,14 +95,24 @@ const PREFLIGHT_FAILURE_REASONS = new Set<SubagentFailureReason | undefined>([
 ]);
 
 /**
- * Mapping rule 3 (design plan §4.6): a preflight/infrastructure rejection
- * rejects the handle. `invalid_parameters` after the item actually started
- * (startedAt present) is NOT preflight — that is a schema child that ran
- * but never submitted, and must resolve so the script sees null (§5.3).
+ * Mapping rule 3 (design plan §4.6 / SDD §4.10): a preflight/infrastructure
+ * rejection rejects the handle. Empty / whitespace-only `prompt_too_large`
+ * stays fatal AGENT_START; a non-empty oversized prompt is NOT preflight
+ * (ordinary child failure with a real taskId). `invalid_parameters` after
+ * the item actually started (startedAt present) is also NOT preflight —
+ * that is a schema child that ran but never submitted, and must resolve
+ * so the script sees null (§5.3).
  */
-function isPreflightRejection(result: SubagentSingleResult | undefined): result is SubagentSingleResult {
+function isPreflightRejection(
+  result: SubagentSingleResult | undefined,
+  request: ChildStartRequest,
+): result is SubagentSingleResult {
   if (result === undefined || result.status === "aborted") {
     return false;
+  }
+  if (result.failureReason === "prompt_too_large") {
+    const empty = typeof request.prompt !== "string" || request.prompt.trim() === "";
+    return empty;
   }
   if (!PREFLIGHT_FAILURE_REASONS.has(result.failureReason)) {
     return false;
@@ -128,6 +143,9 @@ export function createAgentTaskChildSpawner(service: AgentTaskService): Workflow
       // Single-item group by construction; the extras array parallels the
       // tasks array 1:1. A mismatch is host input validation: it fails the
       // start before createTaskGroup (no ChildStarted yet).
+      // tasks[0] + extras[0] are single objects; appendSystemPrompt is a field
+      // on extras[0] — never extras.push a second extra (service length mismatch
+      // silently drops all extras and workflowOwned=false).
       const tasks: SubagentTaskItem[] = [
         {
           prompt: request.prompt,
@@ -135,11 +153,22 @@ export function createAgentTaskChildSpawner(service: AgentTaskService): Workflow
           subagent_type: resolvedAgent.agentType,
         },
       ];
-      const extras: WorkflowTaskExtra[] = [{
+      const extra: WorkflowTaskExtra = {
         modelOverride: request.model,
         outputSchema: request.schema,
         ...(request.maxTurns !== undefined ? { maxTurns: request.maxTurns } : {}),
-      }];
+      };
+      if (request.artifacts !== undefined && request.artifacts.length > 0) {
+        const rendered = renderWorkflowArtifacts(request.artifacts);
+        if (UTF8.encode(rendered).length > MAX_ARTIFACT_INJECT_BYTES) {
+          throw new WorkflowError(
+            `workflow child artifacts render exceeds ${MAX_ARTIFACT_INJECT_BYTES} bytes`,
+            "INVALID_ARGUMENT",
+          );
+        }
+        extra.appendSystemPrompt = rendered;
+      }
+      const extras: WorkflowTaskExtra[] = [extra];
       if (extras.length !== tasks.length) {
         throw new WorkflowError(
           `workflow child start failed: workflowExtras length (${extras.length}) does not match tasks length (${tasks.length})`,
@@ -175,11 +204,21 @@ export function createAgentTaskChildSpawner(service: AgentTaskService): Workflow
         }
         const first = awaited.details.results[0];
         // 3. preflight rejection (incl. an illegal modelOverride): child-failed.
-        if (awaited.kind === "failed" && isPreflightRejection(first)) {
+        // Empty / whitespace prompt_too_large stays here; oversized does not.
+        if (awaited.kind === "failed" && isPreflightRejection(first, request)) {
           throw new WorkflowError(
             `workflow child failed to start: ${first.errorMessage ?? first.failureReason}`,
             "AGENT_START",
           );
+        }
+        // Oversized (non-empty) prompt: ordinary child failure, real taskId.
+        if (awaited.kind === "failed" && first?.failureReason === "prompt_too_large") {
+          return {
+            output: textOutput(""),
+            stopReason: "failed",
+            failureReason: "prompt_too_large",
+            error: first.errorMessage ?? "the delegated prompt exceeds the size cap.",
+          };
         }
         // 4. child failure / queued cancel: resolve; the script side gets null.
         if (awaited.kind === "failed") {

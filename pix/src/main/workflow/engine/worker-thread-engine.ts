@@ -145,6 +145,7 @@ export class WorkerThreadWorkflowEngine extends WorkflowEngine {
   private readonly config: ResolvedConfig;
   private readonly live = new Map<WorkflowRunId, WorkerRun>();
   private readonly getRunningSlotCap: (() => number) | undefined;
+  private readonly cache: WorkflowEngineConfig["cache"];
 
   constructor(
     private readonly spawner: WorkflowChildSpawner,
@@ -153,6 +154,7 @@ export class WorkerThreadWorkflowEngine extends WorkflowEngine {
     super(config);
     this.config = defaultConfig(config);
     this.getRunningSlotCap = config?.getRunningSlotCap;
+    this.cache = config?.cache;
   }
 
   /**
@@ -212,6 +214,7 @@ export class WorkerThreadWorkflowEngine extends WorkflowEngine {
         },
       },
       request.signal,
+      this.cache,
     );
     this.live.set(id, run);
     this.emit("workflow/start", info);
@@ -227,6 +230,7 @@ export class WorkerThreadWorkflowEngine extends WorkflowEngine {
         ...settled.error !== undefined ? { error: settled.error } : {},
         agentsStarted: settled.agentsStarted,
         ...settled.childStats !== undefined ? { childStats: settled.childStats } : {},
+        ...settled.sources !== undefined ? { sources: settled.sources } : {},
       });
     });
     return run;

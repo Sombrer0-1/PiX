@@ -168,6 +168,8 @@ export interface WorkflowTaskExtra {
   outputSchema?: unknown;
   /** Nested-session turn cap; when set, overrides the agent definition default. */
   maxTurns?: number;
+  /** Frozen into the ready item; injected after the agent system prompt. Absent is legal. */
+  appendSystemPrompt?: string;
 }
 
 export interface CreateTaskParams {
@@ -303,6 +305,8 @@ interface PreflightItem {
   outputSchema: unknown | undefined;
   /** workflow children: optional per-item maxTurns override from extras. */
   maxTurnsOverride: number | undefined;
+  /** workflow children: optional system-prompt suffix from extras (artifacts). */
+  appendSystemPrompt: string | undefined;
   projectAgent: boolean;
   failure: { reason: AgentTaskFailureReason; message: string } | undefined;
 }
@@ -1461,6 +1465,8 @@ export class AgentTaskService {
         extra?.maxTurns !== undefined && Number.isSafeInteger(extra.maxTurns) && extra.maxTurns >= 1
           ? extra.maxTurns
           : undefined;
+      const appendSystemPrompt =
+        typeof extra?.appendSystemPrompt === "string" ? extra.appendSystemPrompt : undefined;
 
       let failure: { reason: AgentTaskFailureReason; message: string } | undefined;
       let modelSnapshot: Model<Api> | undefined;
@@ -1511,6 +1517,7 @@ export class AgentTaskService {
         modelLabel,
         outputSchema,
         maxTurnsOverride,
+        appendSystemPrompt,
         projectAgent: definition?.source === "project",
         failure,
       });
@@ -1781,8 +1788,9 @@ export class AgentTaskService {
     }
     const definition = item.definition!;
     // The frozen item model IS the resolved modelOverride (resolution already
-    // applied in preflight); the optional outputSchema is written only when a
-    // workflow schema child requested it, so the baseline shape is unchanged.
+    // applied in preflight); optional outputSchema / appendSystemPrompt are
+    // written only when a workflow extra requested them, so the baseline
+    // shape is unchanged. appendSystemPrompt is persist-on-spec (resume reads it).
     return {
       resolution: "ready",
       index: item.index,
@@ -1792,6 +1800,7 @@ export class AgentTaskService {
       model: { provider: item.modelSnapshot!.provider, modelId: item.modelSnapshot!.id },
       maxTurns: item.maxTurnsOverride ?? definition.maxTurns ?? DEFAULT_MAX_TURNS,
       ...(item.outputSchema !== undefined ? { outputSchema: item.outputSchema } : {}),
+      ...(item.appendSystemPrompt !== undefined ? { appendSystemPrompt: item.appendSystemPrompt } : {}),
     };
   }
 

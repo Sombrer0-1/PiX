@@ -7,6 +7,7 @@
 
 import type { WorkflowMeta, WorkflowResult, WorkflowRunId } from "../../../shared/workflow-types.js";
 import type { AgentTaskSubmissionContext } from "../../agent-task/agent-task-service.js";
+import type { WorkflowChildCache } from "../child-cache.js";
 
 /**
  * What a caller asks for when starting a workflow run. `meta` and `args` are
@@ -16,6 +17,7 @@ import type { AgentTaskSubmissionContext } from "../../agent-task/agent-task-ser
 export interface WorkflowParentRef {
   sessionId: string;
   toolCallId: string;
+  workspaceId: string;
   /** Called once per child-start; the return value is only valid during createTaskGroup — the spawner must not cache the closure past freeze. */
   getSubmissionContext(): AgentTaskSubmissionContext;
 }
@@ -60,4 +62,6 @@ export interface WorkflowEngineConfig {
   maxItemsPerCall?: number;     // default 4096
   syncTimeoutMs?: number;       // default 5000
   disposeGraceMs?: number;      // default 5000
+  /** Host-only child-result cache; never shipped in WorkerInit / workerData. */
+  cache?: WorkflowChildCache;
 }

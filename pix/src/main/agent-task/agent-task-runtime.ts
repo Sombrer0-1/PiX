@@ -250,10 +250,13 @@ function emptyUsage(): SubagentUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
 }
 
-/** Schema children append the capture-tool completion contract after the agent system prompt. */
+/** Nested-session system prompt: base, agent.systemPrompt, extraAppend?, schemaPrompt last. */
 function nestedSystemPromptOverride(item: AgentTaskItemSpec & { resolution: "ready" }): (base: string[]) => string[] {
   return (base) => {
     const parts = [...base, item.agent.systemPrompt];
+    if (item.appendSystemPrompt !== undefined) {
+      parts.push(item.appendSystemPrompt);
+    }
     if (item.outputSchema !== undefined) {
       parts.push(schemaChildCompletionPrompt(item.outputSchema as ObjectJsonSchema));
     }

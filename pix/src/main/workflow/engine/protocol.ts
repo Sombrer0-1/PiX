@@ -20,6 +20,8 @@ export enum WorkerToHostType {
   AgentEnd = "agent-end",
   ChildStart = "child-start",
   ChildDispose = "child-dispose",
+  CacheLookup = "cache-lookup",
+  CacheStore = "cache-store",
   Result = "result",
 }
 export enum HostToWorkerType {
@@ -30,6 +32,8 @@ export enum HostToWorkerType {
   ChildSettled = "child-settled",
   ChildFailed = "child-failed",
   ChildDisposed = "child-disposed",
+  CacheLookupResult = "cache-lookup-result",
+  CacheStored = "cache-stored",
 }
 
 export interface WorkerToHostPayloads {
@@ -40,6 +44,8 @@ export interface WorkerToHostPayloads {
   [WorkerToHostType.AgentEnd]: { info: WorkflowAgentEndInfo };
   [WorkerToHostType.ChildStart]: { callId: number; request: ChildStartRequest };
   [WorkerToHostType.ChildDispose]: { callId: number };
+  [WorkerToHostType.CacheLookup]: { callId: number; key: string };
+  [WorkerToHostType.CacheStore]: { callId: number; key: string; value: unknown; childId?: string };
   [WorkerToHostType.Result]: { result: WorkflowResult };
 }
 export interface HostToWorkerPayloads {
@@ -50,6 +56,8 @@ export interface HostToWorkerPayloads {
   [HostToWorkerType.ChildSettled]: { callId: number; result: ChildResult };
   [HostToWorkerType.ChildFailed]: { callId: number; rendered: string };
   [HostToWorkerType.ChildDisposed]: { callId: number };
+  [HostToWorkerType.CacheLookupResult]: { callId: number; hit: boolean; value?: unknown; childId?: string };
+  [HostToWorkerType.CacheStored]: { callId: number };
 }
 
 export type WorkerToHostMessage<T extends WorkerToHostType = WorkerToHostType> =

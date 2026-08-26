@@ -125,6 +125,8 @@ export type AgentTaskItemSpec =
       maxTurns: number;
       /** workflow schema children only: must already be a subset-legal ObjectJsonSchema (the service does no subset gate). Absent is legal. */
       outputSchema?: unknown;
+      /** workflow children only: extra system-prompt suffix (artifacts). Absent is legal. Persist-on-spec so resume reads it. */
+      appendSystemPrompt?: string;
     }
   | { resolution: "rejected"; index: number; prompt: string; description: string; requestedAgentName?: string; failureReason: AgentTaskFailureReason; errorMessage: string };
 export interface AgentTaskItemSummary {
@@ -558,7 +560,8 @@ export function isAgentTaskInfo(v: unknown): v is AgentTaskInfo {
  * ready/rejected variant discriminants, the frozen agent/model snapshots and
  * the optional workflow outputSchema (absent is legal; present must be a plain
  * object — subset-legal ObjectJsonSchema shape is the worker's gate, not
- * checked here).
+ * checked here) and the optional appendSystemPrompt (absent is legal; present
+ * must be a string). Unknown fields are ignored so old snapshots restore.
  */
 export function isAgentTaskItemSpec(value: unknown): value is AgentTaskItemSpec {
   if (!isRecord(value)) return false;
@@ -582,6 +585,9 @@ export function isAgentTaskItemSpec(value: unknown): value is AgentTaskItemSpec 
     if (typeof value.outputSchema !== "object" || value.outputSchema === null || Array.isArray(value.outputSchema)) {
       return false;
     }
+  }
+  if (value.appendSystemPrompt !== undefined && typeof value.appendSystemPrompt !== "string") {
+    return false;
   }
   return true;
 }

@@ -20,10 +20,11 @@ import type {
   WorkflowResult,
   WorkflowRunId,
 } from "../../../shared/workflow-types.js";
-import type { WorkflowParentRef, WorkflowRun } from "./runtime-types.js";
+import type { WorkflowEngineConfig, WorkflowParentRef, WorkflowRun } from "./runtime-types.js";
 import { assertNever, HostToWorkerType, WorkerToHostType } from "./protocol.js";
 import type { HostToWorkerPayloads, WorkerToHostMessage } from "./protocol.js";
 import { renderThrown } from "./realm.js";
+import { workflowCacheScopeId } from "./child-cache-key.js";
 import type { ChildHandle, ChildResult, ChildStartRequest, WorkerInit } from "./child-types.js";
 import type { WorkflowChildSpawner } from "../child-spawner.js";
 
@@ -131,6 +132,7 @@ export class WorkerRun implements WorkflowRun {
     private readonly disposeGraceMs: number,
     private readonly observer: HostRunObserver,
     signal: AbortSignal | undefined,
+    private readonly cache: WorkflowEngineConfig["cache"],
   ) {
     this.result = new Promise<WorkflowResult>((resolve) => {
       this.settleResolve = resolve;
@@ -294,6 +296,12 @@ export class WorkerRun implements WorkflowRun {
       case WorkerToHostType.ChildDispose:
         this.onChildDispose(message.callId);
         break;
+      case WorkerToHostType.CacheLookup:
+        this.onCacheLookup(message.callId, message.key);
+        break;
+      case WorkerToHostType.CacheStore:
+        this.onCacheStore(message.callId, message.key, message.value, message.childId);
+        break;
       case WorkerToHostType.Result:
         this.onResult(message.result);
         break;
@@ -316,6 +324,55 @@ export class WorkerRun implements WorkflowRun {
       return { reason: "workflow settled", rendered: "workflow run already settled" };
     }
     return undefined;
+  }
+
+  /** Content-key lookup; miss/hit never go through the spawner or hostStarted. */
+  private onCacheLookup(callId: number, key: string): void {
+    void this.lookupCache(callId, key);
+  }
+
+  private async lookupCache(callId: number, key: string): Promise<void> {
+    if (this.cache === undefined) {
+      this.post(HostToWorkerType.CacheLookupResult, { callId, hit: false });
+      return;
+    }
+    try {
+      const hit = await this.cache.lookup(this.cacheScopeId(), key);
+      if (hit === undefined) {
+        this.post(HostToWorkerType.CacheLookupResult, { callId, hit: false });
+        return;
+      }
+      this.post(HostToWorkerType.CacheLookupResult, {
+        callId,
+        hit: true,
+        value: hit.value,
+        ...hit.childId !== undefined ? { childId: hit.childId } : {},
+      });
+    } catch (error: unknown) {
+      console.warn(`workflow: cache lookup failed: ${renderThrown(error)}`);
+      this.post(HostToWorkerType.CacheLookupResult, { callId, hit: false });
+    }
+  }
+
+  /** Store ack is always owed; size/IO failures are swallowed so the script lives. */
+  private onCacheStore(callId: number, key: string, value: unknown, childId?: string): void {
+    void this.storeCache(callId, key, value, childId);
+  }
+
+  private async storeCache(callId: number, key: string, value: unknown, childId?: string): Promise<void> {
+    if (this.cache !== undefined) {
+      try {
+        await this.cache.store(this.cacheScopeId(), key, value, childId);
+      } catch (error: unknown) {
+        console.warn(`workflow: cache store failed: ${renderThrown(error)}`);
+      }
+    }
+    this.post(HostToWorkerType.CacheStored, { callId });
+  }
+
+  /** Scope is host-only: WorkerInit never carries sessionId / workspaceId. */
+  private cacheScopeId(): string {
+    return workflowCacheScopeId(this.parent.workspaceId, this.parent.sessionId, this.meta.name);
   }
 
   private onChildStart(callId: number, request: ChildStartRequest): void {

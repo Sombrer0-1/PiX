@@ -41,6 +41,7 @@ import { AgentTaskStore } from "../agent-task/agent-task-store.js";
 import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
 import {
   AgentTaskService,
+  MAX_DELEGATED_PROMPT_BYTES,
   __setAgentTaskServiceHooksForTests,
   type AgentTaskServiceTestHooks,
   type AgentTaskSubmissionContext,
@@ -52,6 +53,7 @@ import { createAgentTaskChildSpawner, resolveWorkflowAgentType } from "../workfl
 import { WorkflowError } from "../workflow/engine/engine.js";
 import type { ChildStartRequest } from "../workflow/engine/child-types.js";
 import type { WorkflowParentRef } from "../workflow/engine/runtime-types.js";
+import { renderWorkflowArtifacts } from "../workflow/engine/artifact-render.js";
 
 // ============================================================================
 // Test harness (matches agent-task-service.test.ts style)
@@ -399,6 +401,7 @@ function makeParent(harness: Harness): WorkflowParentRef {
   return {
     sessionId: "session-1",
     toolCallId: "tool-call-1",
+    workspaceId: "ws-test",
     getSubmissionContext: () => makeContext(harness),
   };
 }
@@ -612,6 +615,76 @@ await run("spawner: illegal modelOverride rejects the handle (AGENT_START path)"
   await harness.service.dispose("user_cancel");
 });
 
+await run("spawner: empty prompt rejects AGENT_START (must not be empty)", async () => {
+  const harness = makeHarness();
+  const spawner = createAgentTaskChildSpawner(harness.service);
+  const child = await spawner.start(makeRequest({ prompt: "" }), makeParent(harness), new AbortController().signal);
+  let rejected: unknown;
+  try {
+    await child.result;
+  } catch (error) {
+    rejected = error;
+  }
+  assert(rejected instanceof WorkflowError, "empty prompt rejects the handle");
+  assert(
+    rejected instanceof WorkflowError && rejected.code === "AGENT_START",
+    "empty prompt is fatal AGENT_START",
+  );
+  assert(
+    rejected instanceof WorkflowError && rejected.message.includes("must not be empty"),
+    "message states the prompt must not be empty",
+  );
+  await harness.service.dispose("user_cancel");
+});
+
+await run("spawner: whitespace-only prompt rejects AGENT_START (must not be empty)", async () => {
+  const harness = makeHarness();
+  const spawner = createAgentTaskChildSpawner(harness.service);
+  const child = await spawner.start(makeRequest({ prompt: "   " }), makeParent(harness), new AbortController().signal);
+  let rejected: unknown;
+  try {
+    await child.result;
+  } catch (error) {
+    rejected = error;
+  }
+  assert(rejected instanceof WorkflowError, "whitespace prompt rejects the handle");
+  assert(
+    rejected instanceof WorkflowError && rejected.code === "AGENT_START",
+    "whitespace prompt is fatal AGENT_START",
+  );
+  assert(
+    rejected instanceof WorkflowError && rejected.message.includes("must not be empty"),
+    "whitespace message states the prompt must not be empty",
+  );
+  await harness.service.dispose("user_cancel");
+});
+
+await run("spawner: oversized prompt resolves failed with a real taskId (not AGENT_START)", async () => {
+  const harness = makeHarness();
+  const spawner = createAgentTaskChildSpawner(harness.service);
+  const child = await spawner.start(
+    makeRequest({ prompt: "x".repeat(MAX_DELEGATED_PROMPT_BYTES + 1) }),
+    makeParent(harness),
+    new AbortController().signal,
+  );
+  assert(typeof child.id === "string" && child.id.length > 0, "handle.id is present");
+  assert(child.id.startsWith("workflow:") === false, "handle.id is a real taskId, not a workflow: prefix");
+  let resolved: unknown;
+  let threw: unknown;
+  try {
+    resolved = await child.result;
+  } catch (error) {
+    threw = error;
+  }
+  assert(threw === undefined, "oversized prompt does not throw");
+  const result = resolved as { stopReason?: string; failureReason?: string; error?: string; output?: Array<{ type: string; text: string }> };
+  assertEqual(result.stopReason, "failed", "oversized stopReason is failed");
+  assertEqual(result.failureReason, "prompt_too_large", "oversized failureReason is prompt_too_large");
+  assertEqual(result.output?.[0]?.text, "", "oversized output text is empty");
+  assert(typeof result.error === "string" && result.error.length > 0, "oversized error is present");
+  await harness.service.dispose("user_cancel");
+});
+
 await run("spawner: modelOverride resolves into the frozen ready item", async () => {
   const harness = makeHarness();
   const spawner = createAgentTaskChildSpawner(harness.service);
@@ -731,6 +804,86 @@ await run("workflowOwned: auto-background timer is never started", async () => {
   assertEqual(fakeTimers.timers().length, 2, "baseline foreground group arms the auto-background timers");
 
   await child.dispose();
+  await harness.service.dispose("user_cancel");
+});
+
+await run("spawner: artifacts render into extras[0].appendSystemPrompt (single extra object)", async () => {
+  const harness = makeHarness();
+  const spawner = createAgentTaskChildSpawner(harness.service);
+  const artifacts = [{ name: "reviews", value: { items: [1, 2], note: "compact" } }];
+  const schema = { type: "object", required: ["done"] };
+  const child = await spawner.start(
+    makeRequest({ prompt: "synthesize", schema, artifacts }),
+    makeParent(harness),
+    new AbortController().signal,
+  );
+  const runtime = FakeRuntime.instances.find((instance) => instance.spec.taskId === child.id);
+  assertEqual(runtime!.spec.items.length, 1, "single item: tasks[0] + extras[0], no second extra");
+  const item = runtime!.spec.items[0];
+  assert(item.resolution === "ready", "item is ready");
+  if (item.resolution === "ready") {
+    const rendered = renderWorkflowArtifacts(artifacts);
+    assertEqual(item.appendSystemPrompt, rendered, "appendSystemPrompt is the rendered artifacts markdown");
+    assertIncludes(
+      item.appendSystemPrompt ?? "",
+      JSON.stringify({ items: [1, 2], note: "compact" }),
+      "extras[0].appendSystemPrompt contains rendered JSON",
+    );
+    assertJsonEqual(item.outputSchema, schema, "schema stays on the same extras[0] object");
+    assertEqual(item.prompt, "synthesize", "user prompt is the short instruction");
+  }
+  runtime!.complete({ structured: { done: true } });
+  const result = await child.result;
+  assertEqual(result.stopReason, "completed", "child completed");
+  await harness.service.dispose("user_cancel");
+});
+
+await run("spawner: 64KB cap counts only the user prompt, not artifacts", async () => {
+  const harness = makeHarness();
+  const spawner = createAgentTaskChildSpawner(harness.service);
+  const payload = { report: "y".repeat(MAX_DELEGATED_PROMPT_BYTES) };
+  const child = await spawner.start(
+    makeRequest({
+      prompt: "aggregate in JS",
+      artifacts: [{ name: "reviews", value: payload }],
+    }),
+    makeParent(harness),
+    new AbortController().signal,
+  );
+  const runtime = FakeRuntime.instances.find((instance) => instance.spec.taskId === child.id);
+  const item = runtime!.spec.items[0];
+  assert(item.resolution === "ready", "short prompt with large artifacts is ready (64KB is prompt-only)");
+  if (item.resolution === "ready") {
+    assertIncludes(item.appendSystemPrompt ?? "", payload.report.slice(0, 32), "artifact body is in appendSystemPrompt");
+    assertEqual(item.prompt, "aggregate in JS", "user prompt is unchanged");
+    assert(item.prompt.length < MAX_DELEGATED_PROMPT_BYTES, "user prompt is under the cap");
+  }
+  runtime!.complete();
+  const result = await child.result;
+  assertEqual(result.stopReason, "completed", "child completed");
+  await harness.service.dispose("user_cancel");
+});
+
+await run("spawner: artifacts render over 1MiB rejects before createTaskGroup", async () => {
+  const harness = makeHarness();
+  const spawner = createAgentTaskChildSpawner(harness.service);
+  const oversized = { blob: "z".repeat(1024 * 1024) };
+  let caught: unknown;
+  try {
+    await spawner.start(
+      makeRequest({ artifacts: [{ name: "reviews", value: oversized }] }),
+      makeParent(harness),
+      new AbortController().signal,
+    );
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught instanceof WorkflowError && caught.code === "INVALID_ARGUMENT", "over-1MiB render is INVALID_ARGUMENT");
+  assert(
+    caught instanceof Error && caught.message.includes("1048576"),
+    "error names the 1MiB inject cap",
+  );
+  assertEqual(FakeRuntime.instances.length, 0, "over-1MiB render does not create a task group");
   await harness.service.dispose("user_cancel");
 });
 

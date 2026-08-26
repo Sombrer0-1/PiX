@@ -24,13 +24,16 @@ import type {
   WorkflowChildStats,
   WorkflowMeta,
   WorkflowResult,
+  WorkflowSourceChild,
 } from "../../../shared/workflow-types.js";
 import { isFatalWorkflowError, WorkflowError } from "./engine.js";
-import { MaterializeError, materializeFromRealm, renderThrown } from "./realm.js";
+import { MaterializeError, materializeFromRealm, materializeFromRealmWithStats, renderThrown } from "./realm.js";
 import { assertObjectJsonSchema } from "./schema.js";
 import type { ObjectJsonSchema } from "./schema.js";
-import type { ChildHandle, ChildPort, ChildResult, WorkerLimits } from "./child-types.js";
+import type { CachePort, ChildHandle, ChildPort, ChildResult, WorkerLimits, WorkflowArtifactPayload } from "./child-types.js";
 import { DEFAULT_SCHEMA_CHILD_RETRY, SCHEMA_CHILD_DEFAULT_MAX_TURNS } from "./child-types.js";
+import { workflowCacheKey } from "./child-cache-key.js";
+import { renderWorkflowArtifacts } from "./artifact-render.js";
 
 /** The observers the execution reports progress through (the session posts them to the host). */
 export interface ExecutionObserver {
@@ -41,16 +44,28 @@ export interface ExecutionObserver {
 }
 
 /** The `agent()` options the script may pass; everything else rejects loud. */
-const SUPPORTED_AGENT_OPTIONS = new Set(["label", "phase", "schema", "provider", "model", "retry", "maxTurns"]);
+const SUPPORTED_AGENT_OPTIONS = new Set(["label", "phase", "schema", "provider", "model", "retry", "maxTurns", "cache", "artifacts"]);
 /** Deferred Claude Code options we name explicitly in the rejection message. */
 const DEFERRED_AGENT_OPTIONS = new Set(["effort", "isolation", "agentType"]);
 
-const SUPPORTED_OPTION_LIST = "label, phase, schema, provider, model, retry, maxTurns";
+const SUPPORTED_OPTION_LIST = "label, phase, schema, provider, model, retry, maxTurns, cache, artifacts";
 const MAX_AGENT_RETRY = 2;
 const MAX_REPORTED_FAILURES = 32;
+/** UTF-8 of JSON.stringify(materializeFromRealm(value)); over this, skip store. */
+const MAX_CACHE_VALUE_BYTES = 256 * 1024;
+const ARTIFACT_NAME = /^[a-zA-Z0-9._-]{1,64}$/;
+const MAX_ARTIFACTS_PER_RUN = 256;
+const MAX_ARTIFACT_RUN_BYTES = 8 * 1024 * 1024;
+const MAX_ARTIFACT_INJECT_BYTES = 1024 * 1024;
+const UTF8 = new TextEncoder();
 /** Matches coding-agent MAX_AGENT_TURNS so agent({ maxTurns }) can use the loose default. */
 const MAX_CHILD_MAX_TURNS = 200;
 const RETRYABLE_FAILURE_REASONS = new Set(["max_turns", "invalid_parameters", "api_error"]);
+
+/** Frozen pure data handle returned by put()/ref(); brand is type-only. */
+interface ArtifactRef {
+  readonly name: string;
+}
 
 interface AgentHookOptions {
   label?: string;
@@ -60,10 +75,17 @@ interface AgentHookOptions {
   schema?: ObjectJsonSchema;
   retry: number;
   maxTurns?: number;
+  cache: boolean;
+  artifacts?: ArtifactRef[];
 }
 
-type SettledOk = { ok: true; value: unknown };
-type SettledFail = { ok: false; reason: string; message: string; stopReason: string };
+interface StoredArtifact {
+  value: unknown;
+  bytes: number;
+}
+
+type SettledOk = { ok: true; value: unknown; childId?: string };
+type SettledFail = { ok: false; reason: string; message: string; stopReason: string; bytes?: number };
 type SettledResult = SettledOk | SettledFail;
 
 /** Flatten a child's final text output blocks to one string (the non-schema `agent()` result). */
@@ -97,6 +119,8 @@ function defaultLabel(prompt: string): string {
 export class WorkflowExecution {
   /** 1-based count of `agent()` calls started (the `agentsStarted` result field). */
   private started = 0;
+  /** Cache hits; omitted from stats/result when 0. Does not count toward `started`. */
+  private replayed = 0;
   private activeSlots = 0;
   private readonly slotWaiters: { resolve(): void; reject(error: unknown): void }[] = [];
   private cancelReason: string | undefined;
@@ -104,8 +128,11 @@ export class WorkflowExecution {
   private currentPhase: string | undefined;
   private readonly childStats: WorkflowChildStats = { completed: 0, failed: 0, cancelled: 0 };
   private readonly failures: WorkflowChildFailure[] = [];
+  private readonly sources: WorkflowSourceChild[] = [];
   private readonly context: vm.Context;
   private readonly compiled: vm.Script;
+  private readonly artifacts = new Map<string, StoredArtifact>();
+  private artifactRunBytes = 0;
 
   constructor(
     meta: WorkflowMeta,
@@ -115,6 +142,7 @@ export class WorkflowExecution {
     private readonly observer: ExecutionObserver,
     private readonly children: ChildPort,
     private readonly runDefault?: string,
+    private readonly cache?: CachePort,
   ) {
     // Compile FIRST: a body syntax error must throw out of the constructor
     // before any realm state exists. The host pre-parses the identical
@@ -145,6 +173,9 @@ export class WorkflowExecution {
       log: (message: unknown) => {
         this.log(message);
       },
+      put: (name: unknown, value: unknown) => this.put(name, value),
+      get: (name: unknown) => this.get(name),
+      ref: (name: unknown) => this.ref(name),
       // workerData already performed the real cross-thread structured clone.
       args,
     };
@@ -266,9 +297,13 @@ export class WorkflowExecution {
   /** Materialize the script's return value; violations become RESULT_UNSERIALIZABLE. */
   private materializeResult(raw: unknown): unknown {
     try {
-      return materializeFromRealm(raw, "workflow result");
+      const { value, omitted } = materializeFromRealmWithStats(raw, "workflow result");
+      if (omitted > 0) {
+        this.log(`omitted ${omitted} undefined fields`);
+      }
+      return value;
     } catch (error: unknown) {
-      // materializeFromRealm only throws MaterializeError; the guard keeps
+      // materializeFromRealmWithStats only throws MaterializeError; the guard keeps
       // the arm narrow rather than swallowing foreign errors.
       if (!(error instanceof MaterializeError)) throw error;
       throw new WorkflowError(
@@ -306,20 +341,37 @@ export class WorkflowExecution {
     if (next) next.resolve();
   }
 
-  private resultExtras(): { childStats: WorkflowChildStats; failures?: WorkflowChildFailure[] } {
+  private resultExtras(): {
+    childStats: WorkflowChildStats;
+    failures?: WorkflowChildFailure[];
+    sources?: WorkflowSourceChild[];
+  } {
     return {
-      childStats: { ...this.childStats },
+      childStats: this.snapshotChildStats(),
       ...(this.failures.length > 0 ? { failures: this.failures.slice() } : {}),
+      ...(this.sources.length > 0 ? { sources: this.sources.slice() } : {}),
+    };
+  }
+
+  private noteSource(label: string, childId: string | undefined): void {
+    if (typeof childId !== "string" || childId.length === 0) return;
+    this.sources.push({ label, childId });
+  }
+
+  private snapshotChildStats(): WorkflowChildStats {
+    return {
+      ...this.childStats,
+      ...(this.replayed > 0 ? { replayed: this.replayed } : {}),
     };
   }
 
   /** Snapshot of child outcomes; scripts compare lengths before consuming nulls. */
   private stats(): WorkflowChildStats {
     this.throwIfCancelled();
-    return { ...this.childStats };
+    return this.snapshotChildStats();
   }
 
-  /** Tagged `agent()` result: `{ ok, value }` or `{ ok: false, reason, message, stopReason }`. */
+  /** Tagged `agent()` result: `{ ok, value, childId? }` or `{ ok: false, reason, message, stopReason }`. */
   private async settled(rawPrompt: unknown, rawOpts: unknown): Promise<SettledResult> {
     return this.runSettled(rawPrompt, rawOpts);
   }
@@ -339,9 +391,18 @@ export class WorkflowExecution {
     const label = opts.label ?? defaultLabel(rawPrompt);
     const phase = opts.phase ?? this.currentPhase;
 
+    if (opts.cache && this.cache !== undefined) {
+      const hit = await this.lookupCached(rawPrompt, opts, label);
+      if (hit !== undefined) {
+        return hit;
+      }
+    }
+
     await this.acquireSlot();
     try {
       this.throwIfCancelled();
+      const artifacts = this.resolveArtifactPayloads(opts.artifacts);
+      this.assertArtifactInjectBudget(artifacts);
       let lastFail: SettledFail | undefined;
       for (let attempt = 0; attempt <= opts.retry; attempt++) {
         if (this.started >= this.limits.maxTotalAgents) {
@@ -361,8 +422,10 @@ export class WorkflowExecution {
             `agent "${label}" retry ${attempt}/${opts.retry} after ${lastFail?.reason ?? "failure"}: ${lastFail?.message ?? ""}`.trim(),
           );
         }
-        const settled = await this.runOneChild(rawPrompt, opts, seq, label, phase);
+        const settled = await this.runOneChild(rawPrompt, opts, seq, label, phase, artifacts);
         if (settled.ok) {
+          this.noteSource(label, settled.childId);
+          this.maybeStoreCached(rawPrompt, opts, label, settled.value, settled.childId);
           return settled;
         }
         lastFail = settled;
@@ -377,12 +440,62 @@ export class WorkflowExecution {
     }
   }
 
+  /** Replay a cached agent() value: no spawn, no started++, no start/end. */
+  private async lookupCached(prompt: string, opts: AgentHookOptions, label: string): Promise<SettledOk | undefined> {
+    if (this.cache === undefined) return undefined;
+    let hit: { value: unknown; childId?: string } | undefined;
+    try {
+      hit = await this.cache.lookup(this.cacheKey(prompt, opts));
+    } catch {
+      this.throwIfCancelled();
+      return undefined;
+    }
+    this.throwIfCancelled();
+    if (hit === undefined) return undefined;
+    if (opts.schema !== undefined && (typeof hit.value !== "object" || hit.value === null || Array.isArray(hit.value))) {
+      return undefined;
+    }
+    this.replayed += 1;
+    this.log(`cache hit: ${label}`);
+    this.noteSource(label, hit.childId);
+    return { ok: true, value: hit.value, ...hit.childId !== undefined ? { childId: hit.childId } : {} };
+  }
+
+  /** Fire-and-forget store after handing the value to the script. Fail/null never write. */
+  private maybeStoreCached(prompt: string, opts: AgentHookOptions, label: string, value: unknown, childId?: string): void {
+    if (!opts.cache || this.cache === undefined) return;
+    if (value === null) return;
+    let serialized: string;
+    try {
+      const materialized = materializeFromRealm(value, "cache value");
+      serialized = JSON.stringify(materialized);
+    } catch {
+      return;
+    }
+    if (serialized === undefined) return;
+    if (new TextEncoder().encode(serialized).length > MAX_CACHE_VALUE_BYTES) {
+      this.log(`cache skip: ${label} exceeds 256KiB`);
+      return;
+    }
+    this.contain(this.cache.store(this.cacheKey(prompt, opts), value, childId));
+  }
+
+  private cacheKey(prompt: string, opts: AgentHookOptions): string {
+    return workflowCacheKey(prompt, {
+      ...opts.schema !== undefined ? { schema: opts.schema } : {},
+      ...opts.provider !== undefined ? { provider: opts.provider } : {},
+      ...opts.model !== undefined ? { model: opts.model } : {},
+      ...opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {},
+    });
+  }
+
   private async runOneChild(
     prompt: string,
     opts: AgentHookOptions,
     seq: number,
     label: string,
     phase: string | undefined,
+    artifacts: WorkflowArtifactPayload[] | undefined,
   ): Promise<SettledResult> {
     let run: ChildHandle;
     try {
@@ -394,6 +507,7 @@ export class WorkflowExecution {
         ...opts.provider !== undefined ? { provider: opts.provider } : {},
         ...opts.model !== undefined ? { model: opts.model } : {},
         ...this.childMaxTurns(opts) !== undefined ? { maxTurns: this.childMaxTurns(opts) } : {},
+        ...artifacts !== undefined ? { artifacts } : {},
       });
     } catch (error: unknown) {
       if (this.isCancelled()) throw this.cancelledError();
@@ -427,17 +541,28 @@ export class WorkflowExecution {
           return { ok: false, reason, message, stopReason: result.stopReason };
         }
         this.noteChildEnd(info, "completed");
-        return { ok: true, value: opts.schema !== undefined ? result.structured : outputText(result.output) };
+        return {
+          ok: true,
+          value: opts.schema !== undefined ? result.structured : outputText(result.output),
+          childId: run.id,
+        };
       }
       if (this.isCancelled()) {
         this.noteChildEnd(info, "cancelled", result.failureReason, result.error);
         throw this.cancelledError();
       }
       const reason = result.failureReason ?? result.stopReason;
-      const message = result.error ?? `ended ${result.stopReason}`;
+      let message = result.error ?? `ended ${result.stopReason}`;
+      let bytes: number | undefined;
+      if (result.failureReason === "prompt_too_large") {
+        bytes = new TextEncoder().encode(prompt).length;
+        message = `${result.error} Prompt is ${bytes} bytes. Shrink the schema or aggregate in JS; do not inline full child reports.`;
+      }
       this.noteChildEnd(info, "failed", reason, message);
       this.log(`agent "${label}" ended failed (${reason}: ${message})`);
-      return { ok: false, reason, message, stopReason: result.stopReason };
+      return bytes !== undefined
+        ? { ok: false, reason, message, stopReason: result.stopReason, bytes }
+        : { ok: false, reason, message, stopReason: result.stopReason };
     } finally {
       await run.dispose();
     }
@@ -475,7 +600,7 @@ export class WorkflowExecution {
 
   /** Materialize + validate the `agent()` options bag from the realm. */
   private readAgentOptions(rawOpts: unknown): AgentHookOptions {
-    if (rawOpts === undefined) return { retry: 0 };
+    if (rawOpts === undefined) return { retry: 0, cache: true };
     let opts: unknown;
     try {
       opts = materializeFromRealm(rawOpts, "agent() options");
@@ -529,14 +654,27 @@ export class WorkflowExecution {
       assertObjectJsonSchema(record.schema);
       schema = record.schema;
     }
+    let cache = true;
+    if (record.cache !== undefined) {
+      if (typeof record.cache !== "boolean") {
+        throw new WorkflowError('agent() option "cache" must be a boolean', "INVALID_ARGUMENT");
+      }
+      cache = record.cache;
+    }
+    let artifacts: ArtifactRef[] | undefined;
+    if (record.artifacts !== undefined) {
+      artifacts = this.readArtifactRefs(record.artifacts);
+    }
     return {
       retry: retry ?? (schema !== undefined ? DEFAULT_SCHEMA_CHILD_RETRY : 0),
+      cache,
       ...record.label !== undefined ? { label: record.label as string } : {},
       ...record.phase !== undefined ? { phase: record.phase as string } : {},
       ...record.provider !== undefined ? { provider: record.provider as string } : {},
       ...record.model !== undefined ? { model: record.model as string } : {},
       ...schema !== undefined ? { schema } : {},
       ...maxTurns !== undefined ? { maxTurns } : {},
+      ...artifacts !== undefined ? { artifacts } : {},
     };
   }
 
@@ -684,6 +822,128 @@ export class WorkflowExecution {
       throw new WorkflowError(
         `${hook} received ${length} items — over the per-call cap (${this.limits.maxItemsPerCall}); split the work or raise maxItemsPerCall in the engine config`,
         "ITEM_CAP",
+      );
+    }
+  }
+
+  /** The `put(name, value)` hook: materialize and store a named artifact. */
+  private put(rawName: unknown, rawValue: unknown): ArtifactRef {
+    this.throwIfCancelled();
+    const name = this.requireArtifactName(rawName, "put()");
+    let value: unknown;
+    try {
+      value = materializeFromRealm(rawValue, "put() value");
+    } catch (error: unknown) {
+      if (!(error instanceof MaterializeError)) throw error;
+      throw new WorkflowError(`put() value must be plain JSON data — ${error.message}`, "INVALID_ARGUMENT", {
+        cause: error,
+      });
+    }
+    if (value === undefined) {
+      throw new WorkflowError("put() value must be plain JSON data", "INVALID_ARGUMENT");
+    }
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(value);
+    } catch (error: unknown) {
+      throw new WorkflowError(`put() value must be plain JSON data — ${renderThrown(error)}`, "INVALID_ARGUMENT", {
+        cause: error,
+      });
+    }
+    const next = UTF8.encode(serialized).length;
+    const previous = this.artifacts.get(name);
+    const nextRunBytes = previous === undefined ? this.artifactRunBytes + next : this.artifactRunBytes + next - previous.bytes;
+    if (previous === undefined && this.artifacts.size >= MAX_ARTIFACTS_PER_RUN) {
+      throw new WorkflowError(
+        `put() would exceed the per-run artifact count (${MAX_ARTIFACTS_PER_RUN})`,
+        "INVALID_ARGUMENT",
+      );
+    }
+    if (nextRunBytes > MAX_ARTIFACT_RUN_BYTES) {
+      throw new WorkflowError(
+        `put() would exceed the per-run artifact store (${MAX_ARTIFACT_RUN_BYTES} bytes)`,
+        "INVALID_ARGUMENT",
+      );
+    }
+    this.artifacts.set(name, { value, bytes: next });
+    this.artifactRunBytes = nextRunBytes;
+    return this.makeArtifactRef(name);
+  }
+
+  /** The `get(name)` hook: return a stored value, or null when missing. */
+  private get(rawName: unknown): unknown | null {
+    this.throwIfCancelled();
+    const name = this.requireArtifactName(rawName, "get()");
+    const stored = this.artifacts.get(name);
+    return stored === undefined ? null : stored.value;
+  }
+
+  /** The `ref(name)` hook: a frozen handle to an existing stored artifact. */
+  private ref(rawName: unknown): ArtifactRef {
+    this.throwIfCancelled();
+    const name = this.requireArtifactName(rawName, "ref()");
+    if (!this.artifacts.has(name)) {
+      throw new WorkflowError(`ref() unknown artifact "${name}"`, "INVALID_ARGUMENT");
+    }
+    return this.makeArtifactRef(name);
+  }
+
+  private makeArtifactRef(name: string): ArtifactRef {
+    return Object.freeze({ name });
+  }
+
+  private requireArtifactName(rawName: unknown, hook: string): string {
+    if (typeof rawName !== "string" || !this.isLegalArtifactName(rawName)) {
+      throw new WorkflowError(`${hook} requires a legal artifact name`, "INVALID_ARGUMENT");
+    }
+    return rawName;
+  }
+
+  private isLegalArtifactName(name: string): boolean {
+    if (name === "." || name === ".." || name.includes("/")) return false;
+    return ARTIFACT_NAME.test(name);
+  }
+
+  private readArtifactRefs(raw: unknown): ArtifactRef[] {
+    if (!Array.isArray(raw)) {
+      throw new WorkflowError('agent() option "artifacts" must be an array of artifact refs', "INVALID_ARGUMENT");
+    }
+    return raw.map((item, index) => {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        throw new WorkflowError(
+          `agent() option "artifacts" item ${index} must be an artifact ref`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      const record = item as Record<string, unknown>;
+      if (typeof record.name !== "string" || !this.isLegalArtifactName(record.name)) {
+        throw new WorkflowError(
+          `agent() option "artifacts" item ${index} must be an artifact ref`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      return this.makeArtifactRef(record.name);
+    });
+  }
+
+  private resolveArtifactPayloads(refs: ArtifactRef[] | undefined): WorkflowArtifactPayload[] | undefined {
+    if (refs === undefined) return undefined;
+    return refs.map((handle) => {
+      const stored = this.artifacts.get(handle.name);
+      if (stored === undefined) {
+        throw new WorkflowError(`agent() artifacts unknown artifact "${handle.name}"`, "INVALID_ARGUMENT");
+      }
+      return { name: handle.name, value: stored.value };
+    });
+  }
+
+  private assertArtifactInjectBudget(artifacts: WorkflowArtifactPayload[] | undefined): void {
+    if (artifacts === undefined || artifacts.length === 0) return;
+    const rendered = renderWorkflowArtifacts(artifacts);
+    if (UTF8.encode(rendered).length > MAX_ARTIFACT_INJECT_BYTES) {
+      throw new WorkflowError(
+        `agent() artifacts render exceeds ${MAX_ARTIFACT_INJECT_BYTES} bytes`,
+        "INVALID_ARGUMENT",
       );
     }
   }

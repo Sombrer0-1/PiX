@@ -57,6 +57,20 @@ export interface WorkflowChildStats {
   completed: number;
   failed: number;
   cancelled: number;
+  replayed?: number; // omit when 0
+}
+
+/** Completed child identity for a tool-workflow salvage envelope. */
+export interface WorkflowSalvageChild {
+  seq: number;
+  label: string;
+  childId: string;
+}
+
+/** Pure data for tool-workflow derive (S6). Not on WorkflowResult or tool details. */
+export interface WorkflowSalvage {
+  completed: WorkflowSalvageChild[];
+  hint: string;
 }
 
 /** One item-level child failure surfaced to the parent agent and the panel. */
@@ -64,6 +78,12 @@ export interface WorkflowChildFailure {
   label: string;
   reason: string;
   message?: string;
+}
+
+/** Inspectable child identity for a completed run (spawn or cache hit). Not salvage. */
+export interface WorkflowSourceChild {
+  label: string;
+  childId: string;
 }
 
 export interface WorkflowResult {
@@ -74,6 +94,8 @@ export interface WorkflowResult {
   childStats?: WorkflowChildStats;
   /** Failed child attempts (including retried ones); capped; omitted when empty. */
   failures?: WorkflowChildFailure[];
+  /** Spawn/hit children that still have a taskId; omitted when empty. Not on tool details. */
+  sources?: WorkflowSourceChild[];
 }
 
 export interface WorkflowRunInfo {
@@ -99,6 +121,7 @@ export interface WorkflowResultInfo {
   error?: string;
   agentsStarted: number;
   childStats?: WorkflowChildStats;
+  sources?: WorkflowSourceChild[];
 }
 
 export type WorkflowErrorCode =

@@ -4,11 +4,13 @@
  * Independently verifies pix/src/shared/workflow-types.ts: the locked
  * constants, the guards (isWorkflowToolDetails / isWorkflowCommand /
  * isWorkflowViewState), workflowPhaseKey identity semantics ("" vs undefined),
- * projectWorkflowStatus projection, and foldWorkflowRecords invariant
+ * projectWorkflowStatus projection, foldWorkflowRecords invariant
  * enforcement over durable record streams (interrupted prefixes are legal,
  * corruption and unknown kinds are skipped without failing the stream, logs
- * are capped at WORKFLOW_MAX_DURABLE_LOGS). Does not depend on the engine,
- * recorder or any other workflow module, so S0 runs standalone.
+ * are capped at WORKFLOW_MAX_DURABLE_LOGS), optional WorkflowChildStats.replayed,
+ * and WorkflowSalvage types (not on WorkflowResult / WorkflowToolDetails).
+ * Does not depend on the engine, recorder or any other workflow module, so
+ * these tests run standalone.
  *
  * Run with: npm exec tsx -- src/main/__tests__/workflow-types.test.ts
  */
@@ -30,6 +32,11 @@ import {
 } from "../../shared/workflow-types.js";
 import type {
   PixWorkflowRecord,
+  WorkflowChildStats,
+  WorkflowResult,
+  WorkflowSalvage,
+  WorkflowSalvageChild,
+  WorkflowToolDetails,
   WorkflowViewState,
 } from "../../shared/workflow-types.js";
 
@@ -577,6 +584,70 @@ await run("isWorkflowToolDetails: accepts valid details", async () => {
 
   const withError = makeDetailsInput({ value: null, error: "workflow run failed: x" });
   assert(isWorkflowToolDetails(withError), "details with error string accepted");
+});
+
+await run("S1: WorkflowChildStats.replayed is optional; salvage types exist; details stay old-shape", async () => {
+  const withoutReplayed: WorkflowChildStats = { completed: 1, failed: 0, cancelled: 0 };
+  assertEqual(withoutReplayed.replayed, undefined, "old childStats without replayed is assignable");
+
+  const withReplayed: WorkflowChildStats = { completed: 1, failed: 0, cancelled: 0, replayed: 10 };
+  assertEqual(withReplayed.replayed, 10, "replayed is accepted when present");
+
+  const salvageChild: WorkflowSalvageChild = { seq: 1, label: "review:auth", childId: "tsk_1" };
+  const salvage: WorkflowSalvage = {
+    completed: [salvageChild],
+    hint: "1 child results are still on disk.",
+  };
+  assertEqual(salvage.completed[0].childId, "tsk_1", "WorkflowSalvageChild.childId is a string");
+  assertEqual(typeof salvage.hint, "string", "WorkflowSalvage.hint is a string");
+
+  const resultWithoutSalvage: WorkflowResult = {
+    value: null,
+    stopReason: "error",
+    error: "failed",
+    agentsStarted: 1,
+    childStats: withoutReplayed,
+  };
+  assertEqual(
+    "salvage" in resultWithoutSalvage,
+    false,
+    "WorkflowResult does not carry salvage",
+  );
+  const resultWithSources: WorkflowResult = {
+    value: null,
+    stopReason: "completed",
+    agentsStarted: 0,
+    childStats: withReplayed,
+    sources: [{ label: "review:auth", childId: "tsk_1" }],
+  };
+  assertEqual(resultWithSources.sources?.[0]?.childId, "tsk_1", "WorkflowResult.sources is optional");
+
+  const oldDetails = makeDetailsInput();
+  assert(isWorkflowToolDetails(oldDetails), "old details without replayed still pass");
+  assert(
+    !("salvage" in (oldDetails as Record<string, unknown>)),
+    "fixture details do not include salvage",
+  );
+
+  const details: WorkflowToolDetails = {
+    kind: "pix-workflow-run",
+    schemaVersion: WORKFLOW_RECORD_SCHEMA_VERSION,
+    view: makeViewInput() as WorkflowViewState,
+    value: { ok: true },
+    agentsStarted: 1,
+  };
+  assertEqual("salvage" in details, false, "WorkflowToolDetails does not carry salvage");
+  assertEqual(details.schemaVersion, 1, "schemaVersion stays 1");
+
+  const memberWithoutNewFields = {
+    seq: 1,
+    label: "a",
+    childId: "t-1",
+  };
+  assert(
+    isWorkflowViewState(makeViewInput({ members: [memberWithoutNewFields], status: "running", stopReason: undefined })),
+    "isWorkflowMemberState still accepts members without new fields",
+  );
 });
 
 await run("isWorkflowToolDetails: rejects malformed details", async () => {

@@ -1,5 +1,5 @@
 /**
- * SessionBridge workflow wiring tests (S8).
+ * SessionBridge workflow wiring tests (S8 + S10).
  *
  * Constructs the REAL SessionBridge directly (never ipc-handlers/preload, which
  * need the real Electron runtime) against a temp agent dir + faux provider and
@@ -13,22 +13,28 @@
  * productEventCollector.record source for workflow runs (V143 names, payload
  * limited to status/durationMs/counts).
  *
+ * S10: getParentRef carries workspaceIdOf(cwd); engine config.cache is a
+ * WorkflowChildCache whose rootDir is join(getAgentDir(), "workflow-cache").
+ *
  * Run with: npx tsx src/main/__tests__/workflow-session-bridge.test.ts
  */
 
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { AgentSession } from "@earendil-works/pi-coding-agent";
+import { AgentSession, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ProductEvent } from "../../shared/product-events.js";
 import type { ProjectLocation } from "../../shared/types.js";
 import { WorkflowRunId } from "../../shared/workflow-types.js";
 import { AgentTaskStore } from "../agent-task/agent-task-store.js";
 import { AgentTaskService } from "../agent-task/agent-task-service.js";
+import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
 import { SettingsStore } from "../settings-store.js";
 import type { PlanController } from "../plan/plan-controller.js";
 import type { WorkflowRecorder } from "../workflow/recorder.js";
+import { WorkflowChildCache } from "../workflow/child-cache.js";
+import type { WorkflowStartRequest } from "../workflow/engine/index.js";
 import { WorkerThreadWorkflowEngine } from "../workflow/engine/index.js";
 import { SessionBridge } from "../session-bridge.js";
 
@@ -320,6 +326,60 @@ await run("candidate disposal (bind failure) also runs disposeAll BEFORE detachF
     }).bindExtensions = origBind;
     engineProto.disposeAll = origDisposeAll;
     serviceAccess.detachForegroundGroupsForSession = origDetach;
+  }
+  assertNoUnhandledRejections();
+});
+
+await run("getParentRef carries workspaceIdOf(cwd); config.cache is WorkflowChildCache at getAgentDir()/workflow-cache", async () => {
+  const bridge = new SessionBridge({ agentTaskService: makeTaskService() });
+  await bridge.start(makeLocation());
+  const b = accessBridge(bridge);
+  const generation = b._generation!;
+  try {
+    const engine = generation.workflowEngine as unknown as {
+      cache?: WorkflowChildCache & { rootDir: string };
+      start: (request: WorkflowStartRequest) => unknown;
+    };
+    assert(engine.cache instanceof WorkflowChildCache, "engine config.cache is a WorkflowChildCache");
+    assertEqual(
+      engine.cache.rootDir,
+      join(getAgentDir(), "workflow-cache"),
+      "cache rootDir is join(getAgentDir(), \"workflow-cache\")",
+    );
+
+    const session = b._session!;
+    const workflowTool = session.getToolDefinition("workflow");
+    assert(workflowTool !== undefined, "solo parent has a workflow tool definition");
+    const origStart = engine.start;
+    let capturedWorkspaceId: string | undefined;
+    let capturedToolCallId: string | undefined;
+    engine.start = (request: WorkflowStartRequest) => {
+      capturedWorkspaceId = request.parent.workspaceId;
+      capturedToolCallId = request.parent.toolCallId;
+      throw new Error("stop-before-worker");
+    };
+    try {
+      await workflowTool.execute(
+        "call-ws",
+        { script: "return 1;", meta: { name: "audit", description: "Audit" } } as never,
+        undefined,
+        undefined,
+        undefined as never,
+      );
+      assert(false, "execute should throw after capturing parent");
+    } catch (err) {
+      assertEqual(
+        err instanceof Error ? err.message : String(err),
+        "stop-before-worker",
+        "execute reached engine.start with parent ref",
+      );
+    } finally {
+      engine.start = origStart;
+    }
+    assertEqual(capturedWorkspaceId, workspaceIdOf(PROJECT_CWD), "getParentRef.workspaceId is workspaceIdOf(cwd)");
+    assertEqual(capturedToolCallId, "call-ws", "getParentRef.toolCallId is the tool call id");
+  } finally {
+    await bridge.dispose();
   }
   assertNoUnhandledRejections();
 });

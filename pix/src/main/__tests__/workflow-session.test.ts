@@ -131,6 +131,10 @@ interface FakeHostOptions {
   go?: boolean;
   /** Manual mode: do NOT auto-answer child-start at all (the test scripts the replies). */
   manual?: boolean;
+  /** Override cache-lookup. Default miss. Return undefined to leave the lookup pending. */
+  cacheLookup?: (key: string, callId: number) => { hit: boolean; value?: unknown; childId?: string } | undefined;
+  /** If true, do not auto-ack cache-store (proves agent()/settled() do not await store). */
+  holdStore?: boolean;
 }
 
 /**
@@ -183,6 +187,27 @@ function fakeHost(options?: FakeHostOptions): FakeHost {
       }
       case WorkerToHostType.ChildDispose:
         channel.port1.postMessage({ type: HostToWorkerType.ChildDisposed, callId: message.callId } satisfies HostToWorkerMessage);
+        break;
+      case WorkerToHostType.CacheLookup: {
+        const lookup = options?.cacheLookup?.(message.key, message.callId);
+        if (lookup === undefined && options?.cacheLookup !== undefined) break;
+        const reply = lookup ?? { hit: false };
+        channel.port1.postMessage(
+          {
+            type: HostToWorkerType.CacheLookupResult,
+            callId: message.callId,
+            hit: reply.hit,
+            ...reply.hit ? { value: reply.value } : {},
+            ...reply.hit && reply.childId !== undefined ? { childId: reply.childId } : {},
+          } satisfies HostToWorkerMessage,
+        );
+        break;
+      }
+      case WorkerToHostType.CacheStore:
+        if (options?.holdStore) break;
+        channel.port1.postMessage(
+          { type: HostToWorkerType.CacheStored, callId: message.callId } satisfies HostToWorkerMessage,
+        );
         break;
       case WorkerToHostType.Result:
         resultGate.resolve(message.result);
@@ -562,7 +587,8 @@ await run("caps and malformed hook arguments reject loud (the runtime runs uncha
     ["return await agent('p', { label: 3 })", '"label" must be a string'],
     ["return await agent('p', { get label() { throw new Error('read failed') } })", "options must be plain JSON data"],
     ["return await agent('p', { bogus: true })", '"bogus" is not recognized'],
-    ["return await agent('p', { effort: 'high' })", '"effort" is deferred and not supported by this engine (supported: label, phase, schema, provider, model, retry, maxTurns)'],
+    ["return await agent('p', { effort: 'high' })", '"effort" is deferred and not supported by this engine (supported: label, phase, schema, provider, model, retry, maxTurns, cache, artifacts)'],
+    ["return await agent('p', { cache: 'no' })", '"cache" must be a boolean'],
     ["return await agent('p', { isolation: true })", '"isolation" is deferred'],
     ["return await agent('p', { agentType: 'task' })", '"agentType" is deferred'],
     ["return await agent('p', { schema: { type: 'array' } })", "outside the supported subset"],
@@ -853,6 +879,339 @@ await run("parallel({retry:1}) re-runs only null thunks", async () => {
   );
   const result = await host.result();
   assertDeepEqual(result.value, { out: ["keep", "recovered"], n: 2 }, "only the null thunk was retried");
+  host.close();
+});
+
+await run("FakeChildPort prompt_too_large failed: settled carries bytes, guidance, and no put(/ref(", async () => {
+  const prompt = "x".repeat(70000);
+  const bytes = new TextEncoder().encode(prompt).length;
+  const hostError = "The delegated prompt exceeds 65536 bytes.";
+  const host = fakeHost({
+    reply: () => ({
+      output: [],
+      stopReason: "failed",
+      failureReason: "prompt_too_large",
+      error: hostError,
+    }),
+  });
+  void runWorkerSession(
+    host.port,
+    init(`return await settled(${JSON.stringify(prompt)}, { label: 'synthesize' })`),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "script completed with a settled fail");
+  const settled = result.value as {
+    ok: boolean;
+    reason: string;
+    message: string;
+    stopReason: string;
+    bytes?: number;
+  };
+  assertEqual(settled.ok, false, "settled.ok is false");
+  assertEqual(settled.reason, "prompt_too_large", "settled.reason is prompt_too_large");
+  assertEqual(settled.stopReason, "failed", "settled.stopReason is failed");
+  assertEqual(settled.bytes, bytes, "settled.bytes is the utf8 prompt length");
+  assert(
+    settled.message.includes(hostError) && settled.message.includes(`Prompt is ${bytes} bytes.`),
+    "message keeps the host error and adds the byte count",
+  );
+  assert(
+    settled.message.includes("Shrink the schema or aggregate in JS; do not inline full child reports."),
+    "message includes the guidance sentence",
+  );
+  assert(!settled.message.includes("put(") && !settled.message.includes("ref("), "message has no put( or ref(");
+  assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 1, "oversized still spawned (no runtime precheck)");
+  assertEqual(result.failures?.length, 1, "failures lists the oversized child");
+  assertEqual(result.failures?.[0]?.reason, "prompt_too_large", "failures reason is prompt_too_large");
+  assertEqual(result.failures?.[0]?.message, settled.message, "failures message is the augmented guidance");
+  host.close();
+});
+
+await run("empty prompt is INVALID_ARGUMENT with no slot and no spawn", async () => {
+  const host = fakeHost({ reply: () => text("should not spawn") });
+  void runWorkerSession(host.port, init("return await agent('')"));
+  const result = await host.result();
+  assertEqual(result.stopReason, "error", "stopReason is error");
+  assert((result.error ?? "").includes("non-empty prompt string"), "error names the empty prompt");
+  assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 0, "empty prompt does not spawn");
+  assertEqual(result.agentsStarted, 0, "empty prompt does not take a slot");
+  host.close();
+});
+
+await run("whitespace-only prompt still spawns (worker does not trim)", async () => {
+  const host = fakeHost({ reply: () => text("ok") });
+  void runWorkerSession(host.port, init("return await agent(' ')"));
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "whitespace prompt is not INVALID_ARGUMENT");
+  assertEqual(result.value, "ok", "whitespace prompt spawned and completed");
+  assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 1, "whitespace-only still spawns");
+  host.close();
+});
+
+await run("return {a:undefined} completes and logs omitted undefined fields", async () => {
+  const host = fakeHost();
+  void runWorkerSession(host.port, init("return { a: undefined }"));
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "stopReason is completed");
+  assertDeepEqual(result.value, {}, "undefined field is omitted from the result");
+  const logs = host.ofType(WorkerToHostType.Log).map((m) => m.message);
+  assert(logs.some((line) => line.includes("omitted 1 undefined fields")), "omitted log is emitted");
+  host.close();
+});
+
+await run("root undefined still becomes null and is not omitted", async () => {
+  const host = fakeHost();
+  void runWorkerSession(host.port, init("return undefined"));
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "stopReason is completed");
+  assertEqual(result.value, null, "root undefined becomes null");
+  assert(
+    !host.ofType(WorkerToHostType.Log).some((m) => m.message.includes("omitted")),
+    "root undefined is not counted as omitted",
+  );
+  host.close();
+});
+
+await run("cache:false does not lookup or store", async () => {
+  const host = fakeHost({ reply: () => text("fresh") });
+  void runWorkerSession(host.port, init("return await agent('p', { cache: false, label: 'review' })"));
+  const result = await host.result();
+  assertEqual(result.value, "fresh", "cache:false still runs the child");
+  assertEqual(host.ofType(WorkerToHostType.CacheLookup).length, 0, "cache:false does not lookup");
+  assertEqual(host.ofType(WorkerToHostType.CacheStore).length, 0, "cache:false does not store");
+  assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 1, "cache:false still spawns");
+  assertEqual(result.agentsStarted, 1, "cache:false counts as a real start");
+  assertEqual(result.childStats?.replayed, undefined, "cache:false does not set replayed");
+  host.close();
+});
+
+await run("cache hit does not started++ and has no agent-start/end", async () => {
+  const host = fakeHost({
+    reply: () => text("should not spawn"),
+    cacheLookup: () => ({ hit: true, value: "cached-text", childId: "tsk_auth" }),
+  });
+  void runWorkerSession(
+    host.port,
+    init(`
+      const v = await agent('review the file', { label: 'review:auth' })
+      const s = stats()
+      return { v, s }
+    `),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "hit run completed");
+  assertDeepEqual(result.value, { v: "cached-text", s: { completed: 0, failed: 0, cancelled: 0, replayed: 1 } }, "hit value and stats.replayed");
+  assertEqual(result.agentsStarted, 0, "hit does not started++");
+  assertEqual(result.childStats?.replayed, 1, "result childStats.replayed is 1");
+  assertDeepEqual(result.sources, [{ label: "review:auth", childId: "tsk_auth" }], "hit records the cached childId as a source");
+  assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 0, "hit does not spawn");
+  assertEqual(host.ofType(WorkerToHostType.AgentStart).length, 0, "hit has no agent-start");
+  assertEqual(host.ofType(WorkerToHostType.AgentEnd).length, 0, "hit has no agent-end");
+  assertEqual(host.ofType(WorkerToHostType.CacheStore).length, 0, "hit does not store again");
+  const logs = host.ofType(WorkerToHostType.Log).map((m) => m.message);
+  assert(logs.includes("cache hit: review:auth"), "hit logs cache hit: <label>");
+  host.close();
+});
+
+await run("cache hit without childId omits that source", async () => {
+  const host = fakeHost({
+    reply: () => text("should not spawn"),
+    cacheLookup: () => ({ hit: true, value: "cached-text" }),
+  });
+  void runWorkerSession(host.port, init("return await agent('review the file', { label: 'review:auth' })"));
+  const result = await host.result();
+  assertEqual(result.value, "cached-text", "legacy hit still returns the value");
+  assertEqual(result.sources, undefined, "legacy hit without childId does not invent a source");
+  host.close();
+});
+
+await run("schema cache hit that is not an object is treated as a miss", async () => {
+  const host = fakeHost({
+    reply: () => ({ output: [], structured: { ok: true }, stopReason: "completed" }),
+    cacheLookup: () => ({ hit: true, value: "not-an-object" }),
+  });
+  void runWorkerSession(
+    host.port,
+    init("return await agent('p', { schema: { type: 'object', properties: { ok: { type: 'boolean' } } }, retry: 0 })"),
+  );
+  const result = await host.result();
+  assertDeepEqual(result.value, { ok: true }, "non-object schema hit falls through to spawn");
+  assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 1, "non-object schema hit is a miss");
+  assertEqual(result.agentsStarted, 1, "miss after bad hit still started++");
+  assertEqual(result.childStats?.replayed, undefined, "bad schema hit is not replayed");
+  host.close();
+});
+
+await run("successful store does not block the agent() return", async () => {
+  const host = fakeHost({ reply: () => text("ok"), holdStore: true });
+  void runWorkerSession(host.port, init("return await agent('p', { label: 'review' })"));
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "run completed without a store ack");
+  assertEqual(result.value, "ok", "value returned before store ack");
+  assertEqual(host.ofType(WorkerToHostType.CacheStore).length, 1, "store was posted");
+  assertDeepEqual(result.sources, [{ label: "review", childId: "child-0" }], "spawn records the childId as a source");
+  host.close();
+});
+
+await run("fail and null do not store; oversized value skips with a log", async () => {
+  const tooBig = "x".repeat(256 * 1024);
+  let index = 0;
+  const host = fakeHost({
+    reply: () => {
+      const n = index;
+      index += 1;
+      if (n === 0) {
+        return { output: [], stopReason: "failed", failureReason: "max_turns", error: "turns" };
+      }
+      if (n === 1) {
+        return { output: [{ type: "text", text: tooBig }], stopReason: "completed" };
+      }
+      return text("small");
+    },
+  });
+  void runWorkerSession(
+    host.port,
+    init(`
+      const failed = await agent('fail me', { label: 'fail', retry: 0 })
+      const skipped = await agent('big', { label: 'synth' })
+      const stored = await agent('ok', { label: 'ok' })
+      return { failed, skippedLen: skipped.length, stored }
+    `),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "script completed");
+  assertDeepEqual(
+    result.value,
+    { failed: null, skippedLen: tooBig.length, stored: "small" },
+    "fail is null; oversized still succeeds; small stores",
+  );
+  const stores = host.ofType(WorkerToHostType.CacheStore);
+  assertEqual(stores.length, 1, "only the small success stores");
+  assertEqual(stores[0]?.value, "small", "store value is the agent() return");
+  assertEqual(stores[0]?.childId, "child-2", "store carries the spawn taskId");
+  const logs = host.ofType(WorkerToHostType.Log).map((m) => m.message);
+  assert(logs.includes("cache skip: synth exceeds 256KiB"), "oversized logs cache skip: <label> exceeds 256KiB");
+  host.close();
+});
+
+await run("put/get/ref round-trip and agent({artifacts}) forwards payload on child-start", async () => {
+  const host = fakeHost({ reply: () => text("ok") });
+  void runWorkerSession(
+    host.port,
+    init(`
+      const handle = put('reviews', { n: 2, items: ['a', 'b'] })
+      const viaGet = get('reviews')
+      const viaRef = ref('reviews')
+      const missing = get('absent')
+      const out = await agent('synthesize', { artifacts: [handle], cache: false })
+      return { handle, viaGet, viaRef, missing, out }
+    `),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "stopReason is completed");
+  assertDeepEqual(
+    result.value,
+    {
+      handle: { name: "reviews" },
+      viaGet: { n: 2, items: ["a", "b"] },
+      viaRef: { name: "reviews" },
+      missing: null,
+      out: "ok",
+    },
+    "put/get/ref values materialize",
+  );
+  const start = host.ofType(WorkerToHostType.ChildStart)[0];
+  assert(start !== undefined, "a child-start was posted");
+  assertDeepEqual(
+    start.request.artifacts,
+    [{ name: "reviews", value: { n: 2, items: ["a", "b"] } }],
+    "ChildStart carries materialized artifact payloads",
+  );
+  host.close();
+});
+
+await run("illegal artifact names are INVALID_ARGUMENT fatal", async () => {
+  const cases: Array<[string, string]> = [
+    ["put('.', 1)", "legal artifact name"],
+    ["put('..', 1)", "legal artifact name"],
+    ["put('a/b', 1)", "legal artifact name"],
+    ["put('', 1)", "legal artifact name"],
+    ["put('has space', 1)", "legal artifact name"],
+    ["get('/')", "legal artifact name"],
+    ["ref('..')", "legal artifact name"],
+  ];
+  for (const [body, expected] of cases) {
+    const host = fakeHost({ reply: () => text("should not spawn") });
+    void runWorkerSession(host.port, init(body));
+    const result = await host.result();
+    assertEqual(result.stopReason, "error", `${body} -> error`);
+    assert((result.error ?? "").includes(expected), `${body} -> error contains ${JSON.stringify(expected)}`);
+    assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 0, `${body} does not spawn`);
+    host.close();
+  }
+});
+
+await run("put 257th distinct name is INVALID_ARGUMENT fatal", async () => {
+  const host = fakeHost();
+  void runWorkerSession(
+    host.port,
+    init(`
+      for (let i = 0; i < 256; i++) put('n' + i, i)
+      put('n256', 256)
+    `),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "error", "257th put is fatal");
+  assert((result.error ?? "").includes("artifact count"), "error names the object-count cap");
+  host.close();
+});
+
+await run("put over 8MiB is INVALID_ARGUMENT fatal", async () => {
+  const host = fakeHost();
+  void runWorkerSession(
+    host.port,
+    init(`
+      put('keep', 'ok')
+      put('blob', 'x'.repeat(8 * 1024 * 1024 - 16))
+      put('blob', 'y'.repeat(8 * 1024 * 1024))
+    `),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "error", "over-8MiB put is fatal");
+  assert((result.error ?? "").includes("artifact store"), "error names the 8MiB store cap");
+  host.close();
+});
+
+await run("same-name overwrite uses delta so shrinking stays under 8MiB", async () => {
+  const host = fakeHost();
+  void runWorkerSession(
+    host.port,
+    init(`
+      put('blob', 'x'.repeat(5 * 1024 * 1024))
+      const afterShrink = put('blob', 'y')
+      return { name: afterShrink.name, value: get('blob') }
+    `),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "completed", "delta overwrite does not trip the 8MiB cap");
+  assertDeepEqual(result.value, { name: "blob", value: "y" }, "overwrite replaced the stored value");
+  host.close();
+});
+
+await run("artifact render over 1MiB is INVALID_ARGUMENT and does not ChildStart", async () => {
+  const host = fakeHost({ reply: () => text("should not spawn") });
+  void runWorkerSession(
+    host.port,
+    init(`
+      const handle = put('reviews', 'x'.repeat(1024 * 1024))
+      return await agent('synthesize', { artifacts: [handle], cache: false })
+    `),
+  );
+  const result = await host.result();
+  assertEqual(result.stopReason, "error", "oversized render is fatal");
+  assert((result.error ?? "").includes("artifacts render exceeds"), "error names the 1MiB inject cap");
+  assertEqual(host.ofType(WorkerToHostType.ChildStart).length, 0, "render over 1MiB does not ChildStart");
+  assertEqual(result.agentsStarted, 0, "render over 1MiB does not started++");
   host.close();
 });
 

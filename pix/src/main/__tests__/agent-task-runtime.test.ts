@@ -32,8 +32,10 @@ import { createWslExecutionBackend } from "../wsl/wsl-execution-backend.js";
 import type { AgentTaskInputRouter } from "../agent-task/agent-task-input.js";
 import {
   AgentTaskRuntime,
+  MAX_DELEGATED_PROMPT_BYTES,
   __setAgentTaskRuntimeContextFactoriesForTests,
 } from "../agent-task/agent-task-runtime.js";
+import { schemaChildCompletionPrompt } from "../workflow/structured-output-tool.js";
 
 // ============================================================================
 // Test harness (matches subagent-runner.test.ts style)
@@ -1152,6 +1154,143 @@ await run("resume: folded prefix with a failed item breaks before consuming the 
   } finally {
     rmSync(taskSessionDir, { recursive: true, force: true });
   }
+});
+
+await run("prepareResume applies appendSystemPrompt and schema prompt last", async () => {
+  provider.scripts.length = 0;
+  provider.calls.length = 0;
+  provider.scripts.push({
+    kind: "message",
+    text: "",
+    stopReason: "stop",
+    toolCall: { name: "submit_workflow_result", id: "submit-resume-1", args: { answer: { value: 7 } } },
+  });
+  const extra = "## Workflow artifacts\n### reviews\n```json\n{\"n\":1}\n```";
+  const schema = {
+    type: "object",
+    properties: { answer: { type: "object" } },
+    required: ["answer"],
+    additionalProperties: false,
+  };
+  const item = makeReadyItem({
+    outputSchema: schema,
+    appendSystemPrompt: extra,
+  });
+  const taskSessionDir = mkdtempSync(join(tmpdir(), "pix-agent-task-sessions-"));
+  try {
+    const spec = makeSpec({ items: [item] });
+    const sessionFileName = "resume-session.jsonl";
+    const timestamp = new Date().toISOString();
+    writeFileSync(
+      join(taskSessionDir, sessionFileName),
+      [
+        JSON.stringify({ type: "session", version: 3, id: "resume-session-1", timestamp, cwd: PROJECT_CWD }),
+        JSON.stringify({
+          type: "custom_message",
+          customType: "pix-task-resume",
+          content: "recovery note",
+          display: true,
+          details: { generation: 0 },
+          id: "resume-note-1",
+          parentId: "resume-session-1",
+          timestamp,
+        }),
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+    const runtime = new AgentTaskRuntime({ spec, input: makeInputMock().router, taskSessionDir });
+    await runtime.prepareResume({
+      checkpoint: {
+        taskId: spec.taskId,
+        generation: 0,
+        seq: 0,
+        activeItemIndex: 0,
+        sessionFileName,
+        sessionLeafId: "resume-note-1",
+        openToolCalls: [],
+        workspaceFingerprint: { isGit: false, observedFileHashes: {} },
+        ts: Date.now(),
+      },
+      decision: { action: "continue", confirmWorkspaceChanges: true },
+      effectiveModel: { provider: "faux", modelId: "faux-model" },
+      injectNote: "recovery note",
+      priorResults: [],
+    });
+    const result = await runtime.run(new AbortController().signal, () => {});
+    assertEqual(result.status, "completed", "resumed schema child with artifacts append completed");
+    assertEqual(provider.calls.length, 1, "resume path issued one provider call");
+    const systemPrompt = provider.calls[0].context.systemPrompt ?? "";
+    const agentIdx = systemPrompt.indexOf("You are a test agent.");
+    const extraIdx = systemPrompt.indexOf(extra);
+    const schemaPrompt = schemaChildCompletionPrompt({
+      type: "object",
+      properties: { answer: { type: "object" } },
+      required: ["answer"],
+      additionalProperties: false,
+    });
+    const schemaIdx = systemPrompt.indexOf(schemaPrompt);
+    assert(agentIdx >= 0, "resume agent systemPrompt is present");
+    assert(extraIdx > agentIdx, "resume extraAppend follows the agent systemPrompt");
+    assert(schemaIdx > extraIdx, "resume schema completion contract is last");
+    await runtime.dispose();
+  } finally {
+    rmSync(taskSessionDir, { recursive: true, force: true });
+  }
+});
+
+await run("nestedSystemPromptOverride: extraAppend then schema completion contract last", async () => {
+  provider.scripts.length = 0;
+  provider.calls.length = 0;
+  provider.scripts.push({
+    kind: "message",
+    text: "",
+    stopReason: "stop",
+    toolCall: { name: "submit_workflow_result", id: "submit-order-1", args: { answer: { value: 1 } } },
+  });
+  const extra = "## Workflow artifacts\n### reviews\n```json\n{\"n\":1}\n```";
+  const schema = {
+    type: "object",
+    properties: { answer: { type: "object" } },
+    required: ["answer"],
+    additionalProperties: false,
+  };
+  const item = makeReadyItem({
+    outputSchema: schema,
+    appendSystemPrompt: extra,
+  });
+  const runtime = new AgentTaskRuntime({ spec: makeSpec({ items: [item] }), input: makeInputMock().router });
+  const result = await runtime.run(new AbortController().signal, () => {});
+  assertEqual(result.status, "completed", "schema child with artifacts append completed");
+  assertEqual(provider.calls.length, 1, "one provider call");
+  const systemPrompt = provider.calls[0].context.systemPrompt ?? "";
+  const agentIdx = systemPrompt.indexOf("You are a test agent.");
+  const extraIdx = systemPrompt.indexOf(extra);
+  const schemaPrompt = schemaChildCompletionPrompt({
+    type: "object",
+    properties: { answer: { type: "object" } },
+    required: ["answer"],
+    additionalProperties: false,
+  });
+  const schemaIdx = systemPrompt.indexOf(schemaPrompt);
+  assert(agentIdx >= 0, "agent systemPrompt is present");
+  assert(extraIdx > agentIdx, "extraAppend follows the agent systemPrompt");
+  assert(schemaIdx > extraIdx, "schema completion contract is last");
+  await runtime.dispose();
+});
+
+await run("appendSystemPrompt does not count against the 64KB delegated prompt cap", async () => {
+  provider.scripts.length = 0;
+  provider.calls.length = 0;
+  provider.scripts.push({ kind: "message", text: "ok", stopReason: "stop" });
+  const huge = "x".repeat(MAX_DELEGATED_PROMPT_BYTES + 1);
+  const item = makeReadyItem({ prompt: "short instruction", appendSystemPrompt: huge });
+  const runtime = new AgentTaskRuntime({ spec: makeSpec({ items: [item] }), input: makeInputMock().router });
+  const result = await runtime.run(new AbortController().signal, () => {});
+  assertEqual(result.status, "completed", "large appendSystemPrompt does not trip the 64KB prompt cap");
+  assertEqual(provider.calls.length, 1, "session started");
+  assertEqual(userMessageText(provider.calls[0]), "short instruction", "user message is the short prompt only");
+  assert((provider.calls[0].context.systemPrompt ?? "").includes(huge.slice(0, 32)), "append is in the system prompt");
+  await runtime.dispose();
 });
 
 await run("disk session: abort does not emit item_end or item_result", async () => {
