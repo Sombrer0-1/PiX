@@ -97,7 +97,14 @@ const TRANSCRIPT_LIVE_EVENTS_LIMIT = 4000;
 export interface TaskTranscriptState {
   byItem: Record<
     number,
-    { entries: unknown[]; totalCount: number; nextCursor: string | null; loading: boolean }
+    {
+      entries: unknown[];
+      totalCount: number;
+      nextCursor: string | null;
+      prevCursor: string | null;
+      loading: boolean;
+      loadingOlder: boolean;
+    }
   >;
   /** 直播事件环形缓冲:per-task 单调递增 seq(溢出丢最旧并置 liveDropped=true)。 */
   liveEvents: Array<{ seq: number; itemIndex: number; event: AgentSessionEvent }>;
@@ -273,6 +280,10 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     return changed ? next : currentTasks;
   }
 
+  function replaceTaskAt(idx: number, nextTask: AgentTaskInfo): void {
+    tasks.value[idx] = nextTask;
+  }
+
   /** Upsert a task_state push, keeping the mirror in service order. */
   function applyTaskState(task: AgentTaskInfo): void {
     const idx = tasks.value.findIndex((t) => t.taskId === task.taskId);
@@ -288,18 +299,30 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
         previousBg.warningActive &&
         !incomingBg.warningActive
       ) {
-        // The warning is monotonic within a timer run: an equal-deadline push
-        // arriving after the warning fired must not regress it on this task.
         incoming = { ...task, autoBackground: { ...incomingBg, warningActive: true } };
       }
     }
-    const next = tasks.value.slice();
     if (idx >= 0) {
-      next[idx] = incoming;
-    } else {
-      next.push(incoming);
+      replaceTaskAt(idx, incoming);
+      const mirrored = mirrorGroupAutoBackground(incoming, tasks.value);
+      if (mirrored !== tasks.value) {
+        for (let i = 0; i < tasks.value.length; i++) {
+          if (tasks.value[i] !== mirrored[i]) {
+            tasks.value[i] = mirrored[i];
+          }
+        }
+      }
+      return;
     }
-    tasks.value = mirrorGroupAutoBackground(incoming, next);
+    tasks.value.push(incoming);
+    const mirrored = mirrorGroupAutoBackground(incoming, tasks.value);
+    if (mirrored !== tasks.value) {
+      for (let i = 0; i < tasks.value.length; i++) {
+        if (tasks.value[i] !== mirrored[i]) {
+          tasks.value[i] = mirrored[i];
+        }
+      }
+    }
   }
 
   /** Replace a task's activity list wholesale (bounded throttle merges in main). */
@@ -310,23 +333,19 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
   ): void {
     const idx = tasks.value.findIndex((t) => t.taskId === taskId);
     if (idx < 0) return;
-    const next = tasks.value.slice();
-    next[idx] = {
-      ...next[idx],
+    replaceTaskAt(idx, {
+      ...tasks.value[idx],
       activities,
       ...(extras?.toolUseCount !== undefined ? { toolUseCount: extras.toolUseCount } : {}),
       ...(extras?.durationMs !== undefined ? { durationMs: extras.durationMs } : {}),
-    };
-    tasks.value = next;
+    });
   }
 
   /** Replace a task's final output wholesale (bounded throttle merges in main). */
   function applyOutput(taskId: string, output: string, truncated: boolean): void {
     const idx = tasks.value.findIndex((t) => t.taskId === taskId);
     if (idx < 0) return;
-    const next = tasks.value.slice();
-    next[idx] = { ...next[idx], finalOutput: output, outputTruncated: truncated };
-    tasks.value = next;
+    replaceTaskAt(idx, { ...tasks.value[idx], finalOutput: output, outputTruncated: truncated });
   }
 
   /** Append an input request push; duplicates by taskId+requestId+generation are ignored. */
@@ -636,7 +655,7 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
   ): TaskTranscriptState["byItem"][number] {
     let item = state.byItem[itemIndex];
     if (!item) {
-      item = { entries: [], totalCount: 0, nextCursor: null, loading: false };
+      item = { entries: [], totalCount: 0, nextCursor: null, prevCursor: null, loading: false, loadingOlder: false };
       state.byItem = { ...state.byItem, [itemIndex]: item };
     }
     return item;
@@ -647,14 +666,10 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     const state = ensureTranscriptState(taskId);
     const seq = transcriptSeq;
     transcriptSeq += 1;
-    const next = [...state.liveEvents, { seq, itemIndex, event }];
-    if (next.length > TRANSCRIPT_LIVE_EVENTS_LIMIT) {
-      // 环形上限:溢出丢最旧,并置 liveDropped(true 后永久,live 丢失由
-      // 渲染端全量重放重建兜底)。
-      state.liveEvents = next.slice(next.length - TRANSCRIPT_LIVE_EVENTS_LIMIT);
+    state.liveEvents.push({ seq, itemIndex, event });
+    if (state.liveEvents.length > TRANSCRIPT_LIVE_EVENTS_LIMIT) {
+      state.liveEvents.splice(0, state.liveEvents.length - TRANSCRIPT_LIVE_EVENTS_LIMIT);
       state.liveDropped = true;
-    } else {
-      state.liveEvents = next;
     }
   }
 
@@ -693,31 +708,53 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     if (item.loading) return;
     item.loading = true;
     try {
-      let entries: unknown[] = [];
-      let totalCount = 0;
-      let nextCursor: string | null = null;
-      do {
-        // 显式结果注解:result.data.nextCursor 回流为命令参数,泛型推导会因
-        // 自引用退化为 any,这里断开循环(契约类型不变)。
-        const result: PixCommandResult<AgentTaskTranscriptPage> = await runCommand({
-          type: "get_transcript",
-          taskId,
-          itemIndex,
-          cursor: nextCursor ?? undefined,
-        });
-        if (!result.success || !result.data) break;
-        entries = entries.concat(result.data.entries);
-        totalCount = result.data.totalCount;
-        nextCursor = result.data.nextCursor;
-      } while (nextCursor !== null);
-      if (entries.length > 0 || item.entries.length === 0) {
-        item.entries = entries;
-        item.totalCount = totalCount;
-        item.nextCursor = nextCursor;
-      }
+      const result: PixCommandResult<AgentTaskTranscriptPage> = await runCommand({
+        type: "get_transcript",
+        taskId,
+        itemIndex,
+        tail: true,
+        limit: 80,
+      });
+      if (!result.success || !result.data) return;
+      item.entries = result.data.entries;
+      item.totalCount = result.data.totalCount;
+      item.nextCursor = result.data.nextCursor;
+      item.prevCursor = result.data.prevCursor ?? null;
     } finally {
       item.loading = false;
     }
+  }
+
+  async function loadOlderTranscriptPage(taskId: string, itemIndex = 0): Promise<boolean> {
+    const state = ensureTranscriptState(taskId);
+    const item = ensureTranscriptItem(state, itemIndex);
+    if (item.loading || item.loadingOlder || !item.prevCursor) return false;
+    item.loadingOlder = true;
+    try {
+      const result: PixCommandResult<AgentTaskTranscriptPage> = await runCommand({
+        type: "get_transcript",
+        taskId,
+        itemIndex,
+        before: item.prevCursor,
+        limit: 80,
+      });
+      if (!result.success || !result.data || result.data.entries.length === 0) {
+        item.prevCursor = null;
+        return false;
+      }
+      item.entries = result.data.entries.concat(item.entries);
+      item.prevCursor = result.data.prevCursor ?? null;
+      return true;
+    } finally {
+      item.loadingOlder = false;
+    }
+  }
+
+  /** Replace one task with a full service snapshot (selected-task catch-up). */
+  async function hydrateSelectedTask(taskId: string): Promise<void> {
+    const result: PixCommandResult<AgentTaskInfo> = await runCommand({ type: "get", taskId });
+    if (!result.success || !result.data) return;
+    applyTaskState(result.data);
   }
 
   // ==========================================================================
@@ -768,10 +805,12 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
     openTaskCenter,
     closeTaskCenter,
     clearError,
+    hydrateSelectedTask,
     // Transcript channel
     watchTask,
     unwatchTask,
     loadTranscriptPage,
+    loadOlderTranscriptPage,
     // Task log channel (P4)
     getTaskLog,
   };

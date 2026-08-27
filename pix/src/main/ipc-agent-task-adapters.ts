@@ -19,7 +19,40 @@
 
 import { isFiniteNonNegativeNumber, type IpcMainLike, type WebContentsLike } from "./ipc-plan-adapters.js";
 import type { AgentTaskService } from "./agent-task/agent-task-service.js";
-import type { AgentTaskCommand, AgentTaskCommandDataV15, PixCommandResult } from "../shared/types.js";
+import type { AgentTaskInfo } from "../shared/agent-task-types.js";
+import type { AgentTaskCommand, AgentTaskCommandDataV15, AgentTaskEvent, PixCommandResult } from "../shared/types.js";
+
+const LIST_OUTPUT_PREVIEW_CHARS = 240;
+
+function truncatePreview(text: string, maxChars: number): { text: string; truncated: boolean } {
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) {
+    return { text, truncated: false };
+  }
+  return { text: chars.slice(0, maxChars).join(""), truncated: true };
+}
+
+/** Renderer list payload: keep isAgentTaskInfo, drop heavy live fields when the task is not watched. */
+export function toRendererTaskState(task: AgentTaskInfo, watched: boolean): AgentTaskInfo {
+  if (watched) {
+    return task;
+  }
+  const preview = truncatePreview(task.finalOutput, LIST_OUTPUT_PREVIEW_CHARS);
+  const previewBytes = Buffer.byteLength(preview.text, "utf8");
+  const originalBytes = Math.max(task.originalOutputBytes, preview.truncated ? previewBytes + 1 : previewBytes);
+  return {
+    ...task,
+    finalOutput: preview.text,
+    outputTruncated: task.outputTruncated || preview.truncated,
+    originalOutputBytes: originalBytes,
+    activities: [],
+    results: task.results.map((result) => ({
+      ...result,
+      finalOutput: "",
+      activities: [],
+    })),
+  };
+}
 
 export type { IpcMainLike, WebContentsLike } from "./ipc-plan-adapters.js";
 
@@ -35,6 +68,7 @@ const VALID_AGENT_TASK_COMMAND_TYPES = new Set([
   "respond_input",
   "cancel_input",
   "get_all",
+  "get",
   "get_active_input_requests",
   "export_diagnostics",
   "watch_task",
@@ -71,6 +105,8 @@ export function isAgentTaskCommand(cmd: unknown): cmd is AgentTaskCommand {
     case "get_all":
     case "get_active_input_requests":
       return true;
+    case "get":
+      return typeof c.taskId === "string";
     case "export_diagnostics":
       return typeof c.taskId === "string";
     case "watch_task":
@@ -84,7 +120,9 @@ export function isAgentTaskCommand(cmd: unknown): cmd is AgentTaskCommand {
         (c.itemIndex === undefined ||
           (typeof c.itemIndex === "number" && Number.isInteger(c.itemIndex) && c.itemIndex >= 0)) &&
         (c.cursor === undefined || typeof c.cursor === "string") &&
-        (c.limit === undefined || (typeof c.limit === "number" && Number.isInteger(c.limit) && c.limit > 0))
+        (c.limit === undefined || (typeof c.limit === "number" && Number.isInteger(c.limit) && c.limit > 0)) &&
+        (c.tail === undefined || typeof c.tail === "boolean") &&
+        (c.before === undefined || typeof c.before === "string")
       );
     default:
       return true;
@@ -129,6 +167,12 @@ export async function executeAgentTaskCommand(
     case "get_all":
       // 1.4.2 (R2): the full remount snapshot (tasks + recoveryIssues + storageStatuses).
       return { success: true, data: service.getAll() };
+    case "get": {
+      const task = service.get(cmd.taskId);
+      return task
+        ? { success: true, data: task }
+        : { success: false, code: "not_found", error: `Agent task not found: ${cmd.taskId}` };
+    }
     case "get_active_input_requests":
       return { success: true, data: service.getActiveInputRequests() };
     case "export_diagnostics": {
@@ -154,7 +198,10 @@ export async function executeAgentTaskCommand(
       const itemIndex = cmd.itemIndex ?? 0;
       const limit = Math.min(Math.max(1, cmd.limit ?? 200), 1000);
       try {
-        return { success: true, data: await service.getTranscriptPage(cmd.taskId, itemIndex, cmd.cursor, limit) };
+        return {
+          success: true,
+          data: await service.getTranscriptPage(cmd.taskId, itemIndex, cmd.cursor, limit, cmd.tail === true, cmd.before),
+        };
       } catch (err) {
         // 只有任务不存在才是 not_found;I/O 等其它异常保留原始信息,不吞错。
         const notFound = err instanceof Error && err.message === "not_found";
@@ -244,9 +291,17 @@ export function subscribeAgentTaskEventForwarding(
       }
       return;
     }
-    // task_state / task_input_dismissed / task_activities / task_output and
-    // the 1.4.2 (R2) storage_status / recovery_issue events share the exact
-    // AgentTaskEvent shape (§4.9).
+    if (event.type === "task_state") {
+      const watched = service.isTaskWatched(event.task.taskId);
+      const forwarded: AgentTaskEvent = { type: "task_state", task: toRendererTaskState(event.task, watched) };
+      webContents.send("agent-task-event", forwarded);
+      return;
+    }
+    if (event.type === "task_activities" || event.type === "task_output" || event.type === "task_transcript") {
+      if (!service.isTaskWatched(event.taskId)) {
+        return;
+      }
+    }
     webContents.send("agent-task-event", event);
   });
 }

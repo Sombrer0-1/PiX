@@ -53,7 +53,10 @@ const taskInputRequests = computed(() =>
 // ==========================================================================
 
 function attachWatcher(taskId: string): void {
-  void store.watchTask(taskId);
+  void (async () => {
+    await store.watchTask(taskId);
+    await store.hydrateSelectedTask(taskId);
+  })();
 }
 
 function detachWatcher(taskId: string): void {

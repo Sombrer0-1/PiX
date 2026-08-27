@@ -944,7 +944,8 @@ export type AgentTaskCommandV15 =
   | AgentTaskCommandV142
   | { type: "watch_task"; taskId: string }
   | { type: "unwatch_task"; taskId: string }
-  | { type: "get_transcript"; taskId: string; itemIndex?: number; cursor?: string; limit?: number }
+  | { type: "get"; taskId: string }
+  | { type: "get_transcript"; taskId: string; itemIndex?: number; cursor?: string; limit?: number; tail?: boolean; before?: string }
   | { type: "get_task_log"; taskId: string };            // P4
 export type AgentTaskCommand = AgentTaskCommandV15;
 
@@ -997,6 +998,7 @@ export type AgentTaskCommandDataV142<C extends AgentTaskCommandV142> = AgentTask
 export type AgentTaskCommandDataMapV15 = AgentTaskCommandDataMapV142 & {
   watch_task: undefined;
   unwatch_task: undefined;
+  get: AgentTaskInfo;
   get_transcript: AgentTaskTranscriptPage;
   get_task_log: AgentTaskLogSnapshot;
 };

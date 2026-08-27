@@ -643,6 +643,8 @@ await run("S1/S4: V15 commands pass the guard; watch/unwatch/get_transcript disp
     { type: "get_transcript", taskId: "t-1", itemIndex: 0 },
     { type: "get_transcript", taskId: "t-1", itemIndex: 3, cursor: "o=42", limit: 200 },
     { type: "get_transcript", taskId: "t-1", limit: 1000 },
+    { type: "get_transcript", taskId: "t-1", before: "{\"o\":20}", limit: 80 },
+    { type: "get", taskId: "t-1" },
     { type: "get_task_log", taskId: "t-1" },
   ];
   for (const command of valid) {
@@ -661,6 +663,8 @@ await run("S1/S4: V15 commands pass the guard; watch/unwatch/get_transcript disp
     { type: "get_transcript", taskId: "t-1", limit: -5 },
     { type: "get_transcript", taskId: "t-1", limit: 200.5 },
     { type: "get_transcript", taskId: "t-1", cursor: 42 },
+    { type: "get_transcript", taskId: "t-1", before: 20 },
+    { type: "get" },
   ];
   for (const command of invalid) {
     assert(!isAgentTaskCommand(command), `structural guard rejects ${JSON.stringify(command)}`);
@@ -715,6 +719,17 @@ await run("get_all / get_active_input_requests: data envelopes + per-command nar
     assert(Array.isArray(snapshot.storageStatuses), "snapshot carries storageStatuses");
     assert(snapshot.storageStatuses.length >= 1, "at least one workspace storage status present");
   }
+
+  const requestedId = all.success === true ? all.data!.tasks[0].taskId : "";
+  const one = (await ipc.invoke("agent-task-command", { type: "get", taskId: requestedId })) as PixCommandResult<AgentTaskInfo>;
+  assertEqual(one.success, true, "get succeeds for a mirrored task");
+  if (one.success === true) {
+    assertEqual(one.data?.taskId, requestedId, "get returns the requested task");
+    assert(one.data !== undefined && isAgentTaskInfo(one.data), "get payload passes isAgentTaskInfo");
+  }
+  const missing = (await ipc.invoke("agent-task-command", { type: "get", taskId: "no-such-task" })) as PixCommandResult;
+  const missingFailure = assertFailure(missing, "get fails for an unknown task");
+  assertEqual(missingFailure.code, "not_found", "get not_found code");
 
   // get_active_input_requests is data-bearing; empty list when nothing waits.
   const inputs = (await ipc.invoke("agent-task-command", { type: "get_active_input_requests" })) as PixCommandResult<AgentTaskInputRequest[]>;
@@ -1250,7 +1265,8 @@ await run("throttled activities/output reach the renderer on agent-task-event", 
   registerAgentTaskIpcHandlers(ipc, harness.service);
   const webContents = new FakeWebContents();
   const unsubscribe = subscribeAgentTaskEventForwarding(() => webContents, harness.service);
-  const { runtime } = await createSingleForegroundTask(harness);
+  const { runtime, taskId } = await createSingleForegroundTask(harness);
+  await ipc.invoke("agent-task-command", { type: "watch_task", taskId });
 
   // The first emission flushes immediately (the fake clock has never
   // advanced, so lastEmitAt=0 is far outside the window).

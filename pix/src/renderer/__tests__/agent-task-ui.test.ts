@@ -962,6 +962,8 @@ describe("TaskDetailPanel", () => {
 
     expect(taskCalls("watch_task")).toHaveLength(1);
     expect(taskCalls("watch_task")[0]).toMatchObject({ taskId: "task-1" });
+    expect(taskCalls("get")).toHaveLength(1);
+    expect(taskCalls("get")[0]).toMatchObject({ taskId: "task-1" });
     expect(store.transcripts["task-1"]?.watched).toBe(true);
 
     w.unmount();
@@ -1767,6 +1769,46 @@ describe("SubagentToolView terminal fold + deep link", () => {
     expect(wrapper.find('[data-test="subagent-view-detail-btn"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="subagent-fold-summary"]').exists()).toBe(true);
     expect(store.centerOpen).toBe(false);
+  });
+
+  it("main session path renders every block even past the window threshold", async () => {
+    const pinia = installPinia();
+    const blocks = Array.from({ length: 130 }, (_, i) => ({
+      id: `u-${i}`,
+      type: "user-message" as const,
+      text: `m${i}`,
+      timestamp: i,
+    }));
+    wrapper = mount(SessionView, {
+      props: { blocks },
+      global: { plugins: [pinia, vuetify] },
+    });
+    await nextTick();
+    expect(wrapper.findAll(".message-block")).toHaveLength(130);
+    expect(wrapper.find("[data-test=\"session-window-placeholder\"]").exists()).toBe(false);
+  });
+
+  it("windowed task transcript pins to the tail and revealOlderWindow moves the window up", async () => {
+    const pinia = installPinia();
+    const blocks = Array.from({ length: 160 }, (_, i) => ({
+      id: `u-${i}`,
+      type: "user-message" as const,
+      text: `m${i}`,
+      timestamp: i,
+    }));
+    wrapper = mount(SessionView, {
+      props: { blocks, windowed: true },
+      global: { plugins: [pinia, vuetify] },
+    });
+    await nextTick();
+    expect(wrapper.find("[data-test=\"session-window-placeholder\"]").exists()).toBe(true);
+    expect(wrapper.findAll(".message-block")).toHaveLength(80);
+    expect(wrapper.text()).toContain("m159");
+    expect(wrapper.text()).not.toContain("m0");
+    (wrapper.vm as unknown as { revealOlderWindow: () => void }).revealOlderWindow();
+    await nextTick();
+    expect(wrapper.findAll(".message-block").length).toBeGreaterThan(80);
+    expect(wrapper.text()).toContain("m79");
   });
 
   it("SessionView 向 SubagentToolView 透传 tool-call-id", async () => {

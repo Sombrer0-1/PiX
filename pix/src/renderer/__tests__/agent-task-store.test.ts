@@ -790,31 +790,105 @@ describe("transcript channel", () => {
     expect(store.transcripts["task-1"]?.watched).toBe(false);
   });
 
-  it("loadTranscriptPage drains pages until nextCursor is null and accumulates the full entries", async () => {
+  it("loadTranscriptPage requests the tail page instead of draining the whole file", async () => {
     const store = useAgentTaskStore();
-    let page = 0;
     sendAgentTaskCommand.mockImplementation(async (command: Record<string, unknown>) => {
       if (command.type === "get_transcript") {
-        page += 1;
-        return page === 1
-          ? { success: true, data: { taskId: "task-1", itemIndex: 0, entries: [{ n: 1 }, { n: 2 }], totalCount: 3, nextCursor: "c1" } }
-          : { success: true, data: { taskId: "task-1", itemIndex: 0, entries: [{ n: 3 }], totalCount: 3, nextCursor: null } };
+        return {
+          success: true,
+          data: {
+            taskId: "task-1",
+            itemIndex: 0,
+            entries: [{ n: 3 }],
+            totalCount: 3,
+            nextCursor: null,
+            prevCursor: JSON.stringify({ o: 10 }),
+          },
+        };
       }
       return { success: true };
     });
 
     await store.loadTranscriptPage("task-1");
 
-    expect(page).toBe(2);
     const transcriptCalls = sendAgentTaskCommand.mock.calls
       .filter(([command]) => (command as { type: string }).type === "get_transcript")
-      .map(([command]) => command as { type: string; taskId: string; itemIndex: number; cursor?: string });
-    expect(transcriptCalls.map((call) => call.cursor)).toEqual([undefined, "c1"]);
+      .map(([command]) => command as { type: string; tail?: boolean; limit?: number });
+    expect(transcriptCalls).toHaveLength(1);
+    expect(transcriptCalls[0].tail).toBe(true);
     const item = store.transcripts["task-1"]?.byItem[0];
-    expect(item?.entries).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+    expect(item?.entries).toEqual([{ n: 3 }]);
     expect(item?.totalCount).toBe(3);
-    expect(item?.nextCursor).toBeNull();
+    expect(item?.prevCursor).toBe(JSON.stringify({ o: 10 }));
     expect(item?.loading).toBe(false);
+  });
+
+  it("loadOlderTranscriptPage prepends a reverse page in one IPC round-trip", async () => {
+    const store = useAgentTaskStore();
+    sendAgentTaskCommand.mockImplementation(async (command: Record<string, unknown>) => {
+      if (command.type === "get_transcript" && command.tail === true) {
+        return {
+          success: true,
+          data: {
+            taskId: "task-1",
+            itemIndex: 0,
+            entries: [{ n: 80 }, { n: 81 }],
+            totalCount: 100,
+            nextCursor: null,
+            prevCursor: JSON.stringify({ o: 20 }),
+          },
+        };
+      }
+      if (command.type === "get_transcript" && typeof command.before === "string") {
+        return {
+          success: true,
+          data: {
+            taskId: "task-1",
+            itemIndex: 0,
+            entries: [{ n: 1 }, { n: 2 }],
+            totalCount: 100,
+            nextCursor: command.before,
+            prevCursor: null,
+          },
+        };
+      }
+      return { success: true };
+    });
+
+    await store.loadTranscriptPage("task-1");
+    const loaded = await store.loadOlderTranscriptPage("task-1");
+
+    expect(loaded).toBe(true);
+    expect(store.transcripts["task-1"]?.byItem[0]?.entries).toEqual([{ n: 1 }, { n: 2 }, { n: 80 }, { n: 81 }]);
+    expect(store.transcripts["task-1"]?.byItem[0]?.prevCursor).toBeNull();
+    const olderCalls = sendAgentTaskCommand.mock.calls.filter(
+      ([command]) => typeof (command as { before?: unknown }).before === "string",
+    );
+    expect(olderCalls).toHaveLength(1);
+  });
+
+  it("hydrateSelectedTask replaces the slim list row with a full snapshot", async () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    emit({
+      type: "task_state",
+      task: makeTask({ taskId: "task-1", status: "completed", activities: [], finalOutput: "prev" }),
+    });
+    sendAgentTaskCommand.mockResolvedValue({
+      success: true,
+      data: makeTask({
+        taskId: "task-1",
+        status: "completed",
+        activities: [{ sequence: 1, toolCallId: "c1", toolName: "read", status: "completed", summary: "a.ts", startedAt: 1, endedAt: 2 }],
+        finalOutput: "full output",
+      }),
+    });
+
+    await store.hydrateSelectedTask("task-1");
+
+    expect(sendAgentTaskCommand).toHaveBeenCalledWith({ type: "get", taskId: "task-1" });
+    expect(store.tasks[0]?.finalOutput).toBe("full output");
+    expect(store.tasks[0]?.activities).toHaveLength(1);
   });
 
   it("marks byItem.loading while the paging command is in flight", async () => {

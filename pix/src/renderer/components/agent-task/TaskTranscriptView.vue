@@ -39,6 +39,11 @@ const blocks = reactive<DisplayBlock[]>([]);
 const assembler = createDisplayBlockAssembler({ blocks });
 
 const scrollRef = ref<HTMLElement | null>(null);
+const sessionViewRef = ref<{
+  hasHiddenPrefix: () => boolean;
+  revealOlderWindow: () => void;
+  pinToTail: () => void;
+} | null>(null);
 /** 贴底跟随:距底 < 48px 时保持粘底,回放/直播推进后自动滚到底。 */
 const follow = ref(true);
 
@@ -121,12 +126,39 @@ function onScroll(): void {
   const el = scrollRef.value;
   if (!el) return;
   follow.value = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  if (el.scrollTop < 80) {
+    void loadOlder();
+  }
+}
+
+async function loadOlder(): Promise<void> {
+  const el = scrollRef.value;
+  const before = el?.scrollHeight ?? 0;
+  if (sessionViewRef.value?.hasHiddenPrefix?.()) {
+    sessionViewRef.value.revealOlderWindow?.();
+    await nextTick();
+    if (el) {
+      el.scrollTop = el.scrollHeight - before + el.scrollTop;
+    }
+    return;
+  }
+  const item = activeItem.value;
+  if (item?.loading || item?.loadingOlder) return;
+  const loaded = await store.loadOlderTranscriptPage(props.task.taskId, activeItemIndex.value);
+  if (!loaded) return;
+  refold();
+  consumeLiveEvents();
+  await nextTick();
+  if (el) {
+    el.scrollTop = el.scrollHeight - before + el.scrollTop;
+  }
 }
 
 function scheduleScroll(): void {
   void nextTick(() => {
     const el = scrollRef.value;
     if (el && follow.value) {
+      sessionViewRef.value?.pinToTail?.();
       el.scrollTop = el.scrollHeight;
     }
   });
@@ -146,9 +178,13 @@ onMounted(() => {
   void mountTranscript();
 });
 
-// 新增直播事件(store 每次替换 liveEvents 数组)→ 增量消费。
+// 新增直播事件(可变环形缓冲按 length/seq 触发)→ 增量消费。
 watch(
-  () => transcriptState.value?.liveEvents,
+  () => {
+    const events = transcriptState.value?.liveEvents;
+    if (!events || events.length === 0) return 0;
+    return events.length * 1_000_000 + events[events.length - 1].seq;
+  },
   () => {
     consumeLiveEvents();
     if (hasEvictionGap()) {
@@ -197,7 +233,7 @@ watch(
       </button>
     </div>
     <div ref="scrollRef" class="task-transcript-scroll" data-test="task-transcript-scroll" @scroll="onScroll">
-      <SessionView v-if="hasBlocks" :blocks="blocks" />
+      <SessionView v-if="hasBlocks" ref="sessionViewRef" :blocks="blocks" windowed />
       <div v-else-if="loading" class="task-transcript-empty" data-test="task-transcript-loading">加载中...</div>
       <div v-else class="task-transcript-empty" data-test="task-transcript-empty">该 item 无记录</div>
     </div>

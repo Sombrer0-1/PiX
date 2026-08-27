@@ -54,6 +54,7 @@ import { AgentTaskResumer, RESUME_NOTE_CUSTOM_TYPE, __setAgentTaskResumerContext
 import {
   AgentTaskStore,
   TaskStorageLimitError,
+  type AppendEventsResult,
   type TaskCheckpoint,
   type TaskLogEvent,
   type TaskLogEventPayload,
@@ -592,9 +593,18 @@ class FakeRuntime {
   }
 }
 
-/** A store whose next appendEvent rejects with the injected error (tests the resume failure paths). */
+/** A store whose next appendEvents/appendEvent rejects with the injected error (tests the resume failure paths). */
 class FailingAppendStore extends AgentTaskStore {
   nextAppendError: Error | undefined;
+
+  override async appendEvents(workspaceId: string, taskId: string, events: TaskLogEventPayload[]): Promise<AppendEventsResult> {
+    const injected = this.nextAppendError;
+    if (injected !== undefined && events.length > 0) {
+      this.nextAppendError = undefined;
+      return { written: [], lastSeq: 0, failedAt: 0, error: injected };
+    }
+    return super.appendEvents(workspaceId, taskId, events);
+  }
 
   override async appendEvent(workspaceId: string, taskId: string, event: TaskLogEventPayload): Promise<TaskLogEvent> {
     const injected = this.nextAppendError;
@@ -644,6 +654,7 @@ function makeRecoveryHarness(
   const service = new AgentTaskService({ settings, events, store, runId: "recovery-run" });
   const hooks: Partial<AgentTaskServiceTestHooks> = {
     autoBackgroundMsOverride: 0,
+    flushIndexWrites: true,
     // 1.5 (P1): this suite targets hydration semantics and the explicit
     // resume/markFailed flows; the automatic post-restoreAll pass has its own
     // dedicated tests (opt back in with opts.autoRecovery).

@@ -1212,6 +1212,104 @@ await run("workspace-level append limit", async () => {
   assertDeepEqual(entries, [], "refused workspace append creates no files");
 });
 
+await run("appendEvents writes in order and keeps a successful prefix on storage_limit", async () => {
+  const root = await makeRoot();
+  const store = makeStore(root, { maxTaskBytes: 420, maxWorkspaceBytes: 25 * 1024 * 1024 });
+  const ws = "ws-batch";
+  const task = "task-1";
+  const first = await store.appendEvents(ws, task, [diagnosticEvent("a", "one"), diagnosticEvent("b", "two")]);
+  assertEqual(first.written.length, 2, "healthy batch writes both events");
+  assertEqual(first.lastSeq, 2, "healthy batch lastSeq is 2");
+  assertEqual(first.failedAt, undefined, "healthy batch has no failedAt");
+  const over = await store.appendEvents(ws, task, [
+    diagnosticEvent("c", "three"),
+    diagnosticEvent("huge", "x".repeat(800)),
+    diagnosticEvent("d", "never"),
+  ]);
+  assertEqual(over.written.length, 1, "prefix event before the oversize payload is kept");
+  assertEqual(over.lastSeq, 3, "prefix seq is continuous");
+  assertEqual(over.failedAt, 1, "failure stops at the oversize payload");
+  assert(over.error instanceof TaskStorageLimitError, "batch failure is storage_limit");
+  const read = await store.readTask(ws, task);
+  assertDeepEqual(
+    read.events.map((event) => event.seq),
+    [1, 2, 3],
+    "readable prefix is seq-continuous after a mid-batch storage_limit",
+  );
+  assert(
+    !read.events.some((event) => event.type === "diagnostic" && (event as { code?: string }).code === "d"),
+    "events after the failed payload are not written",
+  );
+});
+
+await run("cross-workspace append does not serialize behind another workspace read", async () => {
+  const root = await makeRoot();
+  const store = makeStore(root);
+  await store.appendEvent("ws-a", "t-a", diagnosticEvent("a", "a"));
+  const started = Date.now();
+  const [page, written] = await Promise.all([
+    store.readTranscriptPage("ws-a", "t-a", "missing.jsonl", undefined, 10),
+    store.appendEvent("ws-b", "t-b", diagnosticEvent("b", "b")),
+  ]);
+  assertEqual(page.entries.length, 0, "missing transcript on ws-a stays empty");
+  assertEqual(written.seq, 1, "ws-b append completes independently");
+  assert(Date.now() - started < 5000, "cross-workspace pair finishes promptly");
+});
+
+await run("readTranscriptPage seek + tail + exact totalCount + idempotent cursor", async () => {
+  const root = await makeRoot();
+  const store = makeStore(root);
+  const sessionsDir = join(root, "ws", "t1", "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  const lines = [
+    JSON.stringify({ type: "session", id: "s" }),
+    JSON.stringify({ type: "message", id: "m1", role: "user", content: "中文 🎉" }),
+    "not-json",
+    JSON.stringify({ type: "message", id: "m2", role: "assistant", content: "ok" }),
+    JSON.stringify({ type: "message", id: "m3", role: "user", content: "tail" }),
+  ];
+  await writeFile(join(sessionsDir, "sess.jsonl"), `${lines.join("\n")}\n`, "utf-8");
+  const all = await store.readTranscriptPage("ws", "t1", "sess.jsonl", undefined, 100);
+  assertEqual(all.totalCount, 3, "totalCount is exact displayable entries");
+  assertEqual(all.skippedLines, 1, "bad line counted");
+  const p1 = await store.readTranscriptPage("ws", "t1", "sess.jsonl", undefined, 1);
+  const p1b = await store.readTranscriptPage("ws", "t1", "sess.jsonl", undefined, 1);
+  assertDeepEqual(
+    p1.entries.map((entry) => (entry as { id: string }).id),
+    p1b.entries.map((entry) => (entry as { id: string }).id),
+    "same cursor+limit is idempotent",
+  );
+  const p2 = await store.readTranscriptPage("ws", "t1", "sess.jsonl", p1.nextCursor ?? undefined, 10);
+  assertDeepEqual(
+    p2.entries.map((entry) => (entry as { id: string }).id),
+    ["m2", "m3"],
+    "seek page continues after the first entry",
+  );
+  const mid = p1.nextCursor ? JSON.parse(p1.nextCursor) as { o: number } : { o: 0 };
+  const split = await store.readTranscriptPage("ws", "t1", "sess.jsonl", JSON.stringify({ o: mid.o + 1 }), 10);
+  assert(
+    split.entries.length >= 1,
+    "mid-line cursor falls back to a line boundary instead of throwing",
+  );
+  const tail = await store.readTranscriptPage("ws", "t1", "sess.jsonl", undefined, 1, true);
+  assertEqual((tail.entries[0] as { id: string }).id, "m3", "fromEnd returns the last displayable entry");
+  assert(tail.prevCursor !== null, "fromEnd exposes prevCursor when older entries exist");
+  const older = await store.readTranscriptPage("ws", "t1", "sess.jsonl", undefined, 2, false, tail.prevCursor ?? undefined);
+  assertDeepEqual(
+    older.entries.map((entry) => (entry as { id: string }).id),
+    ["m1", "m2"],
+    "before cursor returns the previous displayable entries in one seek",
+  );
+  assertEqual(older.prevCursor, null, "oldest reverse page has no further prevCursor");
+  const midTail = await store.readTranscriptPage("ws", "t1", "sess.jsonl", undefined, 2, true);
+  const unaligned = await store.readTranscriptPage("ws", "t1", "sess.jsonl", undefined, 80, false, midTail.prevCursor ?? undefined);
+  assertDeepEqual(
+    unaligned.entries.map((entry) => (entry as { id: string }).id),
+    ["m1"],
+    "unaligned remainder before a tail page is returned without overlap",
+  );
+});
+
 // ============================================================================
 
 async function cleanup(): Promise<void> {

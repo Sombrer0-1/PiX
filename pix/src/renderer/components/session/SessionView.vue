@@ -5,7 +5,7 @@
  * Renders display blocks as a flowing document.
  * Tool calls are aggregated into collapsible work-status blocks.
  */
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import type { DisplayBlock, ToolWorkItem } from "@/types/session";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import MessageBlock from "./MessageBlock.vue";
@@ -185,13 +185,89 @@ function resultPreview(result: unknown): string {
   return truncate(compactWhitespace(resultText(result)), 120);
 }
 
+const WINDOW_THRESHOLD = 120;
+const WINDOW_TAIL = 80;
+
 const props = defineProps<{
   blocks: DisplayBlock[];
   /** blockId of the latest retryable error eligible for a retry button (null while streaming). */
   activeRetryBlockId?: string | null;
+  /** When false, always render the full block list (main session path). */
+  windowed?: boolean;
 }>();
 
 const emit = defineEmits<{ retry: []; cancel: [] }>();
+
+const windowingEnabled = computed(() => props.windowed === true && props.blocks.length > WINDOW_THRESHOLD);
+/** Inclusive start index of the mounted window; pinned to the tail until older pages are revealed. */
+const windowStart = ref(0);
+const followTail = ref(true);
+
+watch(
+  () => props.windowed === true,
+  (windowed) => {
+    if (!windowed) {
+      windowStart.value = 0;
+      followTail.value = true;
+    }
+  },
+);
+
+watch(
+  () => props.blocks.length,
+  (length, prevLength) => {
+    if (props.windowed !== true) {
+      windowStart.value = 0;
+      followTail.value = true;
+      return;
+    }
+    // assembler.loadEntries clears then rebuilds; ignore the empty transient.
+    if (length === 0) {
+      return;
+    }
+    if (length <= WINDOW_THRESHOLD) {
+      windowStart.value = 0;
+      return;
+    }
+    const maxStart = length - WINDOW_TAIL;
+    if (followTail.value) {
+      windowStart.value = maxStart;
+      return;
+    }
+    const previous = prevLength && prevLength > 0 ? prevLength : 0;
+    if (previous > 0 && length > previous) {
+      windowStart.value += length - previous;
+    }
+    windowStart.value = Math.min(Math.max(0, windowStart.value), maxStart);
+  },
+  { immediate: true },
+);
+
+const hiddenPrefixCount = computed(() => (windowingEnabled.value ? windowStart.value : 0));
+const visibleBlocks = computed(() =>
+  windowingEnabled.value ? props.blocks.slice(windowStart.value) : props.blocks,
+);
+
+function hasHiddenPrefix(): boolean {
+  return windowingEnabled.value && windowStart.value > 0;
+}
+
+function revealOlderWindow(): void {
+  if (!hasHiddenPrefix()) return;
+  followTail.value = false;
+  windowStart.value = Math.max(0, windowStart.value - WINDOW_TAIL);
+}
+
+function pinToTail(): void {
+  followTail.value = true;
+  if (windowingEnabled.value) {
+    windowStart.value = Math.max(0, props.blocks.length - WINDOW_TAIL);
+  } else {
+    windowStart.value = 0;
+  }
+}
+
+defineExpose({ hasHiddenPrefix, revealOlderWindow, pinToTail });
 
 const rpc = useWorkspaceRpc();
 /** 实际发出的思考档位（thinkingLevelMap 映射后的值，如 max/high）；off 或无映射时为空。 */
@@ -307,7 +383,15 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 
 <template>
   <div class="session-view" @click="handleSessionClick">
-    <template v-for="block in blocks" :key="block.id">
+    <div
+      v-if="hiddenPrefixCount > 0"
+      class="session-window-placeholder"
+      :data-hidden-count="hiddenPrefixCount"
+      data-test="session-window-placeholder"
+    >
+      更早的 {{ hiddenPrefixCount }} 条记录已折叠，向上滚动工作记录可加载更旧页
+    </div>
+    <template v-for="block in visibleBlocks" :key="block.id">
       <!-- Turn separator -->
       <div
         v-if="block.type === 'turn-separator'"
@@ -879,6 +963,15 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--pix-text-primary);
+}
+
+.session-window-placeholder {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  font-size: var(--pix-text-sm, 12px);
+  color: var(--pix-text-secondary);
+  border: 1px dashed var(--pix-border-light);
+  border-radius: 6px;
 }
 
 /* ── Spinner ── */

@@ -245,6 +245,21 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
+		"meta/muse-image": {
+			id: "meta/muse-image",
+			name: "Meta: Muse Image",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
 		"microsoft/mai-image-2.5": {
 			id: "microsoft/mai-image-2.5",
 			name: "Microsoft: MAI-Image-2.5",

@@ -137,6 +137,48 @@ export const MAX_DELIVERY_RETRIES = 3;
 /** Base delay before the first delivery retry; doubles per attempt. */
 export const DELIVERY_RETRY_DELAY_MS = 500;
 
+/** Shape key for skipping identical mid-run task_state clones. Status / autoBackground / terminal jumps always differ. */
+function taskStateFingerprint(info: AgentTaskInfo): string {
+  const bg = info.autoBackground;
+  return [
+    info.status,
+    info.durationMs,
+    info.toolUseCount,
+    info.queuePosition ?? "",
+    info.endedAt ?? "",
+    info.failureReason ?? "",
+    info.errorMessage ?? "",
+    info.hasUnclosedToolCall === true ? 1 : 0,
+    info.usage.cost,
+    info.usage.totalTokens,
+    info.usage.turns,
+    bg ? `${bg.deadlineAt}:${bg.warningAt}:${bg.warningActive ? 1 : 0}` : "",
+    info.presentation,
+    info.generation,
+    info.stopReason ?? "",
+  ].join("|");
+}
+
+function indexEntryFromMetadata(metadata: TaskMetadata, lastWriterRunId: string): TaskIndexEntry {
+  const info = metadata.initialInfo;
+  return {
+    taskId: info.taskId,
+    workspaceId: info.workspaceId,
+    parentSessionId: info.parentSessionId,
+    parentToolCallId: info.parentToolCallId,
+    groupId: info.groupId,
+    planLink: info.planLink ? { ...info.planLink } : undefined,
+    status: info.status,
+    lastCheckpointSeq: info.lastCheckpointSeq ?? 0,
+    hasUnclosedToolCall: info.hasUnclosedToolCall === true,
+    stopReason: info.stopReason,
+    updatedAt: info.updatedAt,
+    schemaVersion: AGENT_TASK_SCHEMA_VERSION,
+    lastWriterRunId,
+    workflowOwned: info.workflowOwned === true,
+  };
+}
+
 // ============================================================================
 // Public contract (design plan §4.5, 1.4.1)
 // ============================================================================
@@ -273,6 +315,8 @@ export interface AgentTaskServiceTestHooks {
   disableAutoRecovery?: boolean;
   /** 1.5 (P1): retention window overrides (retention tests use tiny windows). */
   retentionOverride?: { keepCount?: number; keepAgeMs?: number; emergencyKeepCount?: number; undeliveredGraceMs?: number };
+  /** Flush coalesced running-task index writes immediately (tests that assert index bytes). */
+  flushIndexWrites?: boolean;
 }
 
 let testHooks: AgentTaskServiceTestHooks | undefined;
@@ -490,8 +534,19 @@ export class AgentTaskService {
   private _disposed = false;
   private _disposePromise: Promise<void> | undefined;
   private _preparedShutdown = false;
-  /** Serialized persistence drain: every scheduled flush chains here in order. */
-  private _flushTail: Promise<void> = Promise.resolve();
+  /** Per-task persist flush tails. Shutdown / dispose drain every tail. */
+  private readonly _flushTails = new Map<string, Promise<void>>();
+  /** Per-workspace coalesced index write (running tasks only; terminal writes sync). */
+  private readonly _indexWriteTails = new Map<string, Promise<void>>();
+  private readonly _indexWriteScheduled = new Set<string>();
+  private readonly _indexWriteTimers = new Map<string, AgentTaskServiceTimerHandle>();
+  /** Per-workspace storage refresh, off the persist flush path. */
+  private readonly _storageRefreshTails = new Map<string, Promise<void>>();
+  private readonly _storageRefreshScheduled = new Set<string>();
+  /** Per-workspace retention tails (still serialized after that workspace's task flushes). */
+  private readonly _retentionTails = new Map<string, Promise<void>>();
+  /** Last emitted task_state fingerprint; skips identical mid-run clones. */
+  private readonly _lastTaskStateKeys = new Map<string, string>();
 
   constructor(opts: AgentTaskServiceOptions) {
     this._settings = opts.settings;
@@ -756,6 +811,16 @@ export class AgentTaskService {
     targetSessionId: string,
     confirmDuplicate?: boolean,
   ): Promise<{ ok: boolean; reason?: string }> {
+    return this._deliverToSession(taskId, generation, targetSessionId, confirmDuplicate, true);
+  }
+
+  private async _deliverToSession(
+    taskId: string,
+    generation: number,
+    targetSessionId: string,
+    confirmDuplicate: boolean | undefined,
+    scheduleRetry: boolean,
+  ): Promise<{ ok: boolean; reason?: string }> {
     const entry = this._tasks.get(taskId);
     if (!entry) return { ok: false, reason: "not_found" };
     if (entry.info.generation !== generation) return { ok: false, reason: "stale_generation" };
@@ -796,7 +861,9 @@ export class AgentTaskService {
     } catch (error) {
       this._deliveryInFlight.delete(deliveryKey);
       const message = error instanceof Error && error.message !== "" ? error.message : "delivery_failed";
-      this._scheduleDeliveryRetry(deliveryKey, entry.info.taskId, entry.info.generation, targetSessionId, message);
+      if (scheduleRetry) {
+        this._scheduleDeliveryRetry(deliveryKey, entry.info.taskId, entry.info.generation, targetSessionId, message);
+      }
       return { ok: false, reason: message };
     }
     this._deliveryInFlight.delete(deliveryKey);
@@ -829,6 +896,9 @@ export class AgentTaskService {
       this._deliveryRetries.delete(deliveryKey);
       void this._deliveryRetryAttempt(deliveryKey, taskId, generation, targetSessionId, 1);
     }, DELIVERY_RETRY_DELAY_MS);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
     this._deliveryRetries.set(deliveryKey, { attempts: MAX_DELIVERY_RETRIES, timer });
     console.warn(`[AgentTaskService] delivery failed (${reason}); will retry: ${deliveryKey}`);
   }
@@ -840,12 +910,11 @@ export class AgentTaskService {
     targetSessionId: string,
     attempt: number,
   ): Promise<void> {
-    const result = await this.sendResultToSession(taskId, generation, targetSessionId);
+    const result = await this._deliverToSession(taskId, generation, targetSessionId, undefined, false);
     if (result.ok) {
       return;
     }
     if (this._deliveryRetries.has(deliveryKey)) {
-      // Another flight already holds the retry scheduling.
       return;
     }
     if (attempt >= MAX_DELIVERY_RETRIES) {
@@ -855,7 +924,10 @@ export class AgentTaskService {
     const timer = setTimeout(() => {
       this._deliveryRetries.delete(deliveryKey);
       void this._deliveryRetryAttempt(deliveryKey, taskId, generation, targetSessionId, attempt + 1);
-    }, DELIVERY_RETRY_DELAY_MS * attempt);
+    }, DELIVERY_RETRY_DELAY_MS * Math.max(1, attempt));
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
     this._deliveryRetries.set(deliveryKey, { attempts: MAX_DELIVERY_RETRIES - attempt, timer });
   }
 
@@ -865,6 +937,13 @@ export class AgentTaskService {
       clearTimeout(record.timer);
       this._deliveryRetries.delete(deliveryKey);
     }
+  }
+
+  private _cancelAllDeliveryRetries(): void {
+    for (const record of this._deliveryRetries.values()) {
+      clearTimeout(record.timer);
+    }
+    this._deliveryRetries.clear();
   }
 
   /**
@@ -878,6 +957,8 @@ export class AgentTaskService {
     const workspaceId = entry.info.workspaceId;
     await this._store.deleteTask(workspaceId, entry.info.taskId);
     this._recoveryIssues.delete(entry.info.taskId);
+    this._lastTaskStateKeys.delete(entry.info.taskId);
+    this._flushTails.delete(entry.info.taskId);
     this._removeTask(entry);
     // The persistent index must forget the deleted task, otherwise a restart
     // re-surfaces it as a "recovery data corrupt" record (an index entry whose
@@ -1042,7 +1123,7 @@ export class AgentTaskService {
       entry.persist.resumePersistPending = true;
       try {
         this._schedulePersist(taskId);
-        await this._drainPersist();
+        await this._drainPersist(taskId);
       } finally {
         entry.persist.resumePersistPending = false;
       }
@@ -1115,7 +1196,10 @@ export class AgentTaskService {
     this._logStateEvent(entry, from, "failed", reason);
     entry.persist.indexDirty = true;
     this._schedulePersist(taskId);
-    this._emitTaskState(taskId);
+    void this._drainPersist(taskId).then(
+      () => this._emitTaskState(taskId),
+      () => this._emitTaskState(taskId),
+    );
     this._recordProductEvent("agent_task_failed", {
       status: "failed",
       durationMs: entry.info.durationMs,
@@ -1166,6 +1250,12 @@ export class AgentTaskService {
   // =========================================================================
   // Query surface
   // =========================================================================
+
+  /** Full AgentTaskInfo snapshot for one task (selected-task catch-up; never slim). */
+  get(taskId: string): AgentTaskInfo | undefined {
+    const entry = this._tasks.get(taskId);
+    return entry === undefined ? undefined : structuredClone(entry.info);
+  }
 
   /** 1.4.2 (R2): get_all returns the full remount snapshot (tasks + recovery issues + storage statuses). */
   getAll(workspaceId?: string): AgentTaskListSnapshot {
@@ -1238,14 +1328,16 @@ export class AgentTaskService {
     itemIndex: number,
     cursor: string | undefined,
     limit: number,
+    fromEnd = false,
+    before?: string,
   ): Promise<AgentTaskTranscriptPage> {
     const entry = this._tasks.get(taskId);
     if (!entry) {
       throw new Error("not_found");
     }
-    // The mapping must reflect the latest flush (a runtime item_session emitted
-    // in the same tick would otherwise be missed by the log replay below).
-    await this._drainPersist();
+    // The mapping must reflect this task's latest flush (a runtime item_session
+    // emitted in the same tick would otherwise be missed by the log replay).
+    await this._drainPersist(taskId);
     const read = await this._store.readTask(entry.info.workspaceId, taskId);
     const mapping = new Map<number, string>();
     for (const event of read.events) {
@@ -1269,15 +1361,30 @@ export class AgentTaskService {
     }
     if (sessionFileName === undefined) {
       // No mapping and no file to fall back on: an honest empty page.
-      return { taskId, itemIndex, entries: [], totalCount: 0, nextCursor: null };
+      return { taskId, itemIndex, entries: [], totalCount: 0, nextCursor: null, prevCursor: null };
     }
-    const page = await this._store.readTranscriptPage(entry.info.workspaceId, taskId, sessionFileName, cursor, limit);
-    return { taskId, itemIndex, ...page };
+    const page = await this._store.readTranscriptPage(
+      entry.info.workspaceId,
+      taskId,
+      sessionFileName,
+      cursor,
+      limit,
+      fromEnd,
+      before,
+    );
+    return {
+      taskId,
+      itemIndex,
+      entries: page.entries,
+      totalCount: page.totalCount,
+      nextCursor: page.nextCursor,
+      prevCursor: page.prevCursor,
+    };
   }
 
   /**
    * 1.5 (P4): 任务事件日志快照(design plan §4.2/§4.5)。任务不在镜像时抛
-   * Error("not_found");内部先 await _drainPersist() 保证终态后立即读取也能
+   * Error("not_found");内部先 await _drainPersist(taskId) 保证终态后立即读取也能
    * 看到已 flush 的尾部(事件/checkpoint 排队在串行 flush 队列上),再 readTask。
    * 超过 MAX_TASK_LOG_EVENTS 条时只保留最新 10000 条并置 truncated=true。
    */
@@ -1286,7 +1393,7 @@ export class AgentTaskService {
     if (!entry) {
       throw new Error("not_found");
     }
-    await this._drainPersist();
+    await this._drainPersist(taskId);
     const read = await this._store.readTask(entry.info.workspaceId, taskId);
     const truncated = read.events.length > MAX_TASK_LOG_EVENTS;
     const events = truncated ? read.events.slice(-MAX_TASK_LOG_EVENTS) : read.events;
@@ -1369,6 +1476,8 @@ export class AgentTaskService {
     // settle-induced running); the _onInputSettled guard keeps the settle from
     // rewriting the frozen fact.
     this._input.settleOnShutdown();
+    this._cancelAllDeliveryRetries();
+    this._flushPendingIndexWrites();
     // Flush whatever was queued before the freeze (never write markers here).
     await this._drainPersist();
     await Promise.allSettled([...this._inFlight]);
@@ -1386,6 +1495,7 @@ export class AgentTaskService {
       return;
     }
     this._preparedShutdown = true;
+    this._cancelAllDeliveryRetries();
     const frozen: TaskEntry[] = [];
     for (const entry of this._tasks.values()) {
       if (!isTerminalStatus(entry.info.status) && entry.persist.preShutdownStatus === undefined) {
@@ -1405,6 +1515,7 @@ export class AgentTaskService {
         frozen.push(entry);
       }
     }
+    this._flushPendingIndexWrites();
     await this._drainPersist();
 
     // Bounded abort: queued tasks are removed immediately; running/waiting_input
@@ -2000,7 +2111,7 @@ export class AgentTaskService {
         entry.outputState = { text: event.text, truncated: event.truncated, originalBytes: event.originalBytes };
         entry.throttle.pendingOutput = { text: event.text, truncated: event.truncated, originalBytes: event.originalBytes };
         this._scheduleThrottleFlush(taskId);
-        entry.persist.pendingEvents.push({ type: "output", text: event.text, truncated: event.truncated });
+        this._queueOutputPersist(entry, event.text, event.truncated);
         this._schedulePersist(taskId);
         break;
       }
@@ -2223,27 +2334,28 @@ export class AgentTaskService {
     this._logStateEvent(entry, from, entry.info.status, entry.stopReason);
     entry.persist.indexDirty = true;
     this._schedulePersist(entry.info.taskId);
-    // 1.5 (P3): terminal convergence - the remaining transcript events flush
-    // BEFORE the terminal task_state (once the renderer observes the terminal
-    // state it replays from disk, so dropping the last live events is lossless
-    // by design); watchers are cleared and the live runtime's forwarding is
-    // switched off (an already-cleared runtime - entry.runtime undefined -
-    // needs nothing).
+    // 1.5 (P3): terminal convergence - remaining transcript events flush before
+    // the terminal task_state so disk replay is lossless. Watchers are cleared
+    // and live forwarding is switched off. Persist of this task is drained
+    // before the terminal emit (plan §1).
     this._flushThrottle(entry.info.taskId);
     if ((this._watchers.get(entry.info.taskId) ?? 0) > 0) {
       entry.runtime?.setTranscriptForwarding(false);
     }
     this._watchers.delete(entry.info.taskId);
-    this._emitTaskState(entry.info.taskId);
+    const taskId = entry.info.taskId;
+    const workspaceId = entry.info.workspaceId;
+    const groupId = entry.info.groupId;
     this._recordTaskTerminalEvent(entry.info);
     this._releaseSlot(entry);
     this._releaseResumeReservation(entry);
-    this._checkGroupTerminal(entry.info.groupId);
+    this._checkGroupTerminal(groupId);
     this._maybeAutoDeliver(entry);
-    // 1.5 (P1): every terminal transition is a retention point; the pass is
-    // serialized behind the flush queue and its own exemptions (pending Plan,
-    // undelivered-within-grace) protect freshly finished tasks.
-    this._scheduleRetention(entry.info.workspaceId);
+    this._scheduleRetention(workspaceId);
+    void this._drainPersist(taskId).then(
+      () => this._emitTaskState(taskId),
+      () => this._emitTaskState(taskId),
+    );
   }
 
   /** Frees a held slot exactly once; terminal/aborted runs always release it. */
@@ -2331,8 +2443,20 @@ export class AgentTaskService {
     this._logStateEvent(entry, "queued", "queued", "created");
     entry.persist.indexDirty = true;
     this._schedulePersist(taskId);
-    await this._drainPersist();
+    await this._drainPersist(taskId);
     return entry.persist.storageFailed ? "storage_limit" : "ok";
+  }
+
+  /** Snapshot-coalesce unwatched output; watched tasks keep the 100ms UI cadence. */
+  private _queueOutputPersist(entry: TaskEntry, text: string, truncated: boolean): void {
+    const payload: TaskLogEventPayload = { type: "output", text, truncated };
+    const pending = entry.persist.pendingEvents;
+    const last = pending[pending.length - 1];
+    if (last !== undefined && last.type === "output") {
+      pending[pending.length - 1] = payload;
+      return;
+    }
+    pending.push(payload);
   }
 
   /** Queue a log state event with the current (already-transitioned) info snapshot. */
@@ -2348,8 +2472,8 @@ export class AgentTaskService {
 
   /**
    * Coalesced per-task persistence scheduling: same-tick events/checkpoints
-   * merge into one flush, and every flush chains onto the serialized
-   * _flushTail so prepareShutdown/dispose can drain in order.
+   * merge into one flush on that task's own tail. prepareShutdown/dispose
+   * drain every tail.
    */
   private _schedulePersist(taskId: string): void {
     const entry = this._tasks.get(taskId);
@@ -2357,10 +2481,12 @@ export class AgentTaskService {
       return;
     }
     entry.persist.flushScheduled = true;
-    this._flushTail = this._flushTail.then(
+    const prev = this._flushTails.get(taskId) ?? Promise.resolve();
+    const next = prev.then(
       () => this._runPersistFlush(taskId),
       () => this._runPersistFlush(taskId),
     );
+    this._flushTails.set(taskId, next);
   }
 
   private async _runPersistFlush(taskId: string): Promise<void> {
@@ -2376,17 +2502,31 @@ export class AgentTaskService {
     }
   }
 
-  private async _drainPersist(): Promise<void> {
-    // Keep draining until the tail is quiescent: a flush that fails (storage
-    // limit) schedules its own follow-up index write from inside its body, so
-    // the tail can grow while a plain single await is in flight.
+  private async _awaitTail(getTail: () => Promise<void>): Promise<void> {
     for (;;) {
-      const tail = this._flushTail;
+      const tail = getTail();
       await tail;
-      if (this._flushTail === tail) {
+      if (getTail() === tail) {
         return;
       }
     }
+  }
+
+  /** Drain one task (inspect/log) or every persist + index + retention tail (shutdown). */
+  private async _drainPersist(taskId?: string): Promise<void> {
+    if (taskId !== undefined) {
+      await this._awaitTail(() => this._flushTails.get(taskId) ?? Promise.resolve());
+      return;
+    }
+    const persistTails = [...this._flushTails.values()];
+    const indexTails = [...this._indexWriteTails.values()];
+    if (persistTails.length > 0) {
+      await Promise.all(persistTails);
+    }
+    if (indexTails.length > 0) {
+      await Promise.all(indexTails);
+    }
+    await this._store.drainAll();
   }
 
   /**
@@ -2414,27 +2554,31 @@ export class AgentTaskService {
         persist.initialized = true;
       } catch (err) {
         if (err instanceof TaskStorageLimitError) {
-          this._failOnStorageLimit(entry, err.message);
+          await this._failOnStorageLimit(entry, err.message);
           return;
         }
         console.error("[AgentTaskService] metadata write failed:", err);
-        this._failOnPersistError(entry, err);
+        await this._failOnPersistError(entry, err);
         return;
       }
     }
     const pendingEvents = persist.pendingEvents;
     persist.pendingEvents = [];
-    for (const payload of pendingEvents) {
-      try {
-        const written = await this._store.appendEvent(entry.info.workspaceId, entry.info.taskId, payload);
-        persist.eventSeq = written.seq;
-      } catch (err) {
+    if (pendingEvents.length > 0) {
+      const batch = await this._store.appendEvents(entry.info.workspaceId, entry.info.taskId, pendingEvents);
+      if (batch.written.length > 0) {
+        persist.eventSeq = batch.lastSeq;
+      }
+      if (batch.failedAt !== undefined) {
+        const leftover = pendingEvents.slice(batch.failedAt + 1);
+        persist.pendingEvents = leftover;
+        const err = batch.error;
         if (err instanceof TaskStorageLimitError) {
-          this._failOnStorageLimit(entry, err.message);
+          await this._failOnStorageLimit(entry, err.message);
           return;
         }
         console.error("[AgentTaskService] event append failed:", err);
-        this._failOnPersistError(entry, err);
+        await this._failOnPersistError(entry, err);
         return;
       }
     }
@@ -2456,25 +2600,27 @@ export class AgentTaskService {
           persist.indexDirty = true;
         } catch (err) {
           if (err instanceof TaskStorageLimitError) {
-            this._failOnStorageLimit(entry, err.message);
+            await this._failOnStorageLimit(entry, err.message);
             return;
           }
           console.error("[AgentTaskService] checkpoint write failed:", err);
-          this._failOnPersistError(entry, err);
+          await this._failOnPersistError(entry, err);
           return;
         }
       }
     }
     if (persist.indexDirty) {
       persist.indexDirty = false;
-      try {
-        await this._writeIndexForWorkspace(entry.info.workspaceId);
-      } catch (err) {
-        console.error("[AgentTaskService] index write failed:", err);
+      if (isTerminalStatus(entry.info.status) || persist.preShutdownStatus !== undefined || testHooks?.flushIndexWrites) {
+        try {
+          await this._writeIndexForWorkspace(entry.info.workspaceId);
+        } catch (err) {
+          console.error("[AgentTaskService] index write failed:", err);
+        }
+      } else {
+        this._scheduleIndexWrite(entry.info.workspaceId);
       }
     }
-    // The storage-status refresh scans disk; it never blocks the flush itself
-    // (a slow dirSize must not delay later checkpoints/events).
     this._scheduleStorageRefresh(entry.info.workspaceId);
   }
 
@@ -2500,16 +2646,28 @@ export class AgentTaskService {
     );
   }
 
-  /** Serialized, fire-and-forget storage-status refresh (level changes emit events). */
+  /** Serialized, fire-and-forget storage-status refresh (level changes emit events). Off the persist flush path. */
   private _scheduleStorageRefresh(workspaceId: string): void {
-    this._flushTail = this._flushTail.then(
-      () => this._refreshStorageStatus(workspaceId),
-      () => this._refreshStorageStatus(workspaceId),
+    if (this._storageRefreshScheduled.has(workspaceId)) {
+      return;
+    }
+    this._storageRefreshScheduled.add(workspaceId);
+    const prev = this._storageRefreshTails.get(workspaceId) ?? Promise.resolve();
+    const next = prev.then(
+      async () => {
+        this._storageRefreshScheduled.delete(workspaceId);
+        await this._refreshStorageStatus(workspaceId);
+      },
+      async () => {
+        this._storageRefreshScheduled.delete(workspaceId);
+        await this._refreshStorageStatus(workspaceId);
+      },
     );
+    this._storageRefreshTails.set(workspaceId, next);
   }
 
   /** Storage-limit failure: keep the readable tail, never silently continue. */
-  private _failOnStorageLimit(entry: TaskEntry, message: string): void {
+  private async _failOnStorageLimit(entry: TaskEntry, message: string): Promise<void> {
     const persist = entry.persist;
     persist.pendingEvents = [];
     persist.pendingCheckpoints = [];
@@ -2545,34 +2703,73 @@ export class AgentTaskService {
       entry.info.results = entry.spec.items.map((item) =>
         this._makeSynthItemResult(entry.spec, item, "failed", "storage_limit" as SubagentFailureReason, failureMessage, now),
       );
-      this._emitTaskState(entry.info.taskId);
       this._recordTaskTerminalEvent(entry.info);
       this._releaseSlot(entry);
       this._releaseResumeReservation(entry);
       entry.controller?.abort();
       entry.runtime?.abort();
       this._checkGroupTerminal(entry.info.groupId);
+      await this._writeIndexNow(entry.info.workspaceId);
+      this._emitTaskState(entry.info.taskId);
+      return;
     }
-    // The index write is not budget-checked; always record the current state
-    // through the serialized tail (never fire-and-forget past concurrent
-    // writes - Windows rename needs a quiescent target).
-    this._scheduleIndexWrite(entry.info.workspaceId);
+    await this._writeIndexNow(entry.info.workspaceId);
   }
 
-  /** Serialized index-only write (used by the storage-limit failure path). */
+  /** Cancel coalesced index timers and write immediately (shutdown / dispose). */
+  private _flushPendingIndexWrites(): void {
+    const workspaceIds = new Set<string>([
+      ...this._indexWriteTimers.keys(),
+      ...this._indexWriteScheduled,
+    ]);
+    for (const timer of this._indexWriteTimers.values()) {
+      timer.cancel();
+    }
+    this._indexWriteTimers.clear();
+    this._indexWriteScheduled.clear();
+    for (const workspaceId of workspaceIds) {
+      const prev = this._indexWriteTails.get(workspaceId) ?? Promise.resolve();
+      const next = prev.then(
+        () => this._writeIndexForWorkspace(workspaceId).catch((err: unknown) => {
+          console.error("[AgentTaskService] shutdown index write failed:", err);
+        }),
+        () => this._writeIndexForWorkspace(workspaceId).catch((err: unknown) => {
+          console.error("[AgentTaskService] shutdown index write failed:", err);
+        }),
+      );
+      this._indexWriteTails.set(workspaceId, next);
+    }
+  }
+
+  /** Coalesced running-task index write. Terminal / shutdown paths write synchronously instead. */
   private _scheduleIndexWrite(workspaceId: string): void {
-    this._flushTail = this._flushTail.then(
-      () => this._writeIndexForWorkspace(workspaceId).catch((err: unknown) => {
-        console.error("[AgentTaskService] storage-limit index write failed:", err);
-      }),
-      () => this._writeIndexForWorkspace(workspaceId).catch((err: unknown) => {
-        console.error("[AgentTaskService] storage-limit index write failed:", err);
-      }),
+    if (this._indexWriteScheduled.has(workspaceId)) {
+      return;
+    }
+    this._indexWriteScheduled.add(workspaceId);
+    const existing = this._indexWriteTimers.get(workspaceId);
+    existing?.cancel();
+    this._indexWriteTimers.set(
+      workspaceId,
+      this._setTimer(() => {
+        this._indexWriteTimers.delete(workspaceId);
+        this._indexWriteScheduled.delete(workspaceId);
+        const prev = this._indexWriteTails.get(workspaceId) ?? Promise.resolve();
+        const next = prev.then(
+          () => this._writeIndexForWorkspace(workspaceId).catch((err: unknown) => {
+            console.error("[AgentTaskService] coalesced index write failed:", err);
+          }),
+          () => this._writeIndexForWorkspace(workspaceId).catch((err: unknown) => {
+            console.error("[AgentTaskService] coalesced index write failed:", err);
+          }),
+        );
+        this._indexWriteTails.set(workspaceId, next);
+      }, 750, true),
     );
   }
 
   /** Unexpected persistence failure: fail the task with internal_error. */
-  private _failOnPersistError(entry: TaskEntry, error: unknown): void {
+  private async _failOnPersistError(entry: TaskEntry, error: unknown): Promise<void> {
     const persist = entry.persist;
     persist.pendingEvents = [];
     persist.pendingCheckpoints = [];
@@ -2617,13 +2814,33 @@ export class AgentTaskService {
       entry.info.autoBackground = undefined;
       entry.info.queuePosition = undefined;
       entry.info.updatedAt = now;
-      this._emitTaskState(entry.info.taskId);
       this._recordTaskTerminalEvent(entry.info);
       this._releaseSlot(entry);
       this._releaseResumeReservation(entry);
       entry.controller?.abort();
       entry.runtime?.abort();
       this._checkGroupTerminal(entry.info.groupId);
+      await this._writeIndexNow(entry.info.workspaceId);
+      this._emitTaskState(entry.info.taskId);
+    }
+  }
+
+  /** Immediate index write for terminal failure paths (not the 750ms coalesce window). */
+  private async _writeIndexNow(workspaceId: string): Promise<void> {
+    const existing = this._indexWriteTimers.get(workspaceId);
+    existing?.cancel();
+    this._indexWriteTimers.delete(workspaceId);
+    this._indexWriteScheduled.delete(workspaceId);
+    const prev = this._indexWriteTails.get(workspaceId) ?? Promise.resolve();
+    const next = prev.then(
+      () => this._writeIndexForWorkspace(workspaceId),
+      () => this._writeIndexForWorkspace(workspaceId),
+    );
+    this._indexWriteTails.set(workspaceId, next);
+    try {
+      await next;
+    } catch (err) {
+      console.error("[AgentTaskService] terminal index write failed:", err);
     }
   }
 
@@ -2725,26 +2942,61 @@ export class AgentTaskService {
     const workspaces = await this._store.listWorkspaces();
     for (const workspaceId of workspaces) {
       const index = await this._store.readIndex(workspaceId);
+      const onDiskTaskIds = await this._store.listTaskIds(workspaceId);
       if (!index) {
-        // A fresh workspace has no index (all tasks cleared); an unreadable
-        // pair cannot enumerate its tasks without forging ids.
-        report.diagnostics.push(`workspace ${workspaceId}: no readable index`);
-        await this._refreshStorageStatus(workspaceId);
-        continue;
+        if (onDiskTaskIds.length === 0) {
+          report.diagnostics.push(`workspace ${workspaceId}: no readable index`);
+          await this._refreshStorageStatus(workspaceId);
+          continue;
+        }
+        report.diagnostics.push(`workspace ${workspaceId}: no readable index; reconciling ${onDiskTaskIds.length} on-disk task dir(s)`);
+      } else {
+        this._indexGenerations.set(workspaceId, index.generation);
       }
-      // Seed the per-workspace generation counter from the disk index so the
-      // first post-restart write keeps incrementing instead of restarting at 1
-      // (readIndex already applied the index.prev fallback, so the seeded
-      // value is the last known-valid generation).
-      this._indexGenerations.set(workspaceId, index.generation);
-      const diagnosis = await this._store.consumeCloseMarker(workspaceId, index.lastWriterRunId);
+      const diagnosis = await this._store.consumeCloseMarker(workspaceId, index?.lastWriterRunId ?? this._runId);
       report.diagnostics.push(`workspace ${workspaceId}: ${diagnosis.kind} shutdown`);
-      // 1.4.2 (R3): hydrate into group buckets so every group's GroupEntry can
-      // be rebuilt below (design plan §5.5-5 keeps the original waitingTaskGroupId
-      // for two-phase Plan consumption after restart).
       const hydratedByGroup = new Map<string, TaskEntry[]>();
-      for (const indexEntry of index.tasks) {
+      const seen = new Set<string>();
+      const indexEntries = index?.tasks ?? [];
+      for (const indexEntry of indexEntries) {
+        seen.add(indexEntry.taskId);
         const hydrated = await this._hydrateTask(workspaceId, indexEntry);
+        if (hydrated === null) {
+          report.corrupted++;
+          continue;
+        }
+        report.restored++;
+        if (hydrated.interruptedNow) {
+          report.interrupted++;
+        }
+        const groupTasks = hydratedByGroup.get(hydrated.entry.info.groupId);
+        if (groupTasks === undefined) {
+          hydratedByGroup.set(hydrated.entry.info.groupId, [hydrated.entry]);
+        } else {
+          groupTasks.push(hydrated.entry);
+        }
+      }
+      for (const taskId of onDiskTaskIds) {
+        if (seen.has(taskId)) {
+          continue;
+        }
+        report.diagnostics.push(`workspace ${workspaceId}: on-disk task ${taskId} missing from index; reconciling`);
+        const read = await this._store.readTask(workspaceId, taskId);
+        if (!read.metadata) {
+          this._emitRecoveryIssue({
+            taskId,
+            workspaceId,
+            generation: read.checkpoint?.generation ?? 0,
+            code: read.diagnostics.find((d) => d.code === "migration_failed" || d.code === "unknown_schema")?.code ?? "migration_failed",
+            message: "on-disk task directory has no readable metadata and is absent from the index",
+            recoverable: false,
+            readOnly: true,
+            updatedAt: Date.now(),
+          });
+          report.corrupted++;
+          continue;
+        }
+        const hydrated = await this._hydrateTask(workspaceId, indexEntryFromMetadata(read.metadata, this._runId));
         if (hydrated === null) {
           report.corrupted++;
           continue;
@@ -3550,14 +3802,23 @@ export class AgentTaskService {
    * never schedules itself (its own storage refresh cannot retrigger it).
    */
   private _scheduleRetention(workspaceId: string): void {
-    this._flushTail = this._flushTail.then(
-      () => this._runRetentionForWorkspace(workspaceId).catch((err: unknown) => {
-        console.error("[AgentTaskService] retention pass failed:", err);
-      }),
-      () => this._runRetentionForWorkspace(workspaceId).catch((err: unknown) => {
-        console.error("[AgentTaskService] retention pass failed:", err);
-      }),
-    );
+    if (this._retentionTails.has(workspaceId)) {
+      return;
+    }
+    const snapshot = [...this._flushTails.entries()]
+      .filter(([taskId]) => this._tasks.get(taskId)?.info.workspaceId === workspaceId)
+      .map(([, tail]) => tail);
+    const next = Promise.all(snapshot).then(
+      () => this._runRetentionForWorkspace(workspaceId),
+      () => this._runRetentionForWorkspace(workspaceId),
+    ).catch((err: unknown) => {
+      console.error("[AgentTaskService] retention pass failed:", err);
+    }).finally(() => {
+      if (this._retentionTails.get(workspaceId) === next) {
+        this._retentionTails.delete(workspaceId);
+      }
+    });
+    this._retentionTails.set(workspaceId, next);
   }
 
   private async _runRetentionForWorkspace(workspaceId: string): Promise<void> {
@@ -3608,6 +3869,11 @@ export class AgentTaskService {
     if (!entry) {
       return;
     }
+    const key = taskStateFingerprint(entry.info);
+    if (this._lastTaskStateKeys.get(taskId) === key) {
+      return;
+    }
+    this._lastTaskStateKeys.set(taskId, key);
     this._emitServiceEvent({ type: "task_state", task: structuredClone(entry.info) });
   }
 
@@ -3702,7 +3968,7 @@ export class AgentTaskService {
     return testHooks?.now ? testHooks.now() : Date.now();
   }
 
-  private _setTimer(callback: () => void, ms: number): AgentTaskServiceTimerHandle {
+  private _setTimer(callback: () => void, ms: number, unref = false): AgentTaskServiceTimerHandle {
     if (testHooks?.setTimer) {
       return testHooks.setTimer(callback, ms);
     }
@@ -3712,6 +3978,9 @@ export class AgentTaskService {
         callback();
       }
     }, ms);
+    if (unref && typeof handle.unref === "function") {
+      handle.unref();
+    }
     return {
       cancel: () => {
         cancelled = true;

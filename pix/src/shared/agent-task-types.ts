@@ -279,6 +279,8 @@ export interface AgentTaskTranscriptPage {
   entries: unknown[];
   totalCount: number;
   nextCursor: string | null;
+  /** Byte offset of the first returned entry; used to page backward from a tail load. */
+  prevCursor?: string | null;
 }
 
 /** get_task_log 的单条事件(旧字段 seq/ts/type + payload 平铺)。 */

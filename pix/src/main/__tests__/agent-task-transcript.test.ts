@@ -259,6 +259,10 @@ class FakeRuntime {
     this.onEvent?.({ type: "activity", activity });
   }
 
+  emitOutput(text: string, truncated = false, originalBytes = Buffer.byteLength(text, "utf8")): void {
+    this.onEvent?.({ type: "output", text, truncated, originalBytes });
+  }
+
   complete(partial?: Partial<AgentTaskRuntimeResult>): void {
     if (this.settled) {
       return;
@@ -514,7 +518,7 @@ await run("store: 文件不存在返回全空; 目录不存在 listSessionFiles 
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
   const page = await store.readTranscriptPage("ws", "t1", "missing.jsonl", undefined, 10);
-  assertEqual(page, { entries: [], totalCount: 0, nextCursor: null, skippedLines: 0 }, "missing file returns a fully empty page");
+  assertEqual(page, { entries: [], totalCount: 0, nextCursor: null, prevCursor: null, skippedLines: 0 }, "missing file returns a fully empty page");
   assertEqual(await store.listSessionFiles("ws", "t1"), [], "missing sessions dir returns []");
 });
 
@@ -967,6 +971,35 @@ await run("S6: 快照超过 10000 条保留最新并截断", async () => {
   assertEqual(snap.events.length, 10000, "latest 10000 events retained");
   assertEqual(snap.events[0].seq, 6, "oldest 5 events dropped (seq 1..5 gone)");
   assertEqual(snap.events[snap.events.length - 1].seq, 10005, "newest event survives");
+});
+
+await run("output persist coalesces snapshots: last written text equals the final emit", async () => {
+  const harness = makeHarness();
+  const { taskId, runtime } = await createSingleForegroundTask(harness);
+  runtime.emitOutput("hel");
+  runtime.emitOutput("hell");
+  runtime.emitOutput("hello world");
+  runtime.emitActivity({
+    sequence: 1,
+    toolCallId: "c1",
+    toolName: "read",
+    status: "running",
+    summary: "read",
+    startedAt: Date.now(),
+  });
+  runtime.emitOutput("hello world!");
+  const snap = await harness.service.getTaskLog(taskId);
+  const outputs = snap.events.filter((event) => event.type === "output");
+  assert(outputs.length >= 1, "at least one output event persisted");
+  assertEqual(
+    (outputs[outputs.length - 1] as { text: string }).text,
+    "hello world!",
+    "merged last output text equals the final snapshot emit",
+  );
+  assert(
+    snap.events.some((event) => event.type === "activity"),
+    "activity events are not coalesced away",
+  );
 });
 
 // ============================================================================

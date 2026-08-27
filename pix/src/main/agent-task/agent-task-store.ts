@@ -28,7 +28,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
   AGENT_TASK_SCHEMA_VERSION,
@@ -162,6 +162,7 @@ export interface TranscriptPageRead {
   entries: unknown[];
   totalCount: number;
   nextCursor: string | null;
+  prevCursor: string | null;
   skippedLines: number;
 }
 export interface TaskBudgetReservation {
@@ -517,14 +518,37 @@ type JsonlTailRepairResult =
   | { ok: true; preservedFileName: string }
   | { ok: false; reason: "storage_limit"; message: string };
 
+/** Result of a prefix-preserving batch append (plan §3). */
+export interface AppendEventsResult {
+  written: TaskLogEvent[];
+  lastSeq: number;
+  failedAt: number | undefined;
+  error: unknown;
+}
+
+const TRANSCRIPT_COUNT_CACHE_MAX = 256;
+
+interface TranscriptCountCacheEntry {
+  mtimeMs: number;
+  size: number;
+  totalCount: number;
+  skippedLines: number;
+  /** Byte start of every displayable entry, in file order. */
+  entryStarts: number[];
+}
+
 export class AgentTaskStore {
   private readonly _rootDir: string;
   private readonly _maxTaskBytes: number;
   private readonly _maxWorkspaceBytes: number;
-  private _writeTail: Promise<void> = Promise.resolve();
+  /** Per-workspace write tails; mutations that share seq/index/budget stay atomic inside one workspace. */
+  private readonly _workspaceTails = new Map<string, Promise<void>>();
+  private _globalTail: Promise<void> = Promise.resolve();
   private readonly _reservations = new Map<string, TaskBudgetReservation>();
   /** Cached recursive directory sizes; invalidated on overwrite, incremented on append. */
   private readonly _usedBytesCache = new Map<string, number>();
+  /** Exact display-entry counts keyed by session file path (mtime+size). */
+  private readonly _transcriptCountCache = new Map<string, TranscriptCountCacheEntry>();
 
   constructor(opts: { rootDir: string; maxTaskBytes: number; maxWorkspaceBytes: number }) {
     this._rootDir = opts.rootDir;
@@ -533,18 +557,43 @@ export class AgentTaskStore {
   }
 
   // --------------------------------------------------------------------------
-  // Single-write queue: all mutations and all reads that touch disk are
-  // serialized here, so seq allocation, repairs and usage scans are atomic
-  // with respect to each other.
+  // Per-workspace write queues: seq allocation, index writes and budget
+  // accounting stay atomic inside one workspace. Cross-workspace work does
+  // not wait on an unrelated append. listWorkspaces / drainAll still see a
+  // quiescent global snapshot.
   // --------------------------------------------------------------------------
 
-  private _enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this._writeTail.then(fn, fn);
-    this._writeTail = run.then(
-      () => undefined,
-      () => undefined,
+  private _enqueue<T>(fn: () => Promise<T>, workspaceId?: string): Promise<T> {
+    if (workspaceId === undefined) {
+      const run = this._globalTail.then(fn, fn);
+      this._globalTail = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    }
+    const prev = this._workspaceTails.get(workspaceId) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    this._workspaceTails.set(
+      workspaceId,
+      run.then(
+        () => undefined,
+        () => undefined,
+      ),
     );
     return run;
+  }
+
+  /** Wait until every workspace queue and the global listing queue are idle. */
+  async drainAll(): Promise<void> {
+    for (;;) {
+      const tails = [this._globalTail, ...this._workspaceTails.values()];
+      await Promise.all(tails);
+      const still = [this._globalTail, ...this._workspaceTails.values()];
+      if (still.every((tail, i) => tail === tails[i])) {
+        return;
+      }
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1019,31 +1068,29 @@ export class AgentTaskStore {
   // --------------------------------------------------------------------------
 
   async listWorkspaces(): Promise<string[]> {
-    return this._enqueue(async () => {
-      let entries;
-      try {
-        entries = await readdir(this._rootDir, { withFileTypes: true });
-      } catch {
-        return [];
-      }
-      return entries
-        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-        .map((entry) => entry.name)
-        .sort();
-    });
+    let entries;
+    try {
+      entries = await readdir(this._rootDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    return entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .map((entry) => entry.name)
+      .sort();
   }
 
   async initWorkspace(workspaceId: string): Promise<void> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     return this._enqueue(async () => {
       await mkdir(this._workspaceDir(workspaceId), { recursive: true });
-    });
+    }, workspaceId);
   }
 
   async writeMetadata(workspaceId: string, taskId: string, metadata: TaskMetadata): Promise<void> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     AgentTaskStore._assertSafeComponent(taskId, "taskId");
-    return this._enqueue(() => this._writeMetadataImpl(workspaceId, taskId, metadata));
+    return this._enqueue(() => this._writeMetadataImpl(workspaceId, taskId, metadata), workspaceId);
   }
 
   private async _writeMetadataImpl(workspaceId: string, taskId: string, metadata: TaskMetadata): Promise<void> {
@@ -1069,7 +1116,39 @@ export class AgentTaskStore {
   async appendEvent(workspaceId: string, taskId: string, event: TaskLogEventPayload): Promise<TaskLogEvent> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     AgentTaskStore._assertSafeComponent(taskId, "taskId");
-    return this._enqueue(() => this._appendEventImpl(workspaceId, taskId, event));
+    return this._enqueue(() => this._appendEventImpl(workspaceId, taskId, event), workspaceId);
+  }
+
+  /**
+   * One-queue batch append. Writes payloads in order; a storage_limit or I/O
+   * failure stops at the successful prefix (never all-or-nothing rollback).
+   */
+  async appendEvents(workspaceId: string, taskId: string, events: TaskLogEventPayload[]): Promise<AppendEventsResult> {
+    AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
+    AgentTaskStore._assertSafeComponent(taskId, "taskId");
+    if (events.length === 0) {
+      return { written: [], lastSeq: 0, failedAt: undefined, error: undefined };
+    }
+    return this._enqueue(() => this._appendEventsImpl(workspaceId, taskId, events), workspaceId);
+  }
+
+  private async _appendEventsImpl(
+    workspaceId: string,
+    taskId: string,
+    events: TaskLogEventPayload[],
+  ): Promise<AppendEventsResult> {
+    const written: TaskLogEvent[] = [];
+    let lastSeq = 0;
+    for (let i = 0; i < events.length; i++) {
+      try {
+        const full = await this._appendEventImpl(workspaceId, taskId, events[i]);
+        written.push(full);
+        lastSeq = full.seq;
+      } catch (error) {
+        return { written, lastSeq, failedAt: i, error };
+      }
+    }
+    return { written, lastSeq, failedAt: undefined, error: undefined };
   }
 
   private async _appendEventImpl(workspaceId: string, taskId: string, event: TaskLogEventPayload): Promise<TaskLogEvent> {
@@ -1114,7 +1193,7 @@ export class AgentTaskStore {
   async writeCheckpoint(workspaceId: string, taskId: string, cp: TaskCheckpoint): Promise<void> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     AgentTaskStore._assertSafeComponent(taskId, "taskId");
-    return this._enqueue(() => this._writeCheckpointImpl(workspaceId, taskId, cp));
+    return this._enqueue(() => this._writeCheckpointImpl(workspaceId, taskId, cp), workspaceId);
   }
 
   private async _writeCheckpointImpl(workspaceId: string, taskId: string, cp: TaskCheckpoint): Promise<void> {
@@ -1133,7 +1212,7 @@ export class AgentTaskStore {
   /** Corrupt current generation falls back to the previous known-valid one. */
   async readIndex(workspaceId: string): Promise<TaskIndex | null> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
-    return this._enqueue(() => this._readIndexImpl(workspaceId));
+    return this._enqueue(() => this._readIndexImpl(workspaceId), workspaceId);
   }
 
   private async _readIndexImpl(workspaceId: string): Promise<TaskIndex | null> {
@@ -1148,7 +1227,7 @@ export class AgentTaskStore {
   /** Before replacing the current index, the last known-valid one is preserved as index.prev.json. */
   async writeIndex(workspaceId: string, index: TaskIndex): Promise<void> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
-    return this._enqueue(() => this._writeIndexImpl(workspaceId, index));
+    return this._enqueue(() => this._writeIndexImpl(workspaceId, index), workspaceId);
   }
 
   private async _writeIndexImpl(workspaceId: string, index: TaskIndex): Promise<void> {
@@ -1169,7 +1248,7 @@ export class AgentTaskStore {
   async readTask(workspaceId: string, taskId: string): Promise<TaskReadResult> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     AgentTaskStore._assertSafeComponent(taskId, "taskId");
-    return this._enqueue(() => this._readTaskImpl(workspaceId, taskId));
+    return this._enqueue(() => this._readTaskImpl(workspaceId, taskId), workspaceId);
   }
 
   private async _readTaskImpl(workspaceId: string, taskId: string): Promise<TaskReadResult> {
@@ -1245,7 +1324,7 @@ export class AgentTaskStore {
   async reserveBudget(workspaceId: string, taskId: string, requestedBytes: number): Promise<TaskBudgetReservation> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     AgentTaskStore._assertSafeComponent(taskId, "taskId");
-    return this._enqueue(() => this._reserveBudgetImpl(workspaceId, taskId, requestedBytes));
+    return this._enqueue(() => this._reserveBudgetImpl(workspaceId, taskId, requestedBytes), workspaceId);
   }
 
   releaseBudget(reservationId: string): void {
@@ -1254,7 +1333,7 @@ export class AgentTaskStore {
 
   async writeCloseMarker(workspaceId: string, marker: AgentTaskCloseMarker): Promise<void> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
-    return this._enqueue(() => this._writeCloseMarkerImpl(workspaceId, marker));
+    return this._enqueue(() => this._writeCloseMarkerImpl(workspaceId, marker), workspaceId);
   }
 
   private async _writeCloseMarkerImpl(workspaceId: string, marker: AgentTaskCloseMarker): Promise<void> {
@@ -1289,7 +1368,7 @@ export class AgentTaskStore {
       if (marker === null) return { kind: "stale_marker" };
       if (marker.runId === expectedRunId) return { kind: "clean", marker };
       return { kind: "stale_marker", marker };
-    });
+    }, workspaceId);
   }
 
   async deleteTask(workspaceId: string, taskId: string): Promise<void> {
@@ -1304,7 +1383,7 @@ export class AgentTaskStore {
           this._reservations.delete(id);
         }
       }
-    });
+    }, workspaceId);
   }
 
   /**
@@ -1337,7 +1416,7 @@ export class AgentTaskStore {
       };
       await this._writeIndexImpl(workspaceId, next);
       return next.generation;
-    });
+    }, workspaceId);
   }
 
   async getWorkspaceUsage(workspaceId: string): Promise<{ usedBytes: number; reservedBytes: number; limitBytes: number }> {
@@ -1346,7 +1425,7 @@ export class AgentTaskStore {
       const usedBytes = await this._dirSizeCached(this._workspaceDir(workspaceId), this._wsUsedKey(workspaceId));
       const reservedBytes = this._reservedFor(workspaceId);
       return { usedBytes, reservedBytes, limitBytes: this._maxWorkspaceBytes };
-    });
+    }, workspaceId);
   }
 
   getTaskSessionDir(workspaceId: string, taskId: string): string {
@@ -1369,86 +1448,291 @@ export class AgentTaskStore {
     sessionFileName: string,
     cursor: string | undefined,
     limit: number,
+    fromEnd = false,
+    before?: string,
   ): Promise<TranscriptPageRead> {
     const sessionPath = this._sessionTranscriptPath(workspaceId, taskId, sessionFileName);
-    return AgentTaskStore._readFileSafe(sessionPath).then((buffer) => {
-      const empty: TranscriptPageRead = { entries: [], totalCount: 0, nextCursor: null, skippedLines: 0 };
-      if (buffer === null) {
-        return empty;
+    const empty: TranscriptPageRead = { entries: [], totalCount: 0, nextCursor: null, prevCursor: null, skippedLines: 0 };
+    let fileStat: { mtimeMs: number; size: number } | null = null;
+    try {
+      const info = await stat(sessionPath);
+      fileStat = { mtimeMs: info.mtimeMs, size: info.size };
+    } catch {
+      return empty;
+    }
+    const counts = await this._transcriptCounts(sessionPath, fileStat);
+    if (before !== undefined) {
+      return this._readTranscriptPageBefore(sessionPath, fileStat, counts, before, limit);
+    }
+    if (fromEnd) {
+      const starts = counts.entryStarts;
+      const fromIdx = Math.max(0, starts.length - limit);
+      const from = starts[fromIdx] ?? fileStat.size;
+      const pageRead = await AgentTaskStore._readTranscriptEntriesFrom(sessionPath, from, fileStat.size, limit);
+      return {
+        entries: pageRead.entries,
+        totalCount: counts.totalCount,
+        nextCursor: null,
+        prevCursor: fromIdx > 0 ? JSON.stringify({ o: from }) : null,
+        skippedLines: counts.skippedLines,
+      };
+    }
+    const from = await AgentTaskStore._resolveTranscriptCursorAt(sessionPath, fileStat.size, cursor);
+    const pageRead = await AgentTaskStore._readTranscriptEntriesFrom(sessionPath, from, fileStat.size, limit);
+    const olderCount = AgentTaskStore._firstEntryStartAtOrAfter(counts.entryStarts, from);
+    return {
+      entries: pageRead.entries,
+      totalCount: counts.totalCount,
+      nextCursor: pageRead.nextCursor,
+      prevCursor: olderCount > 0 ? JSON.stringify({ o: from }) : null,
+      skippedLines: counts.skippedLines,
+    };
+  }
+
+  /** Reverse page: last `limit` displayable entries whose byte start is < `before`. */
+  private async _readTranscriptPageBefore(
+    sessionPath: string,
+    fileStat: { mtimeMs: number; size: number },
+    counts: { totalCount: number; skippedLines: number; entryStarts: number[] },
+    before: string,
+    limit: number,
+  ): Promise<TranscriptPageRead> {
+    const empty: TranscriptPageRead = {
+      entries: [],
+      totalCount: counts.totalCount,
+      nextCursor: null,
+      prevCursor: null,
+      skippedLines: counts.skippedLines,
+    };
+    let beforeOffset = 0;
+    try {
+      const parsed = JSON.parse(before) as { o?: unknown };
+      if (typeof parsed.o === "number" && Number.isInteger(parsed.o) && parsed.o >= 0) {
+        beforeOffset = Math.min(parsed.o, fileStat.size);
       }
-      // Line table over BYTE offsets (never string indices): a cursor must
-      // resume at an exact byte-offset line start even when the file holds
-      // multi-byte UTF-8 content (中文/emoji).
-      const newlineIndexes: number[] = [];
-      for (let i = 0; i < buffer.length; i++) {
-        if (buffer[i] === 0x0a) newlineIndexes.push(i);
+    } catch {
+      return empty;
+    }
+    if (beforeOffset <= 0 || limit <= 0) {
+      return empty;
+    }
+    const starts = counts.entryStarts;
+    const endIdx = AgentTaskStore._firstEntryStartAtOrAfter(starts, beforeOffset);
+    if (endIdx <= 0) {
+      return empty;
+    }
+    const fromIdx = Math.max(0, endIdx - limit);
+    const from = starts[fromIdx];
+    const pageRead = await AgentTaskStore._readTranscriptEntriesFrom(sessionPath, from, beforeOffset, limit);
+    return {
+      entries: pageRead.entries,
+      totalCount: counts.totalCount,
+      nextCursor: beforeOffset < fileStat.size ? JSON.stringify({ o: beforeOffset }) : null,
+      prevCursor: fromIdx > 0 ? JSON.stringify({ o: from }) : null,
+      skippedLines: counts.skippedLines,
+    };
+  }
+
+  private static _firstEntryStartAtOrAfter(starts: number[], offset: number): number {
+    let lo = 0;
+    let hi = starts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (starts[mid] < offset) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
       }
-      const lines: Array<{ start: number; endExclusive: number }> = [];
-      let start = 0;
-      for (const newline of newlineIndexes) {
-        lines.push({ start, endExclusive: newline + 1 });
-        start = newline + 1;
+    }
+    return lo;
+  }
+
+  /** Sessions dirs under a workspace (taskId = directory name). Used by restore reconciliation. */
+  async listTaskIds(workspaceId: string): Promise<string[]> {
+    AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
+    return this._enqueue(async () => {
+      let entries;
+      try {
+        entries = await readdir(this._workspaceDir(workspaceId), { withFileTypes: true });
+      } catch {
+        return [];
       }
-      if (start < buffer.length) {
-        lines.push({ start, endExclusive: buffer.length });
+      return entries
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .map((entry) => entry.name)
+        .sort();
+    }, workspaceId);
+  }
+
+  private static async _resolveTranscriptCursorAt(
+    sessionPath: string,
+    fileSize: number,
+    cursor: string | undefined,
+  ): Promise<number> {
+    if (cursor === undefined) {
+      return 0;
+    }
+    let raw = 0;
+    try {
+      const parsed = JSON.parse(cursor) as { o?: unknown };
+      if (typeof parsed.o === "number" && Number.isInteger(parsed.o) && parsed.o >= 0) {
+        raw = Math.min(parsed.o, fileSize);
+      } else {
+        return 0;
       }
-      // From-cursor handling stays lenient: an unparsable or out-of-range
-      // cursor restarts from the nearest line boundary (or EOF), never throws.
-      let from = 0;
-      if (cursor !== undefined) {
-        try {
-          const parsed = JSON.parse(cursor) as { o?: unknown };
-          if (typeof parsed.o === "number" && Number.isInteger(parsed.o) && parsed.o >= 0) {
-            from = Math.min(parsed.o, buffer.length);
+    } catch {
+      return 0;
+    }
+    if (raw === 0 || raw === fileSize) {
+      return raw;
+    }
+    const lookback = Math.min(raw, 64 * 1024);
+    const handle = await open(sessionPath, "r");
+    try {
+      const chunk = Buffer.allocUnsafe(lookback);
+      const { bytesRead } = await handle.read(chunk, 0, lookback, raw - lookback);
+      const window = chunk.subarray(0, bytesRead);
+      if (window.length > 0 && window[window.length - 1] === 0x0a) {
+        return raw;
+      }
+      for (let i = window.length - 1; i >= 0; i--) {
+        if (window[i] === 0x0a) {
+          return raw - lookback + i + 1;
+        }
+      }
+      return raw > lookback ? raw - lookback : 0;
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private static async _readTranscriptEntriesFrom(
+    sessionPath: string,
+    from: number,
+    fileSize: number,
+    limit: number,
+  ): Promise<{ entries: unknown[]; nextCursor: string | null }> {
+    const entries: unknown[] = [];
+    let nextCursor: string | null = null;
+    if (from >= fileSize || limit <= 0) {
+      return { entries, nextCursor: null };
+    }
+    const handle = await open(sessionPath, "r");
+    try {
+      let offset = from;
+      let carry = Buffer.alloc(0);
+      const chunkSize = 64 * 1024;
+      while (offset < fileSize && entries.length < limit) {
+        const toRead = Math.min(chunkSize, fileSize - offset);
+        const chunk = Buffer.allocUnsafe(toRead);
+        const { bytesRead } = await handle.read(chunk, 0, toRead, offset);
+        if (bytesRead === 0) {
+          break;
+        }
+        const data = Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
+        let lineStart = 0;
+        for (let i = 0; i < data.length; i++) {
+          if (data[i] !== 0x0a) {
+            continue;
           }
-        } catch {
-          from = 0;
+          const lineEndExclusive = i + 1;
+          const absoluteEnd = offset - carry.length + lineEndExclusive;
+          const parsed = AgentTaskStore._parseTranscriptLine(data, lineStart, lineEndExclusive);
+          if (parsed.kind === "entry") {
+            entries.push(parsed.value);
+            if (entries.length === limit) {
+              nextCursor = absoluteEnd < fileSize ? JSON.stringify({ o: absoluteEnd }) : null;
+              return { entries, nextCursor };
+            }
+          }
+          lineStart = lineEndExclusive;
+        }
+        carry = data.subarray(lineStart);
+        offset += bytesRead;
+      }
+      if (carry.length > 0 && entries.length < limit) {
+        const parsed = AgentTaskStore._parseTranscriptLine(carry, 0, carry.length);
+        if (parsed.kind === "entry") {
+          entries.push(parsed.value);
         }
       }
-      // totalCount/skippedLines are whole-file facts (诊断用), independent of
-      // the page window; entries/nextCursor are page-window facts.
-      let totalCount = 0;
-      let skippedLines = 0;
-      const page: unknown[] = [];
-      let nextCursor: string | null = null;
-      for (const line of lines) {
-        const isTail = line.start >= from;
-        let parsed: unknown = null;
-        try {
-          // Slice the BUFFER (byte offsets) and decode per line: a string
-          // slice would index by UTF-16 units and misalign every multi-byte
-          // character (中文/emoji 跨页).
-          const lineText = buffer.toString("utf8", line.start, line.endExclusive);
-          parsed = JSON.parse(lineText);
-        } catch {
-          parsed = null;
-        }
-        if (parsed === null) {
-          skippedLines++;
-          continue;
-        }
-        const record = parsed as Record<string, unknown>;
-        const isEntry =
-          typeof record.type === "string" &&
-          (record.type === "message" || (record.type === "custom_message" && record.display !== false));
-        if (!isEntry) {
-          continue;
-        }
+      return { entries, nextCursor: null };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private static _parseTranscriptLine(
+    buffer: Buffer,
+    start: number,
+    endExclusive: number,
+  ): { kind: "entry"; value: unknown } | { kind: "skip" } | { kind: "bad" } {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(buffer.toString("utf8", start, endExclusive));
+    } catch {
+      return { kind: "bad" };
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return parsed === null ? { kind: "bad" } : { kind: "skip" };
+    }
+    const record = parsed as Record<string, unknown>;
+    if (
+      typeof record.type === "string" &&
+      (record.type === "message" || (record.type === "custom_message" && record.display !== false))
+    ) {
+      return { kind: "entry", value: parsed };
+    }
+    return { kind: "skip" };
+  }
+
+  private async _transcriptCounts(
+    sessionPath: string,
+    fileStat: { mtimeMs: number; size: number },
+  ): Promise<{ totalCount: number; skippedLines: number; entryStarts: number[] }> {
+    const cached = this._transcriptCountCache.get(sessionPath);
+    if (cached && cached.mtimeMs === fileStat.mtimeMs && cached.size === fileStat.size) {
+      return { totalCount: cached.totalCount, skippedLines: cached.skippedLines, entryStarts: cached.entryStarts };
+    }
+    const buffer = await AgentTaskStore._readFileSafe(sessionPath);
+    if (buffer === null) {
+      return { totalCount: 0, skippedLines: 0, entryStarts: [] };
+    }
+    let totalCount = 0;
+    let skippedLines = 0;
+    const entryStarts: number[] = [];
+    let offset = 0;
+    while (offset < buffer.length) {
+      let lineEnd = offset;
+      while (lineEnd < buffer.length && buffer[lineEnd] !== 0x0a) {
+        lineEnd++;
+      }
+      if (lineEnd < buffer.length) {
+        lineEnd++;
+      }
+      const parsed = AgentTaskStore._parseTranscriptLine(buffer, offset, lineEnd);
+      if (parsed.kind === "entry") {
         totalCount++;
-        if (isTail && page.length < limit) {
-          page.push(parsed);
-          if (page.length === limit) {
-            // The page cut the file; the cursor continues after this entry line.
-            nextCursor = line.endExclusive < buffer.length ? JSON.stringify({ o: line.endExclusive }) : null;
-          }
-        }
+        entryStarts.push(offset);
+      } else if (parsed.kind === "bad") {
+        skippedLines++;
       }
-      // The tail held fewer entries than the limit: the file is exhausted.
-      if (page.length < limit) {
-        nextCursor = null;
+      offset = lineEnd;
+    }
+    if (this._transcriptCountCache.size >= TRANSCRIPT_COUNT_CACHE_MAX) {
+      const oldest = this._transcriptCountCache.keys().next().value;
+      if (oldest !== undefined) {
+        this._transcriptCountCache.delete(oldest);
       }
-      return { entries: page, totalCount, nextCursor, skippedLines };
+    }
+    this._transcriptCountCache.set(sessionPath, {
+      mtimeMs: fileStat.mtimeMs,
+      size: fileStat.size,
+      totalCount,
+      skippedLines,
+      entryStarts,
     });
+    return { totalCount, skippedLines, entryStarts };
   }
 
   /** sessions 目录下的 .jsonl 文件名列表(字典序)。仅用于降级映射与诊断;目录不存在返回 []。 */
@@ -1484,7 +1768,7 @@ export class AgentTaskStore {
       }
       const scan = AgentTaskStore._scanSessionBuffer(buffer);
       return { kind: scan.kind, lastValidByteOffset: scan.lastValidByteOffset, diagnostics: scan.diagnostics };
-    });
+    }, workspaceId);
   }
 
   /**
@@ -1517,7 +1801,7 @@ export class AgentTaskStore {
         kind: "tail_corrupt",
         lastValidByteOffset: current.lastValidByteOffset,
       });
-    });
+    }, workspaceId);
   }
 }
 
