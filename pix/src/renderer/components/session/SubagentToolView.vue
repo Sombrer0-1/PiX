@@ -46,9 +46,7 @@ const props = defineProps<{
 
 const taskStore = useAgentTaskStore();
 
-/** User collapse wins even while a child is running. */
 const expanded = ref(false);
-const userCollapsed = ref(false);
 
 // ── Parse (fixed order, plan 4.10) ──
 
@@ -106,9 +104,14 @@ function groupModeLabel(mode: AgentTaskGroupHandle["mode"]): string {
   return labels[mode] ?? mode;
 }
 
-/** 逐任务跳转：选中任务，让右侧任务面板展开并定位到该任务。 */
+function taskRecordExists(taskId: string): boolean {
+  return taskStore.tasks.some((task) => task.taskId === taskId);
+}
+
+/** 逐任务跳转：打开任务中心并定位到该任务。 */
 function jumpToTask(taskId: string): void {
-  taskStore.selectTask(taskId);
+  if (!taskRecordExists(taskId)) return;
+  taskStore.openTaskCenter(taskId);
 }
 
 /** Case 2 fallback: text from result.content, then the result value itself. */
@@ -194,11 +197,8 @@ const hasRunning = computed(() => results.value.some((r) => r.status === "runnin
 
 const nowMs = useLiveNow(hasRunning);
 
-/** Body defaults open while running, but a user collapse is honoured immediately. */
-const bodyOpen = computed(() => {
-  if (userCollapsed.value) return false;
-  return expanded.value || hasRunning.value;
-});
+/** Body follows the user toggle only; running stays collapsed until expanded. */
+const bodyOpen = computed(() => expanded.value);
 
 const completedCount = computed(() => results.value.filter((r) => r.status === "completed").length);
 
@@ -392,13 +392,7 @@ function activityStatusClass(activity: SubagentActivity): string {
 }
 
 function toggleBody(): void {
-  if (bodyOpen.value) {
-    userCollapsed.value = true;
-    expanded.value = false;
-  } else {
-    userCollapsed.value = false;
-    expanded.value = true;
-  }
+  expanded.value = !expanded.value;
 }
 
 function isLiveStatus(status: SubagentStatus): boolean {
@@ -556,7 +550,8 @@ function liveDurationMs(item: SubagentSingleResult): number {
               type="button"
               class="subagent-jump-btn"
               data-test="agent-task-jump-btn"
-              :title="`跳转到任务 ${task.taskId}`"
+              :disabled="!taskRecordExists(task.taskId)"
+              :title="taskRecordExists(task.taskId) ? `跳转到任务 ${task.taskId}` : '任务记录已清理'"
               @click="jumpToTask(task.taskId)"
             >
               跳转到任务
@@ -1207,7 +1202,7 @@ function liveDurationMs(item: SubagentSingleResult): number {
   white-space: nowrap;
 }
 
-.subagent-jump-btn:hover {
+.subagent-jump-btn:hover:not(:disabled) {
   background: var(--pix-accent-light);
   color: var(--pix-accent);
 }

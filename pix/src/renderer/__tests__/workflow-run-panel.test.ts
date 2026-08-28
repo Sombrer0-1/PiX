@@ -2,8 +2,8 @@
  * WorkflowRunPanel tests + session-store replay assertions (PiX 1.4.3, stage S11).
  *
  * Acceptance: the SessionView toolName branch mounts the panel for
- * workflow/ralph; running is forced expanded with no toggle button; completed
- * is collapsible; member click calls agent-task-store.selectTask; session-store
+ * workflow/ralph; every status starts collapsed with a toggle; member click
+ * calls agent-task-store.openTaskCenter; session-store
  * replay keeps { content, details } for workflow/ralph; a landed isError
  * result without a stopReason renders interrupted; an empty snapshot renders
  * 无记录 without throwing. The panel reads the real workflow store (fallback
@@ -26,6 +26,7 @@ import type {
 } from "@shared/workflow-types.js";
 import type { AgentMessage } from "@/types/rpc";
 import type { PixApi } from "../../main/preload";
+import type { AgentTaskEvent, AgentTaskInfo } from "@shared/types.js";
 import WorkflowRunPanel from "../components/session/WorkflowRunPanel.vue";
 import { useAgentTaskStore } from "../stores/agent-task-store";
 import { useSessionStore } from "../stores/session-store";
@@ -82,15 +83,63 @@ function resultWithDetails(view: WorkflowViewState): unknown {
 let sendWorkflowCommand: ReturnType<typeof vi.fn>;
 let onWorkflowEvent: ReturnType<typeof vi.fn>;
 let workflowEventCallback: ((event: WorkflowEvent) => void) | null;
+let agentTaskEventCallback: ((event: AgentTaskEvent) => void) | null;
 
 function installPixApiMock(): void {
   workflowEventCallback = null;
+  agentTaskEventCallback = null;
   sendWorkflowCommand = vi.fn().mockResolvedValue({ success: true });
   onWorkflowEvent = vi.fn((callback: (event: WorkflowEvent) => void) => {
     workflowEventCallback = callback;
     return () => {};
   });
-  window.pixApi = { sendWorkflowCommand, onWorkflowEvent } as unknown as PixApi;
+  window.pixApi = {
+    sendWorkflowCommand,
+    onWorkflowEvent,
+    sendAgentTaskCommand: vi.fn().mockResolvedValue({ success: false, error: "not in this test" }),
+    onAgentTaskEvent: (callback: (event: AgentTaskEvent) => void) => {
+      agentTaskEventCallback = callback;
+      return () => {};
+    },
+    onAgentTaskInputRequest: () => () => {},
+  } as unknown as PixApi;
+}
+
+function emitTaskState(task: AgentTaskInfo): void {
+  agentTaskEventCallback?.({ type: "task_state", task });
+}
+
+function makeJumpTask(taskId: string): AgentTaskInfo {
+  return {
+    schemaVersion: 1,
+    taskId,
+    groupId: "group-1",
+    groupMode: "single",
+    workspaceId: "ws-1",
+    parentSessionId: "session-1",
+    parentToolCallId: "tc-1",
+    itemSummaries: [],
+    thinkingLevel: "medium",
+    executionMode: "unattended",
+    project: { path: "/p", physicalPath: "/p", name: "p", environment: { kind: "windows" } },
+    presentation: "foreground",
+    status: "completed",
+    description: taskId,
+    finalOutput: "",
+    outputTruncated: false,
+    originalOutputBytes: 0,
+    results: [],
+    activities: [],
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 },
+    toolUseCount: 0,
+    createdAt: 1,
+    updatedAt: 1,
+    endedAt: 1,
+    durationMs: 0,
+    deliveredSessionIds: [],
+    planLinkState: "none",
+    generation: 0,
+  };
 }
 
 /** Deliver a WorkflowEvent through the currently registered onWorkflowEvent callback. */
@@ -142,7 +191,7 @@ function statusText(wrapper: ReturnType<typeof mount>): string {
 // ============================================================================
 
 describe("disclosure", () => {
-  it("running is forced expanded with no toggle button", () => {
+  it("running starts collapsed with a header spinner and toggle", async () => {
     const view = makeView({
       members: [makeMember()],
       currentPhase: "scan",
@@ -151,15 +200,21 @@ describe("disclosure", () => {
 
     expect(statusText(wrapper)).toBe("运行中");
     expect(wrapper.get('[data-test="workflow-run-panel"]').attributes("data-run-status")).toBe("running");
-    // Forced open: the body renders without any interaction.
+    expect(wrapper.find(".wfp-body").exists()).toBe(false);
+    expect(wrapper.find('[data-test="wfp-member"]').exists()).toBe(false);
+    const header = wrapper.get("button.wfp-header");
+    expect(header.attributes("aria-expanded")).toBe("false");
+    expect(wrapper.find('[data-test="wfp-toggle"]').exists()).toBe(true);
+    expect(wrapper.find(".spinner").exists()).toBe(true);
+    expect(header.text()).toContain("scan");
+
+    await header.trigger("click");
     expect(wrapper.find(".wfp-body").exists()).toBe(true);
+    await wrapper.get("button.wfp-phase-header").trigger("click");
     expect(wrapper.find('[data-test="wfp-member"]').exists()).toBe(true);
-    // No toggle button at all while running.
-    expect(wrapper.find("button.wfp-header").exists()).toBe(false);
-    expect(wrapper.find('[data-test="wfp-toggle"]').exists()).toBe(false);
   });
 
-  it("completed is collapsible and starts expanded", async () => {
+  it("completed is collapsible and starts collapsed", async () => {
     const view = makeView({
       status: "completed",
       stopReason: "completed",
@@ -169,14 +224,15 @@ describe("disclosure", () => {
 
     expect(statusText(wrapper)).toBe("已完成");
     const header = wrapper.get("button.wfp-header");
+    expect(header.attributes("aria-expanded")).toBe("false");
+    expect(wrapper.find(".wfp-body").exists()).toBe(false);
+
+    await header.trigger("click");
+    expect(wrapper.find(".wfp-body").exists()).toBe(true);
     expect(header.attributes("aria-expanded")).toBe("true");
 
     await header.trigger("click");
     expect(wrapper.find(".wfp-body").exists()).toBe(false);
-    expect(header.attributes("aria-expanded")).toBe("false");
-
-    await header.trigger("click");
-    expect(wrapper.find(".wfp-body").exists()).toBe(true);
   });
 
   it("failed / cancelled / interrupted keep the collapsible SubagentToolView conventions", async () => {
@@ -185,9 +241,9 @@ describe("disclosure", () => {
     });
     expect(statusText(failed.wrapper)).toBe("失败");
     expect(failed.wrapper.find("button.wfp-header").exists()).toBe(true);
-    expect(failed.wrapper.find(".wfp-body").exists()).toBe(true);
-    await failed.wrapper.get("button.wfp-header").trigger("click");
     expect(failed.wrapper.find(".wfp-body").exists()).toBe(false);
+    await failed.wrapper.get("button.wfp-header").trigger("click");
+    expect(failed.wrapper.find(".wfp-body").exists()).toBe(true);
 
     const cancelled = mountPanel({
       result: resultWithDetails(makeView({ status: "cancelled", stopReason: "cancelled", members: [makeMember({ outcome: "cancelled" })] })),
@@ -209,7 +265,7 @@ describe("disclosure", () => {
 // ============================================================================
 
 describe("interrupted override", () => {
-  it("a landed isError result without stopReason shows interrupted (replay path)", () => {
+  it("a landed isError result without stopReason shows interrupted (replay path)", async () => {
     // Replay of an interrupted run: the folded view has no run-end, so the
     // fold status is "running"; the panel override flips it to interrupted.
     const view = makeView({ members: [makeMember()] });
@@ -217,15 +273,18 @@ describe("interrupted override", () => {
 
     expect(statusText(wrapper)).toBe("已中断");
     expect(wrapper.get('[data-test="workflow-run-panel"]').attributes("data-run-status")).toBe("interrupted");
-    // Members without an outcome also render interrupted.
+    await wrapper.get("button.wfp-header").trigger("click");
+    await wrapper.get("button.wfp-phase-header").trigger("click");
     expect(wrapper.get('[data-test="wfp-member"]').attributes("data-member-status")).toBe("interrupted");
   });
 
-  it("a live running update with isError false stays running", () => {
+  it("a live running update with isError false stays running", async () => {
     const view = makeView({ members: [makeMember()] });
     const { wrapper } = mountPanel({ result: resultWithDetails(view), isError: false });
 
     expect(statusText(wrapper)).toBe("运行中");
+    await wrapper.get("button.wfp-header").trigger("click");
+    await wrapper.get("button.wfp-phase-header").trigger("click");
     expect(wrapper.get('[data-test="wfp-member"]').attributes("data-member-status")).toBe("running");
   });
 
@@ -247,6 +306,8 @@ describe("interrupted override", () => {
     await flushPromises();
 
     expect(statusText(wrapper)).toBe("已中断");
+    await wrapper.get("button.wfp-header").trigger("click");
+    await wrapper.get("button.wfp-phase-header").trigger("click");
     expect(wrapper.get('[data-test="wfp-member"]').attributes("data-member-status")).toBe("interrupted");
   });
 
@@ -270,9 +331,10 @@ describe("interrupted override", () => {
 // ============================================================================
 
 describe("empty snapshot", () => {
-  it("renders 无记录 for an empty folded view without throwing", () => {
+  it("renders 无记录 for an empty folded view without throwing", async () => {
     const view = makeView(); // no members, no logs
     const { wrapper } = mountPanel({ result: resultWithDetails(view) });
+    await wrapper.get("button.wfp-header").trigger("click");
 
     expect(statusText(wrapper)).toBe("运行中");
     expect(wrapper.get('[data-test="wfp-no-records"]').text()).toBe("无记录");
@@ -296,7 +358,7 @@ describe("empty snapshot", () => {
 });
 
 describe("member failure reason", () => {
-  it("renders the folded member error on a failed row", () => {
+  it("renders the folded member error on a failed row", async () => {
     const view = makeView({
       status: "completed",
       stopReason: "completed",
@@ -308,6 +370,8 @@ describe("member failure reason", () => {
       ],
     });
     const { wrapper } = mountPanel({ result: resultWithDetails(view) });
+    await wrapper.get("button.wfp-header").trigger("click");
+    await wrapper.get("button.wfp-phase-header").trigger("click");
     expect(wrapper.get('[data-test="wfp-member-error"]').text()).toContain("max_turns");
     expect(wrapper.get('[data-test="wfp-member"]').attributes("data-member-status")).toBe("failed");
   });
@@ -318,9 +382,7 @@ describe("member failure reason", () => {
 // ============================================================================
 
 describe("member jump", () => {
-  it("member click calls agent-task-store.selectTask", async () => {
-    // Both members share the "scan" phase; the phase stays forced open because
-    // member 1 has no outcome yet, so both jump buttons are visible.
+  it("member click opens the task center on the child id", async () => {
     const view = makeView({
       members: [
         makeMember({ phase: "scan" }),
@@ -328,12 +390,40 @@ describe("member jump", () => {
       ],
     });
     const { wrapper, taskStore } = mountPanel({ result: resultWithDetails(view) });
+    taskStore.subscribeToEvents();
+    await flushPromises();
+    emitTaskState(makeJumpTask("task-1"));
+    emitTaskState(makeJumpTask("task-2"));
+    await flushPromises();
 
+    await wrapper.get("button.wfp-header").trigger("click");
+    await wrapper.get("[data-phase-key] button.wfp-phase-header").trigger("click");
     const buttons = wrapper.findAll('[data-test="wfp-member-jump"]');
     expect(buttons).toHaveLength(2);
+    expect(buttons[1].attributes("disabled")).toBeUndefined();
 
     await buttons[1].trigger("click");
+    expect(taskStore.centerOpen).toBe(true);
     expect(taskStore.selectedTaskId).toBe("task-2");
+  });
+
+  it("disables jump when the task record is gone", async () => {
+    const view = makeView({
+      members: [makeMember({ phase: "scan", childId: "task-gone", outcome: "completed" })],
+    });
+    const { wrapper, taskStore } = mountPanel({ result: resultWithDetails(view) });
+    taskStore.subscribeToEvents();
+    await flushPromises();
+
+    await wrapper.get("button.wfp-header").trigger("click");
+    await wrapper.get("[data-phase-key] button.wfp-phase-header").trigger("click");
+    const button = wrapper.get('[data-test="wfp-member-jump"]');
+    expect(button.attributes("disabled")).toBeDefined();
+    expect(button.attributes("title")).toBe("任务记录已清理");
+
+    await button.trigger("click");
+    expect(taskStore.centerOpen).toBe(false);
+    expect(taskStore.selectedTaskId).toBeNull();
   });
 });
 
@@ -342,7 +432,7 @@ describe("member jump", () => {
 // ============================================================================
 
 describe("phase grouping", () => {
-  it("groups members by phase identity; undefined and empty string are distinct", () => {
+  it("groups members by phase identity; undefined and empty string are distinct", async () => {
     const view = makeView({
       members: [
         makeMember({ seq: 1, label: "a", phase: "scan" }),
@@ -352,6 +442,7 @@ describe("phase grouping", () => {
       ],
     });
     const { wrapper } = mountPanel({ result: resultWithDetails(view) });
+    await wrapper.get("button.wfp-header").trigger("click");
 
     const phases = wrapper.findAll('[data-test="wfp-phase"]');
     expect(phases).toHaveLength(3);
@@ -359,13 +450,11 @@ describe("phase grouping", () => {
     expect(phases[1].attributes("data-phase-key")).toBe("missing");
     expect(phases[2].attributes("data-phase-key")).toBe("value:0:");
 
-    // Members stay in append order within their group.
+    await phases[0].get("button.wfp-phase-header").trigger("click");
     const labels = phases[0].findAll('[data-test="wfp-member"]').map((row) => row.find(".wfp-member-label").text());
     expect(labels).toEqual(["a", "b"]);
 
-    // A phase with a non-completed member is forced open (no toggle button)...
-    expect(phases[0].find("button.wfp-phase-header").exists()).toBe(false);
-    // ...while all-completed phases are collapsible.
+    expect(phases[0].find("button.wfp-phase-header").exists()).toBe(true);
     expect(phases[1].find("button.wfp-phase-header").exists()).toBe(true);
     expect(phases[2].find("button.wfp-phase-header").exists()).toBe(true);
   });
@@ -377,6 +466,7 @@ describe("phase grouping", () => {
       members: [makeMember({ phase: "scan", outcome: "completed" })],
     });
     const { wrapper } = mountPanel({ result: resultWithDetails(view) });
+    await wrapper.get("button.wfp-header").trigger("click");
 
     const phaseHeader = wrapper.get("button.wfp-phase-header");
     expect(phaseHeader.attributes("aria-expanded")).toBe("false");
@@ -394,6 +484,7 @@ describe("phase grouping", () => {
       currentPhase: "scan",
     });
     const { wrapper } = mountPanel({ result: resultWithDetails(view) });
+    await wrapper.get("button.wfp-header").trigger("click");
 
     expect(wrapper.get(".wfp-current-phase").text()).toBe("当前阶段：scan");
 

@@ -106,6 +106,39 @@ function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | u
 	return getMessageFromEntry(entry);
 }
 
+function emptyUsage(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function addUsage(target: Usage, extra: Usage): Usage {
+	return {
+		input: target.input + extra.input,
+		output: target.output + extra.output,
+		cacheRead: target.cacheRead + extra.cacheRead,
+		cacheWrite: target.cacheWrite + extra.cacheWrite,
+		totalTokens: target.totalTokens + extra.totalTokens,
+		cost: {
+			input: target.cost.input + extra.cost.input,
+			output: target.cost.output + extra.cost.output,
+			cacheRead: target.cost.cacheRead + extra.cost.cacheRead,
+			cacheWrite: target.cost.cacheWrite + extra.cost.cacheWrite,
+			total: target.cost.total + extra.cost.total,
+		},
+	};
+}
+
+export interface SummaryGenerationResult {
+	text: string;
+	usage: Usage;
+}
+
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
 export interface CompactionResult<T = unknown> {
 	summary: string;
@@ -113,6 +146,8 @@ export interface CompactionResult<T = unknown> {
 	tokensBefore: number;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+	/** LLM usage from the summarization call(s). Absent for extension-provided compaction. */
+	usage?: Usage;
 }
 
 // ============================================================================
@@ -574,6 +609,33 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
 ): Promise<string> {
+	const result = await generateSummaryWithUsage(
+		currentMessages,
+		model,
+		reserveTokens,
+		apiKey,
+		headers,
+		signal,
+		customInstructions,
+		previousSummary,
+		thinkingLevel,
+		streamFn,
+	);
+	return result.text;
+}
+
+async function generateSummaryWithUsage(
+	currentMessages: AgentMessage[],
+	model: Model<any>,
+	reserveTokens: number,
+	apiKey: string | undefined,
+	headers?: Record<string, string>,
+	signal?: AbortSignal,
+	customInstructions?: string,
+	previousSummary?: string,
+	thinkingLevel?: ThinkingLevel,
+	streamFn?: StreamFn,
+): Promise<SummaryGenerationResult> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
@@ -623,7 +685,7 @@ export async function generateSummary(
 		.map((c) => c.text)
 		.join("\n");
 
-	return textContent;
+	return { text: textContent, usage: response.usage ?? emptyUsage() };
 }
 
 // ============================================================================
@@ -774,12 +836,12 @@ export async function compact(
 
 	// Generate summaries (can be parallel if both needed) and merge into one
 	let summary: string;
+	let usage = emptyUsage();
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Generate both summaries in parallel
 		const [historyResult, turnPrefixResult] = await Promise.all([
 			messagesToSummarize.length > 0
-				? generateSummary(
+				? generateSummaryWithUsage(
 						messagesToSummarize,
 						model,
 						settings.reserveTokens,
@@ -791,8 +853,8 @@ export async function compact(
 						thinkingLevel,
 						streamFn,
 					)
-				: Promise.resolve("No prior history."),
-			generateTurnPrefixSummary(
+				: Promise.resolve({ text: "No prior history.", usage: emptyUsage() }),
+			generateTurnPrefixSummaryWithUsage(
 				turnPrefixMessages,
 				model,
 				settings.reserveTokens,
@@ -803,11 +865,10 @@ export async function compact(
 				streamFn,
 			),
 		]);
-		// Merge into single summary
-		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
+		summary = `${historyResult.text}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
+		usage = addUsage(historyResult.usage, turnPrefixResult.usage);
 	} else {
-		// Just generate history summary
-		summary = await generateSummary(
+		const historyResult = await generateSummaryWithUsage(
 			messagesToSummarize,
 			model,
 			settings.reserveTokens,
@@ -819,6 +880,8 @@ export async function compact(
 			thinkingLevel,
 			streamFn,
 		);
+		summary = historyResult.text;
+		usage = historyResult.usage;
 	}
 
 	// Compute file lists and append to summary
@@ -834,13 +897,14 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
+		usage,
 	};
 }
 
 /**
  * Generate a summary for a turn prefix (when splitting a turn).
  */
-async function generateTurnPrefixSummary(
+async function generateTurnPrefixSummaryWithUsage(
 	messages: AgentMessage[],
 	model: Model<any>,
 	reserveTokens: number,
@@ -849,7 +913,7 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
-): Promise<string> {
+): Promise<SummaryGenerationResult> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
@@ -876,8 +940,11 @@ async function generateTurnPrefixSummary(
 		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
 	}
 
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
+	return {
+		text: response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n"),
+		usage: response.usage ?? emptyUsage(),
+	};
 }

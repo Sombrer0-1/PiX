@@ -1280,6 +1280,49 @@ export class AgentTaskService {
   }
 
   /**
+   * Cancel and delete every task whose parentSessionId matches. Used by
+   * delete-session so removing a chat also removes its agent/workflow records.
+   * Detached (backgrounded) groups are cancelled per-task because cancelGroup
+   * skips them. Workflow-owned tasks are included.
+   */
+  async deleteTasksForParentSession(parentSessionId: string): Promise<number> {
+    if (!parentSessionId) return 0;
+    const entries = [...this._tasks.values()].filter((entry) => entry.info.parentSessionId === parentSessionId);
+    if (entries.length === 0) return 0;
+    const TERMINAL_WAIT_MS = 8_000;
+    const POLL_MS = 50;
+    for (const entry of entries) {
+      if (!isTerminalStatus(entry.info.status) && entry.info.status !== "interrupted") {
+        await this.cancel(entry.info.taskId, entry.info.generation, "user_cancel");
+      }
+    }
+    const deadline = Date.now() + TERMINAL_WAIT_MS;
+    while (Date.now() < deadline) {
+      const pending = entries.filter((entry) => {
+        const current = this._tasks.get(entry.info.taskId);
+        return current !== undefined && !isTerminalStatus(current.info.status) && current.info.status !== "interrupted";
+      });
+      if (pending.length === 0) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS));
+    }
+    let deleted = 0;
+    for (const entry of entries) {
+      const current = this._tasks.get(entry.info.taskId);
+      if (!current) continue;
+      if (!isTerminalStatus(current.info.status) && current.info.status !== "interrupted") {
+        current.controller?.abort();
+        current.runtime?.abort();
+      }
+      await this._drainPersist(current.info.taskId);
+      const latest = this._tasks.get(entry.info.taskId);
+      if (!latest) continue;
+      await this._deleteTaskRecord(latest);
+      deleted += 1;
+    }
+    return deleted;
+  }
+
+  /**
    * 1.5 (P3): register a transcript watcher (counting; TaskDetailPanel is the
    * single owner). Unknown tasks return false without throwing. The 0->1
    * transition enables the runtime's live forwarding when a runtime already
@@ -2515,7 +2558,14 @@ export class AgentTaskService {
   /** Drain one task (inspect/log) or every persist + index + retention tail (shutdown). */
   private async _drainPersist(taskId?: string): Promise<void> {
     if (taskId !== undefined) {
-      await this._awaitTail(() => this._flushTails.get(taskId) ?? Promise.resolve());
+      // With no scheduled tail there is nothing to wait for. Falling back to a
+      // fresh Promise.resolve() per _awaitTail probe would never pass the tail
+      // identity check below and spin the event loop forever.
+      const scheduled = this._flushTails.get(taskId);
+      if (!scheduled) {
+        return;
+      }
+      await this._awaitTail(() => this._flushTails.get(taskId) ?? scheduled);
       return;
     }
     const persistTails = [...this._flushTails.values()];

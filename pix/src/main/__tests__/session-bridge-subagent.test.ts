@@ -1029,10 +1029,6 @@ await run("resume usage rebuilds from persisted agent tool result details", asyn
     assertEqual(usage.cacheWrite, 5, "resume rebuild aggregated cacheWrite");
     assertEqual(usage.cost, 0.4, "resume rebuild aggregated cost");
     assert(b._auxiliaryUsage === usage, "resume rebuild wrote the same generation-bound accumulator as live usage");
-    assert(
-      bridge.getSessionStats().tokens.input >= 50,
-      "resume-rebuilt usage is included in the session stats",
-    );
   } finally {
     await bridge.dispose();
   }

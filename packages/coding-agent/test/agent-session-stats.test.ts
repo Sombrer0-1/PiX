@@ -109,7 +109,8 @@ describe("AgentSession.getSessionStats", () => {
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
-			expect(stats.tokens.input).toBe(195_000);
+			// Lifetime keeps folded assistant usage (180k + 195k); context window is unknown.
+			expect(stats.tokens.input).toBe(375_000);
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBeNull();
 			expect(stats.contextUsage?.percent).toBeNull();
@@ -132,10 +133,36 @@ describe("AgentSession.getSessionStats", () => {
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
-			expect(stats.tokens.input).toBe(220_000);
+			// Lifetime is monotonic across compaction (180k + 195k + 25k).
+			expect(stats.tokens.input).toBe(400_000);
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBe(25_000);
 			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("includes compaction summarization usage in lifetime totals", () => {
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.appendMessage(createUserMessage("first", 1));
+			sessionManager.appendMessage(createAssistantMessage("response1", 10_000, 2));
+			const keptUserId = sessionManager.appendMessage(createUserMessage("second", 3));
+			sessionManager.appendCompaction("summary", keptUserId, 10_000, undefined, false, {
+				input: 1_000,
+				output: 200,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0.5,
+			});
+			syncAgentMessages(session, sessionManager);
+
+			const stats = session.getSessionStats();
+			expect(stats.tokens.input).toBe(11_000);
+			expect(stats.tokens.output).toBe(200);
+			expect(stats.cost).toBe(0.5);
 		} finally {
 			session.dispose();
 		}

@@ -11,6 +11,7 @@ import { useSettingsStore } from "../stores/settings-store";
 import { useAuthStore } from "../stores/auth-store";
 import { useWorkspaceRpc } from "../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
+import { thinkingLevelItems } from "../utils/thinking-labels";
 import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, AGENT_TASK_MAX_RUNNING_SLOTS } from "@shared/agent-task-types.js";
 import McpSettings from "../components/settings/McpSettings.vue";
 import CustomProviders from "../components/settings/CustomProviders.vue";
@@ -150,14 +151,7 @@ async function deleteKey(provider: string): Promise<void> {
 }
 
 // ---- Option lists ----
-const thinkingLevelItems: Array<{ title: string; value: ThinkingLevel }> = [
-  { title: "关闭", value: "off" },
-  { title: "轻量", value: "minimal" },
-  { title: "低", value: "low" },
-  { title: "标准", value: "medium" },
-  { title: "深入", value: "high" },
-  { title: "极深", value: "xhigh" },
-];
+
 const steeringModeItems = [
   { title: "全部排队", value: "all" },
   { title: "逐条处理", value: "one-at-a-time" },

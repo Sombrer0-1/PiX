@@ -19,6 +19,7 @@ import { useAgentTaskStore } from "../../stores/agent-task-store";
 import { useLiveNow } from "../../composables/useLiveNow";
 import { AGENT_TASK_MAX_ACTIVITIES } from "@shared/agent-task-types.js";
 import type { AgentTaskDiagnosticExport, AgentTaskInfo, AgentTaskRecoveryIssue } from "@shared/agent-task-types.js";
+import { thinkingLevelLabel } from "../../utils/thinking-labels";
 
 const props = defineProps<{
   task: AgentTaskInfo;
@@ -96,15 +97,6 @@ const RECOVERY_ISSUE_LABELS: Record<string, string> = {
   migration_failed: "迁移失败",
 };
 
-const THINKING_LABELS: Record<string, string> = {
-  off: "关闭",
-  minimal: "轻量",
-  low: "低",
-  medium: "标准",
-  high: "深入",
-  xhigh: "极深",
-};
-
 const EXECUTION_MODE_LABELS: Record<string, string> = {
   "read-only": "只读",
   approval: "需要审批",
@@ -133,7 +125,7 @@ const modelLabel = computed(() => {
   const model = props.task.itemSummaries[0]?.model;
   return model ? `${model.provider}/${model.modelId}` : "—";
 });
-const thinkingLabel = computed(() => THINKING_LABELS[props.task.thinkingLevel] ?? props.task.thinkingLevel);
+const thinkingLabel = computed(() => thinkingLevelLabel(props.task.thinkingLevel));
 const executionModeLabel = computed(
   () => EXECUTION_MODE_LABELS[props.task.executionMode] ?? props.task.executionMode,
 );

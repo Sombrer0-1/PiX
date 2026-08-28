@@ -1,5 +1,5 @@
 import { constants as bufferConstants } from "buffer";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -314,5 +314,69 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		const sm2 = SessionManager.open(corruptedFile, tempDir);
 		expect(sm2.getSessionId()).toBe(sessionId);
 		expect(sm2.getHeader()?.type).toBe("session");
+	});
+});
+
+describe("SessionManager user-message flush", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-flush-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("does not create a file for an empty new session", () => {
+		const session = SessionManager.create(tempDir, tempDir);
+		const file = session.getSessionFile();
+		expect(file).toBeDefined();
+		expect(existsSync(file!)).toBe(false);
+		expect(session.flushIfHasUserMessages()).toBe(false);
+		expect(existsSync(file!)).toBe(false);
+	});
+
+	it("creates the jsonl on the first user message without waiting for assistant", () => {
+		const session = SessionManager.create(tempDir, tempDir);
+		const file = session.getSessionFile()!;
+		session.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		expect(existsSync(file)).toBe(true);
+		expect(session.isFlushed()).toBe(true);
+		const lines = readFileSync(file, "utf-8").trim().split("\n").filter(Boolean);
+		expect(JSON.parse(lines[0]).type).toBe("session");
+		expect(JSON.parse(lines[1]).message.role).toBe("user");
+	});
+
+	it("appends the first assistant without rewriting or duplicating the header", () => {
+		const session = SessionManager.create(tempDir, tempDir);
+		const file = session.getSessionFile()!;
+		session.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		session.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "hi" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "test",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const records = readFileSync(file, "utf-8")
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line));
+		expect(records.filter((r) => r.type === "session")).toHaveLength(1);
+		expect(records.filter((r) => r.type === "message" && r.message.role === "user")).toHaveLength(1);
+		expect(records.filter((r) => r.type === "message" && r.message.role === "assistant")).toHaveLength(1);
 	});
 });

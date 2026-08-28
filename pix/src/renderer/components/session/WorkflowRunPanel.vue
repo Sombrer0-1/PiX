@@ -12,12 +12,11 @@
  * 3. no folded view at all -> 无记录 fallback (old-version results, or a
  *    snapshot that never reached the store); never throws
  *
- * The run is status-driven: running is forced open with no toggle button;
- * completed / failed / cancelled / interrupted are collapsible and start
- * expanded (matching SubagentToolView's terminal-state conventions). Members
+ * The run is collapsible in every status and starts collapsed (matching
+ * SubagentToolView). Running still shows a header spinner. Members
  * are grouped by phase identity (workflowPhaseKey: undefined and "" are
  * distinct), in append order, and each member row jumps to its child AgentTask
- * via agent-task-store.selectTask - the panel never touches AgentTaskService.
+ * via agent-task-store.openTaskCenter - the panel never touches AgentTaskService.
  * The interrupted override: when the parent toolResult landed with isError and
  * the run never settled (no stopReason in the fold), the run is interrupted -
  * an interrupted run's toolResult is ALWAYS isError. Live updates never set
@@ -115,12 +114,8 @@ const errorText = computed(() => details.value?.error);
 
 // ── Disclosure ──
 
-/** running is forced open with no toggle button; every other state is
- *  collapsible and starts expanded (SubagentToolView terminal conventions). */
-const forcedOpen = computed(() => status.value === "running");
-
-const expanded = ref(true);
-const bodyOpen = computed(() => forcedOpen.value || expanded.value);
+const expanded = ref(false);
+const bodyOpen = computed(() => expanded.value);
 
 // ── Member grouping (workflowPhaseKey semantics: undefined vs "" distinct) ──
 
@@ -156,15 +151,10 @@ const phaseGroups = computed<PhaseGroup[]>(() => {
   return [...groups.values()];
 });
 
-/** A phase stays forced open while any member has not completed. */
-function phaseForcedOpen(group: PhaseGroup): boolean {
-  return group.members.some((member) => memberStatus(member) !== "completed");
-}
-
 const expandedPhases = ref<Set<string>>(new Set());
 
 function isPhaseOpen(group: PhaseGroup): boolean {
-  return phaseForcedOpen(group) || expandedPhases.value.has(group.key);
+  return expandedPhases.value.has(group.key);
 }
 
 function togglePhase(key: string): void {
@@ -187,9 +177,14 @@ function phaseSummary(group: PhaseGroup): string {
   return parts.join(" · ");
 }
 
-/** Jump to the child AgentTask so the task panel opens on it. */
+function taskRecordExists(taskId: string): boolean {
+  return taskStore.tasks.some((task) => task.taskId === taskId);
+}
+
+/** Jump to the child AgentTask so the task center opens on it. */
 function jumpToTask(childId: string): void {
-  taskStore.selectTask(childId);
+  if (!taskRecordExists(childId)) return;
+  taskStore.openTaskCenter(childId);
 }
 </script>
 
@@ -219,7 +214,6 @@ function jumpToTask(childId: string): void {
     <!-- Folded view: status-driven disclosure -->
     <template v-else>
       <button
-        v-if="!forcedOpen"
         type="button"
         class="wfp-header"
         :aria-expanded="bodyOpen"
@@ -231,18 +225,10 @@ function jumpToTask(childId: string): void {
         </span>
         <span class="wfp-title">{{ displayName }}</span>
         <span class="wfp-status" :class="status" data-test="wfp-status">{{ statusLabel(status) }}</span>
+        <span v-if="currentPhase && status === 'running'" class="wfp-count">{{ currentPhase }}</span>
         <span v-if="memberCount > 0" class="wfp-count">{{ memberCount }} 个子任务</span>
         <span class="wfp-toggle" data-test="wfp-toggle">{{ bodyOpen ? "收起" : "展开" }}</span>
       </button>
-      <div v-else class="wfp-header wfp-header-forced" role="status" aria-live="polite">
-        <span class="wfp-icon" aria-hidden="true">
-          <span v-if="status === 'running'" class="spinner"></span>
-          <span v-else class="wfp-dot" :class="statusClass(status)"></span>
-        </span>
-        <span class="wfp-title">{{ displayName }}</span>
-        <span class="wfp-status" :class="status" data-test="wfp-status">{{ statusLabel(status) }}</span>
-        <span v-if="memberCount > 0" class="wfp-count">{{ memberCount }} 个子任务</span>
-      </div>
 
       <div v-if="bodyOpen" class="wfp-body">
         <div v-if="currentPhase" class="wfp-current-phase">当前阶段：{{ currentPhase }}</div>
@@ -256,7 +242,6 @@ function jumpToTask(childId: string): void {
             :data-phase-key="group.key"
           >
             <button
-              v-if="!phaseForcedOpen(group)"
               type="button"
               class="wfp-phase-header"
               :aria-expanded="isPhaseOpen(group)"
@@ -267,11 +252,6 @@ function jumpToTask(childId: string): void {
               <span class="wfp-phase-summary">{{ phaseSummary(group) }}</span>
               <span class="wfp-toggle">{{ isPhaseOpen(group) ? "收起" : "展开" }}</span>
             </button>
-            <div v-else class="wfp-phase-header wfp-phase-header-forced">
-              <span class="wfp-phase-title">{{ group.label }}</span>
-              <span class="wfp-phase-count">{{ group.members.length }} 个成员</span>
-              <span class="wfp-phase-summary">{{ phaseSummary(group) }}</span>
-            </div>
             <div v-if="isPhaseOpen(group)" class="wfp-phase-body">
               <div
                 v-for="member in group.members"
@@ -292,7 +272,8 @@ function jumpToTask(childId: string): void {
                   type="button"
                   class="wfp-jump-btn"
                   data-test="wfp-member-jump"
-                  :title="`跳转到任务 ${member.childId}`"
+                  :disabled="!taskRecordExists(member.childId)"
+                  :title="taskRecordExists(member.childId) ? `跳转到任务 ${member.childId}` : '任务记录已清理'"
                   @click="jumpToTask(member.childId)"
                 >
                   查看任务
@@ -600,7 +581,7 @@ button.wfp-phase-header:hover {
   white-space: nowrap;
 }
 
-.wfp-jump-btn:hover {
+.wfp-jump-btn:hover:not(:disabled) {
   background: var(--pix-accent-light);
   color: var(--pix-accent);
 }

@@ -394,7 +394,7 @@ function goSettings(): void { void router.push("/settings"); }
       <v-card class="delete-dialog-card">
         <div class="delete-dialog-title">删除会话</div>
         <div class="delete-dialog-text">
-          确定删除 <strong class="delete-session-name">{{ deleteSessionTitle }}</strong>？此操作无法撤销。
+          确定删除 <strong class="delete-session-name">{{ deleteSessionTitle }}</strong>？此操作无法撤销，并将同时删除该会话下的子代理与 workflow 执行记录。
         </div>
         <div v-if="deleteError" class="delete-dialog-error">{{ deleteError }}</div>
         <v-card-actions class="delete-dialog-actions">

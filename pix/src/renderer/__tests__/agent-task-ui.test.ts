@@ -1335,7 +1335,7 @@ describe("AgentTaskDetail", () => {
     const spec = w.get('[data-test="agent-task-spec"]');
     expect(spec.find('[data-test="agent-task-spec-agent"]').text()).toBe("general-purpose");
     expect(spec.find('[data-test="agent-task-spec-model"]').text()).toBe("anthropic/claude-x");
-    expect(spec.find('[data-test="agent-task-spec-thinking"]').text()).toBe("深入");
+    expect(spec.find('[data-test="agent-task-spec-thinking"]').text()).toBe("high");
     expect(spec.find('[data-test="agent-task-spec-mode"]').text()).toBe("需要审批");
     expect(spec.find('[data-test="agent-task-spec-maxturns"]').text()).toBe("最多 15 轮");
   });
@@ -1675,9 +1675,12 @@ describe("SubagentToolView backgrounded group", () => {
     expect(w.find(".subagent-item").exists()).toBe(false);
   });
 
-  it("jumps to the task by selecting it in the agent-task store", async () => {
+  it("jumps to the task by opening the task center", async () => {
     const pinia = installPinia();
     const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    emit({ type: "task_state", task: makeTask({ taskId: "task-bg-1", status: "running", startedAt: 1 }) });
+    emit({ type: "task_state", task: makeTask({ taskId: "task-bg-2", status: "completed", endedAt: 2 }) });
     wrapper = mount(SubagentToolView, {
       props: { result: { details: GROUP_HANDLE }, args: {}, isError: false },
       global: { plugins: [pinia, vuetify] },
@@ -1685,7 +1688,25 @@ describe("SubagentToolView backgrounded group", () => {
     await nextTick();
 
     await wrapper.get('[data-test="agent-task-jump-task-bg-1"] [data-test="agent-task-jump-btn"]').trigger("click");
+    expect(store.centerOpen).toBe(true);
     expect(store.selectedTaskId).toBe("task-bg-1");
+  });
+
+  it("disables jump when the backgrounded task record is gone", async () => {
+    const pinia = installPinia();
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+    wrapper = mount(SubagentToolView, {
+      props: { result: { details: GROUP_HANDLE }, args: {}, isError: false },
+      global: { plugins: [pinia, vuetify] },
+    });
+    await nextTick();
+
+    const button = wrapper.get('[data-test="agent-task-jump-task-bg-1"] [data-test="agent-task-jump-btn"]');
+    expect(button.attributes("disabled")).toBeDefined();
+    expect(button.attributes("title")).toBe("任务记录已清理");
+    await button.trigger("click");
+    expect(store.centerOpen).toBe(false);
   });
 
   it("keeps rendering foreground SubagentDetails results (case 1 regression)", async () => {
@@ -1957,7 +1978,7 @@ describe("SubagentToolView running live UI", () => {
     };
   }
 
-  it("running 时点击收起立即隐藏正文", async () => {
+  it("running 时默认折叠，点击展开后显示正文", async () => {
     const pinia = installPinia();
     wrapper = mount(SubagentToolView, {
       props: { result: { details: makeRunningDetails() }, args: {}, isError: false },
@@ -1965,17 +1986,18 @@ describe("SubagentToolView running live UI", () => {
     });
     await nextTick();
 
+    expect(wrapper.find(".subagent-live").exists()).toBe(false);
+    expect(wrapper.get(".subagent-toggle").text()).toContain("展开");
+    expect(wrapper.find(".spinner").exists()).toBe(true);
+
+    await wrapper.get(".subagent-header").trigger("click");
+    await nextTick();
     expect(wrapper.find(".subagent-live").exists()).toBe(true);
     expect(wrapper.get(".subagent-toggle").text()).toContain("收起");
 
     await wrapper.get(".subagent-header").trigger("click");
     await nextTick();
     expect(wrapper.find(".subagent-live").exists()).toBe(false);
-    expect(wrapper.get(".subagent-toggle").text()).toContain("展开");
-
-    await wrapper.get(".subagent-header").trigger("click");
-    await nextTick();
-    expect(wrapper.find(".subagent-live").exists()).toBe(true);
   });
 
   it("running 时 header 显示实时工具次数且耗时不是 0ms", async () => {

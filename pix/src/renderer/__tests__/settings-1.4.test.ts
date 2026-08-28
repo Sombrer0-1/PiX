@@ -270,7 +270,7 @@ describe("SettingsPage plan section (1.4.0)", () => {
     await openPlanSection(page);
 
     expect(page.get('[data-test="plan-model-select"]').text()).toContain("anthropic/claude-sonnet-4-6");
-    expect(page.get('[data-test="plan-thinking-select"]').text()).toContain("深入");
+    expect(page.get('[data-test="plan-thinking-select"]').text()).toContain("high");
     expect(page.get('[data-test="analytics-switch"]').find("input").element.checked).toBe(true);
   });
 

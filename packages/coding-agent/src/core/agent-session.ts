@@ -109,7 +109,7 @@ import {
 	type UserInputAttachment,
 } from "./request-user-input-tool.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.ts";
+import type { BranchSummaryEntry, CompactionEntry, CompactionUsage, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import { BackgroundTaskRegistry } from "./background-task-registry.ts";
@@ -2544,6 +2544,7 @@ export class AgentSession {
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
+			let compactionUsage: CompactionUsage | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
 				const result = (await this._extensionRunner.emit({
@@ -2591,13 +2592,14 @@ export class AgentSession {
 				firstKeptEntryId = result.firstKeptEntryId;
 				tokensBefore = result.tokensBefore;
 				details = result.details;
+				compactionUsage = toCompactionUsage(result.usage);
 			}
 
 			if (this._compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, compactionUsage);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -2837,6 +2839,7 @@ export class AgentSession {
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
+			let compactionUsage: CompactionUsage | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
 				const extensionResult = (await this._extensionRunner.emit({
@@ -2891,6 +2894,7 @@ export class AgentSession {
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
 				details = compactResult.details;
+				compactionUsage = toCompactionUsage(compactResult.usage);
 			}
 
 			if (this._autoCompactionAbortController.signal.aborted) {
@@ -2904,7 +2908,7 @@ export class AgentSession {
 				return false;
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, compactionUsage);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -3900,6 +3904,9 @@ export class AgentSession {
 
 	/**
 	 * Get session statistics.
+	 * Message counts follow the current LLM context. Token/cost totals are the
+	 * session lifetime: every billed assistant on the current branch (including
+	 * history folded by compaction) plus summarization usage stored on compaction entries.
 	 */
 	getSessionStats(): SessionStats {
 		const state = this.state;
@@ -3908,21 +3915,36 @@ export class AgentSession {
 		const toolResults = state.messages.filter((m) => m.role === "toolResult").length;
 
 		let toolCalls = 0;
+		for (const message of state.messages) {
+			if (message.role === "assistant") {
+				const assistantMsg = message as AssistantMessage;
+				toolCalls += assistantMsg.content.filter((c) => c.type === "toolCall").length;
+			}
+		}
+
 		let totalInput = 0;
 		let totalOutput = 0;
 		let totalCacheRead = 0;
 		let totalCacheWrite = 0;
 		let totalCost = 0;
 
-		for (const message of state.messages) {
-			if (message.role === "assistant") {
-				const assistantMsg = message as AssistantMessage;
-				toolCalls += assistantMsg.content.filter((c) => c.type === "toolCall").length;
-				totalInput += assistantMsg.usage.input;
-				totalOutput += assistantMsg.usage.output;
-				totalCacheRead += assistantMsg.usage.cacheRead;
-				totalCacheWrite += assistantMsg.usage.cacheWrite;
-				totalCost += assistantMsg.usage.cost.total;
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const assistantMsg = entry.message as AssistantMessage;
+				if (assistantMsg.stopReason === "aborted" || assistantMsg.stopReason === "error") continue;
+				const usage = assistantMsg.usage;
+				if (!usage) continue;
+				totalInput += usage.input;
+				totalOutput += usage.output;
+				totalCacheRead += usage.cacheRead;
+				totalCacheWrite += usage.cacheWrite;
+				totalCost += usage.cost.total;
+			} else if (entry.type === "compaction" && entry.usage) {
+				totalInput += entry.usage.input;
+				totalOutput += entry.usage.output;
+				totalCacheRead += entry.usage.cacheRead;
+				totalCacheWrite += entry.usage.cacheWrite;
+				totalCost += entry.usage.cost;
 			}
 		}
 
@@ -4115,4 +4137,15 @@ export class AgentSession {
 	get extensionRunner(): ExtensionRunner {
 		return this._extensionRunner;
 	}
+}
+
+function toCompactionUsage(usage: CompactionResult["usage"]): CompactionUsage | undefined {
+	if (!usage) return undefined;
+	return {
+		input: usage.input,
+		output: usage.output,
+		cacheRead: usage.cacheRead,
+		cacheWrite: usage.cacheWrite,
+		cost: usage.cost.total,
+	};
 }

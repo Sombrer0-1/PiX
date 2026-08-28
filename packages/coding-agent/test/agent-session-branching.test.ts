@@ -104,7 +104,8 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 
 		expect(session.messages.length).toBe(0);
 		expect(session.sessionFile).not.toBeNull();
-		expect(existsSync(session.sessionFile!)).toBe(false);
+		// Forked path still has the user message, so the jsonl is created immediately.
+		expect(existsSync(session.sessionFile!)).toBe(true);
 	});
 
 	it("should support in-memory forking in --no-session mode", async () => {

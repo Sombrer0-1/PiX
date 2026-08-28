@@ -2,32 +2,17 @@
 import { computed, watch } from "vue";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
+import {
+  THINKING_LEVELS,
+  thinkingLevelDescription,
+  thinkingLevelLabel,
+} from "../../utils/thinking-labels";
 
 const emit = defineEmits<{
   close: [];
 }>();
 
 const rpc = useWorkspaceRpc();
-
-const ALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-
-const THINKING_LEVEL_LABELS: Record<string, string> = {
-  off: "关闭",
-  minimal: "轻量",
-  low: "低",
-  medium: "标准",
-  high: "深入",
-  xhigh: "极深",
-};
-
-const THINKING_LEVEL_DESCRIPTIONS: Record<string, string> = {
-  off: "不启用额外推理，适合直接任务",
-  minimal: "最低推理开销，适合快速回答",
-  low: "优先响应速度，适合简单任务",
-  medium: "推荐日常使用",
-  high: "更强推理，适合复杂问题",
-  xhigh: "最充分思考，适合高难任务",
-};
 
 const currentModel = computed(() => rpc.sessionState.value?.model);
 const currentThinkingLevel = computed(() => rpc.sessionState.value?.thinkingLevel ?? "medium");
@@ -43,9 +28,9 @@ const availableLevels = computed<ThinkingLevel[]>(() => {
   if (!model) return ["off"];
   if (!model.reasoning) return ["off"];
   const supported = (model.thinkingLevels ?? []).filter((level): level is ThinkingLevel =>
-    ALL_THINKING_LEVELS.includes(level as ThinkingLevel)
+    THINKING_LEVELS.includes(level as ThinkingLevel)
   );
-  return supported.length > 0 ? supported : [...ALL_THINKING_LEVELS];
+  return supported.length > 0 ? supported : [...THINKING_LEVELS];
 });
 
 const modelTitle = computed(() => {
@@ -54,11 +39,11 @@ const modelTitle = computed(() => {
 });
 
 function thinkingLabel(level = String(currentThinkingLevel.value)): string {
-  return THINKING_LEVEL_LABELS[level] ?? level;
+  return thinkingLevelLabel(level);
 }
 
 function thinkingDescription(level: string): string {
-  return THINKING_LEVEL_DESCRIPTIONS[level] ?? "选择该模型的思考深度";
+  return thinkingLevelDescription(level);
 }
 
 async function selectThinkingLevel(level: ThinkingLevel): Promise<void> {

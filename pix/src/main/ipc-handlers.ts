@@ -7,7 +7,8 @@
  * v2: Uses SessionBridge for direct AgentSession integration (no RPC subprocess).
  */
 
-import { existsSync, rmSync } from "fs";
+import { createReadStream, existsSync, rmSync } from "fs";
+import { createInterface } from "readline";
 import { isAbsolute, join, relative, resolve } from "path";
 import { BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from "electron";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -309,6 +310,31 @@ function isPathInsideDirectory(candidatePath: string, directoryPath: string): bo
   // and any path outside it or on a different drive root. Mirrors
   // SessionBridge._assertSessionPathInNamespace, which throws on rel === "".
   return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath);
+}
+
+async function readSessionHeaderId(sessionPath: string): Promise<string | undefined> {
+  const rl = createInterface({
+    input: createReadStream(sessionPath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  try {
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as { type?: unknown; id?: unknown };
+        if (parsed.type === "session" && typeof parsed.id === "string" && parsed.id) {
+          return parsed.id;
+        }
+      } catch {
+        return undefined;
+      }
+      return undefined;
+    }
+  } finally {
+    rl.close();
+  }
+  return undefined;
 }
 
 export function registerIpcHandlers(
@@ -875,6 +901,10 @@ export function registerIpcHandlers(
         return { success: false, error: "Invalid session path" };
       }
       if (existsSync(resolved)) {
+        const sessionId = await readSessionHeaderId(resolved);
+        if (sessionId) {
+          await agentTaskService.deleteTasksForParentSession(sessionId);
+        }
         rmSync(resolved, { recursive: true, force: true });
         return { success: true };
       }

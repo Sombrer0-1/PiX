@@ -328,6 +328,7 @@ export class SessionBridge {
 	private _teamManager: TeamManager | null = null;
 	private _unsubscribe: (() => void) | null = null;
 	private _auxiliaryUsage = createEmptyAuxiliaryUsage();
+	private _eyeUsage = createEmptyAuxiliaryUsage();
 
 	private _eventListeners: Array<(event: AgentSessionEvent) => void> = [];
 	private _userInputRequestListeners: UserInputRequestListener[] = [];
@@ -1298,11 +1299,12 @@ export class SessionBridge {
 
 	getSessionStats(): SessionStats {
 		const stats = this._getSession().getSessionStats();
+		const extra = this._lifetimeAuxiliaryTokens();
 		const tokens = {
-			input: stats.tokens.input + this._auxiliaryUsage.input,
-			output: stats.tokens.output + this._auxiliaryUsage.output,
-			cacheRead: stats.tokens.cacheRead + this._auxiliaryUsage.cacheRead,
-			cacheWrite: stats.tokens.cacheWrite + this._auxiliaryUsage.cacheWrite,
+			input: stats.tokens.input + extra.input,
+			output: stats.tokens.output + extra.output,
+			cacheRead: stats.tokens.cacheRead + extra.cacheRead,
+			cacheWrite: stats.tokens.cacheWrite + extra.cacheWrite,
 		};
 		return {
 			sessionFile: stats.sessionFile,
@@ -1316,7 +1318,7 @@ export class SessionBridge {
 				...tokens,
 				total: tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite,
 			},
-			cost: stats.cost + this._auxiliaryUsage.cost,
+			cost: stats.cost + extra.cost,
 			contextUsage: stats.contextUsage,
 		};
 	}
@@ -1981,6 +1983,34 @@ export class SessionBridge {
 		this._auxiliaryUsage.cacheRead += usage.cacheRead;
 		this._auxiliaryUsage.cacheWrite += usage.cacheWrite;
 		this._auxiliaryUsage.cost += usage.cost.total;
+		this._eyeUsage.input += usage.input;
+		this._eyeUsage.output += usage.output;
+		this._eyeUsage.cacheRead += usage.cacheRead;
+		this._eyeUsage.cacheWrite += usage.cacheWrite;
+		this._eyeUsage.cost += usage.cost.total;
+	}
+
+	private _lifetimeAuxiliaryTokens(): AuxiliaryUsageTotals {
+		const totals = {
+			input: this._eyeUsage.input,
+			output: this._eyeUsage.output,
+			cacheRead: this._eyeUsage.cacheRead,
+			cacheWrite: this._eyeUsage.cacheWrite,
+			cost: this._eyeUsage.cost,
+		};
+		const sessionId = this._session?.sessionId;
+		if (!this._agentTaskService || !sessionId) {
+			return totals;
+		}
+		for (const task of this._agentTaskService.getAll().tasks) {
+			if (task.parentSessionId !== sessionId) continue;
+			totals.input += task.usage.input;
+			totals.output += task.usage.output;
+			totals.cacheRead += task.usage.cacheRead;
+			totals.cacheWrite += task.usage.cacheWrite;
+			totals.cost += task.usage.cost;
+		}
+		return totals;
 	}
 
 	private _applyEnabledModelScope(session: AgentSession): void {
@@ -2481,6 +2511,7 @@ export class SessionBridge {
 		// The stats reference points at this generation's accumulator so history
 		// rebuild and live usage of the same generation write the same object.
 		this._auxiliaryUsage = this._generation?.auxiliaryUsage ?? createEmptyAuxiliaryUsage();
+		this._eyeUsage = createEmptyAuxiliaryUsage();
 		this._rebuildAuxiliaryUsageFromHistory(session);
 		// Plan rebuild: the controller hydrates the persisted snapshot of the
 		// current branch (dormant planning/revising + A8 executing normalization
@@ -2808,6 +2839,14 @@ export class SessionBridge {
 		const session = this._session;
 		const mcpAdapter = this._mcpAdapter;
 		const generation = this._generation;
+		try {
+			const flush = (
+				session?.sessionManager as { flushIfHasUserMessages?: () => boolean } | undefined
+			)?.flushIfHasUserMessages;
+			flush?.();
+		} catch (err) {
+			console.warn("[SessionBridge] Failed to flush unpersisted user messages:", err);
+		}
 		this._generation = null;
 		// 1.4.2 (R4): unregister the delivery sink FIRST so an in-flight
 		// send_to_session never injects into a closing session; the result
@@ -2870,6 +2909,7 @@ export class SessionBridge {
 		this._pendingMessageCount = 0;
 		this._mcpAdapter = null;
 		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
+		this._eyeUsage = createEmptyAuxiliaryUsage();
 
 		// Mark the input queue closing and invalidate the generation FIRST.
 		// Bridge-level request/dismissal listeners must stay so IPC can still

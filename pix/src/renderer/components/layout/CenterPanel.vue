@@ -33,6 +33,7 @@ import TaskCenterView from "../agent-task/TaskCenterView.vue";
 import { btwValidateQuestion } from "@shared/types.js";
 import type { PlanStatus } from "@shared/types.js";
 import type { RequestUserInputRequest, RequestUserInputQuestion, RpcSlashCommand } from "@/types/rpc";
+import { thinkingLevelLabel } from "../../utils/thinking-labels";
 
 const sessionStore = useWorkspaceSessionStore();
 const rpc = useWorkspaceRpc();
@@ -268,17 +269,7 @@ const modelDisplay = computed(() => {
   return model ? `${model.provider}/${model.id}` : "未选择模型";
 });
 
-const thinkingDisplay = computed(() => {
-  const labels: Record<string, string> = {
-    off: "关闭",
-    minimal: "轻量",
-    low: "低",
-    medium: "标准",
-    high: "深入",
-    xhigh: "极深",
-  };
-  return labels[rpc.sessionState.value?.thinkingLevel || "medium"] || rpc.sessionState.value?.thinkingLevel || "标准";
-});
+const thinkingDisplay = computed(() => thinkingLevelLabel(rpc.sessionState.value?.thinkingLevel || "medium"));
 
 const modelButtonDisplay = computed(() => {
   const model = rpc.sessionState.value?.model;
@@ -297,18 +288,7 @@ const modelOnlyDisplay = computed(() => {
   return model ? `${model.provider}/${model.id}` : "未选择模型";
 });
 
-const cleanThinkingDisplay = computed(() => {
-  const labels: Record<string, string> = {
-    off: "关闭",
-    minimal: "轻量",
-    low: "低",
-    medium: "标准",
-    high: "深入",
-    xhigh: "极深",
-  };
-  const level = rpc.sessionState.value?.thinkingLevel || "medium";
-  return labels[level] || level;
-});
+const cleanThinkingDisplay = computed(() => thinkingLevelLabel(rpc.sessionState.value?.thinkingLevel || "medium"));
 const thinkingButtonDisplay = computed(() => `思考：${cleanThinkingDisplay.value}`);
 const thinkingButtonDisabled = computed(() => !rpc.sessionState.value?.model);
 
