@@ -461,6 +461,11 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     await refreshState();
   }
 
+  async function setAcp(enabled: boolean): Promise<void> {
+    await sendCommandOrThrow({ type: "set_acp", enabled });
+    await refreshState();
+  }
+
   async function setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
     await sendCommand({ type: "set_follow_up_mode", mode });
   }
@@ -545,6 +550,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     setSteeringMode,
     setFollowUpMode,
     compact,
+    setAcp,
     reloadResources,
     getThemes,
     getResourceStatus,

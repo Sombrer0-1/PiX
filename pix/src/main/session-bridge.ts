@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import { chmodSync, existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { basename, isAbsolute, join, relative, resolve } from "path";
 import { lockSync } from "proper-lockfile";
 import { shell } from "electron";
@@ -32,6 +32,7 @@ import {
 	DefaultResourceLoader,
 	ModelRegistry,
 	getAgentDir,
+	createActiveCompressionExtension,
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
 import { aggregateSubagentUsage, isSubagentDetails } from "../shared/subagent-types.js";
@@ -307,6 +308,59 @@ function resolveHeaders(
 	return Object.keys(resolved).length > 0 ? resolved : undefined;
 }
 
+function guiDefaultAcp(gui: GuiSettings | undefined): boolean {
+	return gui?.defaultAcp === true;
+}
+
+function initialAcp(gui: GuiSettings | undefined, parentAcp?: boolean): boolean {
+	if (parentAcp !== undefined) return parentAcp;
+	return guiDefaultAcp(gui);
+}
+
+/** Read the parent header line in bounded chunks; cwd-bearing headers can exceed a single small read. */
+function readParentAcp(parentSession: string | undefined): boolean | undefined {
+	if (!parentSession) return undefined;
+	const CHUNK = 4096;
+	const MAX_HEADER_BYTES = 65536;
+	try {
+		const fd = openSync(parentSession, "r");
+		try {
+			const chunks: Buffer[] = [];
+			let total = 0;
+			let newlineAt = -1;
+			while (total < MAX_HEADER_BYTES) {
+				const buffer = Buffer.alloc(CHUNK);
+				const bytesRead = readSync(fd, buffer, 0, CHUNK, total);
+				if (bytesRead === 0) break;
+				const slice = buffer.subarray(0, bytesRead);
+				const localNewline = slice.indexOf(0x0a);
+				chunks.push(slice);
+				if (localNewline !== -1) {
+					newlineAt = total + localNewline;
+					break;
+				}
+				total += bytesRead;
+			}
+			if (chunks.length === 0) return undefined;
+			const firstLine =
+				(newlineAt !== -1
+					? Buffer.concat(chunks).subarray(0, newlineAt)
+					: Buffer.concat(chunks)
+				)
+					.toString("utf8")
+					.replace(/\r$/, "");
+			if (!firstLine) return undefined;
+			const header = JSON.parse(firstLine) as { type?: unknown; acp?: unknown };
+			if (header?.type !== "session") return undefined;
+			return header.acp === true;
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+}
+
 export class SessionBridge {
 	private readonly _role: SessionBridgeRole;
 	private _productEventCollector: ProductEventCollector | undefined;
@@ -402,6 +456,11 @@ export class SessionBridge {
 		const settingsManager = this._createSettingsManager(this._physicalCwd);
 		const sessionDir = this._getSessionDir(this._physicalCwd, settingsManager.getSessionDir());
 		this._sessionManager = SessionManager.continueRecent(this._physicalCwd, sessionDir);
+		// continueRecent with no recent file internally newSession() without acp.
+		// Unflushed empty sessions take GuiSettings.defaultAcp; flushed files use header only.
+		if (!this._sessionManager.isFlushed()) {
+			this._sessionManager.setAcp(guiDefaultAcp(this._guiSettings));
+		}
 
 		try {
 			const result = await this._createSession(this._physicalCwd, this._sessionManager, {
@@ -605,12 +664,31 @@ export class SessionBridge {
 	async newSession(parentSession?: string): Promise<CommandResult> {
 		const previousSessionFile = this._session?.sessionFile;
 		const sessionDir = this._sessionManager?.getSessionDir();
+		let validatedParentSession: string | undefined;
+		if (parentSession) {
+			try {
+				if (!sessionDir || !parentSession.endsWith(".jsonl")) {
+					throw new Error("Invalid parent session path.");
+				}
+				this._assertSessionPathInNamespace(parentSession, sessionDir);
+				validatedParentSession = parentSession;
+			} catch (err) {
+				// Lineage is dropped on invalid paths; log so the missing
+				// parentSession in the new header is diagnosable.
+				console.warn(
+					`[SessionBridge] newSession dropped invalid parent session ${parentSession}:`,
+					err instanceof Error ? err.message : String(err),
+				);
+				validatedParentSession = undefined;
+			}
+		}
+		const parentAcpIfAny = validatedParentSession ? readParentAcp(validatedParentSession) : undefined;
 		await this._closeCurrentSession("new");
 
-		this._sessionManager = SessionManager.create(this._physicalCwd, sessionDir);
-		if (parentSession) {
-			this._sessionManager.newSession({ parentSession });
-		}
+		this._sessionManager = SessionManager.create(this._physicalCwd, sessionDir, {
+			...(validatedParentSession ? { parentSession: validatedParentSession } : {}),
+			acp: initialAcp(this._guiSettings, parentAcpIfAny),
+		});
 
 		const result = await this._createSession(this._physicalCwd, this._sessionManager, {
 			type: "session_start",
@@ -676,8 +754,10 @@ export class SessionBridge {
 			if (label) {
 				sessionManager.appendLabelChange(selectedEntry.id, label);
 			}
-			const newSessionManager = SessionManager.create(this._physicalCwd, sessionDir);
-			newSessionManager.newSession({ parentSession: currentSessionFile });
+			const newSessionManager = SessionManager.create(this._physicalCwd, sessionDir, {
+				parentSession: currentSessionFile,
+				acp: sessionManager.getAcp(),
+			});
 			await this._closeCurrentSession("fork");
 			this._sessionManager = newSessionManager;
 
@@ -1247,7 +1327,20 @@ export class SessionBridge {
 	}
 
 	async compact(customInstructions?: string): Promise<void> {
-		await this._getSession().compact(customInstructions);
+		const session = this._getSession();
+		if (session.sessionManager.getAcp()) {
+			throw new Error("ACP_COMPACTION_DISABLED");
+		}
+		await session.compact(customInstructions);
+	}
+
+	async setAcp(enabled: boolean): Promise<void> {
+		const session = this._getSession();
+		if (session.isAcpLocked()) {
+			throw new Error("ACP_LOCKED");
+		}
+		session.sessionManager.setAcp(enabled);
+		await session.reload();
 	}
 
 	setSessionName(name: string): void {
@@ -1275,6 +1368,10 @@ export class SessionBridge {
 			sessionId: session.sessionId,
 			sessionName: session.sessionManager.getSessionName() ?? undefined,
 			autoCompactionEnabled: session.settingsManager.getCompactionEnabled(),
+			acp: {
+				enabled: session.sessionManager.getAcp(),
+				locked: session.isAcpLocked(),
+			},
 			messageCount: session.messages.length,
 			pendingMessageCount: this._pendingMessageCount,
 			blockImages: session.settingsManager.getBlockImages(),
@@ -2143,6 +2240,7 @@ export class SessionBridge {
 					extensionFactories: [
 						(pi) => { mcpAdapter.register(pi); },
 						(pi) => { this._teamManager?.registerLeaderTools(pi); },
+						createActiveCompressionExtension(() => sessionManager),
 					],
 				});
 				await resourceLoader.reload();
@@ -2173,6 +2271,7 @@ export class SessionBridge {
 							thinkingLevel: parent?.thinkingLevel ?? "off",
 							executionMode: parent?.settingsManager.getExecutionMode() ?? "approval",
 							verificationGate: parent?.settingsManager.getVerificationGateEnabled() ?? false,
+							acp: parent?.sessionManager.getAcp() === true,
 						};
 					},
 					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
@@ -2388,6 +2487,7 @@ export class SessionBridge {
 				extensionFactories: [
 					(pi) => { mcpAdapter.register(pi); },
 					(pi) => { this._teamManager?.registerLeaderTools(pi); },
+					createActiveCompressionExtension(() => sessionManager),
 				],
 			});
 			await resourceLoader.reload();

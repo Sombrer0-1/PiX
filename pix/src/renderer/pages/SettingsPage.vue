@@ -48,6 +48,7 @@ const followUpMode = ref<"all" | "one-at-a-time">("one-at-a-time");
 const executionMode = ref<"read-only" | "approval" | "unattended">("approval");
 const verificationGate = ref(true);
 const autoCompact = ref(true);
+const defaultAcp = ref(false);
 const quietStartup = ref(false);
 
 const enabledModels = ref("");
@@ -267,6 +268,7 @@ onMounted(async () => {
   enableProductAnalytics.value = settingsStore.settings.enableProductAnalytics ?? false;
   autoBackgroundMs.value = settingsStore.autoBackgroundMs;
   agentTaskMaxConcurrent.value = settingsStore.agentTaskMaxConcurrent;
+  defaultAcp.value = settingsStore.settings.defaultAcp === true;
   wslEnabled.value = settingsStore.settings.wsl?.enabled ?? false;
   wslDistro.value = settingsStore.settings.wsl?.distro ?? "";
   wslDefaultCwd.value = settingsStore.settings.wsl?.defaultCwd || "/home";
@@ -364,6 +366,7 @@ async function saveSettings(): Promise<void> {
       // 1.4.1: auto-background threshold; 0 = off.
       autoBackgroundMs: autoBackgroundMs.value,
       agentTaskMaxConcurrent: agentTaskMaxConcurrent.value,
+      defaultAcp: defaultAcp.value === true ? true : undefined,
       wsl: {
         enabled: wslEnabled.value,
         distro: wslDistro.value,
@@ -488,6 +491,14 @@ async function downloadAndInstall(): Promise<void> {
             </v-select>
             <v-switch v-model="verificationGate" label="完成前验证提醒" hint="代码或配置被修改后，提醒 Agent 在收尾前运行针对性的测试、类型检查、构建或打包。" persistent-hint class="mb-4" />
             <v-switch v-model="autoCompact" label="自动压缩" hint="达到阈值时自动压缩上下文。" persistent-hint class="mb-4" />
+            <v-switch
+              v-model="defaultAcp"
+              data-test="default-acp-switch"
+              label="新会话默认主动压缩"
+              hint="仅作用于全新空会话的初值，不影响已有会话。与自动压缩相互独立。"
+              persistent-hint
+              class="mb-4"
+            />
             <v-switch v-model="quietStartup" label="静默启动" hint="隐藏启动消息。" persistent-hint class="mb-4" />
           </div>
         </div>

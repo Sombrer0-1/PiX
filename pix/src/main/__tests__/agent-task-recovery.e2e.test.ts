@@ -374,7 +374,7 @@ async function runChild(model: Model<Api>): Promise<void> {
     agentDir,
     loadedAgents: undefined,
     modelRegistry: registry,
-    parentRuntime: { model, thinkingLevel: "off", executionMode: "approval", verificationGate: false },
+    parentRuntime: { model, thinkingLevel: "off", executionMode: "approval", verificationGate: false, acp: false },
     requestUserInput: async (request) => ({ id: request.id, answers: {}, cancelled: false }),
     hostDisposed: new Promise(() => {}),
   };

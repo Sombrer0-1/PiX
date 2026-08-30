@@ -153,6 +153,8 @@ export interface AgentTaskSpec {
   parentToolCallId: string;
   planLink?: AgentTaskPlanLink;
   createdAt: number;
+  /** Frozen parent ACP flag. Absent on old task.json; restore must treat missing as false. */
+  acp?: boolean;
 }
 
 export interface AgentTaskInfo {

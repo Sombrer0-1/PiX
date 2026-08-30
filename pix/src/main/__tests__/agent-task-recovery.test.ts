@@ -433,6 +433,7 @@ const PARENT_RUNTIME: SubagentParentRuntimeSnapshot = {
   thinkingLevel: "xhigh",
   executionMode: "approval",
   verificationGate: false,
+  acp: false,
 };
 
 /** Captures product events like the real collector (guard + no-op flush). */

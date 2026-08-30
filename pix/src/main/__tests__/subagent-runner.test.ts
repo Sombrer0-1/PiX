@@ -514,6 +514,7 @@ interface FacadeHarness {
     thinkingLevel: ThinkingLevel;
     executionMode: AgentExecutionMode;
     verificationGate: boolean;
+    acp: boolean;
   };
   projectLocation: ProjectLocation;
 }
@@ -600,6 +601,7 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): FacadeHar
     thinkingLevel: "high" as ThinkingLevel,
     executionMode: "approval" as AgentExecutionMode,
     verificationGate: true,
+    acp: false,
   };
   const loadedAgents = makeLoadedAgents();
 
@@ -1033,6 +1035,7 @@ await run("WSL runtime isolation: explicit shell background tools fail tool_unav
         thinkingLevel: "high",
         executionMode: "approval",
         verificationGate: true,
+        acp: false,
       }),
       requestUserInput: async (request) => ({ id: request.id, cancelled: false, answers: { allow_project_agents: "允许" } }),
       recordAuxiliaryUsage: () => {},
@@ -1133,6 +1136,7 @@ await run("WSL runtime isolation: all-tools activation excludes shell background
         thinkingLevel: "high",
         executionMode: "approval",
         verificationGate: true,
+        acp: false,
       }),
       requestUserInput: async (request) => ({ id: request.id, cancelled: false, answers: { allow_project_agents: "允许" } }),
       recordAuxiliaryUsage: () => {},
@@ -1323,7 +1327,7 @@ await run("tool: no service available fails closed with a structured failed resu
     modelRegistry: registry,
     isWsl: false,
     getLoadedAgents: () => makeLoadedAgents(),
-    getParentRuntime: () => ({ model: undefined, thinkingLevel: "off", executionMode: "approval", verificationGate: false }),
+    getParentRuntime: () => ({ model: undefined, thinkingLevel: "off", executionMode: "approval", verificationGate: false, acp: false }),
     requestUserInput: async (request) => ({ id: request.id, cancelled: false, answers: {} }),
     recordAuxiliaryUsage: () => {},
     getTaskService: () => undefined,

@@ -1,6 +1,11 @@
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";
+export {
+	ACP_TOOL_NAMES,
+	type AcpToolName,
+	createActiveCompressionExtension,
+} from "./core/active-compression/index.ts";
 
 // Config paths
 export { getAgentDir, VERSION } from "./config.ts";

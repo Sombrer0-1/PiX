@@ -66,6 +66,7 @@ export type RpcCommand =
   | { id?: string; type: "cycle_thinking_level" }
   // Compaction
   | { id?: string; type: "compact"; customInstructions?: string }
+  | { id?: string; type: "set_acp"; enabled: boolean }
   // Session
   | { id?: string; type: "get_session_stats" }
   | { id?: string; type: "switch_session"; sessionPath: string }
@@ -129,6 +130,8 @@ export interface RpcSessionState {
   sessionId: string;
   sessionName?: string;
   autoCompactionEnabled: boolean;
+  /** Optional; missing = ACP OFF. */
+  acp?: { enabled: boolean; locked: boolean };
   messageCount: number;
   pendingMessageCount: number;
   blockImages?: boolean;

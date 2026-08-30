@@ -22,6 +22,7 @@ import {
 	AuthStorage,
 	DefaultResourceLoader,
 	getAgentDir,
+	createActiveCompressionExtension,
 } from "@earendil-works/pi-coding-agent";
 import { McpAdapter } from "pi-mcp-adapter";
 import type { ProjectExecutionContext } from "./execution-context.js";
@@ -839,7 +840,9 @@ export class TeamManager {
     // Bootstrap consumers (Session/Settings/Resource loaders) use the physical
     // cwd; the Agent runtime uses the logical cwd via runtimeCwd below
     // (wsl_plan.md §4.8: worker bootstrap uses physical cwd).
-    const sessionManager = SessionManager.create(this._physicalCwd, sessionDir);
+    const sessionManager = SessionManager.create(this._physicalCwd, sessionDir, {
+      acp: this._leaderSession?.sessionManager.getAcp() === true,
+    });
     const settingsManager = SettingsManager.create(this._physicalCwd);
     // WSL mode disables Windows-side stdio MCP (decided by _isWsl, not by
     // backend existence). HTTP/SSE remain configurable (wsl_plan.md §4.10).
@@ -855,6 +858,7 @@ export class TeamManager {
         (pi) => { this._registerTeamMessagingTool(pi, agentId); },
         (pi) => { this._registerTeamTaskTool(pi, agentId); },
         (pi) => { this._registerTeamProtocolTool(pi, agentId); },
+        createActiveCompressionExtension(() => sessionManager),
       ],
     });
     await resourceLoader.reload();
@@ -3165,6 +3169,7 @@ export class TeamManager {
       const readyForWorker = currentTeam.taskList.getReadyTasks(currentWorker.info.role)
         .some((task) => !task.ownerAgentId || task.ownerAgentId === agentId);
       if (readyForWorker) return;
+      if (session.sessionManager.getAcp()) return;
 
       const instructions = [
         "Compact this teammate session after completing a team task.",

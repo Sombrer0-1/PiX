@@ -90,6 +90,7 @@ export function useWorkspaceRpc() {
     setSteeringMode: (mode: "all" | "one-at-a-time"): Promise<void> => activeRpc.value.setSteeringMode(mode),
     setFollowUpMode: (mode: "all" | "one-at-a-time"): Promise<void> => activeRpc.value.setFollowUpMode(mode),
     compact: (customInstructions?: string): Promise<void> => activeRpc.value.compact(customInstructions),
+    setAcp: (enabled: boolean): Promise<void> => activeRpc.value.setAcp(enabled),
     reloadResources: (): Promise<void> => activeRpc.value.reloadResources(),
     getThemes: (): Promise<ThemeInfo[] | null> => activeRpc.value.getThemes(),
     getResourceStatus: (): Promise<ResourceStatus | null> => activeRpc.value.getResourceStatus(),

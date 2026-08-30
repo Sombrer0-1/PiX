@@ -315,6 +315,7 @@ interface RunnerHarness {
     thinkingLevel: ThinkingLevel;
     executionMode: AgentExecutionMode;
     verificationGate: boolean;
+    acp: boolean;
   };
   requestUserInputHandler: (request: RequestUserInputRequest, signal?: AbortSignal) => Promise<RequestUserInputResponse>;
 }
@@ -332,6 +333,7 @@ function makeRunnerHarness(serviceStub?: AgentTaskService): RunnerHarness {
       thinkingLevel: "high",
       executionMode: "unattended",
       verificationGate: false,
+      acp: false,
     },
     requestUserInputHandler: async (request) => ({
       id: request.id,

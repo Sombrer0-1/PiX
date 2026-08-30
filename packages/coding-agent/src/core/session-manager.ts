@@ -37,11 +37,15 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/** Missing or false = this session does not use active compression. Older files omit the field. */
+	acp?: boolean;
 }
 
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+	/** Written to header.acp; omitted by default (equivalent to false). */
+	acp?: boolean;
 }
 
 export interface SessionEntryBase {
@@ -862,6 +866,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
+			acp: options?.acp === true ? true : undefined,
 		};
 		this.fileEntries = [header];
 		this.byId.clear();
@@ -935,6 +940,30 @@ export class SessionManager {
 
 	isFlushed(): boolean {
 		return this.flushed;
+	}
+
+	getAcp(): boolean {
+		return this.getHeader()?.acp === true;
+	}
+
+	isAcpLocked(): boolean {
+		return hasUserOrAssistantMessage(this.fileEntries);
+	}
+
+	setAcp(enabled: boolean): void {
+		if (this.isAcpLocked()) {
+			throw new Error("ACP_LOCKED");
+		}
+		const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
+		if (!header) return;
+		if (enabled) {
+			header.acp = true;
+		} else {
+			delete header.acp;
+		}
+		if (this.isFlushed()) {
+			this._rewriteFile();
+		}
 	}
 
 	/**
@@ -1347,6 +1376,7 @@ export class SessionManager {
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 		const newSessionFile = join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
+		const acp = this.getAcp();
 
 		const header: SessionHeader = {
 			type: "session",
@@ -1355,6 +1385,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: this.persist ? previousSessionFile : undefined,
+			acp: acp ? true : undefined,
 		};
 
 		// Collect labels for entries in the path
@@ -1469,8 +1500,8 @@ export class SessionManager {
 	}
 
 	/** Create an in-memory session (no file persistence) */
-	static inMemory(cwd: string = process.cwd()): SessionManager {
-		return new SessionManager(cwd, "", undefined, false);
+	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions): SessionManager {
+		return new SessionManager(cwd, "", undefined, false, options);
 	}
 
 	/**
@@ -1520,6 +1551,7 @@ export class SessionManager {
 			timestamp,
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
+			acp: sourceHeader.acp === true ? true : undefined,
 		};
 		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
 

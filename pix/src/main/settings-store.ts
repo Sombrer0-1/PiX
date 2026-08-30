@@ -226,6 +226,13 @@ export class SettingsStore {
         this.store.set("agentTaskMaxConcurrent", settings.agentTaskMaxConcurrent);
       }
     }
+    if (Object.hasOwn(settings, "defaultAcp")) {
+      if (settings.defaultAcp === undefined) {
+        this.store.delete("defaultAcp");
+      } else {
+        this.store.set("defaultAcp", settings.defaultAcp);
+      }
+    }
   }
 
   addRecentProject(path: string, name: string): void {

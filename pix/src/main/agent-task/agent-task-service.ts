@@ -1918,6 +1918,7 @@ export class AgentTaskService {
       thinkingLevel: parent.parentRuntime.thinkingLevel,
       executionMode: parent.parentRuntime.executionMode,
       verificationGate: parent.parentRuntime.verificationGate,
+      acp: parent.parentRuntime.acp === true,
       project: structuredClone(parent.project),
       workspaceId: workspaceIdOf(parent.project.physicalPath),
       agentDir: parent.agentDir,

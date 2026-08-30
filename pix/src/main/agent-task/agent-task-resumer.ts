@@ -374,7 +374,7 @@ export class AgentTaskResumer {
     } else {
       let created: { manager: SessionManager; fileName: string; leafId: string; path: string };
       try {
-        created = this._createSessionForNextItem(task, checkpoint.activeItemIndex, item);
+        created = this._createSessionForNextItem(task, checkpoint.activeItemIndex, item, spec);
       } catch (error) {
         return { ok: false, reason: this._prepareFailureReason(error) };
       }
@@ -541,6 +541,7 @@ export class AgentTaskResumer {
     task: AgentTaskInfo,
     itemIndex: number,
     item: AgentTaskItemSpec,
+    spec: AgentTaskSpec,
   ): { manager: SessionManager; fileName: string; leafId: string; path: string } {
     const taskSessionDir = this._store.getTaskSessionDir(task.workspaceId, task.taskId);
     mkdirSync(taskSessionDir, { recursive: true });
@@ -554,7 +555,14 @@ export class AgentTaskResumer {
     // that does not exist yet).
     writeFileSync(
       path,
-      `${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp, cwd: task.project.physicalPath })}\n`,
+      `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: sessionId,
+        timestamp,
+        cwd: task.project.physicalPath,
+        acp: spec.acp === true ? true : undefined,
+      })}\n`,
       "utf-8",
     );
     try {

@@ -141,6 +141,15 @@ function extractContentText(message: AgentMessage): string {
   return "";
 }
 
+/** Display-layer defense: strip model-echoed ACP ref tags so they never leak in the UI. */
+const ACP_DISPLAY_TAG_RE = /<acp\b[^>]*>[\s\S]*?<\/acp>/gi;
+
+function stripAcpDisplayTags(text: string): string {
+  // Display-only: drop echoed <acp> tags. Do not normalize unrelated whitespace
+  // (Markdown hard breaks are two trailing spaces + newline).
+  return text.replace(ACP_DISPLAY_TAG_RE, "");
+}
+
 function isInternalCustomMessage(message: AgentMessage): boolean {
   return message.role === "custom" && (
     message.context === "internal" ||
@@ -274,8 +283,9 @@ function extractMessageDisplay(message: AgentMessage): MessageDisplay {
     : [];
 
   const displayText = typeof message.displayText === "string" ? message.displayText : undefined;
+  const text = displayText !== undefined ? displayText : parsed.text;
   return {
-    text: displayText !== undefined ? displayText : parsed.text,
+    text: stripAcpDisplayTags(text),
     attachments: mergeAttachments(metadataAttachments, parsed.attachments),
   };
 }
@@ -410,7 +420,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           ? blocks.find((b) => b.id === openThinkingBlockId && b.type === "thinking")
           : null;
         if (block && block.type === "thinking" && typeof ame.delta === "string") {
-          block.content += ame.delta;
+          block.content = stripAcpDisplayTags(block.content + ame.delta);
         }
         break;
       }
@@ -424,7 +434,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           // Backfill an empty block so it survives into the timeline instead of
           // being removed at the first output (直播/回放一致).
           if (block.content === "" && typeof ame.content === "string" && ame.content !== "") {
-            block.content = ame.content;
+            block.content = stripAcpDisplayTags(ame.content);
           }
           block.phase = "ended";
         }
@@ -653,7 +663,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     const block: DisplayBlock = {
       id: nextBlockId(),
       type: "agent-message",
-      content: text,
+      content: stripAcpDisplayTags(text),
       isStreaming: isStreamingBlock,
       timestamp,
     };
@@ -747,7 +757,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           } else {
             const block = blocks.find((b) => b.id === currentAgentBlockId);
             if (block && block.type === "agent-message") {
-              block.content = text;
+              block.content = stripAcpDisplayTags(text);
             }
           }
         }
@@ -1083,7 +1093,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
                 blocks.push({
                   id: nextBlockId(),
                   type: "thinking",
-                  content: thinking,
+                  content: stripAcpDisplayTags(thinking),
                   phase: "ended",
                   superseded: true,
                   timestamp,

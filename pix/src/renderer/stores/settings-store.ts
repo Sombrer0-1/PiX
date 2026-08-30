@@ -145,6 +145,8 @@ export const useSettingsStore = defineStore("settings", () => {
     agentTaskMaxConcurrent: computed<number>(
       () => settings.value.agentTaskMaxConcurrent ?? AGENT_TASK_DEFAULT_RUNNING_SLOTS,
     ),
+    // ACP: only seeds brand-new empty sessions; absent / undefined = false.
+    defaultAcp: computed<boolean>(() => settings.value.defaultAcp === true),
     wslDistros,
     wslDiagnostic,
     wslDistrosLoaded,

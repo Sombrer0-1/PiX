@@ -1063,6 +1063,89 @@ describe("thinking blocks (PiX 1.5)", () => {
 // remainingSeconds (retry countdown)
 // ============================================================================
 
+describe("ACP display-tag strip", () => {
+  it("does not show <acp> XML in assistant display text", () => {
+    const a = createDisplayBlockAssembler();
+    const leaked = 'hello <acp tokens="1" type="x">m00001</acp> world';
+    a.applyEvents([
+      msgStart(makeMessage({ role: "assistant", content: leaked, timestamp: 200 })),
+      msgEnd(makeMessage({ role: "assistant", content: leaked, timestamp: 200 })),
+    ]);
+    const agent = a.blocks.find((b) => b.type === "agent-message");
+    expect(agent?.type).toBe("agent-message");
+    if (agent && agent.type === "agent-message") {
+      expect(agent.content).not.toContain("<acp");
+      expect(agent.content).not.toContain("</acp>");
+      expect(agent.content).not.toContain("m00001");
+      expect(agent.content).toContain("hello");
+      expect(agent.content).toContain("world");
+    }
+  });
+
+  it("strips ACP tags from replayed assistant text", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [{ type: "text", text: '<acp tokens="1" type="x">m00001</acp>kept' }],
+          timestamp: 200,
+        }),
+      },
+    ]);
+    const agent = a.blocks.find((b) => b.type === "agent-message");
+    expect(agent?.type).toBe("agent-message");
+    if (agent && agent.type === "agent-message") {
+      expect(agent.content).not.toContain("<acp");
+      expect(agent.content).not.toContain("m00001");
+      expect(agent.content).toContain("kept");
+    }
+  });
+
+  it("preserves Markdown hard line breaks when there is no ACP tag", () => {
+    const a = createDisplayBlockAssembler();
+    const hardBreak = "line  \nnext";
+    a.applyEvents([
+      msgStart(makeMessage({ role: "assistant", content: hardBreak, timestamp: 200 })),
+      msgEnd(makeMessage({ role: "assistant", content: hardBreak, timestamp: 200 })),
+    ]);
+    const agent = a.blocks.find((b) => b.type === "agent-message");
+    expect(agent?.type).toBe("agent-message");
+    if (agent && agent.type === "agent-message") {
+      expect(agent.content).toBe("line  \nnext");
+    }
+  });
+
+  it("strips ACP tags from replayed thinking content", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: 'reason <acp tokens="1" type="x">m00001</acp> more' } as { type: string; text?: string },
+            { type: "text", text: "answer" },
+          ],
+          timestamp: 200,
+        }),
+      },
+    ]);
+    const thinking = a.blocks.find((b) => b.type === "thinking");
+    expect(thinking?.type).toBe("thinking");
+    if (thinking && thinking.type === "thinking") {
+      expect(thinking.content).not.toContain("<acp");
+      expect(thinking.content).not.toContain("</acp>");
+      expect(thinking.content).not.toContain("m00001");
+      expect(thinking.content).toContain("reason");
+      expect(thinking.content).toContain("more");
+    }
+  });
+});
+
 describe("remainingSeconds", () => {
   it("returns the ceiling of leftover seconds before the deadline", () => {
     expect(remainingSeconds(1_000, 4_000, 1_001)).toBe(4);

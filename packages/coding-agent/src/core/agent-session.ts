@@ -414,6 +414,8 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	/** Set on _runAgentPrompt entry; not persisted. Locks ACP before assistant is written. */
+	private _acpAgentLoopStarted = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1203,6 +1205,11 @@ export class AgentSession {
 		return this.agent.state.isStreaming;
 	}
 
+	/** ACP switch is locked once messages exist, a turn is streaming, or an agent loop has started. */
+	isAcpLocked(): boolean {
+		return this.sessionManager.isAcpLocked() || this.isStreaming || this._acpAgentLoopStarted;
+	}
+
 	/** Current effective system prompt (includes any per-turn extension modifications) */
 	get systemPrompt(): string {
 		return this.agent.state.systemPrompt;
@@ -1440,6 +1447,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		this._acpAgentLoopStarted = true;
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
@@ -2517,6 +2525,9 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		if (this.sessionManager.getAcp()) {
+			throw new Error("ACP_COMPACTION_DISABLED");
+		}
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -2676,6 +2687,7 @@ export class AgentSession {
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+		if (this.sessionManager.getAcp()) return false;
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -4060,6 +4072,7 @@ export class AgentSession {
 			// Store the physical (host) cwd in session metadata; the renderer
 			// translates it to the logical path when displaying to the model.
 			cwd: this.sessionManager.getCwd(),
+			acp: this.sessionManager.getAcp() || undefined,
 		};
 
 		const branchEntries = this.sessionManager.getBranch();

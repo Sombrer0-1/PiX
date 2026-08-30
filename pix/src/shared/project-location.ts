@@ -24,6 +24,8 @@
  * (AGENT_TASK_DEFAULT_RUNNING_SLOTS = 4).
  * Migrations are per-version and never write the optional fields: an absent
  * `autoBackgroundMs` means the consumer default (0 = off).
+ * `defaultAcp` is optional; absent / undefined = false. It only seeds brand-new
+ * empty sessions; resume does not use it.
  */
 
 // ============================================================================
@@ -135,4 +137,8 @@ export interface GuiSettings {
    * Integer 1–8; absent = AGENT_TASK_DEFAULT_RUNNING_SLOTS (4).
    */
   agentTaskMaxConcurrent?: number;
+  /**
+   * 仅用于全新空会话的初值。缺省 / undefined = false。resume 不使用。
+   */
+  defaultAcp?: boolean;
 }

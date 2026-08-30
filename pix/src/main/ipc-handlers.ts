@@ -76,6 +76,7 @@ const SETTING_KEYS = new Set([
   "enableProductAnalytics",
   "autoBackgroundMs",
   "agentTaskMaxConcurrent",
+  "defaultAcp",
 ]);
 
 const AUTO_BACKGROUND_MS_VALUES = new Set<number>([0, 60_000, 120_000, 300_000]);
@@ -261,6 +262,12 @@ function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSetting
       if (parsed !== undefined) {
         sanitized.agentTaskMaxConcurrent = parsed;
       }
+    }
+  }
+  if (Object.hasOwn(settings, "defaultAcp")) {
+    const value = settings.defaultAcp;
+    if (value === undefined || typeof value === "boolean") {
+      sanitized.defaultAcp = value;
     }
   }
 
@@ -987,6 +994,9 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
     // Compaction
     case "compact":
       await bridge.compact(cmd.customInstructions);
+      return null;
+    case "set_acp":
+      await bridge.setAcp(cmd.enabled);
       return null;
 
     // Session

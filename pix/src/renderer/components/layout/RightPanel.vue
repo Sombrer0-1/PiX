@@ -31,6 +31,7 @@ const agentTaskSessionNames = computed(() => {
 // Compaction state
 const isCompacting = computed(() => rpc.sessionState.value?.isCompacting ?? false);
 const isStreaming = computed(() => rpc.isStreaming.value);
+const acpEnabled = computed(() => rpc.sessionState.value?.acp?.enabled === true);
 const canCompact = computed(() =>
   rpc.isConnected.value &&
   !isStreaming.value &&
@@ -227,8 +228,11 @@ watch(() => teamStore.teamMode, () => {
     <div class="info-card">
       <div class="card-title-row">
         <span class="card-title">Token 用量</span>
+        <span v-if="acpEnabled" class="acp-badge" data-test="acp-badge" title="主动压缩已启用">ACP</span>
         <button
+          v-else
           class="card-action-btn compact-btn"
+          data-test="compact-btn"
           :class="{ compacting: isCompacting }"
           :disabled="!canCompact"
           :title="isCompacting ? '正在压缩...' : !rpc.isConnected.value ? '未连接会话' : isStreaming ? '运行中，请等待完成' : '压缩上下文'"
@@ -475,6 +479,17 @@ watch(() => teamStore.teamMode, () => {
 
 .compact-btn.compacting {
   color: var(--pix-warning);
+}
+
+.acp-badge {
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-semibold);
+  letter-spacing: 0.04em;
+  color: var(--pix-accent);
+  background: var(--pix-accent-light);
+  border-radius: var(--pix-radius-md);
+  padding: 2px 8px;
+  line-height: 1.4;
 }
 
 .spin-icon {

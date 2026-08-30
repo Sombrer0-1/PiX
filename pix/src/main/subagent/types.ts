@@ -47,6 +47,7 @@ export interface SubagentParentRuntimeSnapshot {
   thinkingLevel: ThinkingLevel;
   executionMode: AgentExecutionMode;
   verificationGate: boolean;
+  acp: boolean;
 }
 
 /**

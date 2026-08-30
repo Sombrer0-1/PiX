@@ -197,6 +197,12 @@ For sessions with a parent (created via `/fork`, `/clone`, or `newSession({ pare
 {"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project","parentSession":"/path/to/original/session.jsonl"}
 ```
 
+Optional `acp` enables session-level active compression. Missing or `false` = off, including all older session files that omit the field. `true` = this session uses ACP.
+
+```json
+{"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project","acp":true}
+```
+
 ### SessionMessageEntry
 
 A message in the conversation. The `message` field contains an `AgentMessage`.
@@ -363,20 +369,24 @@ for (const line of lines) {
 Key methods for working with sessions programmatically.
 
 ### Static Creation Methods
-- `SessionManager.create(cwd, sessionDir?)` - New session
+- `SessionManager.create(cwd, sessionDir?, options?)` - New session (`options.acp` written to header)
 - `SessionManager.open(path, sessionDir?)` - Open existing session file
 - `SessionManager.continueRecent(cwd, sessionDir?)` - Continue most recent or create new
-- `SessionManager.inMemory(cwd?)` - No file persistence
-- `SessionManager.forkFrom(sourcePath, targetCwd, sessionDir?)` - Fork session from another project
+- `SessionManager.inMemory(cwd?, options?)` - No file persistence
+- `SessionManager.forkFrom(sourcePath, targetCwd, sessionDir?)` - Fork session from another project (copies source `header.acp`)
 
 ### Static Listing Methods
 - `SessionManager.list(cwd, sessionDir?, onProgress?)` - List sessions for a directory
 - `SessionManager.listAll(onProgress?)` - List all sessions across all projects
 
 ### Instance Methods - Session Management
-- `newSession(options?)` - Start a new session (options: `{ parentSession?: string }`)
-- `setSessionFile(path)` - Switch to a different session file
-- `createBranchedSession(leafId)` - Extract branch to new session file
+- `newSession(options?)` - Start a new session (options: `{ parentSession?: string, acp?: boolean }`). Each call is a fresh session; previous `header.acp` is not kept.
+- `setSessionFile(path)` - Switch to a different session file. Empty or corrupt files start a new session with ACP off.
+- `createBranchedSession(leafId)` - Extract branch to new session file (copies current `getAcp()`)
+- `getAcp()` - `header.acp === true`
+- `setAcp(enabled)` - Set `header.acp` on an unlocked session. Throws `ACP_LOCKED` after a user or assistant message. Unflushed empty sessions do not create a jsonl file.
+- `isAcpLocked()` - True after a `type:"message"` user or assistant entry. `custom_message` does not lock.
+- `isFlushed()` - Whether the session jsonl has been written to disk.
 
 ### Instance Methods - Appending (all return entry ID)
 - `appendMessage(message)` - Add message

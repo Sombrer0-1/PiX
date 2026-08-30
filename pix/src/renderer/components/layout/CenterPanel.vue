@@ -150,6 +150,22 @@ const canSend = computed(() =>
 const isStreaming = computed(() => rpc.isStreaming.value);
 const isCompacting = computed(() => rpc.sessionState.value?.isCompacting === true);
 const isBusy = computed(() => isStreaming.value || isCompacting.value);
+const isEmptySession = computed(() => sessionStore.displayBlocks.value.length === 0);
+const acpEnabled = computed(() => rpc.sessionState.value?.acp?.enabled === true);
+const acpLocked = computed(() => rpc.sessionState.value?.acp?.locked === true);
+const showAcpToggle = computed(() => isEmptySession.value && rpc.isConnected.value);
+
+async function onAcpToggle(enabled: boolean | null): Promise<void> {
+  if (acpLocked.value) return;
+  try {
+    await rpc.setAcp(enabled === true);
+  } catch (err) {
+    // sendCommandOrThrow already surfaced the failure in the global error card.
+    // Resync so the switch reflects the authoritative session state.
+    console.error("[CenterPanel] setAcp failed:", err);
+    await rpc.refreshState();
+  }
+}
 /** 实际发出的思考档位（映射后值）；off 或无映射时为空。 */
 const streamingEffortLabel = computed(() => {
   const level = rpc.sessionState.value?.thinkingLevel;
@@ -959,9 +975,21 @@ function sendQuickStart(prompt: string): void {
             </span>
           </header>
           <div class="team-conversation" ref="contentArea" @scroll="handleContentScroll">
-            <div v-if="sessionStore.displayBlocks.value.length === 0" class="team-conversation-empty">
+            <div v-if="isEmptySession" class="team-conversation-empty">
               <v-icon icon="mdi-account-star-outline" size="28" />
               <strong>团队负责人已就绪</strong>
+              <v-switch
+                v-if="showAcpToggle"
+                :model-value="acpEnabled"
+                :disabled="acpLocked"
+                :readonly="acpLocked"
+                data-test="acp-session-toggle"
+                hide-details
+                density="compact"
+                color="primary"
+                label="主动压缩"
+                @update:model-value="onAcpToggle"
+              />
             </div>
             <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
             <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
@@ -977,7 +1005,7 @@ function sendQuickStart(prompt: string): void {
     <!-- Session content (normal mode) -->
     <template v-else>
     <div class="session-content" ref="contentArea" @scroll="handleContentScroll">
-      <div v-if="sessionStore.displayBlocks.value.length === 0" class="empty-state">
+      <div v-if="isEmptySession" class="empty-state">
         <div class="empty-orbit" aria-hidden="true">
           <span class="empty-planet"></span>
           <span class="empty-ring"></span>
@@ -986,6 +1014,19 @@ function sendQuickStart(prompt: string): void {
         </div>
         <p class="empty-title">新会话</p>
         <p class="empty-hint">在下方描述任务即可开始使用 Pi。</p>
+        <v-switch
+          v-if="showAcpToggle"
+          :model-value="acpEnabled"
+          :disabled="acpLocked"
+          :readonly="acpLocked"
+          data-test="acp-session-toggle"
+          hide-details
+          density="compact"
+          color="primary"
+          class="empty-acp-toggle"
+          label="主动压缩"
+          @update:model-value="onAcpToggle"
+        />
       </div>
 
       <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
@@ -1050,7 +1091,7 @@ function sendQuickStart(prompt: string): void {
 
         <!-- New-session onboarding hints -->
         <div
-          v-if="!pendingUserInput && sessionStore.displayBlocks.value.length === 0 && !isStreaming"
+          v-if="!pendingUserInput && isEmptySession && !isStreaming"
           class="onboarding-hints"
         >
           <span class="onboarding-label">从常见任务开始：</span>
@@ -1868,6 +1909,11 @@ function sendQuickStart(prompt: string): void {
 .empty-hint {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-secondary);
+}
+
+.empty-acp-toggle {
+  margin-top: var(--pix-space-md);
+  max-width: 220px;
 }
 
 /* Composer */

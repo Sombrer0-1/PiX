@@ -72,6 +72,8 @@ import {
   MAX_AGENT_TURNS as MAX_DEFINITION_AGENT_TURNS,
   SessionManager,
   SettingsManager,
+  ACP_TOOL_NAMES,
+  createActiveCompressionExtension,
   createAgentSession,
   isPathInsideCwd,
   type AgentSession,
@@ -262,6 +264,12 @@ function nestedSystemPromptOverride(item: AgentTaskItemSpec & { resolution: "rea
     }
     return parts;
   };
+}
+
+/** Union ACP tool names into an existing tools allowlist when the frozen spec has ACP on. */
+function withAcpToolsAllowlist(tools: string[] | undefined, acp: boolean | undefined): string[] | undefined {
+  if (tools === undefined || acp !== true) return tools;
+  return [...new Set([...tools, ...ACP_TOOL_NAMES])];
 }
 
 function createTaskControl(): TaskControl {
@@ -641,7 +649,8 @@ export class AgentTaskRuntime {
     // before building the seed, so SessionManager.open's silent-skip behavior
     // is never used as a corruption detector).
     const sessionPath = join(this._taskSessionDir, checkpoint.sessionFileName);
-    this._sessionManager = SessionManager.open(sessionPath, this._taskSessionDir, this._context.physicalCwd);
+    const sessionManager = SessionManager.open(sessionPath, this._taskSessionDir, this._context.physicalCwd);
+    this._sessionManager = sessionManager;
 
     // Mirror the startup dependency block of _runItem: loader reload first,
     // then the frozen execution snapshot, then createAgentSession.
@@ -656,6 +665,7 @@ export class AgentTaskRuntime {
         (pi) => {
           mcpAdapter.register(pi);
         },
+        createActiveCompressionExtension(() => sessionManager),
       ],
     });
     try {
@@ -674,9 +684,12 @@ export class AgentTaskRuntime {
       // outputSchema is already subset-gated by the worker, so the cast is
       // the frozen contract.
       const schemaChild = item.outputSchema !== undefined;
-      const tools = schemaChild && item.agent.tools !== undefined
-        ? [...new Set([...item.agent.tools, STRUCTURED_OUTPUT_TOOL_NAME])]
-        : item.agent.tools;
+      const tools = withAcpToolsAllowlist(
+        schemaChild && item.agent.tools !== undefined
+          ? [...new Set([...item.agent.tools, STRUCTURED_OUTPUT_TOOL_NAME])]
+          : item.agent.tools,
+        this._spec.acp,
+      );
       const created = await createAgentSession({
         cwd: this._context.physicalCwd,
         runtimeCwd: this._context.logicalCwd,
@@ -687,7 +700,7 @@ export class AgentTaskRuntime {
         modelRegistry: this._modelRegistry,
         model: effectiveModel,
         thinkingLevel: this._spec.thinkingLevel,
-        sessionManager: this._sessionManager,
+        sessionManager,
         settingsManager,
         resourceLoader: loader,
         extensionProviderPolicy: "read-only",
@@ -1017,8 +1030,12 @@ export class AgentTaskRuntime {
           // one the runtime keeps the 1.4.1 in-memory behavior.
           const sessionManager =
             this._taskSessionDir !== undefined
-              ? SessionManager.create(this._context.physicalCwd, this._taskSessionDir)
-              : SessionManager.inMemory(this._context.physicalCwd);
+              ? SessionManager.create(this._context.physicalCwd, this._taskSessionDir, {
+                  acp: this._spec.acp === true,
+                })
+              : SessionManager.inMemory(this._context.physicalCwd, {
+                  acp: this._spec.acp === true,
+                });
           this._sessionManager = this._taskSessionDir !== undefined ? sessionManager : undefined;
           mcpAdapterRef.current = new McpAdapter({ allowStdio: !this._context.isWsl });
           const loader = new DefaultResourceLoader({
@@ -1030,6 +1047,7 @@ export class AgentTaskRuntime {
               (pi) => {
                 mcpAdapterRef.current!.register(pi);
               },
+              createActiveCompressionExtension(() => sessionManager),
             ],
           });
           try {
@@ -1051,9 +1069,12 @@ export class AgentTaskRuntime {
             // submit_workflow_result into itself or the allowlist would hide
             // the custom tool.
             const schemaChild = item.outputSchema !== undefined;
-            const tools = schemaChild && item.agent.tools !== undefined
-              ? [...new Set([...item.agent.tools, STRUCTURED_OUTPUT_TOOL_NAME])]
-              : item.agent.tools;
+            const tools = withAcpToolsAllowlist(
+              schemaChild && item.agent.tools !== undefined
+                ? [...new Set([...item.agent.tools, STRUCTURED_OUTPUT_TOOL_NAME])]
+                : item.agent.tools,
+              this._spec.acp,
+            );
             const created = await createAgentSession({
               cwd: this._context.physicalCwd,
               runtimeCwd: this._context.logicalCwd,
