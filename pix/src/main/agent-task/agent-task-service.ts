@@ -70,6 +70,7 @@ import {
   type TaskCheckpoint,
   type TaskIndex,
   type TaskIndexEntry,
+  type TaskIndexProbe,
   type TaskLogEventPayload,
   type TaskMetadata,
 } from "./agent-task-store.js";
@@ -136,6 +137,11 @@ export const MAX_TASK_LOG_EVENTS = 10000;
 export const MAX_DELIVERY_RETRIES = 3;
 /** Base delay before the first delivery retry; doubles per attempt. */
 export const DELIVERY_RETRY_DELAY_MS = 500;
+/**
+ * Perf SDD §4.8 (S9): restoreAll processes workspaces in parallel with this
+ * concurrency cap; each workspace keeps its serial step order.
+ */
+export const RESTORE_WORKSPACE_CONCURRENCY = 4;
 
 /** Shape key for skipping identical mid-run task_state clones. Status / autoBackground / terminal jumps always differ. */
 function taskStateFingerprint(info: AgentTaskInfo): string {
@@ -2987,86 +2993,21 @@ export class AgentTaskService {
    * original parent tool promise no longer exists); only explicit user_cancel
    * keeps cancelled. Corrupted records surface as recovery issues and never
    * forge an AgentTaskInfo.
+   *
+   * Perf SDD §4.8 (S9): workspaces restore in parallel batches of
+   * RESTORE_WORKSPACE_CONCURRENCY (4); inside one workspace the serial step
+   * order is unchanged (probeIndex -> listTaskIds -> consumeCloseMarker ->
+   * per-task hydration -> group rebuild -> storage status), so per-workspace
+   * diagnostics stay in the serial order while cross-workspace diagnostics
+   * interleave by completion order (SDD 0.1 exception 6). The workspace-scoped
+   * index probe removes the per-task index.json/index.prev.json re-read.
    */
   async restoreAll(): Promise<AgentTaskRestoreReport> {
     const report: AgentTaskRestoreReport = { restored: 0, interrupted: 0, corrupted: 0, autoResumed: 0, autoFailed: 0, diagnostics: [] };
     const workspaces = await this._store.listWorkspaces();
-    for (const workspaceId of workspaces) {
-      const index = await this._store.readIndex(workspaceId);
-      const onDiskTaskIds = await this._store.listTaskIds(workspaceId);
-      if (!index) {
-        if (onDiskTaskIds.length === 0) {
-          report.diagnostics.push(`workspace ${workspaceId}: no readable index`);
-          await this._refreshStorageStatus(workspaceId);
-          continue;
-        }
-        report.diagnostics.push(`workspace ${workspaceId}: no readable index; reconciling ${onDiskTaskIds.length} on-disk task dir(s)`);
-      } else {
-        this._indexGenerations.set(workspaceId, index.generation);
-      }
-      const diagnosis = await this._store.consumeCloseMarker(workspaceId, index?.lastWriterRunId ?? this._runId);
-      report.diagnostics.push(`workspace ${workspaceId}: ${diagnosis.kind} shutdown`);
-      const hydratedByGroup = new Map<string, TaskEntry[]>();
-      const seen = new Set<string>();
-      const indexEntries = index?.tasks ?? [];
-      for (const indexEntry of indexEntries) {
-        seen.add(indexEntry.taskId);
-        const hydrated = await this._hydrateTask(workspaceId, indexEntry);
-        if (hydrated === null) {
-          report.corrupted++;
-          continue;
-        }
-        report.restored++;
-        if (hydrated.interruptedNow) {
-          report.interrupted++;
-        }
-        const groupTasks = hydratedByGroup.get(hydrated.entry.info.groupId);
-        if (groupTasks === undefined) {
-          hydratedByGroup.set(hydrated.entry.info.groupId, [hydrated.entry]);
-        } else {
-          groupTasks.push(hydrated.entry);
-        }
-      }
-      for (const taskId of onDiskTaskIds) {
-        if (seen.has(taskId)) {
-          continue;
-        }
-        report.diagnostics.push(`workspace ${workspaceId}: on-disk task ${taskId} missing from index; reconciling`);
-        const read = await this._store.readTask(workspaceId, taskId);
-        if (!read.metadata) {
-          this._emitRecoveryIssue({
-            taskId,
-            workspaceId,
-            generation: read.checkpoint?.generation ?? 0,
-            code: read.diagnostics.find((d) => d.code === "migration_failed" || d.code === "unknown_schema")?.code ?? "migration_failed",
-            message: "on-disk task directory has no readable metadata and is absent from the index",
-            recoverable: false,
-            readOnly: true,
-            updatedAt: Date.now(),
-          });
-          report.corrupted++;
-          continue;
-        }
-        const hydrated = await this._hydrateTask(workspaceId, indexEntryFromMetadata(read.metadata, this._runId));
-        if (hydrated === null) {
-          report.corrupted++;
-          continue;
-        }
-        report.restored++;
-        if (hydrated.interruptedNow) {
-          report.interrupted++;
-        }
-        const groupTasks = hydratedByGroup.get(hydrated.entry.info.groupId);
-        if (groupTasks === undefined) {
-          hydratedByGroup.set(hydrated.entry.info.groupId, [hydrated.entry]);
-        } else {
-          groupTasks.push(hydrated.entry);
-        }
-      }
-      for (const [groupId, entries] of hydratedByGroup) {
-        this._rebuildGroupEntry(groupId, entries);
-      }
-      await this._refreshStorageStatus(workspaceId);
+    for (let start = 0; start < workspaces.length; start += RESTORE_WORKSPACE_CONCURRENCY) {
+      const batch = workspaces.slice(start, start + RESTORE_WORKSPACE_CONCURRENCY);
+      await Promise.all(batch.map((workspaceId) => this._restoreWorkspace(workspaceId, report)));
     }
     // 1.5 (P1): no task may linger in interrupted waiting for a user decision
     // - the auto-recovery pass resumes what it safely can and converges the
@@ -3080,6 +3021,86 @@ export class AgentTaskService {
       this._scheduleRetention(workspaceId);
     }
     return report;
+  }
+
+  /** Perf SDD §4.8 (S9): one workspace's serial restore chain - the loop body of the former serial restoreAll. */
+  private async _restoreWorkspace(workspaceId: string, report: AgentTaskRestoreReport): Promise<void> {
+    const probe = await this._store.probeIndex(workspaceId);
+    const index = probe.index;
+    const onDiskTaskIds = await this._store.listTaskIds(workspaceId);
+    if (!index) {
+      if (onDiskTaskIds.length === 0) {
+        report.diagnostics.push(`workspace ${workspaceId}: no readable index`);
+        await this._refreshStorageStatus(workspaceId);
+        return;
+      }
+      report.diagnostics.push(`workspace ${workspaceId}: no readable index; reconciling ${onDiskTaskIds.length} on-disk task dir(s)`);
+    } else {
+      this._indexGenerations.set(workspaceId, index.generation);
+    }
+    const diagnosis = await this._store.consumeCloseMarker(workspaceId, index?.lastWriterRunId ?? this._runId);
+    report.diagnostics.push(`workspace ${workspaceId}: ${diagnosis.kind} shutdown`);
+    const hydratedByGroup = new Map<string, TaskEntry[]>();
+    const seen = new Set<string>();
+    const indexEntries = index?.tasks ?? [];
+    for (const indexEntry of indexEntries) {
+      seen.add(indexEntry.taskId);
+      const hydrated = await this._hydrateTask(workspaceId, indexEntry, probe);
+      if (hydrated === null) {
+        report.corrupted++;
+        continue;
+      }
+      report.restored++;
+      if (hydrated.interruptedNow) {
+        report.interrupted++;
+      }
+      const groupTasks = hydratedByGroup.get(hydrated.entry.info.groupId);
+      if (groupTasks === undefined) {
+        hydratedByGroup.set(hydrated.entry.info.groupId, [hydrated.entry]);
+      } else {
+        groupTasks.push(hydrated.entry);
+      }
+    }
+    for (const taskId of onDiskTaskIds) {
+      if (seen.has(taskId)) {
+        continue;
+      }
+      report.diagnostics.push(`workspace ${workspaceId}: on-disk task ${taskId} missing from index; reconciling`);
+      const read = await this._store.readTask(workspaceId, taskId, probe);
+      if (!read.metadata) {
+        this._emitRecoveryIssue({
+          taskId,
+          workspaceId,
+          generation: read.checkpoint?.generation ?? 0,
+          code: read.diagnostics.find((d) => d.code === "migration_failed" || d.code === "unknown_schema")?.code ?? "migration_failed",
+          message: "on-disk task directory has no readable metadata and is absent from the index",
+          recoverable: false,
+          readOnly: true,
+          updatedAt: Date.now(),
+        });
+        report.corrupted++;
+        continue;
+      }
+      const hydrated = await this._hydrateTask(workspaceId, indexEntryFromMetadata(read.metadata, this._runId), probe);
+      if (hydrated === null) {
+        report.corrupted++;
+        continue;
+      }
+      report.restored++;
+      if (hydrated.interruptedNow) {
+        report.interrupted++;
+      }
+      const groupTasks = hydratedByGroup.get(hydrated.entry.info.groupId);
+      if (groupTasks === undefined) {
+        hydratedByGroup.set(hydrated.entry.info.groupId, [hydrated.entry]);
+      } else {
+        groupTasks.push(hydrated.entry);
+      }
+    }
+    for (const [groupId, entries] of hydratedByGroup) {
+      this._rebuildGroupEntry(groupId, entries);
+    }
+    await this._refreshStorageStatus(workspaceId);
   }
 
   /**
@@ -3114,13 +3135,15 @@ export class AgentTaskService {
   /**
    * Rebuild one task's in-memory entry from metadata + events.jsonl +
    * checkpoint + index entry. Returns null (with a recovery issue emitted)
-   * when the record cannot be restored reliably.
+   * when the record cannot be restored reliably. Perf SDD §4.8 (S9): the
+   * workspace-scoped index probe lets readTask skip the per-task index re-read.
    */
   private async _hydrateTask(
     workspaceId: string,
     indexEntry: TaskIndexEntry,
+    indexProbe?: TaskIndexProbe,
   ): Promise<{ entry: TaskEntry; interruptedNow: boolean } | null> {
-    const read = await this._store.readTask(workspaceId, indexEntry.taskId);
+    const read = await this._store.readTask(workspaceId, indexEntry.taskId, indexProbe);
     const generation = read.checkpoint?.generation ?? 0;
 
     if (!read.metadata) {

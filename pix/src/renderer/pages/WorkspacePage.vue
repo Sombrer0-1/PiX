@@ -150,21 +150,29 @@ async function syncWorkspaceState(
   // cannot switch transports halfway through a mode transition.
   const targetRpc = mode ? teamLeaderRpc : singleRpc;
   const targetStore = mode ? teamLeaderSessionStore : singleSessionStore;
-  await targetRpc.refreshState();
-  await targetRpc.refreshModels();
-  await targetRpc.refreshSessionStats();
+  // Independent read RPCs, run in parallel. listSessions writes the store
+  // (and recent-project sessionCount), so it stays behind the mode guard:
+  // SDD 3.11 keeps guards at the aggregation point. The model table is not
+  // refreshed here: the connection path (refreshSessionData) already covers
+  // the first frame, and ModelSelector refreshes on open.
+  await Promise.all([
+    targetRpc.refreshState(),
+    targetRpc.refreshSessionStats(),
+  ]);
+  if (teamStore.teamMode !== mode) return;
+  if (mode) {
+    await projectStore.listTeamLeaderSessions();
+  } else {
+    await projectStore.listSessions();
+  }
   if (teamStore.teamMode !== mode) return;
 
   if (!mode) {
-    await projectStore.listSessions();
-    if (teamStore.teamMode !== mode) return;
     projectStore.syncCurrentSession(
       targetRpc.sessionState.value?.sessionFile,
       targetRpc.sessionState.value?.sessionId
     );
   } else {
-    await projectStore.listTeamLeaderSessions();
-    if (teamStore.teamMode !== mode) return;
     projectStore.syncCurrentTeamSession(
       targetRpc.sessionState.value?.sessionFile,
       targetRpc.sessionState.value?.sessionId,
@@ -357,15 +365,25 @@ onMounted(async () => {
   // Strip reactivity so the location can cross the IPC boundary.
   const location = toPlain(projectStore.currentProject);
   if (!singleRpc.isConnected.value) {
-    const attached = await singleRpc.attachToRunningSession();
-    const teamLeaderRunning = location ? await window.pixApi.isTeamLeaderRunning() : false;
-    const hasTeamSnapshot = location ? await window.pixApi.hasTeamSnapshot(location) : false;
+    // Three independent probes, run in parallel; the failure fallback is
+    // evaluated only after aggregation.
+    const [attached, teamLeaderRunning, hasTeamSnapshot] = await Promise.all([
+      singleRpc.attachToRunningSession(),
+      location ? window.pixApi.isTeamLeaderRunning() : Promise.resolve(false),
+      location ? window.pixApi.hasTeamSnapshot(location) : Promise.resolve(false),
+    ]);
     if (!attached && !teamLeaderRunning && !hasTeamSnapshot) {
       await router.push("/");
       return;
     }
   }
 
+  // Fetch provider auth status so the model selector shows correct badges.
+  // No data dependency on the team attach below, so run in parallel; the
+  // failure stays non-fatal.
+  const authRefreshed = authStore.refreshStatus().catch(() => {
+    // non-fatal
+  });
   if (location && !teamStore.teamMode) {
     const teamStarted = await attachTeamRuntimeIfNeeded(location);
     if (teamStarted) {
@@ -374,9 +392,7 @@ onMounted(async () => {
       teamLeaderSessionStore.clearSession();
     }
   }
-
-  // Fetch provider auth status so the model selector shows correct badges.
-  try { await authStore.refreshStatus(); } catch { /* non-fatal */ }
+  await authRefreshed;
 
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
   subscribeToModeEvents();

@@ -1,13 +1,13 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.ts";
-import { loadAgents, type LoadAgentsResult } from "./agents.ts";
+import { type LoadAgentsResult, loadAgents } from "./agents.ts";
 import type { ResourceDiagnostic } from "./diagnostics.ts";
 
-export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 export type { LoadAgentsResult } from "./agents.ts";
+export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
@@ -114,6 +114,97 @@ export function loadProjectContextFiles(options: {
 	contextFiles.push(...ancestorContextFiles);
 
 	return contextFiles;
+}
+
+// ============================================================================
+// Snapshot cache (S8)
+// ============================================================================
+
+/** (mtimeMs, size) stat fingerprint; null marks a tracked-but-absent path. */
+type SnapshotFileStat = { mtimeMs: number; size: number } | null;
+
+/**
+ * Pure-data resource inventory cached across reload() calls. Themes and
+ * extension modules are deliberately excluded: Theme instances are class
+ * instances whose sourceInfo the loader itself mutates in place (and whose
+ * prototype methods structuredClone would strip), and extensions /
+ * extensionFactories must re-register against every generation's extension
+ * runtime - reusing them across generations would register into stale
+ * runtimes. Dynamic imports hit the ESM module cache, so the repeated
+ * registration cost is negligible.
+ */
+interface ResourceInventory {
+	skills: Skill[];
+	skillDiagnostics: ResourceDiagnostic[];
+	prompts: PromptTemplate[];
+	promptDiagnostics: ResourceDiagnostic[];
+	agentsFiles: Array<{ path: string; content: string }>;
+	agentsResult: LoadAgentsResult;
+	systemPrompt: string | undefined;
+	appendSystemPrompt: string[];
+}
+
+interface ResourceSnapshotCacheEntry {
+	/** Discriminates loader configurations that shape the cached inventory. */
+	configKey: string;
+	skillPaths: string[];
+	promptPaths: string[];
+	/** Every file/directory involved in the cached scan, including absent candidates. */
+	stats: Map<string, SnapshotFileStat>;
+	inventory: ResourceInventory;
+}
+
+/** Module-level single-entry snapshot cache; stat-validated, self-invalidating. */
+let resourceSnapshotCache: ResourceSnapshotCacheEntry | undefined;
+
+const SNAPSHOT_CONTEXT_FILE_NAMES = ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+
+function statFingerprint(path: string): SnapshotFileStat {
+	try {
+		const stats = statSync(path);
+		return { mtimeMs: stats.mtimeMs, size: stats.size };
+	} catch {
+		return null;
+	}
+}
+
+function sameStatFingerprint(a: SnapshotFileStat, b: SnapshotFileStat): boolean {
+	if (a === null || b === null) return a === b;
+	return a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
+function stringArraysEqual(a: string[], b: string[]): boolean {
+	return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * Recursively record the stat of a candidate resource root and everything
+ * under it. Mirrors the skill/prompt loaders' traversal boundaries: dot
+ * directories and node_modules are not descended into (the loaders skip them
+ * too), while dot FILES are tracked because ignore files (.gitignore et al.)
+ * drive skill discovery.
+ */
+function collectPathStats(path: string, stats: Map<string, SnapshotFileStat>): void {
+	const fingerprint = statFingerprint(path);
+	stats.set(path, fingerprint);
+	if (fingerprint === null) return;
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(path, { withFileTypes: true }) as Dirent[];
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const childPath = join(path, entry.name);
+		if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
+			collectPathStats(childPath, stats);
+			continue;
+		}
+		const childFingerprint = statFingerprint(childPath);
+		if (childFingerprint !== null) {
+			stats.set(childPath, childFingerprint);
+		}
+	}
 }
 
 export interface DefaultResourceLoaderOptions {
@@ -341,6 +432,119 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 	}
 
+	/**
+	 * Snapshot caching is disabled for loaders with behavior-shaping override
+	 * functions: two closures with identical config keys could still produce
+	 * different inventories, and the cache cannot see through them.
+	 */
+	private isSnapshotEligible(): boolean {
+		return !(
+			this.extensionsOverride ||
+			this.skillsOverride ||
+			this.promptsOverride ||
+			this.themesOverride ||
+			this.agentsFilesOverride ||
+			this.agentsOverride ||
+			this.systemPromptOverride ||
+			this.appendSystemPromptOverride
+		);
+	}
+
+	/** Configuration fingerprint: everything constructor-level that shapes the inventory. */
+	private snapshotConfigKey(): string {
+		return JSON.stringify([
+			this.cwd,
+			this.agentDir,
+			this.noSkills,
+			this.noPromptTemplates,
+			this.noContextFiles,
+			this.systemPromptSource ?? null,
+			this.appendSystemPromptSource ?? null,
+			this.additionalSkillPaths,
+			this.additionalPromptTemplatePaths,
+		]);
+	}
+
+	/**
+	 * Validate a cached snapshot against the current FS. File fingerprints are
+	 * compared with stat; recorded directories are also readdir'd so a newly
+	 * created child still invalidates when the directory mtime is unchanged
+	 * (network / SMB / sync volumes).
+	 */
+	private snapshotStatsValid(stats: Map<string, SnapshotFileStat>): boolean {
+		for (const [path, fingerprint] of stats) {
+			if (!sameStatFingerprint(statFingerprint(path), fingerprint)) {
+				return false;
+			}
+		}
+		for (const [path, fingerprint] of stats) {
+			if (fingerprint === null) continue;
+			let entries: Dirent[];
+			try {
+				entries = readdirSync(path, { withFileTypes: true }) as Dirent[];
+			} catch {
+				continue;
+			}
+			for (const entry of entries) {
+				if (entry.isDirectory() && (entry.name === "node_modules" || entry.name.startsWith("."))) {
+					continue;
+				}
+				const childPath = join(path, entry.name);
+				if (stats.has(childPath)) continue;
+				// collectPathStats would have recorded this directory, or this file
+				// when stat succeeds; either is a new path the snapshot missed.
+				if (entry.isDirectory() || statFingerprint(childPath) !== null) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Build the full stat map for a fresh scan: skill/prompt path roots
+	 * (recursive), the agents directories, every project-context file candidate
+	 * (cwd ancestors + agentDir), the SYSTEM/APPEND_SYSTEM prompt candidates,
+	 * and the two settings.json files (the settings fingerprint). Absent
+	 * candidates are recorded as null so their later appearance invalidates
+	 * the snapshot.
+	 */
+	private collectInventoryStats(skillPaths: string[], promptPaths: string[]): Map<string, SnapshotFileStat> {
+		const stats = new Map<string, SnapshotFileStat>();
+		for (const path of [...skillPaths, ...promptPaths]) {
+			collectPathStats(path, stats);
+		}
+		collectPathStats(join(this.agentDir, "agents"), stats);
+		collectPathStats(join(this.cwd, CONFIG_DIR_NAME, "agents"), stats);
+		const contextRoots = [this.agentDir];
+		let currentDir = this.cwd;
+		const root = resolve("/");
+		while (true) {
+			contextRoots.push(currentDir);
+			if (currentDir === root) break;
+			const parentDir = resolve(currentDir, "..");
+			if (parentDir === currentDir) break;
+			currentDir = parentDir;
+		}
+		for (const dir of contextRoots) {
+			for (const name of SNAPSHOT_CONTEXT_FILE_NAMES) {
+				const path = join(dir, name);
+				stats.set(path, statFingerprint(path));
+			}
+		}
+		for (const path of [
+			join(this.cwd, CONFIG_DIR_NAME, "SYSTEM.md"),
+			join(this.agentDir, "SYSTEM.md"),
+			join(this.cwd, CONFIG_DIR_NAME, "APPEND_SYSTEM.md"),
+			join(this.agentDir, "APPEND_SYSTEM.md"),
+			join(this.agentDir, "settings.json"),
+			join(this.cwd, CONFIG_DIR_NAME, "settings.json"),
+		]) {
+			stats.set(path, statFingerprint(path));
+		}
+		return stats;
+	}
+
 	async reload(): Promise<void> {
 		await this.settingsManager.reload();
 		const resolvedPaths = await this.packageManager.resolve();
@@ -414,6 +618,37 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledPrompts = getEnabledPaths(cliExtensionPaths.prompts);
 		const cliEnabledThemes = getEnabledPaths(cliExtensionPaths.themes);
 
+		// S8: derive the final skill/prompt path lists up front so the snapshot
+		// fast path can validate them before any resource loading happens.
+		const skillPaths = this.noSkills
+			? this.mergePaths(cliEnabledSkills, this.additionalSkillPaths)
+			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], this.additionalSkillPaths);
+		const promptPaths = this.noPromptTemplates
+			? this.mergePaths(cliEnabledPrompts, this.additionalPromptTemplatePaths)
+			: this.mergePaths([...cliEnabledPrompts, ...enabledPrompts], this.additionalPromptTemplatePaths);
+
+		// S8 snapshot fast path: when the loader configuration, the derived path
+		// lists, and the stat of every file/directory involved in the last full
+		// scan are unchanged, the pure-data inventory is reused as a deep copy;
+		// only extensions and themes still reload (they must re-register per
+		// generation). Otherwise the reload runs in full and replaces the cache.
+		let inventorySnapshot: ResourceInventory | undefined;
+		let freshSnapshotStats: Map<string, SnapshotFileStat> | undefined;
+		if (this.isSnapshotEligible()) {
+			const cached = resourceSnapshotCache;
+			if (
+				cached &&
+				cached.configKey === this.snapshotConfigKey() &&
+				stringArraysEqual(cached.skillPaths, skillPaths) &&
+				stringArraysEqual(cached.promptPaths, promptPaths) &&
+				this.snapshotStatsValid(cached.stats)
+			) {
+				inventorySnapshot = structuredClone(cached.inventory);
+			} else {
+				freshSnapshotStats = this.collectInventoryStats(skillPaths, promptPaths);
+			}
+		}
+
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
@@ -441,36 +676,37 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
 		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
-		const skillPaths = this.noSkills
-			? this.mergePaths(cliEnabledSkills, this.additionalSkillPaths)
-			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], this.additionalSkillPaths);
-
-		this.lastSkillPaths = skillPaths;
-		this.updateSkillsFromPaths(skillPaths, metadataByPath);
-		for (const p of this.additionalSkillPaths) {
-			if (isLocalPath(p)) {
-				const resolved = this.resolveResourcePath(p);
-				if (!existsSync(resolved) && !this.skillDiagnostics.some((d) => d.path === resolved)) {
-					this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: resolved });
+		if (inventorySnapshot) {
+			this.lastSkillPaths = skillPaths;
+			this.skills = inventorySnapshot.skills;
+			this.skillDiagnostics = inventorySnapshot.skillDiagnostics;
+			this.lastPromptPaths = promptPaths;
+			this.prompts = inventorySnapshot.prompts;
+			this.promptDiagnostics = inventorySnapshot.promptDiagnostics;
+		} else {
+			this.lastSkillPaths = skillPaths;
+			this.updateSkillsFromPaths(skillPaths, metadataByPath);
+			for (const p of this.additionalSkillPaths) {
+				if (isLocalPath(p)) {
+					const resolved = this.resolveResourcePath(p);
+					if (!existsSync(resolved) && !this.skillDiagnostics.some((d) => d.path === resolved)) {
+						this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: resolved });
+					}
 				}
 			}
-		}
 
-		const promptPaths = this.noPromptTemplates
-			? this.mergePaths(cliEnabledPrompts, this.additionalPromptTemplatePaths)
-			: this.mergePaths([...cliEnabledPrompts, ...enabledPrompts], this.additionalPromptTemplatePaths);
-
-		this.lastPromptPaths = promptPaths;
-		this.updatePromptsFromPaths(promptPaths, metadataByPath);
-		for (const p of this.additionalPromptTemplatePaths) {
-			if (isLocalPath(p)) {
-				const resolved = this.resolveResourcePath(p);
-				if (!existsSync(resolved) && !this.promptDiagnostics.some((d) => d.path === resolved)) {
-					this.promptDiagnostics.push({
-						type: "error",
-						message: "Prompt template path does not exist",
-						path: resolved,
-					});
+			this.lastPromptPaths = promptPaths;
+			this.updatePromptsFromPaths(promptPaths, metadataByPath);
+			for (const p of this.additionalPromptTemplatePaths) {
+				if (isLocalPath(p)) {
+					const resolved = this.resolveResourcePath(p);
+					if (!existsSync(resolved) && !this.promptDiagnostics.some((d) => d.path === resolved)) {
+						this.promptDiagnostics.push({
+							type: "error",
+							message: "Prompt template path does not exist",
+							path: resolved,
+						});
+					}
 				}
 			}
 		}
@@ -486,6 +722,16 @@ export class DefaultResourceLoader implements ResourceLoader {
 			if (!existsSync(resolved) && !this.themeDiagnostics.some((d) => d.path === resolved)) {
 				this.themeDiagnostics.push({ type: "error", message: "Theme path does not exist", path: resolved });
 			}
+		}
+
+		if (inventorySnapshot) {
+			this.agentsFiles = inventorySnapshot.agentsFiles;
+			this.systemPrompt = inventorySnapshot.systemPrompt;
+			this.appendSystemPrompt = inventorySnapshot.appendSystemPrompt;
+			// Refresh the agents catalog last: if reload() throws earlier, the
+			// getter keeps serving the previous successful snapshot.
+			this.agentsResult = inventorySnapshot.agentsResult;
+			return;
 		}
 
 		const agentsFiles = {
@@ -513,6 +759,27 @@ export class DefaultResourceLoader implements ResourceLoader {
 		// Refresh the agents catalog last: if reload() throws earlier, the
 		// getter keeps serving the previous successful snapshot.
 		this.agentsResult = this.loadAgentsInternal();
+
+		if (freshSnapshotStats) {
+			resourceSnapshotCache = {
+				configKey: this.snapshotConfigKey(),
+				skillPaths,
+				promptPaths,
+				stats: freshSnapshotStats,
+				// Clone on write: this.skills / prompts / agents stay owned by
+				// the current loader; callers mutating them must not poison the cache.
+				inventory: structuredClone({
+					skills: this.skills,
+					skillDiagnostics: this.skillDiagnostics,
+					prompts: this.prompts,
+					promptDiagnostics: this.promptDiagnostics,
+					agentsFiles: this.agentsFiles,
+					agentsResult: this.agentsResult,
+					systemPrompt: this.systemPrompt,
+					appendSystemPrompt: this.appendSystemPrompt,
+				}),
+			};
+		}
 	}
 
 	private normalizeExtensionPaths(

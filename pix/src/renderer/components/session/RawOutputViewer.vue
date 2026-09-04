@@ -13,7 +13,7 @@ defineProps<{
   <div class="raw-viewer">
     <div class="raw-header">
       <span class="raw-label">原始事件输出</span>
-      <span class="raw-hint">以 JSON 显示全部 AgentSessionEvent 对象</span>
+      <span class="raw-hint">以 JSON 显示 AgentSessionEvent；message_update 只保留相位与 contentChars</span>
     </div>
     <pre class="raw-content">{{ rawJson }}</pre>
   </div>

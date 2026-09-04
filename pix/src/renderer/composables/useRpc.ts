@@ -28,6 +28,11 @@ import type { CustomProviderConfig } from "@shared/custom-providers";
 type CommandResponse<T = unknown> = { success: boolean; data?: T; error?: string };
 type LifecycleExit = { code: number | null; signal: string | null; stderr: string };
 
+/** Trailing-debounce window (ms) for session stats refreshes: multiple
+ *  stats-triggering events within one turn collapse into a single
+ *  get_session_stats. */
+export const STATS_REFRESH_DEBOUNCE_MS = 500;
+
 export interface RpcTransport {
   sendCommand: <T = unknown>(command: RpcCommand) => Promise<CommandResponse<T>>;
   sendCommandAsync: (command: RpcCommand) => Promise<{ success: boolean; error?: string }>;
@@ -91,10 +96,18 @@ export function createRpcClient(transport: RpcTransport, label: string) {
   /** Execution environment of the active runtime (null while stopped). */
   const executionEnvironment = ref<ExecutionEnvironmentInfo | null>(null);
   let eventUnsubscribers: Array<() => void> = [];
+  let statsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Last time a stats refresh actually ran (leading + trailing). Negative
+   *  infinity so the first schedule after attach always leading-fires. */
+  let lastStatsRefreshAt = Number.NEGATIVE_INFINITY;
 
   function cleanupEventListeners(): void {
     for (const cleanup of eventUnsubscribers) cleanup();
     eventUnsubscribers = [];
+    if (statsRefreshTimer !== null) {
+      clearTimeout(statsRefreshTimer);
+      statsRefreshTimer = null;
+    }
   }
 
   async function refreshState(): Promise<void> {
@@ -133,6 +146,37 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     } catch (err) {
       console.error(`[${label}] Failed to get session stats:`, err);
     }
+  }
+
+  function runSessionStatsRefresh(): void {
+    lastStatsRefreshAt = Date.now();
+    void refreshSessionStats();
+  }
+
+  /** Leading + trailing debounce: the first call in a quiet window fires
+   *  immediately so a long tool chain still moves the token panel; later
+   *  calls within 500ms collapse into one trailing refresh after the gap. */
+  function scheduleSessionStatsRefresh(): void {
+    const elapsed = Date.now() - lastStatsRefreshAt;
+    if (statsRefreshTimer === null && elapsed >= STATS_REFRESH_DEBOUNCE_MS) {
+      runSessionStatsRefresh();
+      return;
+    }
+    if (statsRefreshTimer !== null) clearTimeout(statsRefreshTimer);
+    statsRefreshTimer = setTimeout(() => {
+      statsRefreshTimer = null;
+      runSessionStatsRefresh();
+    }, STATS_REFRESH_DEBOUNCE_MS);
+  }
+
+  /** Cancel any pending debounce timer and refresh immediately (agent_end
+   *  path: the turn's final stats must not wait for the window to close). */
+  function flushPendingStatsRefresh(): void {
+    if (statsRefreshTimer !== null) {
+      clearTimeout(statsRefreshTimer);
+      statsRefreshTimer = null;
+    }
+    runSessionStatsRefresh();
   }
 
   async function refreshExecutionEnvironment(): Promise<void> {
@@ -176,17 +220,17 @@ export function createRpcClient(transport: RpcTransport, label: string) {
       transport.onEvent((event) => {
         if (event.type === "agent_start") {
           if (sessionState.value) sessionState.value = { ...sessionState.value, isStreaming: true };
-          void refreshSessionStats();
+          flushPendingStatsRefresh();
           return;
         }
         if (event.type === "agent_end") {
           if (sessionState.value) sessionState.value = { ...sessionState.value, isStreaming: false };
           void refreshState();
-          void refreshSessionStats();
+          flushPendingStatsRefresh();
           return;
         }
         if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "eye_model_end") {
-          void refreshSessionStats();
+          scheduleSessionStatsRefresh();
           return;
         }
         if (event.type === "session_info_changed" && sessionState.value) {
@@ -528,6 +572,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     refreshCommands,
     refreshModels,
     refreshSessionStats,
+    scheduleSessionStatsRefresh,
     getAvailableThinkingLevels,
     supportsThinking,
     setScopedModels,

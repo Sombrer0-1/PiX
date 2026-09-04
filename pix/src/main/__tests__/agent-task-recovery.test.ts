@@ -14,6 +14,11 @@
  * - corruption: tail-corrupt events repair on restore (recoverable issue),
  *   mid-log corruption stays read-only (recovery issue, never a forged info)
  * - index write amplification: only index fields trigger index writes
+ * - S9 (perf SDD §4.8): workspace-parallel restoreAll (concurrency cap 4)
+ *   restores the same task set/status/usage as the serial semantics,
+ *   per-workspace diagnostics keep their serial order, the workspace index
+ *   is read once per workspace (not once per task), and restoreAll never
+ *   exceeds 4 concurrently restoring workspaces
  * - runtime persistence: foreground tasks write independent session JSONLs
  *   under <task>/sessions, a checkpoint follows every finalized assistant
  *   message / complete tool result / item boundary, and the workspace
@@ -56,12 +61,16 @@ import {
   TaskStorageLimitError,
   type AppendEventsResult,
   type TaskCheckpoint,
+  type TaskIndex,
+  type TaskIndexEntry,
+  type TaskIndexProbe,
   type TaskLogEvent,
   type TaskLogEventPayload,
 } from "../agent-task/agent-task-store.js";
 import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
 import {
   AgentTaskService,
+  RESTORE_WORKSPACE_CONCURRENCY,
   __setAgentTaskServiceHooksForTests,
   type AgentTaskServiceTestHooks,
   type AgentTaskSubmissionContext,
@@ -3149,6 +3158,374 @@ await run("workflowOwned survives restarts through the index and exempts the gro
   await harness.service.dispose("app_shutdown").catch(() => {});
   assertNoUnhandledRejections();
   rmSync(projectDir, { recursive: true, force: true });
+});
+
+// ============================================================================
+// S9 (perf SDD §4.8): workspace-parallel restoreAll + workspace index reuse
+// ============================================================================
+
+/** One task in a hand-built restore fixture (metadata + state event + post-state events + checkpoint). */
+interface RestoreFixtureTask {
+  spec: AgentTaskSpec;
+  status: AgentTaskInfo["status"];
+  stopReason?: AgentTaskInfo["stopReason"];
+  /** Events appended after the state event (folded onto the last state snapshot by the log replay). */
+  postEvents?: TaskLogEventPayload[];
+  /** false = persisted on disk but absent from the index (on-disk reconciliation path). Default true. */
+  inIndex?: boolean;
+}
+
+/** Persist a whole workspace fixture plus one shared index carrying the inIndex tasks. */
+async function writeRestoreFixture(
+  store: AgentTaskStore,
+  tasks: RestoreFixtureTask[],
+  opts: { writeIndex?: boolean } = {},
+): Promise<void> {
+  const ws = tasks[0].spec.workspaceId;
+  await store.initWorkspace(ws);
+  const indexTasks: TaskIndexEntry[] = [];
+  for (const task of tasks) {
+    const spec = task.spec;
+    const terminal = task.status === "completed" || task.status === "failed" || task.status === "cancelled";
+    const info = makeInfo(spec, {
+      status: task.status,
+      ...(task.stopReason !== undefined ? { stopReason: task.stopReason } : {}),
+      ...(terminal ? { endedAt: Date.now() } : {}),
+    });
+    await store.writeMetadata(ws, spec.taskId, { schemaVersion: 1, spec, initialInfo: makeInfo(spec, { status: "queued" }) });
+    await store.appendEvent(ws, spec.taskId, { type: "state", from: "queued", to: info.status, info: { ...info } });
+    for (const event of task.postEvents ?? []) {
+      await store.appendEvent(ws, spec.taskId, event);
+    }
+    const cp = makeDefaultCheckpoint(spec);
+    await store.writeCheckpoint(ws, spec.taskId, cp);
+    if (task.inIndex !== false) {
+      indexTasks.push({
+        taskId: spec.taskId,
+        workspaceId: ws,
+        parentSessionId: spec.parentSessionId,
+        parentToolCallId: spec.parentToolCallId,
+        groupId: spec.groupId,
+        status: info.status,
+        lastCheckpointSeq: cp.seq,
+        hasUnclosedToolCall: false,
+        ...(task.stopReason !== undefined ? { stopReason: task.stopReason } : {}),
+        updatedAt: Date.now(),
+        schemaVersion: 1,
+        lastWriterRunId: "test-run",
+      });
+    }
+  }
+  if (opts.writeIndex !== false && indexTasks.length > 0) {
+    await store.writeIndex(ws, { schemaVersion: 1, workspaceId: ws, generation: 1, lastWriterRunId: "test-run", tasks: indexTasks });
+  }
+}
+
+function sameUsage(a: AgentTaskUsage, b: AgentTaskUsage): boolean {
+  return (
+    a.input === b.input &&
+    a.output === b.output &&
+    a.cacheRead === b.cacheRead &&
+    a.cacheWrite === b.cacheWrite &&
+    a.totalTokens === b.totalTokens &&
+    a.cost === b.cost &&
+    a.turns === b.turns
+  );
+}
+
+/**
+ * The parallel restoreAll must produce exactly what the former serial loop
+ * produced. The expectations below are deterministic values pinned from the
+ * serial semantics (each aspect is separately covered by the serial-era tests
+ * above), asserted per task: count, status, usage, output and the hydration
+ * invariants, plus per-workspace diagnostics order stability.
+ */
+await run("restoreAll (S9): multi-workspace parallel restore matches the serial semantics", async () => {
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-restore-multi-store-"));
+  const store = new AgentTaskStore({ rootDir: storeRoot, maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 });
+  const usageOf = (n: number): AgentTaskUsage => ({ input: n, output: n + 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 * n + 1, cost: n / 100, turns: 1 });
+  const projectDirs: string[] = [];
+
+  // Workspace A (3 tasks, shared index): completed + running->interrupted + user_cancel.
+  const dirA = mkdtempSync(join(tmpdir(), "pix-restore-multi-a-"));
+  projectDirs.push(dirA);
+  const specACompleted = makeSpec(dirA);
+  const specARunning = makeSpec(dirA);
+  const specACancelled = makeSpec(dirA);
+  await writeRestoreFixture(store, [
+    {
+      spec: specACompleted,
+      status: "completed",
+      postEvents: [{ type: "usage", usage: usageOf(1) }, { type: "output", text: "done-a", truncated: false }],
+    },
+    {
+      spec: specARunning,
+      status: "running",
+      postEvents: [
+        { type: "usage", usage: usageOf(2) },
+        {
+          type: "activity",
+          activity: {
+            sequence: 1,
+            toolCallId: "call-1",
+            toolName: "read",
+            status: "completed",
+            summary: "src/a.ts",
+            startedAt: Date.now(),
+            endedAt: Date.now() + 1,
+          },
+        },
+      ],
+    },
+    { spec: specACancelled, status: "cancelled", stopReason: "user_cancel" },
+  ]);
+
+  // Workspace B: one task in the index, two persisted but missing from it (reconciliation).
+  const dirB = mkdtempSync(join(tmpdir(), "pix-restore-multi-b-"));
+  projectDirs.push(dirB);
+  const specBIndexed = makeSpec(dirB);
+  const specBOnDiskCompleted = makeSpec(dirB);
+  const specBOnDiskRunning = makeSpec(dirB);
+  await writeRestoreFixture(store, [
+    { spec: specBIndexed, status: "running", postEvents: [{ type: "usage", usage: usageOf(3) }] },
+    { spec: specBOnDiskCompleted, status: "completed", inIndex: false, postEvents: [{ type: "usage", usage: usageOf(4) }] },
+    { spec: specBOnDiskRunning, status: "running", inIndex: false, postEvents: [{ type: "usage", usage: usageOf(5) }] },
+  ]);
+
+  // Workspace C: a single completed task.
+  const dirC = mkdtempSync(join(tmpdir(), "pix-restore-multi-c-"));
+  projectDirs.push(dirC);
+  const specCCompleted = makeSpec(dirC);
+  await writeRestoreFixture(store, [{ spec: specCCompleted, status: "completed" }]);
+
+  // Workspace D: an empty workspace directory (no index, no tasks).
+  const dirD = mkdtempSync(join(tmpdir(), "pix-restore-multi-d-"));
+  projectDirs.push(dirD);
+  const wsD = workspaceIdOf(dirD);
+  await store.initWorkspace(wsD);
+
+  // Workspace E: no index at all + one on-disk user_cancel task (a missing
+  // index pair is a fresh workspace, NOT corruption).
+  const dirE = mkdtempSync(join(tmpdir(), "pix-restore-multi-e-"));
+  projectDirs.push(dirE);
+  const specECancelled = makeSpec(dirE);
+  await writeRestoreFixture(store, [{ spec: specECancelled, status: "cancelled", stopReason: "user_cancel" }], { writeIndex: false });
+
+  // Workspace F: an unreadable index pair + two on-disk running tasks (the
+  // workspace-scoped index probe must still surface the per-task
+  // index_corrupt diagnostic while hydrating both tasks).
+  const dirF = mkdtempSync(join(tmpdir(), "pix-restore-multi-f-"));
+  projectDirs.push(dirF);
+  const specF1 = makeSpec(dirF);
+  const specF2 = makeSpec(dirF);
+  await writeRestoreFixture(store, [{ spec: specF1, status: "running" }, { spec: specF2, status: "running" }], { writeIndex: false });
+  writeFileSync(join(storeRoot, specF1.workspaceId, "index.json"), "{not-json", "utf-8");
+  writeFileSync(join(storeRoot, specF1.workspaceId, "index.prev.json"), "{not-json", "utf-8");
+
+  const harness = makeRecoveryHarness({ storeRoot });
+  const report = await harness.service.restoreAll();
+  assertEqual(report.restored, 10, "report counts every restored task across the six workspaces");
+  assertEqual(report.interrupted, 5, "report counts every interrupted task (A:1 B:2 F:2)");
+  assertEqual(report.corrupted, 0, "nothing corrupted in the fixture");
+  assertEqual(report.autoResumed, 0, "auto-recovery disabled in this harness");
+  const snap = harness.service.getAll();
+  assertEqual(snap.tasks.length, 10, "all tasks from all workspaces hydrated");
+  assertEqual(snap.storageStatuses.length, 6, "storage status present for every workspace");
+
+  const byId = new Map(snap.tasks.map((info) => [info.taskId, info]));
+  const expectRestored = (
+    spec: AgentTaskSpec,
+    expected: {
+      status: AgentTaskInfo["status"];
+      usage?: AgentTaskUsage;
+      finalOutput?: string;
+      activityCount?: number;
+      stopReason?: AgentTaskInfo["stopReason"];
+      presentation?: AgentTaskInfo["presentation"];
+    },
+  ): void => {
+    const info = byId.get(spec.taskId);
+    assert(info !== undefined, `task ${spec.taskId} restored`);
+    if (!info) return;
+    assertEqual(info.status, expected.status, `task ${spec.taskId} status`);
+    if (expected.usage !== undefined) {
+      assert(sameUsage(info.usage, expected.usage), `task ${spec.taskId} usage folded identically`);
+    }
+    if (expected.finalOutput !== undefined) {
+      assertEqual(info.finalOutput, expected.finalOutput, `task ${spec.taskId} finalOutput`);
+    }
+    if (expected.activityCount !== undefined) {
+      assertEqual(info.activities.length, expected.activityCount, `task ${spec.taskId} activities`);
+    }
+    if (expected.stopReason !== undefined) {
+      assertEqual(info.stopReason, expected.stopReason, `task ${spec.taskId} stopReason`);
+    }
+    if (expected.presentation !== undefined) {
+      assertEqual(info.presentation, expected.presentation, `task ${spec.taskId} presentation`);
+    }
+  };
+
+  expectRestored(specACompleted, { status: "completed", usage: usageOf(1), finalOutput: "done-a" });
+  expectRestored(specARunning, {
+    status: "interrupted",
+    usage: usageOf(2),
+    activityCount: 1,
+    stopReason: "app_shutdown",
+    presentation: "background",
+  });
+  assert(byId.get(specARunning.taskId)?.autoBackground === undefined, "interrupted task clears autoBackground");
+  assert(byId.get(specARunning.taskId)?.queuePosition === undefined, "interrupted task clears queuePosition");
+  expectRestored(specACancelled, { status: "cancelled", stopReason: "user_cancel" });
+  expectRestored(specBIndexed, { status: "interrupted", usage: usageOf(3), stopReason: "app_shutdown" });
+  expectRestored(specBOnDiskCompleted, { status: "completed", usage: usageOf(4) });
+  expectRestored(specBOnDiskRunning, { status: "interrupted", usage: usageOf(5), stopReason: "app_shutdown" });
+  expectRestored(specCCompleted, { status: "completed" });
+  expectRestored(specECancelled, { status: "cancelled", stopReason: "user_cancel" });
+  expectRestored(specF1, { status: "interrupted", stopReason: "app_shutdown" });
+  expectRestored(specF2, { status: "interrupted", stopReason: "app_shutdown" });
+
+  // Per-workspace diagnostics keep the serial order; only cross-workspace
+  // interleaving is allowed (SDD 0.1 exception 6).
+  const diagnosticsFor = (ws: string): string[] => report.diagnostics.filter((d) => d.startsWith(`workspace ${ws}:`));
+  const wsA = specACompleted.workspaceId;
+  assertEqual(diagnosticsFor(wsA).join("\n"), `workspace ${wsA}: crash shutdown`, "workspace A diagnostics (pure index path)");
+  const wsB = specBIndexed.workspaceId;
+  const missingB = [specBOnDiskCompleted.taskId, specBOnDiskRunning.taskId].sort();
+  assertEqual(
+    diagnosticsFor(wsB).join("\n"),
+    [
+      `workspace ${wsB}: crash shutdown`,
+      `workspace ${wsB}: on-disk task ${missingB[0]} missing from index; reconciling`,
+      `workspace ${wsB}: on-disk task ${missingB[1]} missing from index; reconciling`,
+    ].join("\n"),
+    "workspace B diagnostics (reconciliation in sorted on-disk order)",
+  );
+  assertEqual(diagnosticsFor(wsD).join("\n"), `workspace ${wsD}: no readable index`, "workspace D diagnostics (empty workspace)");
+  const wsE = specECancelled.workspaceId;
+  assertEqual(
+    diagnosticsFor(wsE).join("\n"),
+    [
+      `workspace ${wsE}: no readable index; reconciling 1 on-disk task dir(s)`,
+      `workspace ${wsE}: crash shutdown`,
+      `workspace ${wsE}: on-disk task ${specECancelled.taskId} missing from index; reconciling`,
+    ].join("\n"),
+    "workspace E diagnostics (fresh workspace without an index)",
+  );
+  const wsF = specF1.workspaceId;
+  const missingF = [specF1.taskId, specF2.taskId].sort();
+  assertEqual(
+    diagnosticsFor(wsF).join("\n"),
+    [
+      `workspace ${wsF}: no readable index; reconciling 2 on-disk task dir(s)`,
+      `workspace ${wsF}: crash shutdown`,
+      `workspace ${wsF}: on-disk task ${missingF[0]} missing from index; reconciling`,
+      `workspace ${wsF}: on-disk task ${missingF[1]} missing from index; reconciling`,
+    ].join("\n"),
+    "workspace F diagnostics (unreadable index pair)",
+  );
+
+  const issuesF = snap.recoveryIssues.filter((issue) => issue.workspaceId === wsF);
+  assertEqual(issuesF.length, 2, "unreadable index pair surfaces one issue per hydrated task");
+  assert(issuesF.every((issue) => issue.code === "index_corrupt" && issue.readOnly === true), "index_corrupt issues stay read-only");
+  assertEqual(snap.recoveryIssues.length, 2, "no other recovery issues in the fixture");
+
+  assertNoUnhandledRejections();
+  for (const dir of projectDirs) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  rmSync(storeRoot, { recursive: true, force: true });
+});
+
+await run("restoreAll (S9): the workspace index is read once per workspace, not once per task", async () => {
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-restore-probe-store-"));
+  const store = new AgentTaskStore({ rootDir: storeRoot, maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 });
+  const projectDir = mkdtempSync(join(tmpdir(), "pix-restore-probe-"));
+  const specs = [makeSpec(projectDir), makeSpec(projectDir), makeSpec(projectDir)];
+  await writeRestoreFixture(store, [
+    { spec: specs[0], status: "completed" },
+    { spec: specs[1], status: "running" },
+    { spec: specs[2], status: "cancelled", stopReason: "user_cancel" },
+  ]);
+
+  // Count actual index.json/index.prev.json parses: both restoreAll's
+  // top-of-workspace read and the former per-task re-read funnel through
+  // _readIndexImpl (a private prototype method; TS privacy is erased at
+  // runtime, so a scoped monkey-patch observes it without touching the store).
+  type ReadIndexImpl = (workspaceId: string) => Promise<TaskIndex | null>;
+  const storeProto = AgentTaskStore.prototype as unknown as { _readIndexImpl: ReadIndexImpl };
+  const originalReadIndex: ReadIndexImpl = storeProto._readIndexImpl;
+  let indexReads = 0;
+  storeProto._readIndexImpl = async function (this: AgentTaskStore, workspaceId: string) {
+    indexReads++;
+    return originalReadIndex.call(this, workspaceId);
+  };
+  let restored = -1;
+  let interrupted = -1;
+  try {
+    const harness = makeRecoveryHarness({ storeRoot });
+    const report = await harness.service.restoreAll();
+    restored = report.restored;
+    interrupted = report.interrupted;
+  } finally {
+    storeProto._readIndexImpl = originalReadIndex;
+  }
+  // The serial version read the index 1 + tasks times (4 here); the probe
+  // wires the single workspace-scoped read through every per-task readTask.
+  assertEqual(indexReads, 1, "index.json/index.prev.json read exactly once per workspace (probeIndex only)");
+  assertEqual(restored, 3, "all three tasks restored");
+  assertEqual(interrupted, 1, "the running task hydrated interrupted");
+
+  assertNoUnhandledRejections();
+  rmSync(projectDir, { recursive: true, force: true });
+  rmSync(storeRoot, { recursive: true, force: true });
+});
+
+/**
+ * Wraps probeIndex - the FIRST store call of every workspace's restore chain -
+ * with an active counter. The counter increments synchronously before any
+ * await, so the observed cap is deterministic: an unbounded implementation
+ * would reach 9, a serial one 1, the contract is exactly 4.
+ */
+class ConcurrencyProbeStore extends AgentTaskStore {
+  private _active = 0;
+  probeMaxActive = 0;
+  readonly probeStarts: string[] = [];
+
+  override async probeIndex(workspaceId: string): Promise<TaskIndexProbe> {
+    this._active++;
+    this.probeStarts.push(workspaceId);
+    if (this._active > this.probeMaxActive) {
+      this.probeMaxActive = this._active;
+    }
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return await super.probeIndex(workspaceId);
+    } finally {
+      this._active--;
+    }
+  }
+}
+
+await run("restoreAll (S9): workspaces restore in parallel with a concurrency cap of 4", async () => {
+  const storeRoot = mkdtempSync(join(tmpdir(), "pix-restore-conc-store-"));
+  const store = new ConcurrencyProbeStore({ rootDir: storeRoot, maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 });
+  // Nine empty workspaces (two full batches + one): each still runs the full
+  // serial chain (probeIndex -> listTaskIds -> diagnosis -> storage status).
+  for (let i = 0; i < 9; i++) {
+    await store.initWorkspace(workspaceIdOf(`E:\\pix-restore-conc\\project-${i}`));
+  }
+
+  const harness = makeRecoveryHarness({ storeRoot, store });
+  const report = await harness.service.restoreAll();
+  assertEqual(store.probeStarts.length, 9, "every workspace went through the restore chain");
+  assertEqual(store.probeMaxActive, RESTORE_WORKSPACE_CONCURRENCY, "workspace concurrency capped at exactly 4 (parallel, never unbounded)");
+  assertEqual(report.restored, 0, "no tasks in the empty fixture");
+  assertEqual(report.diagnostics.length, 9, "every workspace reports its diagnosis");
+  assertEqual(harness.service.getAll().storageStatuses.length, 9, "storage status refreshed for every workspace");
+
+  await harness.service.dispose("app_shutdown").catch(() => {});
+  assertNoUnhandledRejections();
+  rmSync(storeRoot, { recursive: true, force: true });
 });
 
 // ============================================================================

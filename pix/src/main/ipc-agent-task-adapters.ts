@@ -135,6 +135,30 @@ function agentTaskCommandResult(result: { ok: boolean; reason?: string }): PixCo
   return { success: false, code: result.reason ?? "agent_task_command_failed", error: result.reason ?? "Agent task command failed." };
 }
 
+// Perf SDD §4.5 (S5 startup gating): restoreAll runs in parallel with the
+// first window, so the task queries that used to implicitly wait for it
+// (get_all / get_active_input_requests / get-pending-agent-task-input-requests)
+// hold on this module-level gate until the restore settles. undefined or an
+// already-resolved promise is a passthrough; the wired promise never rejects
+// (index.ts derives it with .catch(() => {})). The module-level gate keeps
+// registerAgentTaskIpcHandlers(ipc, service) signature-free of the wiring.
+let restoreGate: Promise<unknown> | undefined;
+
+/**
+ * Set the restore gate. index.ts calls this once at startup around the IPC
+ * registration; tests may reset it with undefined (passthrough, the default).
+ */
+export function setRestoreGate(whenRestored?: Promise<unknown>): void {
+  restoreGate = whenRestored;
+}
+
+/** Await the restore gate before reading task data (undefined/resolved = passthrough). */
+async function awaitRestoreGate(): Promise<void> {
+  if (restoreGate !== undefined) {
+    await restoreGate;
+  }
+}
+
 export async function executeAgentTaskCommand(
   service: AgentTaskService,
   cmd: AgentTaskCommand,
@@ -165,6 +189,9 @@ export async function executeAgentTaskCommand(
       return { success: true };
     }
     case "get_all":
+      // Perf SDD §4.5: gated on the restore so the first remount sees the
+      // fully hydrated task set while createWindow already ran.
+      await awaitRestoreGate();
       // 1.4.2 (R2): the full remount snapshot (tasks + recoveryIssues + storageStatuses).
       return { success: true, data: service.getAll() };
     case "get": {
@@ -174,6 +201,8 @@ export async function executeAgentTaskCommand(
         : { success: false, code: "not_found", error: `Agent task not found: ${cmd.taskId}` };
     }
     case "get_active_input_requests":
+      // Perf SDD §4.5: same data source as the remount catch-up below - gated.
+      await awaitRestoreGate();
       return { success: true, data: service.getActiveInputRequests() };
     case "export_diagnostics": {
       try {
@@ -255,8 +284,12 @@ export function registerAgentTaskIpcHandlers(ipc: IpcMainLike, service: AgentTas
   });
 
   // Remount catch-up: the renderer store re-subscribes and replays the active
-  // input requests after a window reload (design plan §4.9).
-  ipc.handle("get-pending-agent-task-input-requests", () => service.getActiveInputRequests());
+  // input requests after a window reload (design plan §4.9). Perf SDD §4.5:
+  // gated on the restore like get_active_input_requests (same data source).
+  ipc.handle("get-pending-agent-task-input-requests", async () => {
+    await awaitRestoreGate();
+    return service.getActiveInputRequests();
+  });
 }
 
 /**

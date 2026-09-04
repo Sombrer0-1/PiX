@@ -43,15 +43,59 @@ function sanitizeHref(href: string): string | null {
   }
 }
 
+/**
+ * renderMarkdown 结果 LRU 缓存（perf SDD §3.18/§4.9）。
+ * renderMarkdown 是 content 的纯函数，缓存值即最终 HTML（含
+ * enhanceCodeBlocks 后处理），命中返回与即时解析逐字节一致的字符串。
+ * 插入序 Map 实现 LRU，不引入 LRU 库；空串与超 64KB 内容旁路不入缓存。
+ */
+export const MARKDOWN_CACHE_MAX_ENTRIES = 512;
+export const MARKDOWN_CACHE_MAX_CONTENT_BYTES = 65536;
+
+const markdownCache = new Map<string, string>();
+
+function contentBytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+function isCacheableContent(text: string): boolean {
+  // UTF-16 length is a cheap upper bound on UTF-8 bytes. Only encode when
+  // the string might actually exceed the 64KB cap (non-ASCII near the limit).
+  if (text.length > MARKDOWN_CACHE_MAX_CONTENT_BYTES) return false;
+  if (text.length * 3 <= MARKDOWN_CACHE_MAX_CONTENT_BYTES) return true;
+  return contentBytes(text) <= MARKDOWN_CACHE_MAX_CONTENT_BYTES;
+}
+
 export function renderMarkdown(text: string, copyButton = true): string {
   if (!text) return "&nbsp;";
+  // 缓存键只有原文内容（§7 注意事项），因此仅缓存默认 copyButton=true 的
+  // 渲染结果；其他旗标组合（如 BtwCard 的 copyButton=false）旁路缓存。
+  const cacheable = copyButton && isCacheableContent(text);
+  if (cacheable) {
+    const cached = markdownCache.get(text);
+    if (cached !== undefined) {
+      // 刷新 LRU 位：delete + 重新插入移到尾部。
+      markdownCache.delete(text);
+      markdownCache.set(text, cached);
+      return cached;
+    }
+  }
+  let html: string;
   try {
     const result = marked.parse(text, { async: false, renderer: markdownRenderer });
-    if (typeof result !== "string") return text;
-    return enhanceCodeBlocks(stripTrailingWhitespace(result), copyButton);
+    html = typeof result !== "string" ? text : enhanceCodeBlocks(stripTrailingWhitespace(result), copyButton);
   } catch {
-    return escapeHtml(text);
+    html = escapeHtml(text);
   }
+  if (cacheable) {
+    markdownCache.set(text, html);
+    if (markdownCache.size > MARKDOWN_CACHE_MAX_ENTRIES) {
+      // Map 按插入序迭代：首个键即最旧键。
+      const oldest = markdownCache.keys().next().value;
+      if (oldest !== undefined) markdownCache.delete(oldest);
+    }
+  }
+  return html;
 }
 
 /**

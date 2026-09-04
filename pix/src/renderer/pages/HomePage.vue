@@ -68,6 +68,10 @@ async function finishSoloStartup(location: ProjectLocation): Promise<void> {
     return;
   }
   sessionStore.clearSession();
+  // newSession ran after openProject's list, so the list does not yet contain
+  // the new file. Refresh before syncCurrentSession so the current-session
+  // highlight is set on the jump; workspace mount's syncWorkspaceState will
+  // list again (S1 cache makes the second scan cheap).
   await projectStore.listSessions();
   projectStore.syncCurrentSession(
     rpc.sessionState.value?.sessionFile,

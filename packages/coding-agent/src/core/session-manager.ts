@@ -200,6 +200,19 @@ export interface SessionInfo {
 	allMessagesText: string;
 }
 
+/** Options for readSessionInfo (also passed through by SessionManager.list). */
+export interface ReadSessionInfoOptions {
+	/** Whether to build allMessagesText (join of all message texts). Defaults to true
+	 *  (TUI search relies on it). When false, SessionInfo.allMessagesText is "". */
+	includeAllMessagesText?: boolean;
+}
+
+/** Options for SessionManager.list (optional 4th parameter). */
+export interface ListSessionsOptions {
+	/** Whether readSessionInfo builds allMessagesText for listed sessions. Defaults to true. */
+	includeAllMessagesText?: boolean;
+}
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -494,10 +507,76 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 	}
 }
 
+// =========================================================================
+// Session entries cache (S1 extension): loadEntriesFromFile results keyed by
+// absolute session file path and validated against the file's stat
+// fingerprint (mtimeMs + size). Any append changes the fingerprint, so the
+// write paths carry no invalidation hooks. Cache hits return deep copies to
+// keep caller-side mutation out of the cache.
+// =========================================================================
+
+interface FileStatFingerprint {
+	mtimeMs: number;
+	size: number;
+}
+
+interface SessionEntriesCacheEntry {
+	entries: FileEntry[];
+	stat: FileStatFingerprint;
+	/** Byte cost of this entry, approximated by the file size it was parsed from. */
+	bytes: number;
+}
+
+const SESSION_ENTRIES_CACHE_MAX_ENTRIES = 4;
+const SESSION_ENTRIES_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+
+const sessionEntriesCache = new Map<string, SessionEntriesCacheEntry>();
+
+function storeSessionEntriesCacheEntry(cacheKey: string, entry: SessionEntriesCacheEntry): void {
+	// LRU refresh on overwrite: Map.set of an existing key keeps insertion
+	// order, so delete first to move the hot session to the newest position.
+	sessionEntriesCache.delete(cacheKey);
+	sessionEntriesCache.set(cacheKey, entry);
+	// Evict oldest entries (Map insertion order) until both the count and the
+	// cumulative byte budget are met. A single oversized entry evicts itself.
+	while (sessionEntriesCache.size > 0) {
+		let totalBytes = 0;
+		for (const cached of sessionEntriesCache.values()) {
+			totalBytes += cached.bytes;
+		}
+		if (
+			sessionEntriesCache.size <= SESSION_ENTRIES_CACHE_MAX_ENTRIES &&
+			totalBytes <= SESSION_ENTRIES_CACHE_MAX_BYTES
+		) {
+			break;
+		}
+		const oldestKey = sessionEntriesCache.keys().next().value;
+		if (oldestKey === undefined) break;
+		sessionEntriesCache.delete(oldestKey);
+	}
+}
+
 /** Exported for testing */
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
+	const cacheKey = resolvePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
+
+	let fingerprint: FileStatFingerprint;
+	try {
+		const fileStat = statSync(resolvedFilePath);
+		fingerprint = { mtimeMs: fileStat.mtimeMs, size: fileStat.size };
+	} catch {
+		return [];
+	}
+
+	const cached = sessionEntriesCache.get(cacheKey);
+	if (cached && cached.stat.mtimeMs === fingerprint.mtimeMs && cached.stat.size === fingerprint.size) {
+		// LRU refresh: re-insert at the newest position.
+		sessionEntriesCache.delete(cacheKey);
+		sessionEntriesCache.set(cacheKey, cached);
+		return structuredClone(cached.entries);
+	}
 
 	const entries: FileEntry[] = [];
 	const fd = openSync(resolvedFilePath, "r");
@@ -533,10 +612,12 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
+		// Invalid/empty parses are not cached (same as errors).
 		return [];
 	}
 
-	return entries;
+	storeSessionEntriesCacheEntry(cacheKey, { entries, stat: fingerprint, bytes: fingerprint.size });
+	return structuredClone(entries);
 }
 
 function readSessionHeader(filePath: string): SessionHeader | null {
@@ -618,7 +699,13 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+/** Read a single session file as a SessionInfo. Returns null when the file
+ *  does not exist, the first entry is not a session header, or reading fails. */
+export async function readSessionInfo(
+	filePath: string,
+	options?: ReadSessionInfoOptions,
+): Promise<SessionInfo | null> {
+	const includeAllMessagesText = options?.includeAllMessagesText !== false;
 	try {
 		const stats = await stat(filePath);
 		let header: SessionHeader | null = null;
@@ -660,10 +747,16 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			if (!isMessageWithContent(message)) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
 
+			// When allMessagesText is skipped, message text is only needed until
+			// firstMessage has been found.
+			if (!includeAllMessagesText && firstMessage) continue;
+
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			allMessages.push(textContent);
+			if (includeAllMessagesText) {
+				allMessages.push(textContent);
+			}
 			if (!firstMessage && message.role === "user") {
 				firstMessage = textContent;
 			}
@@ -705,6 +798,7 @@ const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
 async function buildSessionInfosWithConcurrency(
 	files: string[],
 	onLoaded: () => void,
+	options?: ReadSessionInfoOptions,
 ): Promise<(SessionInfo | null)[]> {
 	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
 	const inFlight = new Set<Promise<void>>();
@@ -716,7 +810,7 @@ async function buildSessionInfosWithConcurrency(
 		if (!file) return;
 
 		let task: Promise<void>;
-		task = buildSessionInfo(file)
+		task = readSessionInfo(file, options)
 			.then((info) => {
 				results[index] = info;
 			})
@@ -773,6 +867,148 @@ async function listSessionsFromDir(
 	}
 
 	return sessions;
+}
+
+// =========================================================================
+// Session list cache (S1): SessionManager.list results keyed by normalized
+// directory + includeAllMessagesText, self-validated on every call via stat
+// fingerprints (mtimeMs + size). Only files whose fingerprint changed (or
+// that are new) are re-read; listAll bypasses this cache entirely.
+// =========================================================================
+
+interface SessionListCacheEntry {
+	infos: SessionInfo[];
+	snapshots: Map<string, FileStatFingerprint>;
+}
+
+const SESSION_LIST_CACHE_MAX_ENTRIES = 8;
+
+const sessionListCache = new Map<string, SessionListCacheEntry>();
+
+function sessionListCacheKey(dir: string, includeAllMessagesText: boolean): string {
+	return `${dir}\u0000${includeAllMessagesText}`;
+}
+
+function sessionListCacheKeyPrefix(dir: string): string {
+	return `${normalizePath(dir)}\u0000`;
+}
+
+async function listSessionsFromDirCached(
+	dir: string,
+	onProgress: SessionListProgress | undefined,
+	options?: ListSessionsOptions,
+): Promise<SessionInfo[]> {
+	const sessions: SessionInfo[] = [];
+	if (!existsSync(dir)) {
+		return sessions;
+	}
+
+	const includeAllMessagesText = options?.includeAllMessagesText !== false;
+	const cacheKey = sessionListCacheKey(dir, includeAllMessagesText);
+	const cachedEntry = sessionListCache.get(cacheKey);
+
+	try {
+		const dirEntries = await readdir(dir);
+		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+
+		// Stat every file up front; only files whose fingerprint differs from the
+		// snapshot (including new files) are re-read.
+		const fingerprints = new Map<string, FileStatFingerprint>();
+		const staleFiles = new Set<string>();
+		for (const file of files) {
+			let fingerprint: FileStatFingerprint | null = null;
+			try {
+				const fileStat = await stat(file);
+				fingerprint = { mtimeMs: fileStat.mtimeMs, size: fileStat.size };
+			} catch {
+				fingerprint = null;
+			}
+			if (!fingerprint) {
+				staleFiles.add(file);
+				continue;
+			}
+			fingerprints.set(file, fingerprint);
+			const snapshot = cachedEntry?.snapshots.get(file);
+			if (
+				!snapshot ||
+				snapshot.mtimeMs !== fingerprint.mtimeMs ||
+				snapshot.size !== fingerprint.size
+			) {
+				staleFiles.add(file);
+			}
+		}
+
+		// onProgress only fires for files that were actually read.
+		let loaded = 0;
+		const staleFileList = [...staleFiles];
+		const readResults = await buildSessionInfosWithConcurrency(
+			staleFileList,
+			() => {
+				loaded++;
+				onProgress?.(loaded, staleFileList.length);
+			},
+			options,
+		);
+		const readInfoByPath = new Map<string, SessionInfo>();
+		for (let i = 0; i < staleFileList.length; i++) {
+			const info = readResults[i];
+			if (info) readInfoByPath.set(staleFileList[i], info);
+		}
+
+		// Merge cached infos with fresh reads; drop snapshots for files that no
+		// longer exist. Failed reads (null) stay out of the result and keep no
+		// snapshot, so the next list naturally retries them.
+		const cachedInfoByPath = new Map(
+			cachedEntry ? cachedEntry.infos.map((info) => [info.path, info] as const) : [],
+		);
+		const infos: SessionInfo[] = [];
+		const snapshots = new Map<string, FileStatFingerprint>();
+		for (const file of files) {
+			const fingerprint = fingerprints.get(file);
+			if (!fingerprint) continue;
+			if (!staleFiles.has(file)) {
+				const cachedInfo = cachedInfoByPath.get(file);
+				if (cachedInfo) {
+					infos.push(cachedInfo);
+					snapshots.set(file, fingerprint);
+					continue;
+				}
+			}
+			const readInfo = readInfoByPath.get(file);
+			if (readInfo) {
+				infos.push(readInfo);
+				snapshots.set(file, fingerprint);
+			}
+		}
+
+		sessions.push(...infos);
+		// LRU refresh: delete+set so a repeatedly listed directory stays newest.
+		sessionListCache.delete(cacheKey);
+		sessionListCache.set(cacheKey, { infos, snapshots });
+		while (sessionListCache.size > SESSION_LIST_CACHE_MAX_ENTRIES) {
+			const oldestKey = sessionListCache.keys().next().value;
+			if (oldestKey === undefined) break;
+			sessionListCache.delete(oldestKey);
+		}
+	} catch {
+		// Return empty list on error
+	}
+
+	return sessions;
+}
+
+/** Discard session list caches for a directory (all directories when omitted)
+ *  and clear the session entries cache. Test/strong-consistency entry point. */
+export function invalidateSessionListCache(dir?: string): void {
+	if (dir === undefined) {
+		sessionListCache.clear();
+	} else {
+		const prefix = sessionListCacheKeyPrefix(dir);
+		for (const key of [...sessionListCache.keys()]) {
+			if (key.startsWith(prefix)) sessionListCache.delete(key);
+		}
+	}
+	sessionEntriesCache.clear();
 }
 
 /**
@@ -1569,17 +1805,33 @@ export class SessionManager {
 	 * List all sessions for a directory.
 	 * @param cwd Working directory (used to compute default session directory)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
-	 * @param onProgress Optional callback for progress updates (loaded, total)
+	 * @param onProgress Optional callback for progress updates (loaded, total). Only fires
+	 *   for files that were actually read (cache hits do not fire it).
+	 * @param options Optional list options (includeAllMessagesText, default true).
 	 */
-	static async list(cwd: string, sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+	static async list(
+		cwd: string,
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		options?: ListSessionsOptions,
+	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter(
+		const sessions = (await listSessionsFromDirCached(dir, onProgress, options)).filter(
 			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
 		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-		return sessions;
+		// Deep-copy so callers cannot mutate cached SessionInfo (Dates, strings).
+		return structuredClone(sessions);
+	}
+
+	/**
+	 * Discard session list caches for a directory (all directories when omitted)
+	 * and clear the session entries cache. See module-level invalidateSessionListCache.
+	 */
+	static invalidateSessionListCache(dir?: string): void {
+		invalidateSessionListCache(dir);
 	}
 
 	/**

@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
-import { chmodSync, closeSync, existsSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { basename, isAbsolute, join, relative, resolve } from "path";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { lockSync } from "proper-lockfile";
 import { shell } from "electron";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -248,6 +248,187 @@ function createEmptyAuxiliaryUsage(): AuxiliaryUsageTotals {
 	};
 }
 
+// ===========================================================================
+// S8 engine fingerprint caches
+// ===========================================================================
+
+/** (mtimeMs, size) stat fingerprint; null marks a tracked-but-absent file. */
+type StatFingerprint = { mtimeMs: number; size: number } | null;
+
+function statFingerprint(path: string): StatFingerprint {
+	try {
+		const stats = statSync(path);
+		return { mtimeMs: stats.mtimeMs, size: stats.size };
+	} catch {
+		return null;
+	}
+}
+
+function sameStatFingerprint(a: StatFingerprint, b: StatFingerprint): boolean {
+	if (a === null || b === null) return a === b;
+	return a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
+/**
+ * Serialize a critical section against a file's lockfile. Mirrors the core
+ * auth-storage/settings-storage retry policy: lockSync with realpath:false,
+ * retry on ELOCKED (up to 10 attempts, 20ms apart), release in finally.
+ */
+function acquireFileLockSyncWithRetry(path: string): () => void {
+	const maxAttempts = 10;
+	const delayMs = 20;
+	let lastError: unknown;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			return lockSync(path, { realpath: false });
+		} catch (error) {
+			const code =
+				typeof error === "object" && error !== null && "code" in error
+					? String((error as { code?: unknown }).code)
+					: undefined;
+			if (code !== "ELOCKED" || attempt === maxAttempts) {
+				throw error;
+			}
+			lastError = error;
+			const start = Date.now();
+			while (Date.now() - start < delayMs) {
+				// Sleep synchronously to avoid changing callers to async.
+			}
+		}
+	}
+
+	throw (lastError as Error) ?? new Error(`Failed to acquire file lock: ${path}`);
+}
+
+/** Parsed settings cache entry (S8): raw settings.json contents + the stat fingerprints they were read under. */
+interface SettingsParseCacheEntry {
+	/** cwd the project settings.json lives under (the global file is shared per agentDir). */
+	cwd: string;
+	globalStat: StatFingerprint;
+	projectStat: StatFingerprint;
+	globalContent: string | undefined;
+	projectContent: string | undefined;
+}
+
+/**
+ * Module-level settings parse cache (S8). Keyed by cwd + the stat fingerprints
+ * of the global and project settings.json; stat-based self-invalidation - any
+ * write (setPiSetting, model switch, external edit) changes mtimeMs/size and
+ * naturally misses. Capacity 4, oldest evicted first.
+ */
+const settingsParseCache: SettingsParseCacheEntry[] = [];
+const SETTINGS_PARSE_CACHE_CAPACITY = 4;
+
+/**
+ * S8 observability point for tests: cumulative settings.json disk reads
+ * served through the parse cache layer (cache hits add zero).
+ */
+export const settingsParseCacheMetrics = { diskReads: 0 };
+
+function readSettingsUnderLock(path: string): string | undefined {
+	let release: (() => void) | undefined;
+	try {
+		const fileExists = existsSync(path);
+		if (fileExists) {
+			release = acquireFileLockSyncWithRetry(path);
+		}
+		if (fileExists) {
+			settingsParseCacheMetrics.diskReads++;
+			return readFileSync(path, "utf-8");
+		}
+		return undefined;
+	} finally {
+		if (release) {
+			try {
+				release();
+			} catch {
+				// Ignore unlock errors (lock may have been compromised).
+			}
+		}
+	}
+}
+
+/**
+ * S8 settings storage: serves the cached settings.json content while the
+ * file's stat still matches the entry's fingerprint (stat-equivalent to a
+ * fresh read), and falls back to the exact FileSettingsStorage lock/read/write
+ * sequence on any mismatch or on writes, so SettingsManager.reload() still
+ * observes external edits and settings writes still persist under the lock.
+ * Writes always take the file lock and re-read so concurrent SettingsManager
+ * instances cannot clobber each other from a stale cache blob. SettingsManager
+ * instances stay per-generation; only the disk parse results are reused.
+ */
+class CachedSettingsFileStorage {
+	constructor(
+		private readonly globalPath: string,
+		private readonly projectPath: string,
+		private entry: SettingsParseCacheEntry,
+	) {}
+
+	withLock(scope: "global" | "project", fn: (current: string | undefined) => string | undefined): void {
+		const isGlobal = scope === "global";
+		const path = isGlobal ? this.globalPath : this.projectPath;
+		const cachedStat = isGlobal ? this.entry.globalStat : this.entry.projectStat;
+		// Serve cached content only for reads (fn returns undefined). Writes always
+		// take the file lock and re-read so two SettingsManager instances cannot
+		// clobber each other from a stale cache blob.
+		if (sameStatFingerprint(cachedStat, statFingerprint(path))) {
+			const cached = isGlobal ? this.entry.globalContent : this.entry.projectContent;
+			if (fn(cached) === undefined) return;
+		}
+		this.withFreshFile(isGlobal, path, fn);
+	}
+
+	private withFreshFile(
+		isGlobal: boolean,
+		path: string,
+		fn: (current: string | undefined) => string | undefined,
+	): void {
+		const dir = dirname(path);
+		let release: (() => void) | undefined;
+		try {
+			const fileExists = existsSync(path);
+			if (fileExists) {
+				release = acquireFileLockSyncWithRetry(path);
+			}
+			let current: string | undefined;
+			if (fileExists) {
+				settingsParseCacheMetrics.diskReads++;
+				current = readFileSync(path, "utf-8");
+			}
+			this.updateEntry(isGlobal, current, statFingerprint(path));
+			const next = fn(current);
+			if (next !== undefined) {
+				if (!existsSync(dir)) {
+					mkdirSync(dir, { recursive: true });
+				}
+				release ??= acquireFileLockSyncWithRetry(path);
+				writeFileSync(path, next, "utf-8");
+				this.updateEntry(isGlobal, next, statFingerprint(path));
+			}
+		} finally {
+			if (release) {
+				try {
+					release();
+				} catch {
+					// Ignore unlock errors (lock may have been compromised).
+				}
+			}
+		}
+	}
+
+	private updateEntry(isGlobal: boolean, content: string | undefined, stat: StatFingerprint): void {
+		if (isGlobal) {
+			this.entry.globalContent = content;
+			this.entry.globalStat = stat;
+		} else {
+			this.entry.projectContent = content;
+			this.entry.projectStat = stat;
+		}
+	}
+}
+
 /**
  * Extract a validated `providers` map from a parsed models.json value.
  * Returns an empty map when the value is missing, not an object, or has no
@@ -463,10 +644,15 @@ export class SessionBridge {
 		}
 
 		try {
-			const result = await this._createSession(this._physicalCwd, this._sessionManager, {
-				type: "session_start",
-				reason: "startup",
-			});
+			const result = await this._createSession(
+				this._physicalCwd,
+				this._sessionManager,
+				{
+					type: "session_start",
+					reason: "startup",
+				},
+				settingsManager,
+			);
 			await this._activateSession(result.session);
 		} catch (err) {
 			// AgentSession init failure: release the candidate and enter
@@ -577,7 +763,9 @@ export class SessionBridge {
 		const physicalPath = projectLocation.physicalPath;
 		const settingsManager = this._createSettingsManager(physicalPath);
 		const sessionDir = this._getSessionDir(physicalPath, settingsManager.getSessionDir());
-		const sessions = await SessionManager.list(physicalPath, sessionDir);
+		const sessions = await SessionManager.list(physicalPath, sessionDir, undefined, {
+			includeAllMessagesText: false,
+		});
 		// SessionInfo.cwd is model-visible: translate the stored physical cwd back
 		// to logical in WSL mode. SessionInfo.path is the physical JSONL path and
 		// is not shown to the model (wsl_plan.md §4.8).
@@ -1185,7 +1373,7 @@ export class SessionBridge {
 		const modelsPath = join(getAgentDir(), "models.json");
 		let release: (() => void) | undefined;
 		try {
-			release = this._acquireModelsLockSync(modelsPath);
+			release = acquireFileLockSyncWithRetry(modelsPath);
 			return fn();
 		} finally {
 			if (release) {
@@ -1196,33 +1384,6 @@ export class SessionBridge {
 				}
 			}
 		}
-	}
-
-	private _acquireModelsLockSync(path: string): () => void {
-		const maxAttempts = 10;
-		const delayMs = 20;
-		let lastError: unknown;
-
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			try {
-				return lockSync(path, { realpath: false });
-			} catch (error) {
-				const code =
-					typeof error === "object" && error !== null && "code" in error
-						? String((error as { code?: unknown }).code)
-						: undefined;
-				if (code !== "ELOCKED" || attempt === maxAttempts) {
-					throw error;
-				}
-				lastError = error;
-				const start = Date.now();
-				while (Date.now() - start < delayMs) {
-					// Sleep synchronously to avoid changing callers to async.
-				}
-			}
-		}
-
-		throw (lastError as Error) ?? new Error("Failed to acquire models.json lock");
 	}
 
 	// =========================================================================
@@ -2199,8 +2360,12 @@ export class SessionBridge {
 		cwd: string,
 		sessionManager: SessionManager,
 		sessionStartEvent: SessionStartEvent,
+		settingsManagerOverride?: SettingsManager,
 	): Promise<CreateAgentSessionResult> {
-		const settingsManager = this._createSettingsManager(cwd);
+		// S8: start() already built this generation's settings manager (for
+		// sessionDir resolution); reuse it instead of re-parsing settings.json
+		// for the same generation. Other entry points create their own.
+		const settingsManager = settingsManagerOverride ?? this._createSettingsManager(cwd);
 		const context = this._executionContext;
 		const isSolo = this._role === "single";
 		// Resolved exactly once per candidate generation and used uniformly for
@@ -3066,7 +3231,45 @@ export class SessionBridge {
 	}
 
 	private _createSettingsManager(cwd: string): SettingsManager {
-		const settingsManager = SettingsManager.create(cwd);
+		// S8 settings parse cache: SettingsManager instances stay per-generation
+		// (modified-field trackers and the write queue are generation state),
+		// but the settings.json disk reads are served from the stat-validated
+		// cache. Paths mirror the core FileSettingsStorage layout exactly
+		// (piConfig.configDir is ".pi" for this install).
+		const agentDir = getAgentDir();
+		const globalPath = join(resolve(agentDir), "settings.json");
+		const projectPath = join(resolve(cwd), ".pi", "settings.json");
+		const globalStat = statFingerprint(globalPath);
+		const projectStat = statFingerprint(projectPath);
+
+		let entry = settingsParseCache.find(
+			(cacheEntry) =>
+				cacheEntry.cwd === cwd &&
+				sameStatFingerprint(cacheEntry.globalStat, globalStat) &&
+				sameStatFingerprint(cacheEntry.projectStat, projectStat),
+		);
+		if (!entry) {
+			entry = {
+				cwd,
+				globalStat,
+				projectStat,
+				globalContent: readSettingsUnderLock(globalPath),
+				projectContent: readSettingsUnderLock(projectPath),
+			};
+			const existingIndex = settingsParseCache.findIndex((cacheEntry) => cacheEntry.cwd === cwd);
+			if (existingIndex >= 0) {
+				settingsParseCache[existingIndex] = entry;
+			} else {
+				if (settingsParseCache.length >= SETTINGS_PARSE_CACHE_CAPACITY) {
+					settingsParseCache.shift();
+				}
+				settingsParseCache.push(entry);
+			}
+		}
+
+		const settingsManager = SettingsManager.fromStorage(
+			new CachedSettingsFileStorage(globalPath, projectPath, entry),
+		);
 		const overrides: Parameters<SettingsManager["applyOverrides"]>[0] = {};
 
 		if (this._guiSettings?.defaultProvider) {

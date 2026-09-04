@@ -6,11 +6,18 @@
  * optimistic user messages, and both seam-dedup rules (toolCallId duplicate
  * drop, triple-key message drop).
  *
+ * perf SDD stage S3 additions: blockById Map index invariant
+ * (map.size === blocks.length after every operation), enforceBlockCap
+ * (head trim to floor(max/2)), and the session store keeping message_update
+ * out of the debug events array.
+ *
  * The assembler is framework-free: tests exercise it directly without Pinia
- * or Vue mounting.
+ * or Vue mounting (the store cases below activate a standalone Pinia).
  */
 
 import { describe, expect, it } from "vitest";
+import { createPinia, setActivePinia } from "pinia";
+import { reactive, watch } from "vue";
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
 import { INTERNAL_CUSTOM_MESSAGE_TYPES, formatInternalNotification } from "@shared/internal-notification";
 // Imported from the coding-agent source (its only top-level imports are
@@ -18,7 +25,9 @@ import { INTERNAL_CUSTOM_MESSAGE_TYPES, formatInternalNotification } from "@shar
 // the drift check must compare live sources on both sides.
 import { LEGACY_INTERNAL_CUSTOM_TYPES } from "../../../../packages/coding-agent/src/core/messages.ts";
 import type { DisplayBlock } from "@/types/session";
+import type { DisplayBlockAssembler } from "../utils/display-blocks";
 import { createDisplayBlockAssembler, remainingSeconds } from "../utils/display-blocks";
+import { useSessionStore } from "../stores/session-store";
 
 // ============================================================================
 // Fixtures
@@ -1159,5 +1168,248 @@ describe("remainingSeconds", () => {
   it("returns 0 after the deadline", () => {
     expect(remainingSeconds(1_000, 4_000, 5_001)).toBe(0);
     expect(remainingSeconds(1_000, 4_000, 9_000)).toBe(0);
+  });
+});
+
+// ============================================================================
+// Map index & enforceBlockCap (perf SDD stage S3, §4.3)
+// ============================================================================
+
+/** §4.3 invariant: after any operation the internal id→block index mirrors
+ *  the blocks array exactly (same size, same object identities). */
+function expectIndexInSync(a: DisplayBlockAssembler): void {
+  expect(a.blockById.size).toBe(a.blocks.length);
+  for (const block of a.blocks) {
+    expect(a.blockById.get(block.id)).toBe(block);
+  }
+}
+
+describe("block id index (S3)", () => {
+  it("keeps map.size === blocks.length across live folding, supersede removals and clear", () => {
+    const a = createDisplayBlockAssembler();
+    expectIndexInSync(a);
+
+    a.applyEvent({ type: "agent_start" });
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    expectIndexInSync(a); // user-message + thinking placeholder
+
+    // First text supersedes the empty thinking placeholder — a removal path.
+    const partial = makeMessage({ role: "assistant", content: "answer", timestamp: 2 });
+    a.applyEvent({ type: "message_update", message: partial, assistantMessageEvent: { type: "text_start" } });
+    expectIndexInSync(a);
+    a.applyEvent(msgUpdate(partial));
+    expectIndexInSync(a);
+    a.applyEvent(msgEnd(partial));
+    expectIndexInSync(a);
+
+    a.applyEvent({ type: "eye_model_start", id: "eye-1", provider: "p", modelId: "m", imageCount: 1 });
+    a.applyEvent({ type: "eye_model_end", id: "eye-1", provider: "p", modelId: "m", imageCount: 1, success: true });
+    a.applyEvent(toolStart("t1"));
+    a.applyEvent(toolEnd("t1", "bash", "ok"));
+    a.applyEvent({ type: "compaction_start", reason: "threshold" });
+    a.applyEvent({ type: "api_error", errorMessage: "boom", category: "rate_limit", httpStatus: 429, title: "限流", retryable: true });
+    a.applyEvent({ type: "agent_end", messages: [] });
+    expectIndexInSync(a);
+
+    // Optimistic append + failure removal (removeBlocks + error push).
+    const optimisticId = a.appendOptimisticUserMessage("temp");
+    expect(optimisticId).not.toBeNull();
+    expectIndexInSync(a);
+    a.failOptimisticUserMessage(optimisticId, "发送失败: 网络错误");
+    expectIndexInSync(a);
+
+    a.clear();
+    expectIndexInSync(a);
+    expect(a.blockById.size).toBe(0);
+  });
+
+  it("keeps the index in sync across replay folding (thinking, notes, tools)", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      { type: "message", timestamp: "2026-01-01T00:00:00.000Z", message: makeMessage({ role: "user", content: "q", timestamp: 1 }) },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:01.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "thoughts" } as { type: string; text?: string },
+            ...textBlocks("answer"),
+            toolCallBlock("t1", "bash", {}),
+          ],
+          timestamp: 2,
+        }),
+      },
+      { type: "custom_message", timestamp: "2026-01-01T00:00:02.000Z", customType: "pix-task-resume", content: "note", display: true, details: {} },
+    ]);
+    expectIndexInSync(a);
+
+    // A live event after replay still resolves ids through the index.
+    a.applyEvent(toolEnd("t1", "bash", "done"));
+    expectIndexInSync(a);
+    const ws = a.blocks.find((b) => b.type === "work-status");
+    expect(ws?.type).toBe("work-status");
+    if (ws?.type === "work-status") {
+      expect(ws.tools[0].result).toBe("done");
+    }
+  });
+
+  it("enforceBlockCap trims from the head to floor(maxBlocks/2) and syncs the index", () => {
+    const a = createDisplayBlockAssembler();
+    // Alternating optimistic messages: separators interleave, count is dynamic.
+    for (let i = 0; i < 12; i++) {
+      a.appendOptimisticUserMessage(`cap-msg-${i}`);
+    }
+    const ids = a.blocks.map((b) => b.id);
+    expect(ids.length).toBeGreaterThanOrEqual(10);
+
+    const removed = a.enforceBlockCap(10);
+    const target = Math.floor(10 / 2);
+    expect(removed).toBe(ids.length - target);
+    expect(a.blocks).toHaveLength(target);
+    expect(a.blocks.map((b) => b.id)).toEqual(ids.slice(removed));
+    expectIndexInSync(a);
+    for (const id of ids.slice(0, removed)) {
+      expect(a.blockById.has(id)).toBe(false);
+    }
+  });
+
+  it("enforceBlockCap returns 0 and leaves the array untouched below the cap", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvents([msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 }))]);
+    const before = [...a.blocks];
+    expect(a.enforceBlockCap(10)).toBe(0);
+    expect(a.blocks).toEqual(before);
+    expectIndexInSync(a);
+  });
+
+  it("indexes the array-visible object so thinking updates stay reactive (Vue proxy)", () => {
+    const blocks = reactive<DisplayBlock[]>([]);
+    const a = createDisplayBlockAssembler({ blocks });
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    expectIndexInSync(a);
+
+    const thinking = a.blocks.find((block) => block.type === "thinking");
+    expect(thinking?.type).toBe("thinking");
+    if (!thinking || thinking.type !== "thinking") return;
+    expect(a.blockById.get(thinking.id)).toBe(thinking);
+
+    const seen: string[] = [];
+    const stop = watch(
+      () => thinking.content,
+      (value) => {
+        seen.push(value);
+      },
+      { flush: "sync" },
+    );
+    a.applyEvents([
+      {
+        type: "message_update",
+        message: makeMessage({ role: "assistant", content: [], timestamp: 2 }),
+        assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
+      },
+      {
+        type: "message_update",
+        message: makeMessage({ role: "assistant", content: [], timestamp: 2 }),
+        assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "hello" },
+      },
+    ]);
+    stop();
+
+    expect(thinking.content).toBe("hello");
+    expect(seen).toContain("hello");
+    expect(a.blocks.filter((block) => block.type === "thinking")).toHaveLength(1);
+    expectIndexInSync(a);
+  });
+
+  it("enforceBlockCap drops assembler pointers to trimmed blocks so a new thinking placeholder can open", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "first", timestamp: 1 })));
+    const open = a.blocks.find((block) => block.type === "thinking");
+    expect(open?.type).toBe("thinking");
+
+    for (let i = 0; i < 12; i++) {
+      a.appendOptimisticUserMessage(`cap-msg-${i}`);
+    }
+    expect(a.blocks.length).toBeGreaterThanOrEqual(10);
+    a.enforceBlockCap(10);
+    expectIndexInSync(a);
+    expect(a.blocks.some((block) => block.id === open?.id)).toBe(false);
+
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "after-cap", timestamp: 99 })));
+    const thinking = a.blocks.filter((block) => block.type === "thinking");
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].id).not.toBe(open?.id);
+    expectIndexInSync(a);
+  });
+});
+
+// ============================================================================
+// Session store events slimming (perf SDD stage S3, §3.9)
+// ============================================================================
+
+describe("session store events slimming (S3)", () => {
+  it("keeps a slimmed message_update in the debug events array while still folding blocks", () => {
+    setActivePinia(createPinia());
+    const store = useSessionStore();
+    store.addEvents([
+      { type: "agent_start" },
+      msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })),
+      msgEnd(makeMessage({ role: "user", content: "hi", timestamp: 1 })),
+      msgUpdate(makeMessage({ role: "assistant", content: "partial", timestamp: 2 })),
+      {
+        type: "message_update",
+        message: makeMessage({ role: "assistant", content: "full answer", timestamp: 2 }),
+        assistantMessageEvent: { type: "text_delta", delta: " answer" },
+      },
+      msgEnd(makeMessage({ role: "assistant", content: "full answer", timestamp: 2 })),
+      { type: "agent_end", messages: [] },
+    ]);
+
+    expect(store.events.map((e) => e.type)).toEqual([
+      "agent_start",
+      "message_start",
+      "message_end",
+      "message_update",
+      "message_update",
+      "message_end",
+      "agent_end",
+    ]);
+    const updates = store.events.filter((e) => e.type === "message_update");
+    expect(updates).toHaveLength(2);
+    for (const update of updates) {
+      if (update.type !== "message_update") continue;
+      expect(update.message.content).toBe("");
+      expect((update.message as { contentChars?: number }).contentChars).toBeGreaterThan(0);
+    }
+    expect(updates[1].assistantMessageEvent).toEqual({ type: "text_delta", delta: " answer" });
+
+    // The updates still folded into blocks from the full event, not the slim copy.
+    const agent = store.displayBlocks.find((b) => b.type === "agent-message");
+    expect(agent?.type).toBe("agent-message");
+    if (agent?.type === "agent-message") {
+      expect(agent.content).toBe("full answer");
+      expect(agent.isStreaming).toBe(false);
+    }
+  });
+
+  it("getRawEventsJson keeps slimmed message_update for the raw viewer", () => {
+    setActivePinia(createPinia());
+    const store = useSessionStore();
+    store.addEvent({
+      type: "message_update",
+      message: makeMessage({ role: "assistant", content: "hello world", timestamp: 1 }),
+      assistantMessageEvent: { type: "text_delta", delta: " world" },
+    });
+    store.addEvent(msgEnd(makeMessage({ role: "assistant", content: "hello world", timestamp: 1 })));
+
+    const parsed = JSON.parse(store.getRawEventsJson()) as AgentSessionEvent[];
+    const update = parsed.find((e) => e.type === "message_update");
+    expect(update?.type).toBe("message_update");
+    if (update?.type === "message_update") {
+      expect(update.message.content).toBe("");
+      expect((update.message as { contentChars?: number }).contentChars).toBe("hello world".length);
+      expect(update.assistantMessageEvent).toEqual({ type: "text_delta", delta: " world" });
+    }
+    expect(parsed.some((e) => e.type === "message_end")).toBe(true);
   });
 });

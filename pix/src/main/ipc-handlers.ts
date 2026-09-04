@@ -11,11 +11,12 @@ import { createReadStream, existsSync, rmSync } from "fs";
 import { createInterface } from "readline";
 import { isAbsolute, join, relative, resolve } from "path";
 import { BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from "electron";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import electronUpdater from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
 import { resolveProjectLocation } from "./execution-context.js";
 import { createGitStatusService } from "./git/git-status-service.js";
+import { MessageUpdateCoalescer } from "./message-update-coalescer.js";
 import type { SessionBridge } from "./session-bridge.js";
 import type { SettingsStore } from "./settings-store.js";
 import type {
@@ -1142,13 +1143,23 @@ export function setupEventForwarding(
     }
   }));
 
-  // Forward ordinary session events.
-  eventForwardingUnsubscribes.push(singleSessionBridge.onEvent((event) => {
+  // Forward ordinary session events. message_update events are coalesced on a
+  // fixed 50ms window before crossing the IPC boundary (perf SDD §4.2); markers
+  // and all other event types flush the pending update and pass through
+  // immediately, preserving event order. The sink keeps the window-alive check.
+  // The bridge types its events with the shared serialized AgentSessionEvent;
+  // at runtime they are the core AgentSessionEvent objects (session-bridge
+  // casts on emit), so the coalescer sees the core type.
+  const piEventCoalescer = new MessageUpdateCoalescer((event) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("pi-event", event);
     }
+  });
+  eventForwardingUnsubscribes.push(singleSessionBridge.onEvent((event) => {
+    piEventCoalescer.push(event as AgentSessionEvent);
   }));
+  eventForwardingUnsubscribes.push(() => piEventCoalescer.dispose());
 
   eventForwardingUnsubscribes.push(singleSessionBridge.onUserInputRequest((request) => {
     const win = getWin();
@@ -1238,13 +1249,18 @@ export function setupEventForwarding(
     ),
   );
 
-  // Forward Team leader AgentSession events on dedicated channels.
-  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onEvent((event) => {
+  // Forward Team leader AgentSession events on dedicated channels. Same
+  // message_update coalescing as the pi-event channel above (perf SDD §4.2).
+  const teamLeaderEventCoalescer = new MessageUpdateCoalescer((event) => {
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("team-leader-event", event);
     }
+  });
+  eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onEvent((event) => {
+    teamLeaderEventCoalescer.push(event as AgentSessionEvent);
   }));
+  eventForwardingUnsubscribes.push(() => teamLeaderEventCoalescer.dispose());
 
   eventForwardingUnsubscribes.push(teamLeaderSessionBridge.onUserInputRequest((request) => {
     const win = getWin();

@@ -86,6 +86,17 @@ export interface TaskIndex {
   lastWriterRunId: string;
   tasks: TaskIndexEntry[];
 }
+/**
+ * Workspace-scoped index facts, computed once per workspace by restoreAll
+ * (perf SDD §4.8) so per-task readTask calls stop re-reading
+ * index.json/index.prev.json (the former per-task read amplification).
+ */
+export interface TaskIndexProbe {
+  /** readIndex result: null = both generations unreadable (or absent). */
+  index: TaskIndex | null;
+  /** Whether index.json or index.prev.json exists on disk. */
+  exists: boolean;
+}
 export interface TaskMetadata {
   schemaVersion: number;
   spec: AgentTaskSpec;
@@ -1224,6 +1235,26 @@ export class AgentTaskStore {
     return null;
   }
 
+  /**
+   * readIndex plus the raw index-pair existence, computed ONCE per workspace by
+   * restoreAll (perf SDD §4.8) and handed to readTask as TaskIndexProbe so the
+   * per-task path reuses it instead of re-reading index.json/index.prev.json.
+   */
+  async probeIndex(workspaceId: string): Promise<TaskIndexProbe> {
+    AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
+    return this._enqueue(async () => {
+      const index = await this._readIndexImpl(workspaceId);
+      if (index !== null) {
+        return { index, exists: true };
+      }
+      const wsDir = this._workspaceDir(workspaceId);
+      const exists =
+        (await AgentTaskStore._fileExists(join(wsDir, "index.json"))) ||
+        (await AgentTaskStore._fileExists(join(wsDir, "index.prev.json")));
+      return { index: null, exists };
+    }, workspaceId);
+  }
+
   /** Before replacing the current index, the last known-valid one is preserved as index.prev.json. */
   async writeIndex(workspaceId: string, index: TaskIndex): Promise<void> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
@@ -1245,13 +1276,13 @@ export class AgentTaskStore {
     this._invalidateUsedBytes(workspaceId);
   }
 
-  async readTask(workspaceId: string, taskId: string): Promise<TaskReadResult> {
+  async readTask(workspaceId: string, taskId: string, indexProbe?: TaskIndexProbe): Promise<TaskReadResult> {
     AgentTaskStore._assertSafeComponent(workspaceId, "workspaceId");
     AgentTaskStore._assertSafeComponent(taskId, "taskId");
-    return this._enqueue(() => this._readTaskImpl(workspaceId, taskId), workspaceId);
+    return this._enqueue(() => this._readTaskImpl(workspaceId, taskId, indexProbe), workspaceId);
   }
 
-  private async _readTaskImpl(workspaceId: string, taskId: string): Promise<TaskReadResult> {
+  private async _readTaskImpl(workspaceId: string, taskId: string, indexProbe?: TaskIndexProbe): Promise<TaskReadResult> {
     const taskDir = this._taskDir(workspaceId, taskId);
     const diagnostics: TaskStorageDiagnostic[] = [];
 
@@ -1301,11 +1332,22 @@ export class AgentTaskStore {
 
     // An unreadable index pair marks the whole workspace's tasks recovery-
     // corrupt; a missing index pair (fresh workspace) is not corruption.
+    // Perf SDD §4.8: restoreAll passes a workspace-scoped probe so the index
+    // pair is read once per workspace instead of once per task; callers
+    // without a probe keep the on-demand check.
     const wsDir = this._workspaceDir(workspaceId);
-    const indexExists =
-      (await AgentTaskStore._fileExists(join(wsDir, "index.json"))) ||
-      (await AgentTaskStore._fileExists(join(wsDir, "index.prev.json")));
-    if (indexExists && (await this._readIndexImpl(workspaceId)) === null) {
+    if (indexProbe === undefined) {
+      const indexExists =
+        (await AgentTaskStore._fileExists(join(wsDir, "index.json"))) ||
+        (await AgentTaskStore._fileExists(join(wsDir, "index.prev.json")));
+      if (indexExists && (await this._readIndexImpl(workspaceId)) === null) {
+        diagnostics.push({
+          code: "index_corrupt",
+          message: "workspace index.json and index.prev.json are both unreadable; cannot fall back to a known-valid generation",
+          recoverable: false,
+        });
+      }
+    } else if (indexProbe.exists && indexProbe.index === null) {
       diagnostics.push({
         code: "index_corrupt",
         message: "workspace index.json and index.prev.json are both unreadable; cannot fall back to a known-valid generation",

@@ -21,6 +21,7 @@ import {
   AgentTaskStore,
 } from "./agent-task/agent-task-store.js";
 import { AgentTaskService } from "./agent-task/agent-task-service.js";
+import { setRestoreGate } from "./ipc-agent-task-adapters.js";
 
 // ESM doesn't have __dirname; derive it from import.meta.url.
 const __filename = fileURLToPath(import.meta.url);
@@ -197,9 +198,12 @@ app.whenReady().then(async () => {
   }
 
   // App-level agent task store (1.4.2) + service. The runId is frozen at
-  // construction; index writes never bypass the store. restoreAll() runs
-  // before createWindow/accepting tasks so the renderer's first get_all sees
-  // the fully hydrated task set (design plan §3, §5.5).
+  // construction; index writes never bypass the store. restoreAll() starts
+  // here WITHOUT awaiting (perf SDD §4.5): the first window and the IPC
+  // registration below no longer wait for the restore - the task query
+  // commands hold on the restore gate instead, so the renderer's first get_all
+  // still sees the fully hydrated task set (design plan §3, §5.5).
+  let restorePromise: Promise<unknown>;
   try {
     agentTaskStore = new AgentTaskStore({
       rootDir: join(getAgentDir(), "agent-tasks"),
@@ -213,11 +217,17 @@ app.whenReady().then(async () => {
       store: agentTaskStore,
       runId: agentTaskRunId,
     });
-    await agentTaskService.restoreAll();
+    restorePromise = agentTaskService.restoreAll();
   } catch (err) {
     console.error("[main] AgentTaskService FAILED:", err);
     throw err;
   }
+  // The gate never rejects: queries pending on a failed restore still settle;
+  // the original "restore failure fails startup" semantics live in the await
+  // further below. Wired before SessionBridge construction / IPC so a later
+  // throw cannot leave get_all hanging on an unset gate.
+  const whenRestored = restorePromise.catch(() => {});
+  setRestoreGate(whenRestored);
 
   try {
     singleSessionBridge = new SessionBridge({
@@ -227,6 +237,7 @@ app.whenReady().then(async () => {
     });
   } catch (err) {
     console.error("[main] Single SessionBridge FAILED:", err);
+    setRestoreGate(Promise.resolve());
     throw err;
   }
 
@@ -234,6 +245,7 @@ app.whenReady().then(async () => {
     teamManager = new TeamManager();
   } catch (err) {
     console.error("[main] TeamManager FAILED:", err);
+    setRestoreGate(Promise.resolve());
     throw err;
   }
 
@@ -242,6 +254,7 @@ app.whenReady().then(async () => {
     teamLeaderSessionBridge = new SessionBridge({ role: "team-leader", teamManager: teamManager ?? undefined });
   } catch (err) {
     console.error("[main] Team leader SessionBridge FAILED:", err);
+    setRestoreGate(Promise.resolve());
     throw err;
   }
 
@@ -251,6 +264,15 @@ app.whenReady().then(async () => {
   if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager && agentTaskService) {
     registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager, agentTaskService);
     setupEventForwarding(() => activeWin, singleSessionBridge, teamLeaderSessionBridge, teamManager, agentTaskService);
+  } else {
+    setRestoreGate(Promise.resolve());
+  }
+
+  try {
+    await restorePromise;
+  } catch (err) {
+    console.error("[main] AgentTaskService FAILED:", err);
+    throw err;
   }
 
   app.on("activate", () => {

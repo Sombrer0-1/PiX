@@ -64,6 +64,7 @@ export function useWorkspaceRpc() {
     refreshCommands: (): Promise<void> => activeRpc.value.refreshCommands(),
     refreshModels: (): Promise<void> => activeRpc.value.refreshModels(),
     refreshSessionStats: (): Promise<void> => activeRpc.value.refreshSessionStats(),
+    scheduleSessionStatsRefresh: (): void => activeRpc.value.scheduleSessionStatsRefresh(),
     getAvailableThinkingLevels: (): Promise<ThinkingLevel[] | null> => activeRpc.value.getAvailableThinkingLevels(),
     supportsThinking: (): Promise<boolean | null> => activeRpc.value.supportsThinking(),
     setScopedModels: (patterns: string[]): Promise<void> => activeRpc.value.setScopedModels(patterns),

@@ -545,7 +545,10 @@ describe("CenterPanel /btw interception", () => {
       filePaths: undefined,
       images: undefined,
     });
-    expect(sessionMock.state.appendOptimisticUserMessage).toHaveBeenCalledWith("/btw 团队问题", undefined);
+    // sendMessage always materializes empty attachment arrays; the assertion
+    // previously expected a bare single-argument call that no longer matches
+    // the composer contract.
+    expect(sessionMock.state.appendOptimisticUserMessage).toHaveBeenCalledWith("/btw 团队问题", [], []);
   });
 
   it("shows the usage card for a bare /btw without sending a request", async () => {

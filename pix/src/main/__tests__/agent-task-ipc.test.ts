@@ -13,7 +13,9 @@
  * (get-pending-agent-task-input-requests), throttled activities/output
  * reaching the renderer, state visibility within 1s, and the 1.5 delivery
  * catch-up (an undelivered terminal background result lands the moment its
- * parent session opens a sink).
+ * parent session opens a sink), and the S5 restore gate (get_all /
+ * get_active_input_requests / the remount catch-up hold until the gate
+ * resolves; other commands pass through; undefined/resolved gate = passthrough).
  *
  * IPC harness rule (design plan §3): the test registers the REAL production
  * handlers from ipc-agent-task-adapters.ts on a top-level-imported injectable
@@ -58,6 +60,7 @@ import type { ProjectLocation } from "../../shared/project-location.js";
 import {
   isAgentTaskCommand,
   registerAgentTaskIpcHandlers,
+  setRestoreGate,
   subscribeAgentTaskEventForwarding,
   type IpcMainLike,
   type WebContentsLike,
@@ -1537,6 +1540,104 @@ await run("R3: export_diagnostics command returns metadata-only content", async 
   assertFailure(unknown, "unknown task diagnostics fail");
 
   rmSync(projectDir, { recursive: true, force: true });
+});
+
+// ============================================================================
+// S5 restore gate (perf SDD §4.5)
+// ============================================================================
+
+await run("S5 gate: task queries hold until the gate resolves; other commands pass through", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+  const { taskId, runtime } = await createSingleForegroundTask(harness);
+  const controller = new AbortController();
+  runtime.requestInput(controller, makeInputRequest("req-gate"));
+  await waitFor(() => harness.service.getActiveInputRequests().length === 1, 20000, "input request pending");
+
+  // Manual gate promise: holds until releaseGate() (drain loops never settle
+  // it, so the not-settled assertions below are deterministic).
+  let releaseGate: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  setRestoreGate(gate);
+  try {
+    let getAllSettled = false;
+    let getInputsSettled = false;
+    let getPendingSettled = false;
+    const getAll = ipc.invoke("agent-task-command", { type: "get_all" }).then((result) => {
+      getAllSettled = true;
+      return result;
+    });
+    const getInputs = ipc.invoke("agent-task-command", { type: "get_active_input_requests" }).then((result) => {
+      getInputsSettled = true;
+      return result;
+    });
+    const getPending = ipc.invoke("get-pending-agent-task-input-requests").then((result) => {
+      getPendingSettled = true;
+      return result;
+    });
+    for (let i = 0; i < 50; i++) {
+      await drain();
+    }
+    assert(!getAllSettled, "get_all holds while the restore gate is unresolved");
+    assert(!getInputsSettled, "get_active_input_requests holds while the restore gate is unresolved");
+    assert(!getPendingSettled, "get-pending-agent-task-input-requests holds while the restore gate is unresolved");
+
+    // Ungated commands are NOT held back: get / unwatch_task answer immediately.
+    const getOne = (await ipc.invoke("agent-task-command", { type: "get", taskId })) as PixCommandResult<AgentTaskInfo>;
+    assertEqual(getOne.success, true, "get answers while the gate holds (not gated)");
+    assertEqual(getOne.success === true ? getOne.data?.taskId : undefined, taskId, "get returns the task while the gate holds");
+    const unwatch = (await ipc.invoke("agent-task-command", { type: "unwatch_task", taskId })) as PixCommandResult;
+    assertEqual(unwatch.success, true, "unwatch_task answers while the gate holds (not gated)");
+
+    // Releasing the gate unblocks the held queries with the full task set.
+    releaseGate();
+    const all = (await getAll) as PixCommandResult<{ tasks: AgentTaskInfo[] }>;
+    assertEqual(all.success, true, "get_all succeeds after the gate resolves");
+    if (all.success === true) {
+      assertEqual(all.data!.tasks.length, 1, "get_all returns the full task set after the gate resolves");
+      assertEqual(all.data!.tasks[0].taskId, taskId, "get_all task id after the gate resolves");
+    }
+    const inputs = (await getInputs) as PixCommandResult<AgentTaskInputRequest[]>;
+    assertEqual(inputs.success, true, "get_active_input_requests succeeds after the gate resolves");
+    if (inputs.success === true) {
+      assertEqual(inputs.data!.length, 1, "active input requests visible after the gate resolves");
+      assertEqual(inputs.data![0].requestId, "req-gate", "gated input request payload");
+    }
+    const pending = (await getPending) as AgentTaskInputRequest[];
+    assertEqual(pending.length, 1, "remount catch-up visible after the gate resolves");
+    assertEqual(pending[0].requestId, "req-gate", "remount catch-up payload");
+  } finally {
+    // Module-level state: reset so the remaining tests run ungated.
+    setRestoreGate(undefined);
+  }
+});
+
+await run("S5 gate: undefined or already-resolved gate is a passthrough", async () => {
+  const harness = makeHarness();
+  const ipc = new FakeIpcMain();
+  registerAgentTaskIpcHandlers(ipc, harness.service);
+  await harness.service.createTaskGroup(makeParams("parallel", [makeTask(0), makeTask(1)]), makeContext(harness), "foreground");
+
+  // An already-resolved gate promise is equivalent to no gate.
+  setRestoreGate(Promise.resolve());
+  const resolved = (await ipc.invoke("agent-task-command", { type: "get_all" })) as PixCommandResult<{ tasks: AgentTaskInfo[] }>;
+  assertEqual(resolved.success, true, "get_all succeeds with a resolved gate");
+  if (resolved.success === true) {
+    assertEqual(resolved.data!.tasks.length, 2, "resolved gate returns the full task set");
+  }
+  const resolvedPending = (await ipc.invoke("get-pending-agent-task-input-requests")) as AgentTaskInputRequest[];
+  assertEqual(resolvedPending.length, 0, "resolved gate returns the empty pending list");
+
+  // undefined is the pre-S5 default (no gate at all) - current behavior.
+  setRestoreGate(undefined);
+  const ungated = (await ipc.invoke("agent-task-command", { type: "get_all" })) as PixCommandResult<{ tasks: AgentTaskInfo[] }>;
+  assertEqual(ungated.success, true, "get_all succeeds with no gate set");
+  if (ungated.success === true) {
+    assertEqual(ungated.data!.tasks.length, 2, "no-gate passthrough returns the full task set");
+  }
 });
 
 // ============================================================================

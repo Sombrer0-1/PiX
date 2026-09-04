@@ -5,8 +5,10 @@
  * Owns the main session layout and team-mode split view.
  */
 import { computed, ref, watch, nextTick, onMounted } from "vue";
+import { storeToRefs } from "pinia";
 import { useWorkspaceSessionStore } from "../../composables/useWorkspaceSessionStore";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
+import { useComposerStore } from "../../stores/composer-store";
 import { useBtw } from "../../composables/useBtw";
 import { useProjectStore } from "../../stores/project-store";
 import SessionView from "../session/SessionView.vue";
@@ -88,6 +90,9 @@ const showSwitchToSoloConfirmDialog = ref(false);
 const showExecutionModeMenu = ref(false);
 const contentArea = ref<HTMLElement | null>(null);
 const shouldStickToBottom = ref(true);
+/** 浮动回顶/回底按钮的可见性；由 handleContentScroll 持续维护。 */
+const isNearBottom = ref(true);
+const isNearTop = ref(true);
 
 // Only the latest retryable API error is eligible for a retry button, and only
 // while the agent is idle. Once a new turn starts this becomes null, so older
@@ -108,8 +113,19 @@ async function cancelRetry(): Promise<void> {
   });
 }
 
-// Composer state
-const inputText = ref("");
+// Composer state. inputText/attachments live in the composer draft store so
+// they survive CenterPanel unmounts; the textarea binds v-model="inputText"
+// and no code writes its DOM value. Drafts are per session file so switching
+// session / project / solo-team does not leak the previous input.
+const composerStore = useComposerStore();
+const { inputText, attachments } = storeToRefs(composerStore);
+watch(
+  () => [rpc.sessionState.value?.sessionFile, rpc.sessionState.value?.sessionId] as const,
+  ([sessionFile, sessionId]) => {
+    composerStore.bindSession(sessionFile, sessionId);
+  },
+  { immediate: true },
+);
 const searchQuery = ref("");
 const showCommandPalette = ref(false);
 const showModelSelector = ref(false);
@@ -118,17 +134,15 @@ const isSending = ref(false);
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const isDraggingFiles = ref(false);
 const AUTO_SCROLL_THRESHOLD_PX = 48;
-let programmaticScrollFrame: number | null = null;
-let isProgrammaticScroll = false;
-
-interface ChatAttachment {
-  path: string;
-  name: string;
-  base64?: string;
-  mimeType?: string;
-}
-
-const attachments = ref<ChatAttachment[]>([]);
+/**
+ * 程序化跳底时预期的 scrollTop（scrollHeight - clientHeight，浏览器会钳制）。
+ * 流式输出时跳底自己的 scroll 事件可能在布局繁忙后才派发，单个 rAF 的标志位
+ * 守卫会错过它并把"距底 > 阈值"误判成用户上滚，悄悄关掉自动跟随；改为按位置
+ * 匹配：落在预期位置附近的滚动事件视为自己的跳底并消费掉，显著偏离的才是
+ * 用户意图（滚轮/滚动条/键盘均覆盖）。无溢出时不会有 scroll 事件，用短超时兜底清除。
+ */
+let programmaticScrollTarget: number | null = null;
+let programmaticScrollTimeout: number | null = null;
 
 const projectName = computed(() => projectStore.currentProject?.name || "");
 const environmentLabel = computed(() => {
@@ -354,6 +368,45 @@ watch(canUseTeamMode, (available) => {
   }
 });
 
+// 任务中心开关走 v-if 链，session-content 容器被销毁重建后 scrollTop 归零。
+// 本 watcher 在渲染前触发（打开时旧元素仍在），先捕获位置；关闭后容器回来时，
+// 跟随中则跳到底部，否则恢复原位置。
+let savedSessionScrollTop = 0;
+watch(
+  () => agentTaskStore.centerOpen,
+  (open) => {
+    if (open) {
+      savedSessionScrollTop = contentArea.value?.scrollTop ?? 0;
+      return;
+    }
+    void nextTick(() => {
+      const el = contentArea.value;
+      if (!el) return;
+      if (shouldStickToBottom.value) {
+        scrollContentToBottom();
+      } else {
+        el.scrollTop = savedSessionScrollTop;
+      }
+    });
+  }
+);
+
+// 子代理与 workflow 子进程以独立的 AgentTask 计费，主会话在整段工具调用期间
+// 不产生任何会刷新 token 面板的会话事件（useRpc 只监听主会话流事件）。任务
+// 转为终态正是其 usage 落账的时刻，对终态计数做 watcher 补上这条刷新链路。
+const AGENT_TASK_TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+const terminalAuxTaskCount = computed(
+  () => agentTaskStore.tasks.filter((task) => AGENT_TASK_TERMINAL_STATUSES.has(task.status)).length
+);
+watch(terminalAuxTaskCount, () => {
+  rpc.scheduleSessionStatsRefresh();
+});
+
 // Scroll to bottom on mount when there are existing blocks (e.g. navigating back from settings)
 onMounted(async () => {
   // Plan event mirror: subscribe once here so PlanPanel (v-if'ed on the plan
@@ -372,21 +425,45 @@ onMounted(async () => {
 function scrollContentToBottom(): void {
   const el = contentArea.value;
   if (!el) return;
-  isProgrammaticScroll = true;
+  programmaticScrollTarget = el.scrollHeight - el.clientHeight;
   el.scrollTop = el.scrollHeight;
-  if (programmaticScrollFrame !== null) cancelAnimationFrame(programmaticScrollFrame);
-  programmaticScrollFrame = requestAnimationFrame(() => {
-    isProgrammaticScroll = false;
-    programmaticScrollFrame = null;
-  });
+  if (programmaticScrollTimeout !== null) window.clearTimeout(programmaticScrollTimeout);
+  programmaticScrollTimeout = window.setTimeout(() => {
+    programmaticScrollTarget = null;
+    programmaticScrollTimeout = null;
+  }, 200);
 }
 
 function handleContentScroll(): void {
-  if (isProgrammaticScroll) return;
   const el = contentArea.value;
   if (!el) return;
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-  shouldStickToBottom.value = distance <= AUTO_SCROLL_THRESHOLD_PX;
+  isNearBottom.value = distance <= AUTO_SCROLL_THRESHOLD_PX;
+  isNearTop.value = el.scrollTop <= AUTO_SCROLL_THRESHOLD_PX;
+  if (
+    programmaticScrollTarget !== null &&
+    Math.abs(programmaticScrollTarget - el.scrollTop) <= AUTO_SCROLL_THRESHOLD_PX
+  ) {
+    // 自己的跳底在收尾（可能是布局繁忙后迟到的事件）：消费掉，跟随闩锁不动。
+    if (programmaticScrollTimeout !== null) window.clearTimeout(programmaticScrollTimeout);
+    programmaticScrollTarget = null;
+    programmaticScrollTimeout = null;
+    return;
+  }
+  shouldStickToBottom.value = isNearBottom.value;
+}
+
+/** 回到底部并恢复自动跟随（浮动按钮入口）。 */
+function jumpToBottom(): void {
+  shouldStickToBottom.value = true;
+  scrollContentToBottom();
+}
+
+/** 回到顶部并停止自动跟随（浮动按钮入口）。 */
+function jumpToTop(): void {
+  shouldStickToBottom.value = false;
+  const el = contentArea.value;
+  if (el) el.scrollTop = 0;
 }
 
 // Session ops
@@ -499,9 +576,9 @@ async function handleFork(entryId: string, label?: string): Promise<void> {
 }
 
 // Composer methods
+// v-model 负责把输入同步进 inputText；本函数只做斜杠命令面板探测与高度自适应。
 function handleInput(e: Event): void {
   const target = e.target as HTMLTextAreaElement;
-  inputText.value = target.value;
   void nextTick(autoResize);
 
   const cursorPos = target.selectionStart;
@@ -527,6 +604,8 @@ function handleInput(e: Event): void {
 }
 
 function handleKeydown(e: KeyboardEvent): void {
+  // IME 组合中的 Enter 是确认候选词，不是发送。
+  if (e.isComposing) return;
   if (e.key === "Enter" && !e.shiftKey) {
     if (showCommandPalette.value) return;
     e.preventDefault();
@@ -685,10 +764,8 @@ async function sendMessage(): Promise<void> {
   // 命中则清空输入框与附件，不进入主消息通道（不 appendOptimisticUserMessage、
   // 不发送 prompt）。
   if (!teamStore.teamMode && /^\/btw(\s|$)/.test(text)) {
-    inputText.value = "";
-    attachments.value = [];
+    composerStore.clearDraft();
     if (textareaRef.value) {
-      textareaRef.value.value = "";
       textareaRef.value.style.height = "auto";
     }
     const question = text.replace(/^\/btw\s*/, "");
@@ -721,11 +798,9 @@ async function sendMessage(): Promise<void> {
     }
   }
 
-  // Clear input immediately while the request is being sent.
-  inputText.value = "";
-  attachments.value = [];
+  // Clear the live draft (and its slot) immediately while the request is sent.
+  composerStore.clearDraft();
   if (textareaRef.value) {
-    textareaRef.value.value = "";
     textareaRef.value.style.height = "auto";
   }
 
@@ -763,10 +838,7 @@ async function sendMessage(): Promise<void> {
     sessionStore.failOptimisticUserMessage(optimisticBlockId, sendErrorMessage(error));
     inputText.value = originalText;
     attachments.value = originalAttachments;
-    if (textareaRef.value) {
-      textareaRef.value.value = originalText;
-      void nextTick(autoResize);
-    }
+    void nextTick(autoResize);
   } finally {
     isSending.value = false;
   }
@@ -785,7 +857,6 @@ function onCommandSelected(commandName: string): void {
       const before = inputText.value.slice(0, lastSlashIndex);
       const after = inputText.value.slice(cursorPos);
       inputText.value = before + "/" + commandName + " " + after;
-      textareaRef.value.value = inputText.value;
     }
   }
   showCommandPalette.value = false;
@@ -974,26 +1045,48 @@ function sendQuickStart(prompt: string): void {
               {{ statusText }}
             </span>
           </header>
-          <div class="team-conversation" ref="contentArea" @scroll="handleContentScroll">
-            <div v-if="isEmptySession" class="team-conversation-empty">
-              <v-icon icon="mdi-account-star-outline" size="28" />
-              <strong>团队负责人已就绪</strong>
-              <v-switch
-                v-if="showAcpToggle"
-                :model-value="acpEnabled"
-                :disabled="acpLocked"
-                :readonly="acpLocked"
-                data-test="acp-session-toggle"
-                hide-details
-                density="compact"
-                color="primary"
-                label="主动压缩"
-                @update:model-value="onAcpToggle"
-              />
+          <div class="session-pane team-conversation-scroll">
+            <div class="team-conversation" ref="contentArea" @scroll="handleContentScroll">
+              <div v-if="isEmptySession" class="team-conversation-empty">
+                <v-icon icon="mdi-account-star-outline" size="28" />
+                <strong>团队负责人已就绪</strong>
+                <v-switch
+                  v-if="showAcpToggle"
+                  :model-value="acpEnabled"
+                  :disabled="acpLocked"
+                  :readonly="acpLocked"
+                  data-test="acp-session-toggle"
+                  hide-details
+                  density="compact"
+                  color="primary"
+                  label="主动压缩"
+                  @update:model-value="onAcpToggle"
+                />
+              </div>
+              <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
+              <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
+              <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
             </div>
-            <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
-            <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
-            <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
+            <button
+              v-if="!isNearTop"
+              type="button"
+              class="scroll-float-btn scroll-float-top"
+              title="回到顶部"
+              aria-label="回到顶部"
+              @click="jumpToTop"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+            </button>
+            <button
+              v-if="!isNearBottom"
+              type="button"
+              class="scroll-float-btn scroll-float-bottom"
+              title="回到底部"
+              aria-label="回到底部"
+              @click="jumpToBottom"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
           </div>
         </section>
         <div class="team-console-sidebar">
@@ -1004,35 +1097,58 @@ function sendQuickStart(prompt: string): void {
 
     <!-- Session content (normal mode) -->
     <template v-else>
-    <div class="session-content" ref="contentArea" @scroll="handleContentScroll">
-      <div v-if="isEmptySession" class="empty-state">
-        <div class="empty-orbit" aria-hidden="true">
-          <span class="empty-planet"></span>
-          <span class="empty-ring"></span>
-          <span class="empty-star empty-star-a"></span>
-          <span class="empty-star empty-star-b"></span>
-        </div>
-        <p class="empty-title">新会话</p>
-        <p class="empty-hint">在下方描述任务即可开始使用 Pi。</p>
-        <v-switch
-          v-if="showAcpToggle"
-          :model-value="acpEnabled"
-          :disabled="acpLocked"
-          :readonly="acpLocked"
-          data-test="acp-session-toggle"
-          hide-details
-          density="compact"
-          color="primary"
-          class="empty-acp-toggle"
-          label="主动压缩"
-          @update:model-value="onAcpToggle"
-        />
-      </div>
+      <div class="session-pane">
+        <div class="session-content" ref="contentArea" @scroll="handleContentScroll">
+          <div v-if="isEmptySession" class="empty-state">
+            <div class="empty-orbit" aria-hidden="true">
+              <span class="empty-planet"></span>
+              <span class="empty-ring"></span>
+              <span class="empty-star empty-star-a"></span>
+              <span class="empty-star empty-star-b"></span>
+            </div>
+            <p class="empty-title">新会话</p>
+            <p class="empty-hint">在下方描述任务即可开始使用 Pi。</p>
+            <v-switch
+              v-if="showAcpToggle"
+              :model-value="acpEnabled"
+              :disabled="acpLocked"
+              :readonly="acpLocked"
+              data-test="acp-session-toggle"
+              hide-details
+              density="compact"
+              color="primary"
+              class="empty-acp-toggle"
+              label="主动压缩"
+              @update:model-value="onAcpToggle"
+            />
+          </div>
 
-      <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
-      <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
-      <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
-    </div>
+          <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
+          <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
+          <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
+        </div>
+        <!-- 浮动导航（TeamTimeline 同款 absolute 定位）：距顶/距底超过阈值时出现。 -->
+        <button
+          v-if="!isNearTop"
+          type="button"
+          class="scroll-float-btn scroll-float-top"
+          title="回到顶部"
+          aria-label="回到顶部"
+          @click="jumpToTop"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+        </button>
+        <button
+          v-if="!isNearBottom"
+          type="button"
+          class="scroll-float-btn scroll-float-bottom"
+          title="回到底部"
+          aria-label="回到底部"
+          @click="jumpToBottom"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+      </div>
     </template>
 
     <!-- PlanPanel sits between the message area and the composer (solo only).
@@ -1129,6 +1245,7 @@ function sendQuickStart(prompt: string): void {
         <textarea
           v-if="!pendingUserInput"
           ref="textareaRef"
+          v-model="inputText"
           class="composer-textarea"
           :placeholder="composerPlaceholder"
           @input="handleInput"
@@ -1812,10 +1929,49 @@ function sendQuickStart(prompt: string): void {
 }
 
 /* Session content */
+.session-pane {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
 .session-content {
   flex: 1;
   overflow-y: auto;
   padding: var(--pix-space-3xl) var(--pix-space-xl) var(--pix-space-xl);
+}
+
+.scroll-float-btn {
+  position: absolute;
+  right: var(--pix-space-lg);
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--pix-border-light);
+  background: var(--pix-bg-content);
+  color: var(--pix-text-secondary);
+  box-shadow: var(--pix-shadow-xs);
+  cursor: pointer;
+}
+
+.scroll-float-btn:hover {
+  border-color: var(--pix-border);
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-primary);
+}
+
+.scroll-float-top {
+  top: var(--pix-space-md);
+}
+
+.scroll-float-bottom {
+  bottom: var(--pix-space-md);
 }
 
 .empty-state {

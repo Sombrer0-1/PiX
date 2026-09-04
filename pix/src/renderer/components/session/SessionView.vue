@@ -14,7 +14,8 @@ import RetryNotice from "./RetryNotice.vue";
 import SubagentToolView from "./SubagentToolView.vue";
 import WorkflowRunPanel from "./WorkflowRunPanel.vue";
 import ThinkingBlock from "./ThinkingBlock.vue";
-import { codeCheckIcon, codeCopyIcon, renderMarkdown } from "@/utils/markdown";
+import AgentMessageView from "./AgentMessageView.vue";
+import { codeCheckIcon, codeCopyIcon } from "@/utils/markdown";
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
@@ -407,17 +408,13 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         :timestamp="block.timestamp"
       />
 
-      <!-- Agent Message -->
-      <div
+      <!-- Agent Message (pure-display child component: primitive props keep
+           unchanged blocks from re-running markdown rendering) -->
+      <AgentMessageView
         v-else-if="block.type === 'agent-message'"
-        class="agent-block"
-      >
-        <div
-          class="agent-content markdown-body"
-          :class="{ streaming: block.isStreaming }"
-          v-html="renderMarkdown(block.content)"
-        ></div>
-      </div>
+        :content="block.content"
+        :is-streaming="block.isStreaming"
+      />
 
       <!-- Thinking process - collapsible chain-of-thought block -->
       <ThinkingBlock
@@ -584,95 +581,10 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   background: linear-gradient(90deg, transparent, var(--pix-border), transparent);
 }
 
-/* ── Agent message block ── */
-.agent-block {
-  margin-bottom: var(--pix-space-lg);
-  animation: block-in 0.18s ease-out;
-}
-
-.agent-content {
-  font-size: var(--pix-text-base);
-  line-height: var(--pix-leading-relaxed);
-  color: #000000;
-  max-width: 100%;
-}
-
-.agent-content :deep(p) { margin-bottom: var(--pix-space-sm); }
-.agent-content :deep(p:last-child) { margin-bottom: 0; }
-.agent-content :deep(ul), .agent-content :deep(ol) { margin: var(--pix-space-sm) 0; padding-left: var(--pix-space-xl); }
-.agent-content :deep(li) { margin-bottom: var(--pix-space-xs); }
-.agent-content :deep(h1), .agent-content :deep(h2), .agent-content :deep(h3), .agent-content :deep(h4) { margin: var(--pix-space-lg) 0 var(--pix-space-sm); font-weight: var(--pix-weight-semibold); line-height: var(--pix-leading-tight); }
-.agent-content :deep(h1) { font-size: var(--pix-text-xl); }
-.agent-content :deep(h2) { font-size: var(--pix-text-lg); }
-.agent-content :deep(h3) { font-size: var(--pix-text-md); }
-.agent-content :deep(h4) { font-size: var(--pix-text-base); }
-.agent-content :deep(blockquote) { border-left: 3px solid var(--pix-border); padding-left: var(--pix-space-md); color: var(--pix-text-secondary); margin: var(--pix-space-md) 0; }
-.agent-content :deep(table) { border-collapse: collapse; margin: var(--pix-space-md) 0; font-size: var(--pix-text-sm); width: 100%; }
-.agent-content :deep(th), .agent-content :deep(td) { border: 1px solid var(--pix-border-light); padding: var(--pix-space-xs) var(--pix-space-md); text-align: left; }
-.agent-content :deep(th) { background: var(--pix-bg-code); font-weight: var(--pix-weight-semibold); }
-.agent-content :deep(hr) { border: none; border-top: 1px solid var(--pix-border-light); margin: var(--pix-space-lg) 0; }
-.agent-content :deep(strong) { font-weight: var(--pix-weight-semibold); }
-.agent-content :deep(a) { color: var(--pix-accent); }
-.agent-content :deep(code) {
-  font-size: 0.94em;
-}
-.agent-content :deep(.code-block) {
-  position: relative;
-  margin: var(--pix-space-md) 0;
-}
-.agent-content :deep(.code-block pre) {
-  margin: 0;
-  padding: var(--pix-space-lg);
-  padding-top: 38px;
-  background: #f7f8fc;
-  border-color: var(--pix-border-light);
-  color: #000000;
-  font-size: var(--pix-text-sm);
-  line-height: 1.65;
-}
-.agent-content :deep(.code-block code) {
-  font-size: inherit;
-  color: inherit;
-}
-.agent-content :deep(.code-copy-btn) {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--pix-radius-md);
-  background: #ffffff;
-  border: 1px solid var(--pix-border);
-  color: var(--pix-text-secondary);
-  box-shadow: var(--pix-shadow-xs);
-}
-.agent-content :deep(.code-copy-btn:hover) {
-  color: var(--pix-text-primary);
-  background: var(--pix-accent-light);
-}
-.agent-content :deep(.code-copy-btn.copied) {
-  color: var(--pix-success);
-  border-color: #bbf7d0;
-}
-
-.agent-content.streaming :deep(p:last-child::after) {
-  content: '';
-  display: inline-block;
-  width: 6px;
-  height: 14px;
-  background: var(--pix-accent);
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  animation: cursor-blink 1s step-end infinite;
-}
-
-@keyframes cursor-blink {
-  50% { opacity: 0; }
-}
+/* Agent-message styles live on AgentMessageView (child scoped CSS). The
+   parent only keeps the adjacent-sibling tweak: Vue puts the parent scope
+   attribute on the child root, so `.work-status-block + .agent-block` still
+   matches. block-in is shared with work-status / vision blocks below. */
 
 /* ── Thinking indicator ── */
 /* .thinking-block capsule migrated into ThinkingBlock.vue; .thinking-spinner

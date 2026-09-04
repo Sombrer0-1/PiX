@@ -99,37 +99,47 @@ export const useProjectStore = defineStore("project", () => {
       sessionCount: 0,
     };
 
-    // Save to recent projects
-    try {
-      const settings = await api().getSettings();
-      const existing = (settings.recentProjects || []).findIndex((p: ProjectInfo) => projectKey(p) === key);
-      let updated: ProjectInfo[];
-      if (existing !== -1) {
-        // Remove from old position and move to front; preserve known sessionCount.
-        updated = [...settings.recentProjects];
-        const [moved] = updated.splice(existing, 1);
-        updated.unshift({ ...location, lastOpened: Date.now(), sessionCount: moved.sessionCount ?? 0 });
-      } else {
-        updated = [
-          { ...location, lastOpened: Date.now(), sessionCount: 0 },
-          ...(settings.recentProjects || []),
-        ].slice(0, 20);
+    // Save to recent projects. The read-modify-write chain has no data
+    // dependency on the session list fetch, so both run in parallel;
+    // getSettings→setSettings itself stays serial (read-modify-write order).
+    const recentProjectsChain = (async () => {
+      try {
+        const settings = await api().getSettings();
+        const existing = (settings.recentProjects || []).findIndex((p: ProjectInfo) => projectKey(p) === key);
+        let updated: ProjectInfo[];
+        if (existing !== -1) {
+          // Remove from old position and move to front; preserve known sessionCount.
+          updated = [...settings.recentProjects];
+          const [moved] = updated.splice(existing, 1);
+          updated.unshift({ ...location, lastOpened: Date.now(), sessionCount: moved.sessionCount ?? 0 });
+        } else {
+          updated = [
+            { ...location, lastOpened: Date.now(), sessionCount: 0 },
+            ...(settings.recentProjects || []),
+          ].slice(0, 20);
+        }
+        await api().setSettings({ recentProjects: updated });
+        recentProjects.value = updated;
+      } catch {
+        // Non-critical
       }
-      await api().setSettings({ recentProjects: updated });
-      recentProjects.value = updated;
-    } catch {
-      // Non-critical
-    }
+    })();
 
     if (options.loadSessions === false) {
       sessions.value = [];
       currentSession.value = null;
       teamSessions.value = [];
       currentTeamSession.value = null;
+      await recentProjectsChain;
       return;
     }
     teamSessions.value = [];
     currentTeamSession.value = null;
+    // recentProjects is a read-modify-write of the same settings array that
+    // listSessions later patches (sessionCount). Running them in parallel let
+    // the slower writer clobber the other's fields. Settings RMW first, then
+    // the session scan updates sessionCount on top.
+    await recentProjectsChain;
     await listSessions();
   }
 

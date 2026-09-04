@@ -38,9 +38,20 @@ export interface DisplayBlockAssemblerOptions {
 
 export interface DisplayBlockAssembler {
   readonly blocks: DisplayBlock[];
+  /**
+   * 内部 id→block 索引（perf SDD §3.8/§4.3，Map 加速按 id 查找）。只读视图：
+   * blocks 数组仍是唯一对外真源，此索引仅供 O(1) 查询与不变量校验
+   * （任意操作后 blockById.size === blocks.length）。
+   */
+  readonly blockById: ReadonlyMap<string, DisplayBlock>;
   /** 直播事件折叠(即现 session-store.processEvent 语义 + 4.7.2 去重规则)。 */
   applyEvent(event: AgentSessionEvent): void;
   applyEvents(events: AgentSessionEvent[]): void;
+  /**
+   * 块数达到 maxBlocks 时从头部修剪至 floor(maxBlocks / 2)，同步维护内部
+   * id→block 索引。返回实际剪掉的数量。length < maxBlocks 时返回 0 且不修改数组。
+   */
+  enforceBlockCap(maxBlocks: number): number;
   /**
    * 回放装载(全量重折叠语义):先 clear 再按序折叠传入的完整条目数组。
    * 幂等:同一数组重复调用结果一致。分页追加由调用方(store)拼全量数组后整体重折叠,
@@ -346,14 +357,66 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   // events are dropped, so the same message folds only once.
   let foldedMessageKeys = new Set<string>();
 
+  // id→block 加速索引（perf SDD §3.8）。不变量：任意操作后
+  // blockById.size === blocks.length，且 map.get(id) === 数组里同 id 的元素
+  // （同一对象身份）。blocks 数组仍是唯一对外真源。
+  // 所有按 id 查找的内部路径走 Map；创建/移除路径同步维护。
+  const blockById = new Map<string, DisplayBlock>();
+
+  /**
+   * Index whatever identity `blocks[i]` currently yields. Session-store /
+   * TaskTranscriptView / worker-thinking inject a Vue reactive array:
+   * `push(plain)` stores the raw object, but reading `blocks[i]` returns the
+   * reactive proxy. The Map must hold that proxy so in-place field writes
+   * (thinking content, agent text, tool results) trigger Vue. Plain arrays
+   * (unit tests) yield the same object either way.
+   */
+  function reindexAll(): void {
+    blockById.clear();
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      blockById.set(block.id, block);
+    }
+  }
+
+  reindexAll();
+
+  /** Append a block and index the array-visible identity, not the raw argument. */
+  function pushBlock(block: DisplayBlock): void {
+    const index = blocks.length;
+    blocks.push(block);
+    const stored = blocks[index]!;
+    blockById.set(stored.id, stored);
+  }
+
   /** Filter blocks in place; the injected array may be a Vue reactive array,
    * so the reference is never swapped — only mutated. */
   function removeBlocks(keep: (block: DisplayBlock) => boolean): void {
     let write = 0;
     for (let i = 0; i < blocks.length; i++) {
-      if (keep(blocks[i])) blocks[write++] = blocks[i];
+      const block = blocks[i];
+      if (keep(block)) {
+        blocks[write++] = block;
+      }
     }
     if (write < blocks.length) blocks.length = write;
+    reindexAll();
+  }
+
+  /** Drop assembler pointers that refer to blocks just trimmed from the head. */
+  function dropRefsTo(removedIds: Set<string>): void {
+    if (removedIds.size === 0) return;
+    if (openThinkingBlockId && removedIds.has(openThinkingBlockId)) openThinkingBlockId = null;
+    if (currentAgentBlockId && removedIds.has(currentAgentBlockId)) currentAgentBlockId = null;
+    if (currentWorkStatusId && removedIds.has(currentWorkStatusId)) currentWorkStatusId = null;
+    if (legacyVisionStatusId && removedIds.has(legacyVisionStatusId)) legacyVisionStatusId = null;
+    if (lastRetryableError && removedIds.has(lastRetryableError.blockId)) lastRetryableError = null;
+    for (const [key, blockId] of visionStatusIds) {
+      if (removedIds.has(blockId)) visionStatusIds.delete(key);
+    }
+    optimisticUserMessages = optimisticUserMessages.filter(
+      (item) => !removedIds.has(item.blockId) && (item.separatorId === null || !removedIds.has(item.separatorId)),
+    );
   }
 
   /**
@@ -365,7 +428,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   function supersedeOpenThinking(): void {
     if (!openThinkingBlockId) return;
     const blockId = openThinkingBlockId;
-    const block = blocks.find((b) => b.id === blockId && b.type === "thinking");
+    const block = blockById.get(blockId);
     if (block && block.type === "thinking") {
       block.phase = "ended";
       block.superseded = true;
@@ -387,7 +450,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       timestamp,
     };
     openThinkingBlockId = block.id;
-    blocks.push(block);
+    pushBlock(block);
   }
 
   /**
@@ -405,9 +468,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         // keeps the block open, so an ended open block means a new segment
         // starts — supersede it first so each segment folds into its own block
         // (matches the replay path, which folds each thinking block separately).
-        const openBlock = openThinkingBlockId
-          ? blocks.find((b) => b.id === openThinkingBlockId && b.type === "thinking")
-          : null;
+        const openBlock = openThinkingBlockId ? blockById.get(openThinkingBlockId) : null;
         if (openBlock && openBlock.type === "thinking" && openBlock.phase === "ended") {
           supersedeOpenThinking();
         }
@@ -416,18 +477,14 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       }
       case "thinking_delta": {
         if (!openThinkingBlockId) showThinkingBlock(timestamp);
-        const block = openThinkingBlockId
-          ? blocks.find((b) => b.id === openThinkingBlockId && b.type === "thinking")
-          : null;
+        const block = openThinkingBlockId ? blockById.get(openThinkingBlockId) : null;
         if (block && block.type === "thinking" && typeof ame.delta === "string") {
           block.content = stripAcpDisplayTags(block.content + ame.delta);
         }
         break;
       }
       case "thinking_end": {
-        const block = openThinkingBlockId
-          ? blocks.find((b) => b.id === openThinkingBlockId && b.type === "thinking")
-          : null;
+        const block = openThinkingBlockId ? blockById.get(openThinkingBlockId) : null;
         if (block && block.type === "thinking") {
           // Redacted thinking (Anthropic safety filter) and any provider that
           // emits no thinking_delta: the final value only arrives here.
@@ -453,11 +510,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     const last = blocks.at(-1);
     if (!last || last.type === "turn-separator") return null;
     const id = nextBlockId();
-    blocks.push({
-      id,
-      type: "turn-separator",
-      timestamp,
-    });
+    pushBlock({ id, type: "turn-separator", timestamp });
     return id;
   }
 
@@ -476,7 +529,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       // Unreachable for closed <orchestrator-event> envelopes (legacy hide
       // above). Left so a non-closed wake payload can still render a note.
       if (renderTeamLeaderNotes && rawText.startsWith("<orchestrator-event>")) {
-        blocks.push({
+        pushBlock({
           id: nextBlockId(),
           type: "note",
           text: summarizeOrchestratorEvent(rawText),
@@ -488,7 +541,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       // Steered worker report: render as a styled note, not a fake "user" bubble.
       const teammateNote = renderTeamLeaderNotes ? parseTeammateMessageNote(rawText) : null;
       if (teammateNote) {
-        blocks.push({
+        pushBlock({
           id: nextBlockId(),
           type: "note",
           text: teammateNote,
@@ -501,7 +554,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     const display = extractMessageDisplay(msg);
     if (msg.role === "custom" && display.noteKind && display.noteKind !== "user_command") {
       if (display.text) {
-        blocks.push({
+        pushBlock({
           id: nextBlockId(),
           type: "note",
           text: display.text,
@@ -517,7 +570,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         const fingerprint = fingerprintUserMessage(display.text, display.attachments);
         const optimistic = optimisticUserMessages.find((item) => item.fingerprint === fingerprint);
         if (optimistic) {
-          const optimisticBlock = blocks.find((block) => block.id === optimistic.blockId);
+          const optimisticBlock = blockById.get(optimistic.blockId);
           if (optimisticBlock && optimisticBlock.type === "user-message") {
             optimisticBlock.text = display.text;
             optimisticBlock.attachments = display.attachments;
@@ -528,7 +581,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         }
         appendTurnSeparator(messageTimestamp(msg));
       }
-      blocks.push({
+      pushBlock({
         id: nextBlockId(),
         type: "user-message",
         text: display.text,
@@ -563,7 +616,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       attachments,
       timestamp,
     };
-    blocks.push(block);
+    pushBlock(block);
     optimisticUserMessages.push({
       blockId: block.id,
       fingerprint: fingerprintUserMessage(text, attachments),
@@ -582,7 +635,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     removeBlocks((block) => !removeIds.has(block.id));
     optimisticUserMessages = optimisticUserMessages.filter((item) => item.blockId !== blockId);
 
-    blocks.push({
+    pushBlock({
       id: nextBlockId(),
       type: "error",
       message,
@@ -606,14 +659,12 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     } else {
       legacyVisionStatusId = block.id;
     }
-    blocks.push(block);
+    pushBlock(block);
   }
 
   function finishVisionStatus(event: Extract<AgentSessionEvent, { type: "eye_model_end" }>): void {
     const blockId = event.id ? visionStatusIds.get(event.id) : legacyVisionStatusId;
-    const block = blockId
-      ? blocks.find((item) => item.id === blockId && item.type === "vision-status")
-      : null;
+    const block = blockId ? blockById.get(blockId) : null;
     if (block && block.type === "vision-status") {
       block.status = event.success ? "success" : "error";
       block.timestamp = Date.now();
@@ -624,7 +675,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       }
       return;
     }
-    blocks.push({
+    pushBlock({
       id: nextBlockId(),
       type: "vision-status",
       provider: event.provider,
@@ -636,9 +687,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   }
 
   function closeCurrentWorkStatus(force = false): void {
-    const ws = currentWorkStatusId
-      ? blocks.find((b) => b.id === currentWorkStatusId && b.type === "work-status")
-      : null;
+    const ws = currentWorkStatusId ? blockById.get(currentWorkStatusId) : null;
     if (ws && ws.type === "work-status") {
       const hasPending = ws.tools.some((tool) => tool.result === null);
       if (ws.tools.length === 0) {
@@ -667,7 +716,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       isStreaming: isStreamingBlock,
       timestamp,
     };
-    blocks.push(block);
+    pushBlock(block);
     return block.id;
   }
 
@@ -681,11 +730,9 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         timestamp,
       };
       currentWorkStatusId = wsBlock.id;
-      blocks.push(wsBlock);
+      pushBlock(wsBlock);
     }
-    const ws = blocks.find(
-      (b) => b.id === currentWorkStatusId && b.type === "work-status"
-    );
+    const ws = blockById.get(currentWorkStatusId);
     if (!ws || ws.type !== "work-status") {
       throw new Error("创建工作状态块失败");
     }
@@ -755,7 +802,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
             // First text in this response — create the agent block now
             currentAgentBlockId = createAgentBlock(text, true);
           } else {
-            const block = blocks.find((b) => b.id === currentAgentBlockId);
+            const block = blockById.get(currentAgentBlockId);
             if (block && block.type === "agent-message") {
               block.content = stripAcpDisplayTags(text);
             }
@@ -767,7 +814,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         const msg = event.message;
         if (isFoldableRole(msg.role) && foldedMessageKeys.has(foldKeyOf(msg))) break;
         if (currentAgentBlockId) {
-          const block = blocks.find((b) => b.id === currentAgentBlockId);
+          const block = blockById.get(currentAgentBlockId);
           if (block && block.type === "agent-message") {
             block.isStreaming = false;
           }
@@ -845,7 +892,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       }
 
       case "compaction_start": {
-        blocks.push({
+        pushBlock({
           id: nextBlockId(),
           type: "compaction",
           reason: event.reason,
@@ -862,7 +909,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
             : undefined) ||
           event.errorMessage ||
           "压缩完成";
-        blocks.push({
+        pushBlock({
           id: nextBlockId(),
           type: "compaction",
           reason: event.reason,
@@ -874,7 +921,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       }
 
       case "auto_retry_start": {
-        blocks.push({
+        pushBlock({
           id: nextBlockId(),
           type: "retry",
           success: false,
@@ -907,7 +954,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           }
         }
         if (event.success && !settled) {
-          blocks.push({
+          pushBlock({
             id: nextBlockId(),
             type: "retry",
             success: true,
@@ -921,7 +968,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
 
       case "api_error": {
         const blockId = nextBlockId();
-        blocks.push({
+        pushBlock({
           id: blockId,
           type: "error",
           message: event.errorMessage,
@@ -963,7 +1010,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     }
     const display = extractMessageDisplay(msg);
     if (display.text) {
-      blocks.push({
+      pushBlock({
         id: nextBlockId(),
         type: "note",
         text: display.text,
@@ -1058,7 +1105,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           const structuredRetryAfterMs =
             typeof apiError?.retryAfterMs === "number" ? apiError.retryAfterMs : undefined;
           const errorBlockId = nextBlockId();
-          blocks.push({
+          pushBlock({
             id: errorBlockId,
             type: "error",
             message: msg.errorMessage,
@@ -1090,7 +1137,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
               // are skipped — no blank placeholder blocks.
               const thinking = (block as { thinking?: unknown }).thinking;
               if (typeof thinking === "string" && thinking !== "") {
-                blocks.push({
+                pushBlock({
                   id: nextBlockId(),
                   type: "thinking",
                   content: stripAcpDisplayTags(thinking),
@@ -1139,6 +1186,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
 
   function clear(): void {
     blocks.splice(0, blocks.length);
+    blockById.clear();
     currentAgentBlockId = null;
     currentWorkStatusId = null;
     openThinkingBlockId = null;
@@ -1149,12 +1197,29 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     foldedMessageKeys = new Set();
   }
 
+  /** perf SDD §4.3：块数达到 maxBlocks 时从头部修剪至 floor(maxBlocks/2)。 */
+  function enforceBlockCap(maxBlocks: number): number {
+    if (blocks.length < maxBlocks) return 0;
+    const targetLength = Math.floor(maxBlocks / 2);
+    const removeCount = blocks.length - targetLength;
+    const removedIds = new Set<string>();
+    for (let i = 0; i < removeCount; i++) {
+      removedIds.add(blocks[i].id);
+    }
+    blocks.splice(0, removeCount);
+    reindexAll();
+    dropRefsTo(removedIds);
+    return removeCount;
+  }
+
   return {
     blocks,
+    blockById,
     applyEvent,
     applyEvents,
     loadEntries,
     clear,
+    enforceBlockCap,
     appendOptimisticUserMessage,
     failOptimisticUserMessage,
     get lastRetryableError() {
