@@ -12,7 +12,6 @@ import { useComposerStore } from "../../stores/composer-store";
 import { useBtw } from "../../composables/useBtw";
 import { useProjectStore } from "../../stores/project-store";
 import SessionView from "../session/SessionView.vue";
-import RawOutputViewer from "../session/RawOutputViewer.vue";
 import SessionTreeView from "../session/SessionTreeView.vue";
 import ForkDialog from "../session/ForkDialog.vue";
 import CommandPalette from "../input/CommandPalette.vue";
@@ -79,7 +78,7 @@ const emit = defineEmits<{
   cancelClarification: [];
 }>();
 
-type ViewMode = "session" | "raw" | "tree";
+type ViewMode = "session" | "tree";
 type ExecutionMode = "read-only" | "approval" | "unattended";
 type WorkspaceMode = "solo" | "team";
 /** 会话视图模式（打开任务中心前的视图；任务中心经 store.centerOpen 顶层渲染）。 */
@@ -932,11 +931,6 @@ function sendQuickStart(prompt: string): void {
         >分支树</button>
         <button
           class="view-tab"
-          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'raw' }"
-          @click="switchSessionView('raw')"
-        >原始事件</button>
-        <button
-          class="view-tab"
           :class="{ active: agentTaskStore.centerOpen }"
           @click="agentTaskStore.openTaskCenter()"
         >任务</button>
@@ -1016,10 +1010,6 @@ function sendQuickStart(prompt: string): void {
             </button>
           </div>
         </v-menu>
-        <span class="conn-pill" :class="rpc.isConnected.value ? 'connected' : 'offline'">
-          <span class="conn-dot"></span>
-          {{ rpc.isConnected.value ? '已连接' : '离线' }}
-        </span>
       </div>
     </div>
 
@@ -1064,8 +1054,7 @@ function sendQuickStart(prompt: string): void {
                 />
               </div>
               <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
-              <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
-              <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
+              <SessionTreeView v-else />
             </div>
             <button
               v-if="!isNearTop"
@@ -1124,8 +1113,7 @@ function sendQuickStart(prompt: string): void {
           </div>
 
           <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
-          <SessionTreeView v-else-if="sessionViewMode === 'tree'" />
-          <RawOutputViewer v-else :raw-json="sessionStore.getRawEventsJson()" />
+          <SessionTreeView v-else />
         </div>
         <!-- 浮动导航（TeamTimeline 同款 absolute 定位）：距顶/距底超过阈值时出现。 -->
         <button
@@ -1376,6 +1364,8 @@ function sendQuickStart(prompt: string): void {
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  container-type: inline-size;
+  container-name: center-panel;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0.94)),
     var(--pix-bg-content);
@@ -1736,37 +1726,6 @@ function sendQuickStart(prompt: string): void {
   line-height: 1.35;
 }
 
-/* Connection pill */
-.conn-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 10px;
-  border-radius: 12px;
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-medium);
-}
-.conn-pill .conn-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.conn-pill.connected {
-  background: var(--pix-success-bg);
-  color: var(--pix-success);
-}
-.conn-pill.connected .conn-dot {
-  background: var(--pix-success);
-}
-.conn-pill.offline {
-  background: var(--pix-bg-hover);
-  color: var(--pix-text-secondary);
-}
-.conn-pill.offline .conn-dot {
-  background: var(--pix-text-secondary);
-}
-
 /* Team mode layout */
 .team-middle {
   flex: 1;
@@ -1892,8 +1851,7 @@ function sendQuickStart(prompt: string): void {
     padding-left: var(--pix-space-md);
   }
 
-  .topbar-path:last-of-type,
-  .conn-pill {
+  .topbar-path:last-of-type {
     display: none;
   }
 
@@ -2247,6 +2205,8 @@ function sendQuickStart(prompt: string): void {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--pix-space-sm);
+  min-width: 0;
   padding: 0 2px;
 }
 
@@ -2255,12 +2215,15 @@ function sendQuickStart(prompt: string): void {
   gap: var(--pix-space-xs);
   position: relative;
   align-items: center;
+  min-width: 0;
+  flex: 1;
 }
 
 .composer-right {
   display: flex;
   gap: var(--pix-space-xs);
   align-items: center;
+  flex-shrink: 0;
 }
 
 /* Composer */
@@ -2273,6 +2236,7 @@ function sendQuickStart(prompt: string): void {
   border-radius: var(--pix-radius-md);
   color: var(--pix-text-secondary);
   cursor: pointer;
+  flex-shrink: 0;
   transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
 }
 
@@ -2286,6 +2250,10 @@ function sendQuickStart(prompt: string): void {
   display: inline-flex;
   align-items: center;
   min-width: 0;
+}
+
+.plan-toggle-in-composer {
+  flex-shrink: 0;
 }
 
 /* Composer */
@@ -2302,11 +2270,14 @@ function sendQuickStart(prompt: string): void {
   cursor: pointer;
   transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
   white-space: nowrap;
-  max-width: min(420px, 48vw);
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
 }
 
 .thinking-btn {
-  max-width: 180px;
+  max-width: 148px;
+  flex-shrink: 0;
   color: var(--pix-accent);
   background: var(--pix-accent-light);
 }
@@ -2345,6 +2316,7 @@ function sendQuickStart(prompt: string): void {
   border-radius: var(--pix-radius-md);
   background: #ffffff;
   color: var(--pix-text-muted);
+  flex-shrink: 0;
 }
 
 .eye-indicator.active {
@@ -2366,6 +2338,7 @@ function sendQuickStart(prompt: string): void {
   width: 38px;
   height: 38px;
   border-radius: var(--pix-radius-lg);
+  flex-shrink: 0;
   cursor: pointer;
   transition:
     background var(--pix-transition-fast),
@@ -2424,5 +2397,15 @@ function sendQuickStart(prompt: string): void {
 
 .confirm-dialog-actions {
   padding: var(--pix-space-sm) 0 0 !important;
+}
+
+@container center-panel (max-width: 720px) {
+  .model-btn {
+    max-width: 160px;
+  }
+
+  .thinking-btn {
+    max-width: 120px;
+  }
 }
 </style>

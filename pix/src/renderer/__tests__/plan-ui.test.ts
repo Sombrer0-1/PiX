@@ -72,7 +72,6 @@ const sessionMock = vi.hoisted(() => ({
     failOptimisticUserMessage: vi.fn(),
     clearSession: vi.fn(),
     loadMessages: vi.fn(),
-    getRawEventsJson: vi.fn().mockReturnValue("[]"),
   },
 }));
 
@@ -135,7 +134,6 @@ vi.mock("../composables/useWorkspaceSessionStore", () => ({
     failOptimisticUserMessage: sessionMock.state.failOptimisticUserMessage,
     clearSession: sessionMock.state.clearSession,
     loadMessages: sessionMock.state.loadMessages,
-    getRawEventsJson: sessionMock.state.getRawEventsJson,
   }),
 }));
 
@@ -299,7 +297,6 @@ function mountPanel(): ReturnType<typeof mount> {
       plugins: [pinia, vuetify],
       stubs: {
         SessionView: true,
-        RawOutputViewer: true,
         SessionTreeView: true,
         ForkDialog: true,
         CommandPalette: true,
@@ -443,7 +440,7 @@ describe("plan toggle", () => {
 
     const toggle = w.get(".plan-mode-toggle");
     expect((toggle.element as HTMLButtonElement).disabled).toBe(true);
-    expect(w.get(".plan-toggle-disable-reason").text()).toContain("运行中不可切换规划");
+    expect(toggle.attributes("title")).toContain("运行中不可切换规划");
 
     // A disabled toggle never arms, even via keyboard.
     await toggle.trigger("keydown", { key: "Enter" });
@@ -460,7 +457,7 @@ describe("plan toggle", () => {
 
     const toggle = w.get(".plan-mode-toggle");
     expect((toggle.element as HTMLButtonElement).disabled).toBe(true);
-    expect(w.get(".plan-toggle-disable-reason").text()).toContain("计划进行中，请先批准或放弃");
+    expect(toggle.attributes("title")).toContain("计划进行中，请先批准或放弃");
   });
 
   it("is disabled on planning_failed with its own disable reason", async () => {
@@ -485,14 +482,14 @@ describe("plan toggle", () => {
 
     const toggle = w.get(".plan-mode-toggle");
     expect((toggle.element as HTMLButtonElement).disabled).toBe(true);
-    expect(w.get(".plan-toggle-disable-reason").text()).toContain("规划失败，请先重试或放弃");
+    expect(toggle.attributes("title")).toContain("规划失败，请先重试或放弃");
   });
 
   it("is enabled when idle with no disable reason", async () => {
     const w = await mountAndFlush();
     const toggle = w.get(".plan-mode-toggle");
     expect((toggle.element as HTMLButtonElement).disabled).toBe(false);
-    expect(w.find(".plan-toggle-disable-reason").exists()).toBe(false);
+    expect(toggle.attributes("title")).toBe("开启后，提交任务将先规划后执行");
   });
 });
 

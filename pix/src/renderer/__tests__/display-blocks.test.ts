@@ -7,16 +7,14 @@
  * drop, triple-key message drop).
  *
  * perf SDD stage S3 additions: blockById Map index invariant
- * (map.size === blocks.length after every operation), enforceBlockCap
- * (head trim to floor(max/2)), and the session store keeping message_update
- * out of the debug events array.
+ * (map.size === blocks.length after every operation) and enforceBlockCap
+ * (head trim to floor(max/2)).
  *
  * The assembler is framework-free: tests exercise it directly without Pinia
- * or Vue mounting (the store cases below activate a standalone Pinia).
+ * or Vue mounting.
  */
 
 import { describe, expect, it } from "vitest";
-import { createPinia, setActivePinia } from "pinia";
 import { reactive, watch } from "vue";
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
 import { INTERNAL_CUSTOM_MESSAGE_TYPES, formatInternalNotification } from "@shared/internal-notification";
@@ -27,7 +25,6 @@ import { LEGACY_INTERNAL_CUSTOM_TYPES } from "../../../../packages/coding-agent/
 import type { DisplayBlock } from "@/types/session";
 import type { DisplayBlockAssembler } from "../utils/display-blocks";
 import { createDisplayBlockAssembler, remainingSeconds } from "../utils/display-blocks";
-import { useSessionStore } from "../stores/session-store";
 
 // ============================================================================
 // Fixtures
@@ -1340,76 +1337,5 @@ describe("block id index (S3)", () => {
     expect(thinking).toHaveLength(1);
     expect(thinking[0].id).not.toBe(open?.id);
     expectIndexInSync(a);
-  });
-});
-
-// ============================================================================
-// Session store events slimming (perf SDD stage S3, §3.9)
-// ============================================================================
-
-describe("session store events slimming (S3)", () => {
-  it("keeps a slimmed message_update in the debug events array while still folding blocks", () => {
-    setActivePinia(createPinia());
-    const store = useSessionStore();
-    store.addEvents([
-      { type: "agent_start" },
-      msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })),
-      msgEnd(makeMessage({ role: "user", content: "hi", timestamp: 1 })),
-      msgUpdate(makeMessage({ role: "assistant", content: "partial", timestamp: 2 })),
-      {
-        type: "message_update",
-        message: makeMessage({ role: "assistant", content: "full answer", timestamp: 2 }),
-        assistantMessageEvent: { type: "text_delta", delta: " answer" },
-      },
-      msgEnd(makeMessage({ role: "assistant", content: "full answer", timestamp: 2 })),
-      { type: "agent_end", messages: [] },
-    ]);
-
-    expect(store.events.map((e) => e.type)).toEqual([
-      "agent_start",
-      "message_start",
-      "message_end",
-      "message_update",
-      "message_update",
-      "message_end",
-      "agent_end",
-    ]);
-    const updates = store.events.filter((e) => e.type === "message_update");
-    expect(updates).toHaveLength(2);
-    for (const update of updates) {
-      if (update.type !== "message_update") continue;
-      expect(update.message.content).toBe("");
-      expect((update.message as { contentChars?: number }).contentChars).toBeGreaterThan(0);
-    }
-    expect(updates[1].assistantMessageEvent).toEqual({ type: "text_delta", delta: " answer" });
-
-    // The updates still folded into blocks from the full event, not the slim copy.
-    const agent = store.displayBlocks.find((b) => b.type === "agent-message");
-    expect(agent?.type).toBe("agent-message");
-    if (agent?.type === "agent-message") {
-      expect(agent.content).toBe("full answer");
-      expect(agent.isStreaming).toBe(false);
-    }
-  });
-
-  it("getRawEventsJson keeps slimmed message_update for the raw viewer", () => {
-    setActivePinia(createPinia());
-    const store = useSessionStore();
-    store.addEvent({
-      type: "message_update",
-      message: makeMessage({ role: "assistant", content: "hello world", timestamp: 1 }),
-      assistantMessageEvent: { type: "text_delta", delta: " world" },
-    });
-    store.addEvent(msgEnd(makeMessage({ role: "assistant", content: "hello world", timestamp: 1 })));
-
-    const parsed = JSON.parse(store.getRawEventsJson()) as AgentSessionEvent[];
-    const update = parsed.find((e) => e.type === "message_update");
-    expect(update?.type).toBe("message_update");
-    if (update?.type === "message_update") {
-      expect(update.message.content).toBe("");
-      expect((update.message as { contentChars?: number }).contentChars).toBe("hello world".length);
-      expect(update.assistantMessageEvent).toEqual({ type: "text_delta", delta: " world" });
-    }
-    expect(parsed.some((e) => e.type === "message_end")).toBe(true);
   });
 });

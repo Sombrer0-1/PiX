@@ -58,7 +58,6 @@ const sessionMock = vi.hoisted(() => ({
     failOptimisticUserMessage: vi.fn(),
     clearSession: vi.fn(),
     loadMessages: vi.fn(),
-    getRawEventsJson: vi.fn().mockReturnValue("[]"),
   },
 }));
 
@@ -121,7 +120,6 @@ vi.mock("../composables/useWorkspaceSessionStore", () => ({
     failOptimisticUserMessage: sessionMock.state.failOptimisticUserMessage,
     clearSession: sessionMock.state.clearSession,
     loadMessages: sessionMock.state.loadMessages,
-    getRawEventsJson: sessionMock.state.getRawEventsJson,
   }),
 }));
 
@@ -239,7 +237,6 @@ function mountPanel(): ReturnType<typeof mount> {
       plugins: [pinia, vuetify],
       stubs: {
         SessionView: true,
-        RawOutputViewer: true,
         SessionTreeView: true,
         ForkDialog: true,
         CommandPalette: CommandPaletteStub,

@@ -116,7 +116,6 @@ const sessionMock = vi.hoisted(() => ({
     failOptimisticUserMessage: vi.fn(),
     clearSession: vi.fn(),
     loadMessages: vi.fn(),
-    getRawEventsJson: vi.fn().mockReturnValue("[]"),
   },
 }));
 
@@ -197,7 +196,6 @@ vi.mock("../composables/useWorkspaceSessionStore", () => ({
     failOptimisticUserMessage: sessionMock.state.failOptimisticUserMessage,
     clearSession: sessionMock.state.clearSession,
     loadMessages: sessionMock.state.loadMessages,
-    getRawEventsJson: sessionMock.state.getRawEventsJson,
   }),
 }));
 
@@ -2107,7 +2105,6 @@ describe("CenterPanel task center", () => {
         plugins: [pinia, vuetify],
         stubs: {
           SessionView: true,
-          RawOutputViewer: true,
           SessionTreeView: true,
           ForkDialog: true,
           CommandPalette: true,
@@ -2139,29 +2136,29 @@ describe("CenterPanel task center", () => {
     expect(w.find(".center-composer").exists()).toBe(true);
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(false);
 
-    // 先切到原始事件视图
-    await tabButton(w, "原始事件").trigger("click");
+    // 先切到分支树视图
+    await tabButton(w, "分支树").trigger("click");
     await nextTick();
-    expect(w.find("raw-output-viewer-stub").exists()).toBe(true);
+    expect(w.find("session-tree-view-stub").exists()).toBe(true);
 
     // 打开任务中心:顶层渲染 TaskCenterView,会话上下文与 composer 隐藏
     await tabButton(w, "任务").trigger("click");
     await nextTick();
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(true);
-    expect(w.find("raw-output-viewer-stub").exists()).toBe(false);
+    expect(w.find("session-tree-view-stub").exists()).toBe(false);
     expect(w.find("session-view-stub").exists()).toBe(false);
     expect(w.find(".center-composer").exists()).toBe(false);
     expect(tabButton(w, "任务").classes()).toContain("active");
 
-    // 关闭:点击既有 tab 回打开前的原始事件视图
-    await tabButton(w, "原始事件").trigger("click");
+    // 关闭:点击既有 tab 回打开前的分支树视图
+    await tabButton(w, "分支树").trigger("click");
     await nextTick();
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(false);
-    expect(w.find("raw-output-viewer-stub").exists()).toBe(true);
+    expect(w.find("session-tree-view-stub").exists()).toBe(true);
     expect(w.find(".center-composer").exists()).toBe(true);
   });
 
-  it("team 模式下打开中心渲染 TaskCenterView 不落 RawOutputViewer，关闭后回 team split 视图", async () => {
+  it("team 模式下打开中心渲染 TaskCenterView 不落会话视图，关闭后回 team split 视图", async () => {
     teamStoreMock.state.teamMode.value = true;
     const w = mountCenterPanel();
     await flushPromises();
@@ -2172,7 +2169,6 @@ describe("CenterPanel task center", () => {
     useAgentTaskStore().openTaskCenter();
     await nextTick();
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(true);
-    expect(w.find("raw-output-viewer-stub").exists()).toBe(false);
     expect(w.find("session-view-stub").exists()).toBe(false);
     expect(w.find(".team-middle").exists()).toBe(false);
     expect(w.find(".center-composer").exists()).toBe(false);
@@ -2181,6 +2177,6 @@ describe("CenterPanel task center", () => {
     await nextTick();
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(false);
     expect(w.find(".team-middle").exists()).toBe(true);
-    expect(w.find("raw-output-viewer-stub").exists()).toBe(false);
+    expect(w.find("session-view-stub").exists()).toBe(true);
   });
 });

@@ -4,7 +4,7 @@
  *
  * 只维护当前 Solo 会话 composer 的 armed 状态：切换不发起任何 IPC，也不启动
  * 模型回合。真正的 enter_planning 由 CenterPanel 在用户提交非空需求时发送。
- * 仅在空闲时可切换；禁用时显示原因（文字+图标，不只靠颜色）。与 PlanPanel 和
+ * 仅在空闲时可切换；禁用原因放在按钮 title 上。与 PlanPanel 和
  * CenterPanel 的会话状态文字共同构成三处明确的规划标识。
  */
 
@@ -45,10 +45,6 @@ function requestToggle(): void {
       <v-icon :icon="armed ? 'mdi-map-check-outline' : 'mdi-map-outline'" size="14" />
       <span class="plan-toggle-text">{{ armed ? "规划已开启" : "规划" }}</span>
     </button>
-    <span v-if="disabled && disableReason" class="plan-toggle-disable-reason">
-      <v-icon icon="mdi-alert-outline" size="13" />
-      <span>{{ disableReason }}</span>
-    </span>
   </div>
 </template>
 
@@ -97,18 +93,6 @@ function requestToggle(): void {
 }
 
 .plan-toggle-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.plan-toggle-disable-reason {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  max-width: 160px;
-  color: var(--pix-text-muted);
-  font-size: var(--pix-text-xs);
-  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }

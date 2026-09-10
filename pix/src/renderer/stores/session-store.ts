@@ -19,32 +19,10 @@ import type { AgentMessage, AgentSessionEvent } from "@/types/rpc";
 import type { DisplayBlock } from "@/types/session";
 import { createDisplayBlockAssembler } from "@/utils/display-blocks";
 
-const MAX_EVENTS = 50000;
 const MAX_DISPLAY_BLOCKS = 20000;
-
-/** Debug-array shape of a streaming update: drop the accumulated message body,
- *  keep the phase event and a content-length hint so RawOutputViewer can still
- *  inspect delta splicing without O(deltas × 全文) memory. */
-function slimMessageUpdate(
-  event: Extract<AgentSessionEvent, { type: "message_update" }>,
-): AgentSessionEvent {
-  const content = event.message.content;
-  const contentChars =
-    typeof content === "string"
-      ? content.length
-      : Array.isArray(content)
-        ? content.reduce((n, part) => n + (typeof part.text === "string" ? part.text.length : 0), 0)
-        : 0;
-  return {
-    type: "message_update",
-    message: { role: event.message.role, content: "", contentChars },
-    assistantMessageEvent: event.assistantMessageEvent,
-  };
-}
 
 export function createSessionStore(id: string, options: { teamLeader?: boolean } = {}) {
   return defineStore(id, () => {
-    const events = ref<AgentSessionEvent[]>([]);
     const displayBlocks = ref<DisplayBlock[]>([]);
     const isStreaming = ref(false);
     const errorMessage = ref<string | null>(null);
@@ -63,19 +41,12 @@ export function createSessionStore(id: string, options: { teamLeader?: boolean }
     }
 
     function addEvent(event: AgentSessionEvent): void {
-      // message_update 进 events 调试数组时裁掉累积 message 正文（perf SDD
-      // §3.9：避免 O(deltas × 全文)），只留 assistantMessageEvent 与
-      // contentChars，原始事件视图仍能看到流式相位。装配器仍拿完整事件。
-      if (events.value.length >= MAX_EVENTS) {
-        events.value = events.value.slice(-Math.floor(MAX_EVENTS / 2));
-      }
       if (displayBlocks.value.length >= MAX_DISPLAY_BLOCKS) {
         // Cap in place: the assembler holds the same array reference and its
         // id→block index, so the trim goes through the assembler instead of
         // an external splice.
         assembler.enforceBlockCap(MAX_DISPLAY_BLOCKS);
       }
-      events.value.push(event.type === "message_update" ? slimMessageUpdate(event) : event);
       if (event.type === "agent_start") {
         isStreaming.value = true;
         errorMessage.value = null;
@@ -119,19 +90,13 @@ export function createSessionStore(id: string, options: { teamLeader?: boolean }
     }
 
     function clearSession(): void {
-      events.value = [];
       isStreaming.value = false;
       errorMessage.value = null;
       assembler.clear();
       syncLastRetryableError();
     }
 
-    function getRawEventsJson(): string {
-      return JSON.stringify(events.value, null, 2);
-    }
-
     return {
-      events,
       displayBlocks,
       isStreaming,
       errorMessage,
@@ -142,7 +107,6 @@ export function createSessionStore(id: string, options: { teamLeader?: boolean }
       failOptimisticUserMessage,
       loadMessages,
       clearSession,
-      getRawEventsJson,
     };
   });
 }
