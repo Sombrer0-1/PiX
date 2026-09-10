@@ -103,8 +103,11 @@ const statsSegments = computed(() => {
   if (c.unstaged > 0) segs.push(`未暂存 ${c.unstaged}`);
   if (c.untracked > 0) segs.push(`未跟踪 ${c.untracked}`);
   if (c.conflicts > 0) segs.push(`冲突 ${c.conflicts}`);
-  if (c.additions > 0 || c.deletions > 0) segs.push(`+${c.additions}/-${c.deletions}`);
   return segs;
+});
+const showDiffTotals = computed(() => {
+  const c = counts.value;
+  return !!c && (c.additions > 0 || c.deletions > 0);
 });
 
 // ---- 文件列表：服务端已排序，只切片 ----
@@ -138,11 +141,6 @@ function fileChips(file: GitChangedFile): GitChip[] {
   return chips;
 }
 
-/** 右对齐 +N/-M（null → —）。 */
-function diffText(file: GitChangedFile): string {
-  if (file.additions == null || file.deletions == null) return "—";
-  return `+${file.additions}/-${file.deletions}`;
-}
 </script>
 
 <template>
@@ -190,8 +188,12 @@ function diffText(file: GitChangedFile): string {
       <div class="git-top-line">{{ topSegments.join(" · ") }}</div>
       <div v-if="incomplete" class="git-incomplete">状态数据过大，结果不完整</div>
       <div v-else-if="cleanWorkdir" class="git-clean">工作区干净</div>
-      <div v-else-if="statsSegments.length > 0" class="git-stats">
-        {{ statsSegments.join(" · ") }}
+      <div v-else-if="statsSegments.length > 0 || showDiffTotals" class="git-stats">
+        <template v-if="statsSegments.length > 0">{{ statsSegments.join(" · ") }}</template>
+        <template v-if="showDiffTotals && counts">
+          <span v-if="statsSegments.length > 0"> · </span>
+          <span class="git-diff-add">+{{ counts.additions }}</span>/<span class="git-diff-del">-{{ counts.deletions }}</span>
+        </template>
       </div>
 
       <div v-if="visibleFiles.length > 0" class="git-file-list">
@@ -204,7 +206,12 @@ function diffText(file: GitChangedFile): string {
           <span class="git-file-chips">
             <span v-for="chip in fileChips(file)" :key="chip.label" class="git-chip" :class="chip.cls">{{ chip.label }}</span>
           </span>
-          <span class="git-file-diff">{{ diffText(file) }}</span>
+          <span class="git-file-diff">
+            <template v-if="file.additions == null || file.deletions == null">—</template>
+            <template v-else>
+              <span class="git-diff-add">+{{ file.additions }}</span>/<span class="git-diff-del">-{{ file.deletions }}</span>
+            </template>
+          </span>
         </div>
         <div v-if="truncated" class="git-more">
           仅显示前 100 项，共 {{ incomplete ? "100+" : files.length }} 项
@@ -415,6 +422,16 @@ function diffText(file: GitChangedFile): string {
   font-family: var(--pix-font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--pix-text-secondary);
+}
+
+.git-diff-add {
+  color: var(--pix-success);
+  font-variant-numeric: tabular-nums;
+}
+
+.git-diff-del {
+  color: var(--pix-error);
+  font-variant-numeric: tabular-nums;
 }
 
 .git-more {

@@ -190,8 +190,11 @@ class ScriptedRunner implements GitCommandRunner {
   }
 }
 
-function makeService(runner: GitCommandRunner): GitStatusService {
-  return createGitStatusService({ createRunner: () => runner });
+function makeService(
+  runner: GitCommandRunner,
+  options: { maxUntrackedFiles?: number; maxUntrackedTotalBytes?: number } = {},
+): GitStatusService {
+  return createGitStatusService({ createRunner: () => runner, ...options });
 }
 
 function winLocation(physicalPath: string, path = physicalPath): ProjectLocation {
@@ -388,9 +391,150 @@ await run("parse: branch/upstream/ab + changed/untracked + numstat + counts", as
   const n = fileByPath(s, "new.txt");
   assert(n !== undefined, "new.txt in files");
   assertEqual(n!.untracked, true, "new untracked");
-  assertEqual(n!.additions, null, "untracked additions null");
+  assertEqual(n!.additions, null, "missing untracked file stays uncounted");
 
-  assertDeepEqual(s.counts, { staged: 1, unstaged: 1, untracked: 1, conflicts: 0, additions: 4, deletions: 1 }, "counts");
+  assertDeepEqual(s.counts, { staged: 1, unstaged: 1, untracked: 1, conflicts: 0, additions: 4, deletions: 1 }, "counts exclude missing untracked");
+});
+
+await run("parse: untracked text file line counts from disk are included in totals", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pix-git-untracked-"));
+  try {
+    writeFileSync(join(dir, "new.txt"), "a\nb\nc\n", "utf8");
+    writeFileSync(join(dir, "empty.txt"), "", "utf8");
+    writeFileSync(join(dir, "bin.dat"), Buffer.from([0, 1, 2, 3]));
+    writeFileSync(join(dir, "no-nl.txt"), "solo", "utf8");
+    mkdirSync(join(dir, "nested"), { recursive: true });
+    writeFileSync(join(dir, "nested", "u.txt"), "x\ny\n", "utf8");
+    const slash = dir.replace(/\\/g, "/");
+    const status = nulJoin([
+      `# branch.oid ${OID}`,
+      "# branch.head main",
+      "? new.txt",
+      "? empty.txt",
+      "? bin.dat",
+      "? no-nl.txt",
+      "? nested/u.txt",
+    ]);
+    const runner = new ScriptedRunner([
+      stdoutResult(slash + "\n"),
+      stdoutResult(status),
+      stdoutResult(""),
+      stdoutResult(""),
+    ]);
+    const s = await makeService(runner).getStatus(winLocation(dir));
+    const n = fileByPath(s, "new.txt");
+    assertEqual(n?.untracked, true, "new untracked");
+    assertEqual(n?.additions, 3, "new.txt 3 lines");
+    assertEqual(n?.deletions, 0, "new.txt deletions 0");
+    const empty = fileByPath(s, "empty.txt");
+    assertEqual(empty?.additions, 0, "empty file 0 lines");
+    assertEqual(empty?.deletions, 0, "empty file deletions 0");
+    const bin = fileByPath(s, "bin.dat");
+    assertEqual(bin?.additions, null, "binary untracked stays null");
+    assertEqual(bin?.deletions, null, "binary untracked deletions null");
+    const solo = fileByPath(s, "no-nl.txt");
+    assertEqual(solo?.additions, 1, "no trailing newline still 1 line");
+    const nested = fileByPath(s, "nested/u.txt");
+    assertEqual(nested?.additions, 2, "nested untracked counted");
+    assertDeepEqual(
+      s.counts,
+      { staged: 0, unstaged: 0, untracked: 5, conflicts: 0, additions: 6, deletions: 0 },
+      "totals include untracked text lines and skip binary",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await run("parse: untracked file budget stops counting and flags the snapshot incomplete", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pix-git-untracked-budget-"));
+  try {
+    writeFileSync(join(dir, "f1.txt"), "1\n", "utf8");
+    writeFileSync(join(dir, "f2.txt"), "2\n3\n", "utf8");
+    writeFileSync(join(dir, "f3.txt"), "4\n5\n6\n", "utf8");
+    const slash = dir.replace(/\\/g, "/");
+    const status = nulJoin([
+      `# branch.oid ${OID}`,
+      "# branch.head main",
+      "? f1.txt",
+      "? f2.txt",
+      "? f3.txt",
+    ]);
+    const runner = new ScriptedRunner([
+      stdoutResult(slash + "\n"),
+      stdoutResult(status),
+      stdoutResult(""),
+      stdoutResult(""),
+    ]);
+    const s = await makeService(runner, { maxUntrackedFiles: 2 }).getStatus(winLocation(dir));
+    assertEqual(fileByPath(s, "f1.txt")?.additions, 1, "f1 counted within budget");
+    assertEqual(fileByPath(s, "f2.txt")?.additions, 2, "f2 counted within budget");
+    assertEqual(fileByPath(s, "f3.txt")?.additions, null, "f3 over budget stays uncounted");
+    assertEqual(s.complete, false, "file budget exhaustion marks incomplete");
+    assertDeepEqual(
+      s.counts,
+      { staged: 0, unstaged: 0, untracked: 3, conflicts: 0, additions: 3, deletions: 0 },
+      "totals only include counted untracked files",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await run("parse: untracked byte budget skips the file that no longer fits and flags incomplete", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pix-git-untracked-bytes-"));
+  try {
+    writeFileSync(join(dir, "small.txt"), "aa\n", "utf8"); // 3 bytes
+    writeFileSync(join(dir, "large.txt"), "bbbbbb\n", "utf8"); // 7 bytes
+    const slash = dir.replace(/\\/g, "/");
+    const status = nulJoin([
+      `# branch.oid ${OID}`,
+      "# branch.head main",
+      "? small.txt",
+      "? large.txt",
+    ]);
+    const runner = new ScriptedRunner([
+      stdoutResult(slash + "\n"),
+      stdoutResult(status),
+      stdoutResult(""),
+      stdoutResult(""),
+    ]);
+    const s = await makeService(runner, { maxUntrackedTotalBytes: 4 }).getStatus(winLocation(dir));
+    assertEqual(fileByPath(s, "small.txt")?.additions, 1, "small file fits the byte budget");
+    assertEqual(fileByPath(s, "large.txt")?.additions, null, "large file exceeds the remaining bytes");
+    assertEqual(s.complete, false, "byte budget exhaustion marks incomplete");
+    assertEqual(s.counts?.additions, 1, "totals exclude the skipped file");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await run("parse: oversized untracked file is skipped without consuming the budget", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pix-git-untracked-oversize-"));
+  try {
+    // > 单文件上限（1 MiB）：跳过且不消耗预算，后续小文件仍被统计。
+    writeFileSync(join(dir, "big.txt"), "x\n".repeat(600 * 1024), "utf8");
+    writeFileSync(join(dir, "small.txt"), "ok\n", "utf8");
+    const slash = dir.replace(/\\/g, "/");
+    const status = nulJoin([
+      `# branch.oid ${OID}`,
+      "# branch.head main",
+      "? big.txt",
+      "? small.txt",
+    ]);
+    const runner = new ScriptedRunner([
+      stdoutResult(slash + "\n"),
+      stdoutResult(status),
+      stdoutResult(""),
+      stdoutResult(""),
+    ]);
+    const s = await makeService(runner, { maxUntrackedFiles: 1 }).getStatus(winLocation(dir));
+    assertEqual(fileByPath(s, "big.txt")?.additions, null, "oversized file stays uncounted");
+    assertEqual(fileByPath(s, "small.txt")?.additions, 1, "file budget preserved for the next file");
+    assertEqual(s.complete, true, "per-file skip does not flag incomplete");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 await run("parse: upstream without branch.ab defaults ahead/behind to 0", async () => {
@@ -725,9 +869,10 @@ if (!HAS_GIT) {
     const h = fileByPath(s, "h.txt");
     assert(h !== undefined, "h.txt in files");
     assertEqual(h!.untracked, true, "h untracked");
-    assertEqual(h!.additions, null, "h additions null");
+    assertEqual(h!.additions, 1, "h additions from disk");
+    assertEqual(h!.deletions, 0, "h deletions 0");
 
-    assertDeepEqual(s.counts, { staged: 1, unstaged: 1, untracked: 1, conflicts: 0, additions: 5, deletions: 0 }, "counts");
+    assertDeepEqual(s.counts, { staged: 1, unstaged: 1, untracked: 1, conflicts: 0, additions: 6, deletions: 0 }, "counts include untracked");
   });
 
   await run("integration: rename via git mv", async () => {

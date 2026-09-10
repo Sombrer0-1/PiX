@@ -1,15 +1,18 @@
 /**
  * Git workdir status service (PiX 1.5.0, SDD §4.3.3).
  *
- * Orchestrates four read-only git commands against the project directory and
- * produces a GitWorkdirSnapshot (pure metadata: no file contents, no diff
- * text, no commit history; git stderr is never exposed beyond a stable
- * errorCode):
+ * Orchestrates four read-only git commands against the project directory,
+ * then counts untracked text files on disk, and produces a GitWorkdirSnapshot
+ * (pure metadata: no file contents, no diff text, no commit history; git
+ * stderr is never exposed beyond a stable errorCode):
  *
  *   1. rev-parse --show-toplevel            -> repository detection + scope
  *   2. status --porcelain=v2 --branch -z    -> branch/upstream + changed files
  *   3. diff --cached --numstat -z           -> staged-side line counts
  *   4. diff --numstat -z                    -> worktree-side line counts
+ *   5. untracked text files on disk         -> +N/-0 (git diff 不含未跟踪路径；
+ *                                              受文件数/字节预算约束，耗尽则
+ *                                              余下不统计并置 complete:false)
  *
  * Parsing follows the git official formats (verified against the porcelain v2
  * / numstat docs): with -z, porcelain v2 header lines are terminated by NUL
@@ -23,7 +26,8 @@
  * records go; the incomplete trailing record is dropped.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { win32 as pathWin32 } from "node:path";
 import { isProjectLocationLike } from "../../shared/types.js";
 import type {
   GitChangedFile,
@@ -46,11 +50,17 @@ const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 export function createGitStatusService(options?: {
   timeoutMs?: number;        // 默认 2000
   maxOutputBytes?: number;   // 默认 1 MiB
+  /** 未跟踪行数统计：单次快照最多读取的文件数（默认 4000）。 */
+  maxUntrackedFiles?: number;
+  /** 未跟踪行数统计：单次快照最多读取的总字节数（默认 32 MiB）。 */
+  maxUntrackedTotalBytes?: number;
   /** 测试缝：默认 createGitCommandRunner；tsx 测试注入 fake runner。 */
   createRunner?: typeof createGitCommandRunner;
 }): GitStatusService {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxOutputBytes = options?.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const maxUntrackedFiles = options?.maxUntrackedFiles ?? DEFAULT_MAX_UNTRACKED_FILES;
+  const maxUntrackedTotalBytes = options?.maxUntrackedTotalBytes ?? DEFAULT_MAX_UNTRACKED_TOTAL_BYTES;
   const createRunner = options?.createRunner ?? createGitCommandRunner;
 
   return {
@@ -138,6 +148,13 @@ export function createGitStatusService(options?: {
       const files = buildFiles(parsed.records);
       applyNumstat(files, cachedResult.stdout);
       applyNumstat(files, worktreeResult.stdout);
+      // 未跟踪统计受预算约束（同步读盘）：耗尽时余下文件保持未统计，且快照
+      // 置 complete:false —— 少算的合计不得当作精确值呈现。
+      const untrackedTruncated = applyUntrackedLineCounts(files, toplevel, location, {
+        filesLeft: maxUntrackedFiles,
+        bytesLeft: maxUntrackedTotalBytes,
+      });
+      if (untrackedTruncated) complete = false;
       const sortedFiles = [...files.values()].sort(compareFiles);
 
       // 8. observedAt 固定为快照采集时刻。
@@ -400,6 +417,108 @@ function parseNumstatCount(value: string): number | null {
   if (value === "-") return null;
   const n = Number.parseInt(value, 10);
   return Number.isNaN(n) ? null : n;
+}
+
+/** 未跟踪文件不出现在 `git diff --numstat` 中，按磁盘文本行数记为 +N/-0。 */
+const MAX_UNTRACKED_FILE_BYTES = 1024 * 1024;
+/**
+ * 单次快照的未跟踪统计预算。统计在主进程同步读盘，逐文件无上限会在
+ * node_modules 级未跟踪目录上阻塞事件循环；预算按实际读取的文件数与字节数
+ * 计（读后判为二进制的文件同样消耗读取，故同样计数）。
+ */
+const DEFAULT_MAX_UNTRACKED_FILES = 4000;
+const DEFAULT_MAX_UNTRACKED_TOTAL_BYTES = 32 * 1024 * 1024;
+
+/** 未跟踪统计预算：还能读几个文件、还能读多少字节。 */
+interface UntrackedCountBudget {
+  filesLeft: number;
+  bytesLeft: number;
+}
+
+/** 返回 true = 预算耗尽提前停止，剩余未跟踪文件保持未统计（null → "—"）。 */
+function applyUntrackedLineCounts(
+  files: Map<string, GitChangedFile>,
+  toplevel: string,
+  location: ProjectLocation,
+  budget: UntrackedCountBudget,
+): boolean {
+  for (const file of files.values()) {
+    if (!file.untracked || file.conflict) continue;
+    if (file.additions !== null || file.deletions !== null) continue;
+    const physical = resolveUntrackedPhysicalPath(toplevel, location, file.path);
+    if (physical === undefined) continue;
+    // 非普通文件/超单文件上限/不可读：跳过且不消耗预算（未发生读取）。
+    const size = textFileSize(physical);
+    if (size === null) continue;
+    if (budget.filesLeft <= 0 || size > budget.bytesLeft) return true;
+    budget.filesLeft -= 1;
+    budget.bytesLeft -= size;
+    const counted = countTextFileLines(physical);
+    if (counted === null) continue;
+    file.additions = counted;
+    file.deletions = 0;
+  }
+  return false;
+}
+
+function resolveUntrackedPhysicalPath(
+  toplevel: string,
+  location: ProjectLocation,
+  repoRelativePosix: string,
+): string | undefined {
+  if (repoRelativePosix.length === 0) return undefined;
+  const segments = splitPosixSegments(repoRelativePosix);
+  if (segments.length === 0) return undefined;
+  if (location.environment.kind === "windows") {
+    return pathWin32.join(toplevel.replace(/\//g, "\\"), ...segments);
+  }
+  const logicalRoot = stripTrailingSlashes(location.path);
+  const logicalFile = `${stripTrailingSlashes(toplevel)}/${repoRelativePosix}`;
+  if (logicalFile === logicalRoot) return location.physicalPath;
+  if (logicalFile.startsWith(`${logicalRoot}/`)) {
+    const rest = logicalFile.slice(logicalRoot.length + 1);
+    return pathWin32.join(location.physicalPath, ...splitPosixSegments(rest));
+  }
+  return undefined;
+}
+
+function splitPosixSegments(posix: string): string[] {
+  if (posix.startsWith("/") || posix.includes("\\")) return [];
+  const segs = posix.split("/").filter((s) => s.length > 0);
+  if (segs.some((s) => s === "." || s === "..")) return [];
+  return segs;
+}
+
+function stripTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+/** 可读文本候选的字节数；非普通文件、超过单文件上限、stat 失败 → null。 */
+function textFileSize(physical: string): number | null {
+  try {
+    const st = statSync(physical);
+    if (!st.isFile() || st.size > MAX_UNTRACKED_FILE_BYTES) return null;
+    return st.size;
+  } catch {
+    return null;
+  }
+}
+
+function countTextFileLines(physical: string): number | null {
+  try {
+    const buf = readFileSync(physical);
+    if (buf.includes(0)) return null;
+    const text = buf.toString("utf8");
+    if (text.length === 0) return 0;
+    let n = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) === 10) n++;
+    }
+    if (text.charCodeAt(text.length - 1) !== 10) n++;
+    return n;
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================================

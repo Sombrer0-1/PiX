@@ -214,6 +214,8 @@ describe("stats line", () => {
     expect(stats).toContain("+5/-3");
     expect(stats).not.toContain("未暂存");
     expect(stats).not.toContain("未跟踪");
+    expect(wrapper!.find(".git-stats .git-diff-add").text()).toBe("+5");
+    expect(wrapper!.find(".git-stats .git-diff-del").text()).toBe("-3");
   });
 
   it("replaces the whole stats line and fuzzes totals when complete=false", async () => {
@@ -268,7 +270,7 @@ describe("file list", () => {
           makeFile({ path: "b.txt", conflict: true }),
           makeFile({ path: "c.txt", staged: true, deleted: true }),
           makeFile({ path: "d.txt", staged: true, renamed: true, origPath: "old.txt" }),
-          makeFile({ path: "e.txt", untracked: true }),
+          makeFile({ path: "e.txt", untracked: true, additions: 4, deletions: 0 }),
           makeFile({ path: "bin.dat", additions: null, deletions: null }),
           makeFile({ path: longPath, unstaged: true, additions: 10, deletions: 2 }),
         ],
@@ -286,9 +288,14 @@ describe("file list", () => {
     expect(chipsOf(rows[2].element)).toEqual(["已暂存", "已删除"]);
     expect(chipsOf(rows[3].element)).toEqual(["已暂存", "重命名"]);
     expect(chipsOf(rows[4].element)).toEqual(["未跟踪"]);
+    expect(rows[4].find(".git-file-diff").text()).toBe("+4/-0");
+    expect(rows[4].find(".git-diff-add").text()).toBe("+4");
+    expect(rows[4].find(".git-diff-del").text()).toBe("-0");
     // Binary/unstatable → "—"; counted files right-aligned +N/-M.
     expect(rows[5].find(".git-file-diff").text()).toBe("—");
     expect(rows[6].find(".git-file-diff").text()).toBe("+10/-2");
+    expect(rows[6].find(".git-diff-add").text()).toBe("+10");
+    expect(rows[6].find(".git-diff-del").text()).toBe("-2");
     // Middle-truncated path with full-path tooltip.
     const pathCell = rows[6].find(".git-file-path");
     expect(pathCell.attributes("title")).toBe(longPath);

@@ -30,7 +30,7 @@ export interface GitChangedFile {
   renamed: boolean;
   /** 删除（X 或 Y 为 D）。 */
   deleted: boolean;
-  /** 暂存+工作区新增行合计；null = 二进制/未跟踪/冲突等不可统计。 */
+  /** 暂存+工作区+未跟踪新增行合计；null = 二进制/冲突/不可读/预算未统计等。 */
   additions: number | null;
   /** 同上，删除行。 */
   deletions: number | null;
@@ -48,7 +48,7 @@ export interface GitWorkdirCounts {
   unstaged: number;
   untracked: number;
   conflicts: number;
-  /** 全部已统计文件的 + 行合计（仅 complete 时精确）。 */
+  /** 全部已统计文件的 + 行合计（含未跟踪文本；仅 complete 时精确）。 */
   additions: number;
   deletions: number;
 }
@@ -61,7 +61,8 @@ export type GitErrorCode =
 
 /**
  * Git 工作区快照。kind:
- *  - "repository"    : 正常数据（complete=false 表示输出超限截断）
+ *  - "repository"    : 正常数据（complete=false 表示输出超限截断或未跟踪
+ *                      统计预算耗尽）
  *  - "not-repository": 目录不在任何 Git 工作树内 → 卡片整体不显示
  *  - "unavailable"   : 采集失败 → renderer 保留上次快照并标 stale；首次则显示错误+重试
  */
@@ -81,7 +82,7 @@ export interface GitWorkdirSnapshot {
   counts?: GitWorkdirCounts;
   /** 已按 §6.3 排序规则排好的全量列表（字节上限内）。 */
   files: GitChangedFile[];
-  /** false = 输出上限触发，统计与总数不得精确呈现。 */
+  /** false = 输出上限或未跟踪统计预算触发，统计与总数不得精确呈现。 */
   complete: boolean;
   observedAt: number;
   errorCode?: GitErrorCode;
