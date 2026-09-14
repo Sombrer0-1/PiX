@@ -29,6 +29,27 @@ const rpc = useRpc();
 const piDetection = ref<{ found: boolean; path: string; note?: string } | null>(null);
 const showOpenDialog = ref(false);
 
+/** 旧快照提示状态（AC-13）：一次确认即 ack，并与本次会话的记名表对齐。 */
+const showLegacyDialog = ref(false);
+const legacyNoticeLocation = ref<ProjectLocation | null>(null);
+/** 同一会话内的快速缓存；权威判定在主进程（ack.json，见 shouldPromptLegacyNotice）。 */
+const legacyNoticeAcked = new Set<string>();
+
+/** 旧快照 ack 是工作区级的，键与最近项目行一致（环境 + 物理路径）。 */
+function workspaceKey(location: ProjectLocation): string {
+  return `${location.environment.kind}:${location.physicalPath}`;
+}
+
+/**
+ * 「这个工作区要不要弹旧快照提示」完全依赖 IPC：`has-legacy-team-snapshot` 会读
+ * 工作区级 ack.json，确认过之后直接回 false（重启/换会话都算数）。本地 Set 只是
+ * 同一会话的快速缓存——ack 写盘与下一次探针之间总有窗口，缓存挡住重复弹框。
+ */
+async function shouldPromptLegacyNotice(target: ProjectLocation): Promise<boolean> {
+  if (!(await window.pixApi.hasLegacyTeamSnapshot(target))) return false;
+  return !legacyNoticeAcked.has(workspaceKey(target));
+}
+
 onMounted(async () => {
   await projectStore.loadSettings();
   await settingsStore.load();
@@ -91,11 +112,28 @@ async function startFreshWorkspace(location: ProjectLocation): Promise<void> {
   const hasTeamSnapshot = await window.pixApi.hasTeamSnapshot(target);
   const lastMode = await window.pixApi.getWorkspaceMode(target);
   const targetTeam = lastMode === "team" && hasTeamSnapshot;
+
+  // AC-13 / H14：旧 team.json 永远不是可恢复的场（has-team-snapshot 只认
+  // roundtables/<sha1>/current.json），但也不能静默丢掉——仅旧快照存在时提示
+  // 一次，确认后才继续打开工作区。
+  if (!targetTeam) {
+    if (await shouldPromptLegacyNotice(target)) {
+      legacyNoticeLocation.value = target;
+      showLegacyDialog.value = true;
+      return;
+    }
+  }
+
+  await launchWorkspace(target, targetTeam);
+}
+
+/** 打开工作区：按已决定的前台模式启动运行时并进入 workspace。 */
+async function launchWorkspace(target: ProjectLocation, targetTeam: boolean): Promise<void> {
   const sameProject = projectStore.isCurrentProject(target);
 
   if (targetTeam) {
     // Only (re)start the team when we are not already in team mode for this
-    // same project: a stop+restart would discard in-flight worker work for no
+    // same project: a stop+restart would discard in-flight seat work for no
     // reason. A different project still gets a fresh team via the toggle.
     const needsTeamStart = !teamStore.teamMode || !sameProject;
     if (needsTeamStart) {
@@ -132,6 +170,17 @@ async function startFreshWorkspace(location: ProjectLocation): Promise<void> {
     return;
   }
   await finishSoloStartup(target);
+}
+
+/** 旧快照提示只确认一次：ack 落盘（团队路径不会再提示）+ 本次会话记名。 */
+async function confirmLegacyNotice(): Promise<void> {
+  const target = legacyNoticeLocation.value;
+  showLegacyDialog.value = false;
+  legacyNoticeLocation.value = null;
+  if (!target) return;
+  legacyNoticeAcked.add(workspaceKey(target));
+  await window.pixApi.ackLegacyTeamSnapshot(target);
+  await launchWorkspace(target, false);
 }
 
 /** Open the project picker dialog (Windows folder browse or WSL distro + cwd). */
@@ -261,6 +310,20 @@ function formatDate(timestamp: number): string {
       :wsl-diagnostic="settingsStore.wslDiagnostic ?? undefined"
       @open="handleOpenLocation"
     />
+
+    <!-- 旧团队快照提示（AC-13 / H14）：只提示一次，确认后才打开工作区。 -->
+    <v-dialog v-model="showLegacyDialog" max-width="440" persistent>
+      <v-card class="legacy-dialog-card" data-test="legacy-snapshot-dialog">
+        <div class="legacy-dialog-title">检测到旧版团队快照</div>
+        <div class="legacy-dialog-text">
+          这个工作区只有旧版 <code>team.json</code>：它不在可恢复列表里，圆桌讨论需要重新开始（旧文件保留，不会被删除）。将以单人模式打开项目。
+        </div>
+        <v-card-actions class="legacy-dialog-actions">
+          <v-spacer />
+          <v-btn color="primary" variant="tonal" @click="confirmLegacyNotice">知道了</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
@@ -496,5 +559,39 @@ function formatDate(timestamp: number): string {
 
 .footer-link:hover {
   color: var(--pix-text-secondary);
+}
+
+/* 旧快照提示：白玻璃、克制深度、安静蓝反馈。 */
+.legacy-dialog-card {
+  padding: var(--pix-space-lg);
+  border-radius: var(--pix-radius-xl);
+}
+
+.legacy-dialog-title {
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-lg);
+  font-weight: var(--pix-weight-semibold);
+  line-height: 1.35;
+  margin-bottom: var(--pix-space-md);
+}
+
+.legacy-dialog-text {
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-sm);
+  line-height: var(--pix-leading-base);
+  word-break: break-word;
+}
+
+.legacy-dialog-text code {
+  padding: 1px 5px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-code);
+  color: var(--pix-text-primary);
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-xs);
+}
+
+.legacy-dialog-actions {
+  padding: var(--pix-space-lg) 0 0;
 }
 </style>

@@ -1,213 +1,128 @@
 <script setup lang="ts">
 /**
- * TeamTimeline - Chronological message feed for the Team Dashboard.
+ * TeamTimeline - 群聊时间线：用户与席位混排。
  *
- * Shows rich bus messages with from/to direction, role colors, and kind badges.
- * Falls back to legacy per-worker messages when bus messages are empty.
- * Auto-scrolls to bottom when new messages arrive, unless the user scrolled up
- * to read history; a scroll-to-bottom button re-enables auto-scroll.
+ * One chronological record for the whole table: the user speaks as a
+ * participant (蓝), every seat speaks from its own colour, and system notices
+ * sit on their own line. There is no leader row and no "负责人" addressing —
+ * targets are 全员 / @某席 / 私密（正文只在席位收件箱）.
+ *
+ * Two record rules the group chat must show (AC-8 / FR-2 / FR-6):
+ * - 投递三态: every record is 已记录, plus one chip per seat that is 待注入 or
+ *   已注入, so the user can tell "落盘成功" from "模型已看到".
+ * - 长会话折叠: only the newest `overflowCap` records render; the older prefix
+ *   collapses behind 「整理中 N 条」 with an expand affordance. Nothing is
+ *   dropped — expanding re-renders the hidden prefix.
  */
-import { ref, watch, nextTick, computed, onMounted } from "vue";
-import type { TeammateChatMessage, TeammateInfo, TeamMessage } from "@shared/types.js";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
+import {
+  TIMELINE_OVERFLOW_CAP,
+  deliveryRows,
+  deliveryStateIcon,
+  deliveryStateLabel,
+  deliveryStateTone,
+  formatClock,
+  interruptLabel,
+  isUserItem,
+  overflowWindow,
+  seatColor,
+  seatLabel,
+  timelineTypeIcon,
+  timelineTypeLabel,
+} from "./roundtable-display";
+import { useTeamStore } from "../../stores/team-store";
+import type { DeliveryState, SeatInfo, TimelineItem } from "@shared/team-types.js";
 
-const props = defineProps<{
-  /** All worker messages, keyed by agentId (legacy). */
-  messages: Record<string, TeammateChatMessage[]>;
-  /** Teammate info map for name lookup. */
-  teammates: Record<string, TeammateInfo>;
-  /** Rich bus messages (primary source when non-empty). */
-  teamMessages: TeamMessage[];
-  /** Leader agent ID for identifying leader messages. */
-  leadAgentId: string;
+const props = withDefaults(defineProps<{
+  /** Ordered timeline records the chat renders. */
+  items: TimelineItem[];
+  /** Seat roster for names/colours (falls back to the store). */
+  seats?: Record<string, SeatInfo>;
   compact?: boolean;
-}>();
+  /** Force-expand and highlight one record (结论上浮 / 跳转). */
+  highlightId?: string | null;
+  /** Long-session collapse threshold. */
+  overflowCap?: number;
+}>(), {
+  seats: undefined,
+  compact: false,
+  highlightId: null,
+  overflowCap: TIMELINE_OVERFLOW_CAP,
+});
+
+const teamStore = useTeamStore();
 
 const scrollContainer = ref<HTMLElement | null>(null);
 const shouldAutoScroll = ref(true);
+const expanded = ref(false);
 
-/** Resolve an agentId to a display name. */
-function agentName(agentId: string): string {
-  if (agentId === props.leadAgentId) return "负责人";
-  const info = props.teammates[agentId];
-  return info?.name ?? agentId.split("::")[0];
-}
+const roster = computed<Record<string, SeatInfo>>(() => props.seats ?? teamStore.seats);
 
-/** Resolve an agentId to a role. */
-function agentRole(agentId: string): string {
-  if (agentId === props.leadAgentId) return "leader";
-  return props.teammates[agentId]?.role ?? "unknown";
-}
+const window_ = computed(() => overflowWindow(props.items, props.overflowCap));
 
-/** Resolve an agentId to a display color (per-teammate color wins over role color). */
-function agentDisplayColor(agentId: string, role: string): string {
-  const teammateColor = props.teammates[agentId]?.color;
-  return teammateColor ?? roleColor(role);
-}
-
-interface TimelineEntry {
-  id: string;
-  fromName: string;
-  fromRole: string;
-  fromColor: string;
-  toName: string;
-  toRole: string;
-  toColor: string;
-  text: string;
-  summary: string;
-  kind: string;
-  timestamp: number;
-}
-
-/** Build timeline from bus messages (primary) or legacy messages (fallback). */
-const timeline = computed<TimelineEntry[]>(() => {
-  // Primary: use rich bus messages
-  if (props.teamMessages.length > 0) {
-    return props.teamMessages.map((m) => {
-      const toRole = m.toAgentId === "*" ? "broadcast" : agentRole(m.toAgentId);
-      return {
-        id: m.id,
-        fromName: agentName(m.fromAgentId),
-        fromRole: m.fromRole,
-        fromColor: agentDisplayColor(m.fromAgentId, m.fromRole),
-        toName: m.toAgentId === "*" ? "全员" : agentName(m.toAgentId),
-        toRole,
-        toColor: m.toAgentId === "*" ? roleColor("broadcast") : agentDisplayColor(m.toAgentId, toRole),
-        text: m.text,
-        summary: m.summary,
-        kind: m.kind,
-        timestamp: m.timestamp,
-      };
-    });
-  }
-
-  // Fallback: legacy per-worker messages
-  const entries: TimelineEntry[] = [];
-  for (const [agentId, msgs] of Object.entries(props.messages)) {
-    const info = props.teammates[agentId];
-    const name = info?.name ?? agentId.split("::")[0];
-    const role = info?.role ?? "unknown";
-    const color = info?.color ?? roleColor(role);
-    for (const msg of msgs) {
-      if (msg.role === "user") {
-        entries.push({
-          id: msg.id,
-          fromName: "负责人",
-          fromRole: "leader",
-          fromColor: roleColor("leader"),
-          toName: name,
-          toRole: role,
-          toColor: color,
-          text: msg.content,
-          summary: "",
-          kind: "leader_message",
-          timestamp: msg.timestamp,
-        });
-      } else {
-        entries.push({
-          id: msg.id,
-          fromName: name,
-          fromRole: role,
-          fromColor: color,
-          toName: "负责人",
-          toRole: "leader",
-          toColor: roleColor("leader"),
-          text: msg.content,
-          summary: "",
-          kind: "peer_message",
-          timestamp: msg.timestamp,
-        });
-      }
-    }
-  }
-  entries.sort((a, b) => a.timestamp - b.timestamp);
-  return entries;
+/** A located record must be visible even if it sits in the hidden prefix. */
+const forceExpanded = computed(() => {
+  const id = props.highlightId;
+  return id !== null && window_.value.hidden.some((item) => item.id === id);
 });
 
-const roleColor = (role: string): string => {
-  switch (role) {
-    case "planner": return "#6356f3";
-    case "coder": return "#16a34a";
-    case "reviewer": return "#f59e0b";
-    case "tester": return "#0ea5e9";
-    case "researcher": return "#a855f7";
-    case "leader": return "#3b82f6";
-    default: return "#7d859a";
-  }
-};
+const showAll = computed(() => expanded.value || forceExpanded.value);
 
-const roleIcon = (role: string): string => {
-  switch (role) {
-    case "planner": return "mdi-clipboard-text-outline";
-    case "coder": return "mdi-code-braces";
-    case "reviewer": return "mdi-magnify";
-    case "tester": return "mdi-test-tube";
-    case "researcher": return "mdi-book-search-outline";
-    case "leader": return "mdi-account-star";
-    default: return "mdi-robot";
-  }
-};
+const renderedItems = computed(() =>
+  showAll.value ? [...window_.value.hidden, ...window_.value.visible] : window_.value.visible,
+);
 
-const kindColor = (kind: string): string => {
-  switch (kind) {
-    case "shutdown": return "#ef4444";
-    case "blocked": return "#ef4444";
-    case "objection": return "#f97316";
-    case "fix_request": return "#f97316";
-    case "leader_message": return "#3b82f6";
-    case "decision": return "#3b82f6";
-    case "peer_message": return "#22c55e";
-    case "answer": return "#22c55e";
-    case "broadcast": return "#a855f7";
-    case "task_message": return "#6b7280";
-    case "permission_request": return "#f59e0b";
-    case "permission_response": return "#f59e0b";
-    case "plan_approval": return "#0ea5e9";
-    default: return "#7d859a";
-  }
-};
+function fromName(item: TimelineItem): string {
+  return seatLabel(item.fromId, roster.value);
+}
 
-const kindLabel = (kind: string): string => {
-  switch (kind) {
-    case "shutdown": return "停止";
-    case "leader_message": return "负责人";
-    case "peer_message": return "成员";
-    case "broadcast": return "广播";
-    case "task_message": return "任务";
-    case "question": return "提问";
-    case "answer": return "回答";
-    case "proposal": return "建议";
-    case "objection": return "异议";
-    case "decision": return "决定";
-    case "handoff": return "交接";
-    case "review_request": return "审查";
-    case "fix_request": return "修复";
-    case "task_result": return "结果";
-    case "blocked": return "阻塞";
-    case "permission_request": return "权限";
-    case "permission_response": return "权限";
-    case "plan_approval": return "计划";
-    case "worker_summary": return "摘要";
-    default: return kind;
-  }
-};
+function fromColor(item: TimelineItem): string {
+  return seatColor(item.fromId, roster.value);
+}
 
-const formatTime = (ts: number): string => {
-  const d = new Date(ts);
-  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-};
+/**
+ * 目标标签（AC-20）：只有 `private_stub` 是「对外不可见」的那一类记录，公开 @单席
+ * 只是定向可见。判据必须落在 type 上 —— 用 `type === "user" && toId !== "*"` 会把
+ * 每一句公开 @ 标成「私密」，而真私密记录反而退回普通 `→ 席名`（方向相反）。
+ */
+function targetText(item: TimelineItem): string {
+  if (item.type === "private_stub") return `私密 → ${seatLabel(item.toId, roster.value)}`;
+  if (item.toId === "*") return "全员";
+  if (item.type === "user") return `@ → ${seatLabel(item.toId, roster.value)}`;
+  return `→ ${seatLabel(item.toId, roster.value)}`;
+}
 
-// Auto-scroll to bottom when timeline grows, unless the user scrolled up.
+/** Recorded is implied by being on the timeline; per-seat chips add 待注入/已注入. */
+function deliveryChips(item: TimelineItem): Array<{ seatId: string; state: DeliveryState }> {
+  return deliveryRows(item).filter((row) => row.state !== "recorded");
+}
+
+interface RefInfo {
+  label: string;
+  title: string;
+}
+
+/** 引用跳转: replyTo / basedOn show the referenced record when it is in view. */
+function refInfo(id: string | undefined, prefix: string): RefInfo | null {
+  if (id === undefined) return null;
+  const target = props.items.find((item) => item.id === id);
+  if (target === undefined) return { label: `${prefix} ${id.slice(0, 6)}`, title: id };
+  return { label: `${prefix} #${target.seq} ${seatLabel(target.fromId, roster.value)}`, title: target.summary || target.text };
+}
+
+const visibleCount = computed(() => renderedItems.value.length);
+
 watch(
-  () => timeline.value.length,
+  () => renderedItems.value.length,
   async () => {
     if (!shouldAutoScroll.value) return;
     await nextTick();
     scrollToBottom();
-  }
+  },
 );
 
 onMounted(async () => {
-  if (timeline.value.length > 0) {
+  if (renderedItems.value.length > 0) {
     await nextTick();
     scrollToBottom();
   }
@@ -224,58 +139,149 @@ function handleScroll(): void {
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
   shouldAutoScroll.value = distance <= 48;
 }
+
+function collapse(): void {
+  expanded.value = false;
+}
 </script>
 
 <template>
-  <div class="team-timeline" :class="{ 'team-timeline--compact': compact }">
-    <div v-if="!compact" class="team-timeline__header">
-      <v-icon icon="mdi-message-text-outline" size="16" />
-      <span>团队消息</span>
-      <span class="team-timeline__count">{{ timeline.length }}</span>
+  <div class="team-timeline" :class="{ 'team-timeline--compact': compact }" data-test="team-timeline">
+    <div v-if="!compact" class="tt-header">
+      <v-icon icon="mdi-forum-outline" size="15" />
+      <span>圆桌群聊</span>
+      <span class="tt-header-count" data-test="timeline-count">{{ items.length }}</span>
     </div>
-    <div ref="scrollContainer" class="team-timeline__body" @scroll="handleScroll">
-      <div v-if="timeline.length === 0" class="team-timeline__empty">
-        暂无消息
-      </div>
-      <div
-        v-for="entry in timeline"
-        :key="entry.id"
-        class="team-timeline__entry"
-      >
-        <div class="team-timeline__meta">
-          <v-icon
-            :icon="roleIcon(entry.fromRole)"
-            size="14"
-            :style="{ color: entry.fromColor }"
-          />
-          <span class="team-timeline__agent" :style="{ color: entry.fromColor }">
-            {{ entry.fromName }}
-          </span>
-          <span class="team-timeline__arrow">&rarr;</span>
-          <v-icon
-            v-if="entry.toRole !== 'broadcast'"
-            :icon="roleIcon(entry.toRole)"
-            size="14"
-            :style="{ color: entry.toColor }"
-          />
-          <span class="team-timeline__agent" :style="{ color: entry.toColor }">
-            {{ entry.toName }}
-          </span>
-          <span
-            class="team-timeline__kind"
-            :style="{ color: kindColor(entry.kind), borderColor: kindColor(entry.kind) }"
+
+    <div ref="scrollContainer" class="tt-body" @scroll="handleScroll">
+      <div v-if="items.length === 0" class="tt-empty">还没有发言。用下面的输入框说第一句。</div>
+
+      <template v-else>
+        <!-- 整理中 N 条：默认收起较早的记录，展开后原文一条不少 -->
+        <div v-if="!showAll && window_.collapsed > 0" class="tt-overflow">
+          <button
+            type="button"
+            class="tt-overflow-btn"
+            data-test="timeline-overflow-toggle"
+            @click="expanded = true"
           >
-            {{ kindLabel(entry.kind) }}
-          </span>
-          <span class="team-timeline__time">{{ formatTime(entry.timestamp) }}</span>
+            <v-icon icon="mdi-autorenew" size="12" />
+            整理中 {{ window_.collapsed }} 条 · 展开
+          </button>
         </div>
-        <div v-if="entry.summary && entry.summary !== entry.text" class="team-timeline__summary">
-          {{ entry.summary }}
+        <div v-if="showAll && window_.collapsed > 0" class="tt-overflow">
+          <button type="button" class="tt-overflow-btn" data-test="timeline-collapse-toggle" @click="collapse">
+            <v-icon icon="mdi-chevron-up" size="12" />
+            收起较早的 {{ window_.collapsed }} 条
+          </button>
         </div>
-        <div class="team-timeline__content">{{ entry.text }}</div>
-      </div>
+
+        <p class="tt-render-note" data-test="timeline-render-note">
+          当前渲染 {{ visibleCount }} / {{ items.length }} 条
+        </p>
+
+        <article
+          v-for="item in renderedItems"
+          :key="item.id"
+          class="tt-item"
+          :class="{
+            'tt-item--user': isUserItem(item),
+            'tt-item--system': item.type === 'system',
+            'tt-item--private': item.type === 'private_stub',
+            'tt-item--highlight': highlightId === item.id,
+          }"
+          :data-test="`timeline-item-${item.id}`"
+        >
+          <!-- 系统提示（用户 id + system 类型）居中显示，不是发言。
+               原文优先：开场公告、退出协商说法、硬停止告知都是多行文本，summary
+               只是首行摘要，用它渲染会让时间线（记录面）丢掉正文。 -->
+          <div v-if="item.type === 'system'" class="tt-system">
+            <v-icon icon="mdi-information-outline" size="12" />
+            <span class="tt-system-text">{{ item.text || item.summary }}</span>
+            <span class="tt-system-time">{{ formatClock(item.ts) }}</span>
+          </div>
+
+          <template v-else>
+            <div class="tt-meta">
+              <span class="tt-dot" :style="{ backgroundColor: fromColor(item) }"></span>
+              <span class="tt-from" :style="{ color: fromColor(item) }" data-test="timeline-from">
+                {{ fromName(item) }}
+              </span>
+              <span class="tt-target">{{ targetText(item) }}</span>
+              <span class="tt-type">
+                <v-icon :icon="timelineTypeIcon(item.type)" size="11" />
+                {{ timelineTypeLabel(item.type) }}
+              </span>
+              <span v-if="item.interrupt && item.interrupt !== 'L0'" class="tt-interrupt">
+                {{ interruptLabel(item.interrupt) }}
+              </span>
+              <span v-if="item.threadId" class="tt-thread" :title="`线程 ${item.threadId}`">
+                <v-icon icon="mdi-source-branch" size="11" />
+                {{ item.threadId.slice(0, 10) }}
+              </span>
+              <span class="tt-time">{{ formatClock(item.ts) }}</span>
+            </div>
+
+            <div v-if="item.type === 'private_stub'" class="tt-private-note">
+              <v-icon icon="mdi-lock-outline" size="12" />
+              私密消息：正文只在该席位的收件箱里，时间线仅留痕迹。
+            </div>
+            <div v-else-if="item.knowledgeCard" class="tt-card">
+              <div class="tt-card-claim">{{ item.knowledgeCard.claim }}</div>
+              <div class="tt-card-meta">
+                <span>{{ item.knowledgeCard.claimKind === "evidenced" ? "有依据" : "观点" }}</span>
+                <span>置信度 {{ item.knowledgeCard.confidence }}</span>
+              </div>
+              <ul v-if="item.knowledgeCard.evidence.length > 0" class="tt-card-evidence">
+                <li v-for="(evidence, index) in item.knowledgeCard.evidence" :key="index">
+                  <span class="tt-evidence-kind">{{ evidence.kind }}</span>
+                  <span class="tt-evidence-ref">{{ evidence.ref }}</span>
+                  <span v-if="evidence.excerpt" class="tt-evidence-excerpt">{{ evidence.excerpt }}</span>
+                </li>
+              </ul>
+              <div v-if="item.knowledgeCard.uncertainty" class="tt-card-uncertainty">
+                不确定：{{ item.knowledgeCard.uncertainty }}
+              </div>
+            </div>
+            <div v-else class="tt-text" data-test="timeline-text">{{ item.text }}</div>
+
+            <div v-if="item.attachments && item.attachments.length > 0" class="tt-attachments">
+              <span v-for="attachment in item.attachments" :key="attachment.path" class="tt-attachment">
+                <v-icon icon="mdi-paperclip" size="11" />
+                {{ attachment.name || attachment.path }}
+              </span>
+            </div>
+
+            <div class="tt-foot">
+              <span class="tt-delivery-chip tt-delivery-chip--recorded" data-test="delivery-recorded">
+                <v-icon icon="mdi-content-save-outline" size="11" />
+                已记录
+              </span>
+              <span
+                v-for="chip in deliveryChips(item)"
+                :key="chip.seatId"
+                class="tt-delivery-chip"
+                :class="`tt-delivery-chip--${deliveryStateTone(chip.state)}`"
+                :data-test="`delivery-${chip.state}`"
+                :title="`${seatLabel(chip.seatId, roster)}：${deliveryStateLabel(chip.state)}`"
+              >
+                <v-icon :icon="deliveryStateIcon(chip.state)" size="11" />
+                {{ seatLabel(chip.seatId, roster) }}·{{ deliveryStateLabel(chip.state) }}
+              </span>
+
+              <span v-if="refInfo(item.replyToId, '回复')" class="tt-ref">
+                {{ refInfo(item.replyToId, "回复")?.label }}
+              </span>
+              <span v-if="refInfo(item.basedOnId, '基于')" class="tt-ref">
+                {{ refInfo(item.basedOnId, "基于")?.label }}
+              </span>
+            </div>
+          </template>
+        </article>
+      </template>
     </div>
-    <div v-if="!shouldAutoScroll && timeline.length > 0" class="team-timeline__scroll-btn">
+
+    <div v-if="!shouldAutoScroll && items.length > 0" class="tt-scroll-btn">
       <v-btn
         size="x-small"
         variant="flat"
@@ -293,134 +299,329 @@ function handleScroll(): void {
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-lg);
-  overflow: hidden;
-  background: var(--pix-bg-card);
   position: relative;
+  background: var(--pix-bg-card);
 }
 
 .team-timeline--compact {
-  border: 0;
-  border-radius: 0;
   background: transparent;
 }
 
-.team-timeline__header {
+.tt-header {
   display: flex;
   align-items: center;
   gap: var(--pix-space-xs);
   padding: var(--pix-space-xs) var(--pix-space-sm);
+  border-bottom: 1px solid var(--pix-border-subtle);
+  color: var(--pix-text-secondary);
   font-size: var(--pix-text-xs);
   font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-secondary);
-  border-bottom: 1px solid var(--pix-border-subtle);
-  background: var(--pix-bg-hover);
+  flex-shrink: 0;
 }
 
-.team-timeline__count {
+.tt-header-count {
   margin-left: auto;
-  background: var(--pix-accent-light);
-  color: var(--pix-accent);
   padding: 1px 6px;
   border-radius: var(--pix-radius-xs);
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
   font-size: 11px;
 }
 
-.team-timeline__body {
+.tt-body {
   flex: 1;
   overflow-y: auto;
-  padding: var(--pix-space-xs) var(--pix-space-sm);
+  padding: var(--pix-space-sm);
   display: flex;
   flex-direction: column;
-  gap: var(--pix-space-xs);
+  gap: 6px;
 }
 
-.team-timeline--compact .team-timeline__body {
-  padding: var(--pix-space-sm);
-}
-
-.team-timeline__empty {
-  text-align: center;
+.tt-empty {
+  padding: var(--pix-space-lg) 0;
   color: var(--pix-text-muted);
   font-size: var(--pix-text-xs);
-  padding: var(--pix-space-lg) 0;
+  text-align: center;
 }
 
-.team-timeline__entry {
-  padding: 6px 8px;
-  border-radius: var(--pix-radius-sm);
+.tt-overflow {
+  display: flex;
+  justify-content: center;
+}
+
+.tt-overflow-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 2px 10px;
+  border: 1px dashed var(--pix-border);
+  border-radius: 12px;
   background: var(--pix-bg-hover);
-  transition: background var(--pix-transition-fast);
+  color: var(--pix-text-secondary);
+  font-size: 10px;
+  cursor: pointer;
 }
 
-.team-timeline__entry:hover {
-  background: var(--pix-bg-active);
+.tt-overflow-btn:hover {
+  border-color: var(--pix-accent);
+  color: var(--pix-accent);
 }
 
-.team-timeline__meta {
+.tt-render-note {
+  margin: 0;
+  color: var(--pix-text-muted);
+  font-size: 9px;
+  text-align: center;
+}
+
+.tt-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 9px;
+  border: 1px solid var(--pix-border-subtle);
+  border-left: 3px solid var(--pix-border);
+  border-radius: var(--pix-radius-md);
+  background: #ffffff;
+}
+
+.tt-item--user {
+  border-left-color: #2563eb;
+  background: rgba(37, 99, 235, 0.04);
+}
+
+.tt-item--system {
+  border-left-color: transparent;
+  border-style: dashed;
+  background: transparent;
+}
+
+.tt-item--private {
+  border-left-color: var(--pix-warning);
+  background: var(--pix-warning-bg);
+}
+
+.tt-item--highlight {
+  border-color: var(--pix-accent);
+  box-shadow: 0 0 0 2px var(--pix-accent-light);
+}
+
+.tt-system {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  color: var(--pix-text-muted);
+  font-size: 10px;
+}
+
+.tt-system-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tt-system-time {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.tt-meta {
   display: flex;
   align-items: center;
-  gap: 4px;
-  margin-bottom: 2px;
+  gap: 5px;
+  flex-wrap: wrap;
 }
 
-.team-timeline__agent {
+.tt-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tt-from {
   font-size: 11px;
   font-weight: var(--pix-weight-semibold);
-  text-transform: capitalize;
 }
 
-.team-timeline__arrow {
-  font-size: 10px;
-  color: var(--pix-text-muted);
-  margin: 0 2px;
-}
-
-.team-timeline__kind {
-  font-size: 9px;
-  font-weight: var(--pix-weight-semibold);
-  text-transform: uppercase;
-  letter-spacing: 0;
-  padding: 1px 4px;
+.tt-target,
+.tt-type,
+.tt-interrupt,
+.tt-thread {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 5px;
   border-radius: 3px;
-  border: 1px solid;
-  opacity: 0.8;
-  margin-left: 4px;
+  font-size: 9px;
 }
 
-.team-timeline__summary {
-  font-size: 10px;
+.tt-target {
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-secondary);
+}
+
+.tt-type {
   color: var(--pix-text-muted);
-  font-style: italic;
-  margin-bottom: 2px;
 }
 
-.team-timeline__time {
+.tt-interrupt {
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+  font-weight: var(--pix-weight-semibold);
+}
+
+.tt-thread {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+}
+
+.tt-time {
   margin-left: auto;
-  font-size: 10px;
   color: var(--pix-text-muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tt-text {
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-xs);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tt-private-note {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--pix-warning);
+  font-size: 11px;
+}
+
+.tt-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--pix-border-subtle);
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-code);
+}
+
+.tt-card-claim {
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  line-height: 1.5;
+}
+
+.tt-card-meta {
+  display: flex;
+  gap: 8px;
+  color: var(--pix-text-muted);
+  font-size: 9px;
+}
+
+.tt-card-evidence {
+  margin: 0;
+  padding-left: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tt-card-evidence li {
+  color: var(--pix-text-secondary);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.tt-evidence-kind {
+  margin-right: 4px;
+  color: var(--pix-accent);
+  font-weight: var(--pix-weight-semibold);
+}
+
+.tt-evidence-ref {
   font-family: var(--pix-font-mono);
 }
 
-.team-timeline__content {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-primary);
-  line-height: var(--pix-leading-tight);
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 120px;
-  overflow-y: auto;
+.tt-evidence-excerpt {
+  color: var(--pix-text-muted);
 }
 
-.team-timeline--compact .team-timeline__content {
-  max-height: 72px;
+.tt-card-uncertainty {
+  color: var(--pix-warning);
+  font-size: 10px;
 }
 
-.team-timeline__scroll-btn {
+.tt-attachments {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.tt-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border: 1px solid var(--pix-border-subtle);
+  border-radius: 9px;
+  background: #ffffff;
+  color: var(--pix-text-secondary);
+  font-size: 9px;
+}
+
+.tt-foot {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.tt-delivery-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: var(--pix-weight-medium);
+}
+
+.tt-delivery-chip--recorded {
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-secondary);
+}
+
+.tt-delivery-chip--amber {
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+}
+
+.tt-delivery-chip--blue {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+}
+
+.tt-delivery-chip--grey {
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-muted);
+}
+
+.tt-ref {
+  color: var(--pix-text-muted);
+  font-size: 9px;
+}
+
+.tt-scroll-btn {
   position: absolute;
-  bottom: 8px;
-  right: 8px;
+  bottom: 10px;
+  right: 10px;
   z-index: 1;
 }
 </style>

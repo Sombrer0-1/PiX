@@ -356,8 +356,9 @@ watch(() => teamStore.teamMode, async () => {
   subscribeToModeEvents();
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
   if (teamStore.teamMode) {
-    await teamStore.fetchTeamState();
-    await teamStore.fetchTeamHistory();
+    // 圆桌状态只能从这里 pull（事件可能在订阅前丢失）：一场 roundtable 的
+    // state/timeline/metrics/attention 由 refresh() 一次读回。
+    await teamStore.refresh();
   }
 });
 
@@ -397,8 +398,8 @@ onMounted(async () => {
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
   subscribeToModeEvents();
   if (teamStore.teamMode) {
-    await teamStore.fetchTeamState();
-    await teamStore.fetchTeamHistory();
+    // 恢复/挂载路径：圆桌 state+timeline+metrics+attention 走一次 refresh。
+    await teamStore.refresh();
   }
   subscriptionsReady.value = true;
 });

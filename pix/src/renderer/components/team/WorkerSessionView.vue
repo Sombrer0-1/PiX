@@ -1,13 +1,20 @@
 <script setup lang="ts">
 /**
- * WorkerSessionView - focused work log for one worker.
+ * WorkerSessionView - optional seat tool activity (not the conversation).
  *
- * The view coalesces streaming assistant fragments, keeps tool/file events
- * visible, and shows small counters so the user can see what the worker is
- * actually doing during a long-running team task.
+ * The main surface of team mode is TeamTimeline: this view only exists to look
+ * inside one seat's run — streaming fragments, tool calls, file changes and the
+ * folded thinking blocks. Talking to a seat happens on the timeline (composer
+ * with `@席位` or a private message), so there is no per-seat composer here.
  */
 import { computed, ref, watch, nextTick, onMounted } from "vue";
 import { useTeamStore, type TaggedSessionEvent } from "../../stores/team-store";
+import {
+  authTierLabel,
+  seatLabel,
+  seatStatusDot,
+  seatStatusLabel,
+} from "./roundtable-display";
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
 import ThinkingBlock from "../session/ThinkingBlock.vue";
 import { collectWorkerThinkingBlocks, type ThinkingBlockData } from "../../utils/worker-thinking";
@@ -18,36 +25,12 @@ const scrollContainer = ref<HTMLElement | null>(null);
 const shouldAutoScroll = ref(true);
 const expandedErrors = ref<Record<string, boolean>>({});
 
-const focusedId = computed(() => teamStore.focusedAgentId);
-const focusedAgent = computed(() => {
-  const id = focusedId.value;
-  return id ? teamStore.teamState?.teammates[id] ?? null : null;
-});
+const focusedSeatId = computed(() => teamStore.focusedSeatId);
+const focusedSeat = computed(() => teamStore.focusedSeat);
 
-// Direct user-to-worker messaging (delivered via the team bus as a
-// leader-priority message; the worker picks it up on its next idle cycle).
-const directMessage = ref("");
-const isSendingDirect = ref(false);
-const canSendDirect = computed(() => {
-  const status = focusedAgent.value?.status;
-  return Boolean(focusedId.value) && status !== "shutdown" && status !== "error";
-});
-
-async function sendDirectMessage(): Promise<void> {
-  const text = directMessage.value.trim();
-  const id = focusedId.value;
-  if (!text || !id || isSendingDirect.value) return;
-  isSendingDirect.value = true;
-  try {
-    const ok = await teamStore.sendMessageToWorker(id, text);
-    if (ok) directMessage.value = "";
-  } finally {
-    isSendingDirect.value = false;
-  }
-}
 const rawEvents = computed<TaggedSessionEvent[]>(() => {
-  const id = focusedId.value;
-  return id ? teamStore.workerEvents[id] ?? [] : [];
+  const seatId = focusedSeatId.value;
+  return seatId === null ? [] : teamStore.seatEvents[seatId] ?? [];
 });
 
 interface CoalescedEntry {
@@ -113,15 +96,15 @@ const streamEntries = computed<StreamEntry[]>(() => {
 });
 
 /**
- * Thinking blocks folded from the worker's raw event stream by the shared
- * display-block assembler (SDD §4.1.5). One assembler instance per agent;
- * identity-cursor incremental application keeps recomputes cheap, and a slid
- * or cleared buffer (team-store 200-event cap, team rebuild) triggers a full
- * replay of the current window.
+ * Thinking blocks folded from the seat's raw event stream by the shared
+ * display-block assembler. One assembler instance per seat; identity-cursor
+ * incremental application keeps recomputes cheap, and a slid or cleared buffer
+ * (team-store 200-event cap, roundtable rebuild) triggers a full replay of the
+ * current window.
  */
 const thinkingBlocks = computed<ThinkingBlockData[]>(() => {
-  const id = focusedId.value;
-  return id ? collectWorkerThinkingBlocks(id, rawEvents.value) : [];
+  const seatId = focusedSeatId.value;
+  return seatId === null ? [] : collectWorkerThinkingBlocks(seatId, rawEvents.value);
 });
 
 /**
@@ -169,17 +152,19 @@ const timelineEntries = computed<TimelineEntry[]>(() => {
 
 const workStats = computed(() => {
   let tools = 0;
-  let files = 0;
   let messages = 0;
   let errors = 0;
+  // 与「变更」tab 的 FileChangeSummary 同口径：按 path 去重（同一文件被改多次仍是
+  // 1 个文件），没解析出 path 时用 toolCallId 兜底，避免多个未知文件塌成一个。
+  const paths = new Set<string>();
   for (const tagged of rawEvents.value) {
     const ev = tagged.event;
     if (ev.type === "tool_execution_start") tools++;
-    if (ev.type === "file_change") files++;
+    if (ev.type === "file_change") paths.add(ev.change.path ?? `(unknown #${ev.toolCallId})`);
     if (ev.type === "message_update" || ev.type === "message_start") messages++;
     if (ev.type === "tool_execution_end" && ev.isError) errors++;
   }
-  return { tools, files, messages, errors };
+  return { tools, files: paths.size, messages, errors };
 });
 
 watch(
@@ -247,29 +232,6 @@ function toggleErrorExpand(toolCallId: string): void {
   expandedErrors.value[toolCallId] = !expandedErrors.value[toolCallId];
 }
 
-function statusLabel(status?: string): string {
-  switch (status) {
-    case "running": return "工作中";
-    case "idle": return "就绪";
-    case "standby": return "就绪";
-    case "dormant": return "已暂停";
-    case "error": return "有问题";
-    case "shutdown": return "已停止";
-    default: return status ?? "";
-  }
-}
-
-function roleLabel(role?: string): string {
-  switch (role) {
-    case "planner": return "规划";
-    case "coder": return "开发";
-    case "reviewer": return "审查";
-    case "tester": return "测试";
-    case "researcher": return "调研";
-    default: return role ?? "成员";
-  }
-}
-
 function isToolStart(ev: AgentSessionEvent): ev is { type: "tool_execution_start"; toolCallId: string; toolName: string; args: unknown } {
   return ev.type === "tool_execution_start";
 }
@@ -298,92 +260,90 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
 </script>
 
 <template>
-  <div class="worker-session-view">
-    <div v-if="!focusedId" class="wsv-empty">
-      <v-icon icon="mdi-account-group-outline" size="36" color="grey-lighten-1" />
-      <p>未选择团队成员。</p>
+  <div class="seat-session-view" data-test="seat-session-view">
+    <div v-if="!focusedSeatId" class="ssv-empty">
+      <v-icon icon="mdi-account-search-outline" size="32" color="grey-lighten-1" />
+      <p>选择上方席位条中的席位，查看它的工具活动。</p>
     </div>
 
     <template v-else>
-      <div class="wsv-header">
-        <div class="wsv-worker">
-          <strong>{{ focusedAgent?.name ?? focusedId.split('::')[0] }}</strong>
-          <span>{{ roleLabel(focusedAgent?.role) }}</span>
-          <em>{{ statusLabel(focusedAgent?.status) }}</em>
+      <div class="ssv-header">
+        <div class="ssv-seat">
+          <span class="ssv-dot" :style="{ backgroundColor: seatStatusDot(focusedSeat?.status ?? 'idle') }"></span>
+          <strong :style="{ color: focusedSeat?.color ?? undefined }">
+            {{ focusedSeat?.name ?? seatLabel(focusedSeatId, teamStore.seats) }}
+          </strong>
+          <span>{{ seatStatusLabel(focusedSeat?.status ?? "idle") }}</span>
+          <em v-if="focusedSeat">{{ authTierLabel(focusedSeat.auth) }}</em>
         </div>
-        <div class="wsv-stats">
+        <div class="ssv-stats">
           <span>{{ streamEntries.length }} 条事件</span>
           <span>{{ workStats.tools }} 次工具调用</span>
-          <span>{{ workStats.files }} 个文件</span>
-          <span v-if="workStats.errors" class="wsv-stat-error">{{ workStats.errors }} 个错误</span>
+          <span data-test="seat-file-count">{{ workStats.files }} 个文件</span>
+          <span v-if="workStats.errors" class="ssv-stat-error">{{ workStats.errors }} 个错误</span>
         </div>
       </div>
 
-      <div v-if="timelineEntries.length === 0" class="wsv-empty wsv-empty--inside">
-        <v-icon icon="mdi-clock-outline" size="32" color="grey-lighten-1" />
-        <p>该成员当前空闲，暂无事件。</p>
+      <div v-if="timelineEntries.length === 0" class="ssv-empty ssv-empty--inside">
+        <v-icon icon="mdi-clock-outline" size="30" color="grey-lighten-1" />
+        <p>该席位当前空闲，暂无工具活动。</p>
       </div>
 
       <div
         v-else
         ref="scrollContainer"
-        class="wsv-stream"
+        class="ssv-stream"
         @scroll="handleScroll"
       >
         <template
-          v-for="entry in timelineEntries"
-          :key="entry.kind === 'event' ? entry.tagged.timestamp : entry.kind === 'coalesced' ? entry.entry.firstTs : entry.block.id"
+          v-for="(entry, index) in timelineEntries"
+          :key="entry.kind === 'event' ? `e-${index}` : entry.kind === 'coalesced' ? `c-${entry.entry.firstTs}-${index}` : entry.block.id"
         >
-          <div
-            v-if="entry.kind === 'coalesced'"
-            class="wsv-message-block"
-          >
-            <div class="wsv-msg-header">
+          <div v-if="entry.kind === 'coalesced'" class="ssv-message-block">
+            <div class="ssv-msg-header">
               <v-icon icon="mdi-comment-text-outline" size="14" color="purple" />
-              <span class="wsv-msg-label">助手</span>
-              <span class="wsv-msg-count" v-if="entry.entry.events.length > 1">
+              <span class="ssv-msg-label">助手</span>
+              <span v-if="entry.entry.events.length > 1" class="ssv-msg-count">
                 {{ entry.entry.events.length }} 个片段
               </span>
             </div>
-            <div class="wsv-msg-body">
-              <pre class="wsv-msg-text">{{ entry.entry.finalText }}</pre>
+            <div class="ssv-msg-body">
+              <pre class="ssv-msg-text">{{ entry.entry.finalText }}</pre>
             </div>
-            <div class="wsv-msg-time">{{ formatTime(entry.entry.lastTs) }}</div>
+            <div class="ssv-msg-time">{{ formatTime(entry.entry.lastTs) }}</div>
           </div>
 
-          <!-- Worker thinking blocks reuse the main-session component; the
-               worker has no separate effort tier UI, so effortLabel is omitted. -->
           <ThinkingBlock v-else-if="entry.kind === 'thinking'" :block="entry.block" />
 
           <template v-else>
-            <div v-if="isTurnStart(entry.tagged.event)" class="wsv-turn-sep">
-              <span class="wsv-turn-line"></span>
-              <span class="wsv-turn-label">新一轮</span>
-              <span class="wsv-turn-line"></span>
+            <div v-if="isTurnStart(entry.tagged.event)" class="ssv-turn-sep">
+              <span class="ssv-turn-line"></span>
+              <span class="ssv-turn-label">新一轮</span>
+              <span class="ssv-turn-line"></span>
             </div>
 
-            <div v-else-if="isToolStart(entry.tagged.event)" class="wsv-entry wsv-entry--tool-start">
-              <v-icon icon="mdi-cog" size="14" class="wsv-entry-icon" color="blue" />
-              <span class="wsv-entry-tool">{{ entry.tagged.event.toolName }}</span>
-              <span v-if="formatToolArgs(entry.tagged.event.args)" class="wsv-entry-args">
+            <div v-else-if="isToolStart(entry.tagged.event)" class="ssv-entry ssv-entry--tool-start">
+              <v-icon icon="mdi-cog" size="14" class="ssv-entry-icon" color="blue" />
+              <span class="ssv-entry-tool">{{ entry.tagged.event.toolName }}</span>
+              <span v-if="formatToolArgs(entry.tagged.event.args)" class="ssv-entry-args">
                 {{ formatToolArgs(entry.tagged.event.args) }}
               </span>
-              <span class="wsv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
+              <span class="ssv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
             </div>
 
             <template v-else-if="isToolEnd(entry.tagged.event)">
-              <div class="wsv-entry wsv-entry--tool-end">
+              <div class="ssv-entry ssv-entry--tool-end">
                 <v-icon
                   :icon="entry.tagged.event.isError ? 'mdi-alert-circle' : 'mdi-check-circle'"
                   size="14"
-                  class="wsv-entry-icon"
+                  class="ssv-entry-icon"
                   :color="entry.tagged.event.isError ? 'red' : 'green'"
                 />
-                <span class="wsv-entry-tool">{{ entry.tagged.event.toolName }}</span>
+                <span class="ssv-entry-tool">{{ entry.tagged.event.toolName }}</span>
                 <span
                   v-if="entry.tagged.event.isError"
-                  class="wsv-entry-error"
-                  :class="{ 'wsv-entry-error--toggle': formatToolResult(entry.tagged.event.result) }"
+                  class="ssv-entry-error"
+                  :class="{ 'ssv-entry-error--toggle': formatToolResult(entry.tagged.event.result) }"
                   :title="formatToolResult(entry.tagged.event.result) || undefined"
                   @click="formatToolResult(entry.tagged.event.result) && toggleErrorExpand(entry.tagged.event.toolCallId)"
                 >
@@ -392,61 +352,40 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
                     v-if="formatToolResult(entry.tagged.event.result)"
                     :icon="expandedErrors[entry.tagged.event.toolCallId] ? 'mdi-chevron-up' : 'mdi-chevron-down'"
                     size="11"
-                    class="wsv-entry-error-chev"
+                    class="ssv-entry-error-chev"
                   />
                 </span>
-                <span class="wsv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
+                <span class="ssv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
               </div>
               <div
                 v-if="entry.tagged.event.isError && expandedErrors[entry.tagged.event.toolCallId] && formatToolResult(entry.tagged.event.result)"
-                class="wsv-entry-error-detail"
+                class="ssv-entry-error-detail"
               >
-                <pre class="wsv-error-text">{{ formatToolResult(entry.tagged.event.result) }}</pre>
+                <pre class="ssv-error-text">{{ formatToolResult(entry.tagged.event.result) }}</pre>
               </div>
             </template>
 
-            <div v-else-if="isFileChange(entry.tagged.event)" class="wsv-entry wsv-entry--file-change">
-              <v-icon icon="mdi-file-edit-outline" size="14" class="wsv-entry-icon" color="amber" />
-              <span class="wsv-entry-path">{{ entry.tagged.event.change.path || '(未知文件)' }}</span>
-              <span class="wsv-entry-diff">
-                <span class="wsv-diff-add">+{{ entry.tagged.event.change.added }}</span>
-                <span class="wsv-diff-rem">-{{ entry.tagged.event.change.removed }}</span>
+            <div v-else-if="isFileChange(entry.tagged.event)" class="ssv-entry ssv-entry--file-change">
+              <v-icon icon="mdi-file-edit-outline" size="14" class="ssv-entry-icon" color="amber" />
+              <span class="ssv-entry-path">{{ entry.tagged.event.change.path || '(未知文件)' }}</span>
+              <span class="ssv-entry-diff">
+                <span class="ssv-diff-add">+{{ entry.tagged.event.change.added }}</span>
+                <span class="ssv-diff-rem">-{{ entry.tagged.event.change.removed }}</span>
               </span>
-              <span class="wsv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
+              <span class="ssv-entry-time">{{ formatTime(entry.tagged.timestamp) }}</span>
             </div>
 
-            <div v-else-if="isTurnEnd(entry.tagged.event)" class="wsv-turn-sep wsv-turn-sep--end">
-              <span class="wsv-turn-line"></span>
-              <span class="wsv-turn-label">本轮完成</span>
-              <span class="wsv-turn-line"></span>
+            <div v-else-if="isTurnEnd(entry.tagged.event)" class="ssv-turn-sep ssv-turn-sep--end">
+              <span class="ssv-turn-line"></span>
+              <span class="ssv-turn-label">本轮完成</span>
+              <span class="ssv-turn-line"></span>
             </div>
           </template>
         </template>
       </div>
-
-      <div v-if="canSendDirect" class="wsv-composer">
-        <input
-          v-model="directMessage"
-          class="wsv-composer-input"
-          type="text"
-          :placeholder="`直接向 ${focusedAgent?.name ?? '该成员'} 发送消息...`"
-          :disabled="isSendingDirect"
-          @keydown.enter.prevent="sendDirectMessage"
-        />
-        <button
-          class="wsv-composer-send"
-          type="button"
-          :disabled="!directMessage.trim() || isSendingDirect"
-          title="向该成员发送直接消息"
-          aria-label="向该成员发送直接消息"
-          @click="sendDirectMessage"
-        >
-          <v-icon icon="mdi-send" size="14" />
-        </button>
-      </div>
     </template>
 
-    <div v-if="!shouldAutoScroll && streamEntries.length > 0" class="wsv-scroll-btn">
+    <div v-if="!shouldAutoScroll && streamEntries.length > 0" class="ssv-scroll-btn">
       <v-btn
         size="x-small"
         variant="flat"
@@ -459,7 +398,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
 </template>
 
 <style scoped>
-.worker-session-view {
+.seat-session-view {
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -467,7 +406,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   position: relative;
 }
 
-.wsv-header {
+.ssv-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -478,28 +417,34 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   flex-shrink: 0;
 }
 
-.wsv-worker {
+.ssv-seat {
   display: flex;
   align-items: baseline;
   gap: 6px;
   min-width: 0;
 }
 
-.wsv-worker strong {
-  color: var(--pix-text-primary);
-  font-size: var(--pix-text-sm);
-  text-transform: capitalize;
+.ssv-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  align-self: center;
 }
 
-.wsv-worker span,
-.wsv-worker em {
+.ssv-seat strong {
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-sm);
+}
+
+.ssv-seat span,
+.ssv-seat em {
   color: var(--pix-text-muted);
   font-size: 10px;
   font-style: normal;
-  text-transform: capitalize;
 }
 
-.wsv-stats {
+.ssv-stats {
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -509,7 +454,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   font-size: 10px;
 }
 
-.wsv-stats span {
+.ssv-stats span {
   height: 18px;
   padding: 0 6px;
   border-radius: 9px;
@@ -517,12 +462,12 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   line-height: 18px;
 }
 
-.wsv-stats .wsv-stat-error {
+.ssv-stats .ssv-stat-error {
   color: var(--pix-error);
   background: var(--pix-error-bg);
 }
 
-.wsv-empty {
+.ssv-empty {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -534,16 +479,16 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   padding: var(--pix-space-md);
 }
 
-.wsv-empty--inside {
-  min-height: 220px;
+.ssv-empty--inside {
+  min-height: 180px;
 }
 
-.wsv-empty p {
+.ssv-empty p {
   margin: 0;
   font-size: var(--pix-text-sm);
 }
 
-.wsv-stream {
+.ssv-stream {
   flex: 1;
   overflow-y: auto;
   padding: var(--pix-space-sm);
@@ -552,33 +497,31 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   gap: 4px;
 }
 
-.wsv-turn-sep {
+.ssv-turn-sep {
   display: flex;
   align-items: center;
   gap: var(--pix-space-sm);
   padding: var(--pix-space-sm) 0;
 }
 
-.wsv-turn-line {
+.ssv-turn-line {
   flex: 1;
   height: 1px;
   background: var(--pix-border-subtle);
 }
 
-.wsv-turn-label {
+.ssv-turn-label {
   font-size: 10px;
   font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0;
   flex-shrink: 0;
 }
 
-.wsv-turn-sep--end .wsv-turn-label {
+.ssv-turn-sep--end .ssv-turn-label {
   color: var(--pix-success);
 }
 
-.wsv-entry {
+.ssv-entry {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -588,27 +531,27 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   transition: background var(--pix-transition-fast);
 }
 
-.wsv-entry:hover {
+.ssv-entry:hover {
   background: var(--pix-bg-hover);
 }
 
-.wsv-entry--tool-start {
+.ssv-entry--tool-start {
   border-left: 2px solid #3b82f6;
 }
 
-.wsv-entry--tool-end {
+.ssv-entry--tool-end {
   border-left: 2px solid #16a34a;
 }
 
-.wsv-entry--file-change {
+.ssv-entry--file-change {
   border-left: 2px solid #f59e0b;
 }
 
-.wsv-entry-icon {
+.ssv-entry-icon {
   flex-shrink: 0;
 }
 
-.wsv-entry-tool {
+.ssv-entry-tool {
   flex: 0 0 auto;
   max-width: 120px;
   overflow: hidden;
@@ -618,7 +561,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   white-space: nowrap;
 }
 
-.wsv-entry-args {
+.ssv-entry-args {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -629,25 +572,25 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   white-space: nowrap;
 }
 
-.wsv-entry-error {
+.ssv-entry-error {
   font-weight: var(--pix-weight-semibold);
   color: var(--pix-error);
   font-size: 10px;
   flex-shrink: 0;
 }
 
-.wsv-entry-error--toggle {
+.ssv-entry-error--toggle {
   display: inline-flex;
   align-items: center;
   gap: 2px;
   cursor: pointer;
 }
 
-.wsv-entry-error-chev {
+.ssv-entry-error-chev {
   flex-shrink: 0;
 }
 
-.wsv-entry-error-detail {
+.ssv-entry-error-detail {
   margin: 0 7px 2px 16px;
   padding: 4px 6px;
   border-left: 2px solid var(--pix-error);
@@ -657,7 +600,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   overflow-y: auto;
 }
 
-.wsv-error-text {
+.ssv-error-text {
   margin: 0;
   font-family: var(--pix-font-mono);
   font-size: 10px;
@@ -667,7 +610,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   word-break: break-word;
 }
 
-.wsv-entry-path {
+.ssv-entry-path {
   color: var(--pix-text-primary);
   font-family: var(--pix-font-mono);
   font-size: 11px;
@@ -677,7 +620,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   white-space: nowrap;
 }
 
-.wsv-entry-diff {
+.ssv-entry-diff {
   display: inline-flex;
   gap: 4px;
   font-family: var(--pix-font-mono);
@@ -685,15 +628,15 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   flex-shrink: 0;
 }
 
-.wsv-diff-add {
+.ssv-diff-add {
   color: var(--pix-success);
 }
 
-.wsv-diff-rem {
+.ssv-diff-rem {
   color: var(--pix-error);
 }
 
-.wsv-entry-time {
+.ssv-entry-time {
   font-size: 10px;
   color: var(--pix-text-muted);
   font-variant-numeric: tabular-nums;
@@ -702,7 +645,7 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   text-align: right;
 }
 
-.wsv-message-block {
+.ssv-message-block {
   background: var(--pix-bg-card);
   border: 1px solid var(--pix-border-subtle);
   border-left: 3px solid #8b5cf6;
@@ -711,20 +654,20 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   margin: 2px 0;
 }
 
-.wsv-msg-header {
+.ssv-msg-header {
   display: flex;
   align-items: center;
   gap: 6px;
   margin-bottom: 4px;
 }
 
-.wsv-msg-label {
+.ssv-msg-label {
   font-size: var(--pix-text-xs);
   font-weight: var(--pix-weight-semibold);
   color: var(--pix-text-primary);
 }
 
-.wsv-msg-count {
+.ssv-msg-count {
   font-size: 10px;
   color: var(--pix-text-muted);
   background: var(--pix-bg-hover);
@@ -732,12 +675,12 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   border-radius: 6px;
 }
 
-.wsv-msg-body {
+.ssv-msg-body {
   max-height: 300px;
   overflow-y: auto;
 }
 
-.wsv-msg-text {
+.ssv-msg-text {
   margin: 0;
   font-family: var(--pix-font-ui);
   font-size: var(--pix-text-xs);
@@ -747,72 +690,17 @@ function isTurnEnd(ev: AgentSessionEvent): ev is { type: "turn_end"; message: un
   word-break: break-word;
 }
 
-.wsv-msg-time {
+.ssv-msg-time {
   font-size: 10px;
   color: var(--pix-text-muted);
   text-align: right;
   margin-top: 4px;
 }
 
-.wsv-scroll-btn {
+.ssv-scroll-btn {
   position: absolute;
-  bottom: 52px;
+  bottom: 16px;
   right: 16px;
   z-index: 1;
-}
-
-.wsv-composer {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px var(--pix-space-sm);
-  border-top: 1px solid var(--pix-border-subtle);
-  background: rgba(255, 255, 255, 0.85);
-  flex-shrink: 0;
-}
-
-.wsv-composer-input {
-  flex: 1;
-  min-width: 0;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--pix-border-subtle);
-  border-radius: var(--pix-radius-md);
-  background: #ffffff;
-  color: var(--pix-text-primary);
-  font-family: var(--pix-font-ui);
-  font-size: var(--pix-text-xs);
-}
-
-.wsv-composer-input:focus {
-  outline: none;
-  border-color: var(--pix-accent);
-}
-
-.wsv-composer-input::placeholder {
-  color: var(--pix-text-muted);
-}
-
-.wsv-composer-send {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--pix-radius-md);
-  background: var(--pix-accent-light);
-  color: var(--pix-accent);
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background var(--pix-transition-fast), opacity var(--pix-transition-fast);
-}
-
-.wsv-composer-send:hover:not(:disabled) {
-  background: var(--pix-accent-soft);
-}
-
-.wsv-composer-send:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 </style>

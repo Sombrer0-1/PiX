@@ -1,179 +1,165 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+/**
+ * TeamDashboard - the roundtable workbench.
+ *
+ * Main surface = the group chat (TeamTimeline + composer); the rail carries the
+ * attention surface, the open items board, the deliverables and the seat detail
+ * card; the secondary tabs keep the activity stream and the aggregated change
+ * summary one click away. There is no leader conversation here: the discussion
+ * is the timeline, and the host runtime only runs the seats.
+ */
+import { computed, onMounted, ref, watch } from "vue";
 import { useTeamStore } from "../../stores/team-store";
-import { useWorkbenchTab, type WorkbenchTab } from "../../composables/useWorkbenchTab";
+import { useProjectStore } from "../../stores/project-store";
 import AllActivityView from "./AllActivityView.vue";
+import AttentionSurface from "./AttentionSurface.vue";
+import CostStrip from "./CostStrip.vue";
+import DeliverablePanel from "./DeliverablePanel.vue";
 import FileChangeSummary from "./FileChangeSummary.vue";
-import TeamProtocolPanel from "./TeamProtocolPanel.vue";
+import RosterSetupDialog from "./RosterSetupDialog.vue";
+import RoundtableSettingsDialog from "./RoundtableSettingsDialog.vue";
+import RoundtableComposer from "./RoundtableComposer.vue";
 import TeamTimeline from "./TeamTimeline.vue";
+import ThreadFilter from "./ThreadFilter.vue";
 import WorkerDetailCard from "./WorkerDetailCard.vue";
 import WorkerSessionView from "./WorkerSessionView.vue";
-import type { TeamTask, TeamTaskStatus } from "@shared/types.js";
+import { formatClock, seatLabel } from "./roundtable-display";
+import type { OpenItem } from "@shared/team-types.js";
+
+type WorkbenchTab = "discussion" | "activity" | "changes";
 
 const teamStore = useTeamStore();
-const { activeTab, activityMode, showActivityFocused } = useWorkbenchTab();
+const projectStore = useProjectStore();
+
+const activeTab = ref<WorkbenchTab>("discussion");
+const activityScope = ref<"focused" | "all">("focused");
+const selectedThread = ref<string | null>(null);
+const locatedId = ref<string | null>(null);
+const showRoster = ref(false);
+const rosterMode = ref<"create" | "add">("create");
+const showSettings = ref(false);
 const showStopDialog = ref(false);
-const isStoppingTeam = ref(false);
+const stopWithWrapUp = ref(false);
+const isStopping = ref(false);
 
-const teamActive = computed(() => teamStore.isTeamActive);
-const teammateMap = computed(() => teamStore.teamState?.teammates ?? {});
-const leadAgentId = computed(() => teamStore.teamState?.leadAgentId ?? "");
-const focusedAgent = computed(() => {
-  const id = teamStore.focusedAgentId;
-  return id ? teamStore.teamState?.teammates[id] ?? null : null;
-});
+const roundtable = computed(() => teamStore.roundtable);
+const isRunning = computed(() => teamStore.isTeamActive);
+const allowWrapUpOnStop = computed(() => roundtable.value?.settings.hardStop?.allowWrapUpOnStop === true);
 
-const sortedOpenTasks = computed(() => {
-  const order: Record<TeamTaskStatus, number> = {
-    failed: 0,
-    blocked: 1,
-    in_progress: 2,
-    assigned: 3,
-    pending: 4,
-    completed: 5,
-    cancelled: 6,
-  };
-  return teamStore.teamTasks
-    .filter((task) => task.status !== "completed" && task.status !== "cancelled")
-    .sort((a, b) => {
-      const statusDiff = order[a.status] - order[b.status];
-      return statusDiff !== 0 ? statusDiff : b.updatedAt - a.updatedAt;
-    });
-});
-
-const workingCount = computed(() => teamStore.teammates.filter((agent) => agent.status === "running").length);
-const readyCount = computed(() =>
-  teamStore.teammates.filter((agent) => agent.status === "idle" || agent.status === "standby").length,
-);
-const issueCount = computed(() => teamStore.problemTasks.length);
-const activityCount = computed(() =>
-  Object.values(teamStore.workerEvents).reduce((total, events) => total + events.length, 0),
+/** 主线永远可见；线程默认可见，少看（mute）的隐藏，选中线程后只看它。 */
+const visibleTimeline = computed(() =>
+  teamStore.timeline.filter((item) => {
+    const threadId = item.threadId;
+    // 空串也算主线（与 TeamTimeline 的 v-if="item.threadId" 一致）：否则选中任一
+    // 真实线程后，这批 threadId === "" 的记录会从群聊里整段消失。
+    if (!threadId) return true;
+    if (teamStore.mutedThreads.includes(threadId)) return false;
+    if (selectedThread.value !== null && threadId !== selectedThread.value) return false;
+    return true;
+  }),
 );
 
-const teamPulse = computed(() => [
-  { label: "工作中", value: workingCount.value, icon: "mdi-run", tone: "green" },
-  { label: "就绪", value: readyCount.value + teamStore.readyTasks.length, icon: "mdi-playlist-play", tone: "blue" },
-  { label: "等待中", value: teamStore.waitingTasks.length, icon: "mdi-source-branch", tone: "amber" },
-  { label: "问题", value: issueCount.value, icon: "mdi-alert-circle-outline", tone: "red" },
-]);
+const openItems = computed(() => teamStore.openItems);
+const activeOpenItems = computed(() => openItems.value.filter((item) => item.status === "open" || item.status === "claimed"));
 
-const workbenchTabs = computed<Array<{ value: WorkbenchTab; label: string; icon: string; count?: number }>>(() => [
-  { value: "tasks", label: "任务", icon: "mdi-format-list-checks", count: sortedOpenTasks.value.length },
-  { value: "activity", label: "活动", icon: "mdi-pulse", count: activityCount.value },
+const tabs = computed<Array<{ value: WorkbenchTab; label: string; icon: string; count?: number }>>(() => [
+  { value: "discussion", label: "讨论", icon: "mdi-forum-outline", count: teamStore.timeline.length },
+  {
+    value: "activity",
+    label: "活动",
+    icon: "mdi-pulse",
+    count: Object.values(teamStore.seatEvents).reduce((total, events) => total + events.length, 0),
+  },
   { value: "changes", label: "变更", icon: "mdi-file-edit-outline" },
-  { value: "messages", label: "消息", icon: "mdi-message-text-outline", count: teamStore.teamMessages.length },
 ]);
 
-const currentHeadline = computed(() => {
-  if (focusedAgent.value) {
-    const activity = teamStore.currentActivity[focusedAgent.value.agentId];
-    return activity || `${focusedAgent.value.name}：${statusLabel(focusedAgent.value.status)}`;
+const lifecycleLabel = computed(() => {
+  switch (teamStore.lifecycle) {
+    case "active": return "进行中";
+    case "paused": return "已暂停";
+    case "stopped": return "已归档";
+    default: return "未开始";
   }
-  const running = teamStore.teammates.filter((agent) => agent.status === "running");
-  if (running.length > 0) return `${running.map((agent) => agent.name).join("、")} 正在工作`;
-  const nextTask = sortedOpenTasks.value[0];
-  return nextTask ? `下一项：${nextTask.subject}` : "等待负责人安排下一步";
 });
 
-async function handleStartTeam(): Promise<void> {
-  await teamStore.createTeam();
+const statusLine = computed(() => {
+  const speaking = teamStore.activeSeats.filter((seat) => seat.status === "speaking" || seat.status === "exploring");
+  if (speaking.length === 0) return "空闲";
+  return `${speaking.map((seat) => seat.name).join("、")} 正在推进`;
+});
+
+onMounted(() => {
+  void teamStore.refreshOpenItems();
+  void teamStore.refreshDeliverables();
+});
+
+// A new roundtable starts on the discussion tab with no thread focus.
+watch(() => roundtable.value?.roundtableId, () => {
+  selectedThread.value = null;
+  locatedId.value = null;
+  activeTab.value = "discussion";
+});
+
+function openRoster(mode: "create" | "add"): void {
+  rosterMode.value = mode;
+  showRoster.value = true;
 }
 
-async function handleStopTeam(): Promise<void> {
-  isStoppingTeam.value = true;
+function onLocated(itemId: string): void {
+  locatedId.value = itemId;
+}
+
+function selectThread(threadId: string | null): void {
+  selectedThread.value = threadId;
+  locatedId.value = null;
+}
+
+function toggleActivityScope(): void {
+  activityScope.value = activityScope.value === "focused" ? "all" : "focused";
+}
+
+function openItemStatusLabel(status: OpenItem["status"]): string {
+  switch (status) {
+    case "open": return "未决";
+    case "claimed": return "认领中";
+    case "resolved": return "已解决";
+    case "dropped": return "已丢弃";
+  }
+}
+
+function openItemTone(status: OpenItem["status"]): string {
+  switch (status) {
+    case "open": return "open";
+    case "claimed": return "claimed";
+    case "resolved": return "resolved";
+    case "dropped": return "dropped";
+  }
+}
+
+function openItemOwner(item: OpenItem): string {
+  return item.claimedBy === undefined ? "无人认领" : seatLabel(item.claimedBy, teamStore.seats);
+}
+
+async function confirmStop(): Promise<void> {
+  if (isStopping.value) return;
+  isStopping.value = true;
   try {
-    await teamStore.stopTeam();
-  } finally {
-    isStoppingTeam.value = false;
+    await teamStore.stopRoundtable({ wrapUp: allowWrapUpOnStop.value && stopWithWrapUp.value });
     showStopDialog.value = false;
+    stopWithWrapUp.value = false;
+  } finally {
+    isStopping.value = false;
   }
 }
 
-function focusTaskOwner(task: TeamTask): void {
-  if (!task.ownerAgentId) return;
-  teamStore.focusWorker(task.ownerAgentId);
-  showActivityFocused();
-}
-
-function taskOwnerName(task: TeamTask): string {
-  if (!task.ownerAgentId) return "未分配";
-  const agent = teamStore.teamState?.teammates[task.ownerAgentId];
-  return agent?.name ?? task.ownerAgentId.split("::")[0];
-}
-
-function statusLabel(status: string): string {
-  switch (status) {
-    case "running": return "工作中";
-    case "idle":
-    case "standby": return "就绪";
-    case "dormant": return "已暂停";
-    case "error": return "有问题";
-    case "shutdown": return "已停止";
-    default: return status;
-  }
-}
-
-function roleLabel(role: string): string {
-  switch (role) {
-    case "planner": return "规划";
-    case "coder": return "开发";
-    case "reviewer": return "审查";
-    case "tester": return "测试";
-    case "researcher": return "调研";
-    case "leader": return "负责人";
-    default: return role;
-  }
-}
-
-function taskStatusLabel(status: TeamTaskStatus): string {
-  switch (status) {
-    case "pending": return "排队中";
-    case "assigned": return "已分配";
-    case "in_progress": return "进行中";
-    case "blocked": return "已阻塞";
-    case "completed": return "已完成";
-    case "failed": return "失败";
-    case "cancelled": return "已取消";
-    default: return status;
-  }
-}
-
-function taskStatusTone(status: TeamTaskStatus): string {
-  switch (status) {
-    case "in_progress": return "blue";
-    case "assigned": return "cyan";
-    case "pending": return "grey";
-    case "blocked": return "amber";
-    case "failed": return "red";
-    case "completed": return "green";
-    case "cancelled": return "grey";
-    default: return "grey";
-  }
-}
-
-function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-}
-
-function formatCount(value: number): string {
-  return value > 99 ? "99+" : String(value);
-}
-
-function taskEvidenceSummary(task: TeamTask): string {
-  const evidence = task.evidence;
-  if (!evidence) return "";
-  return [
-    evidence.changedFiles.length ? `${evidence.changedFiles.length} 个文件` : "",
-    evidence.completedScope.length ? `${evidence.completedScope.length} 项完成` : "",
-    evidence.verification.length ? `${evidence.verification.length} 项验证` : "",
-    evidence.missingScope.length ? `${evidence.missingScope.length} 项缺失` : "",
-    evidence.risks.length ? `${evidence.risks.length} 项风险` : "",
-  ].filter(Boolean).join(" / ");
+async function dismissLegacy(): Promise<void> {
+  // The ack is workspace-level (one notice per workspace, not per roundtable).
+  await teamStore.dismissLegacyNotice(projectStore.currentProject ?? undefined);
 }
 </script>
 
 <template>
-  <div class="team-dashboard">
+  <div class="team-dashboard" data-test="team-dashboard">
     <v-alert
       v-if="teamStore.lastError"
       type="error"
@@ -186,25 +172,31 @@ function taskEvidenceSummary(task: TeamTask): string {
       {{ teamStore.lastError }}
     </v-alert>
 
-    <div v-if="teamStore.isLoading && !teamActive" class="team-empty">
-      <v-icon icon="mdi-loading" size="26" class="team-loading-icon" />
-      <strong>正在启动团队...</strong>
+    <div v-if="teamStore.legacyNotice" class="legacy-banner" data-test="legacy-notice">
+      <v-icon icon="mdi-alert-outline" size="14" />
+      <span>检测到旧版团队快照：不会出现在可恢复列表里，讨论记录需要重新开始。</span>
+      <button type="button" class="legacy-ack" @click="dismissLegacy">知道了</button>
     </div>
 
-    <div v-else-if="!teamActive" class="team-empty">
+    <div v-if="teamStore.recordCorruptNotice" class="legacy-banner" data-test="record-corrupt-notice">
+      <v-icon icon="mdi-alert-outline" size="14" />
+      <span>{{ teamStore.recordCorruptNotice }}</span>
+      <button type="button" class="legacy-ack" @click="teamStore.dismissRecordCorruptNotice()">知道了</button>
+    </div>
+
+    <div v-if="teamStore.isLoading && roundtable === null" class="team-empty">
+      <v-icon icon="mdi-loading" size="26" class="team-loading-icon" />
+      <strong>正在读取圆桌...</strong>
+    </div>
+
+    <div v-else-if="roundtable === null" class="team-empty" data-test="team-empty">
       <span class="team-empty-icon">
-        <v-icon icon="mdi-account-group-outline" size="28" />
+        <v-icon icon="mdi-forum-outline" size="28" />
       </span>
-      <strong>当前没有活动团队</strong>
-      <v-btn
-        :loading="teamStore.isLoading"
-        color="primary"
-        variant="flat"
-        size="small"
-        prepend-icon="mdi-play"
-        @click="handleStartTeam"
-      >
-        启动团队
+      <strong>当前没有圆桌</strong>
+      <span class="team-empty-hint">选一个档位、写议题，用户和席位在同一个群聊里讨论。</span>
+      <v-btn color="primary" variant="flat" size="small" prepend-icon="mdi-table-chair" @click="openRoster('create')">
+        组建圆桌
       </v-btn>
     </div>
 
@@ -212,148 +204,173 @@ function taskEvidenceSummary(task: TeamTask): string {
       <header class="workbench-header">
         <div class="workbench-title">
           <span class="workbench-mark">
-            <v-icon icon="mdi-view-dashboard-outline" size="18" />
+            <v-icon icon="mdi-forum-outline" size="18" />
           </span>
           <span class="workbench-title-copy">
-            <strong>{{ teamStore.teamName || "团队工作台" }}</strong>
-            <span :title="currentHeadline">{{ currentHeadline }}</span>
+            <strong>{{ roundtable.name }}</strong>
+            <span :title="statusLine">{{ statusLine }}</span>
           </span>
         </div>
-        <v-btn
-          icon="mdi-stop-circle-outline"
-          size="small"
-          color="error"
-          variant="text"
-          :loading="isStoppingTeam"
-          title="停止并解散团队"
-          aria-label="停止并解散团队"
-          @click="showStopDialog = true"
-        />
+        <div class="workbench-controls">
+          <span class="lifecycle-chip" :class="`lifecycle-chip--${teamStore.lifecycle ?? 'inactive'}`">
+            {{ lifecycleLabel }}
+          </span>
+          <span class="seat-count">{{ teamStore.activeSeats.length }} 席</span>
+          <v-btn
+            v-if="isRunning"
+            icon="mdi-cog-outline"
+            size="small"
+            variant="text"
+            title="圆桌设置"
+            aria-label="圆桌设置"
+            data-test="roundtable-settings"
+            @click="showSettings = true"
+          />
+          <v-btn
+            v-if="isRunning"
+            size="small"
+            variant="text"
+            prepend-icon="mdi-account-plus-outline"
+            @click="openRoster('add')"
+          >
+            加席位
+          </v-btn>
+          <v-btn
+            v-if="teamStore.lifecycle === 'stopped'"
+            size="small"
+            variant="tonal"
+            color="primary"
+            prepend-icon="mdi-table-chair"
+            @click="openRoster('create')"
+          >
+            新圆桌
+          </v-btn>
+          <v-btn
+            v-else
+            icon="mdi-stop-circle-outline"
+            size="small"
+            color="error"
+            variant="text"
+            title="停止并归档"
+            aria-label="停止并归档"
+            @click="showStopDialog = true"
+          />
+        </div>
       </header>
 
-      <TeamProtocolPanel />
+      <CostStrip />
 
-      <div class="team-metrics" aria-label="团队概览">
-        <div
-          v-for="metric in teamPulse"
-          :key="metric.label"
-          class="team-metric"
-          :class="`team-metric--${metric.tone}`"
-        >
-          <v-icon :icon="metric.icon" size="14" />
-          <span>{{ metric.label }}</span>
-          <strong>{{ metric.value }}</strong>
-        </div>
-      </div>
-
-      <nav class="workbench-tabs" role="tablist" aria-label="团队工作台视图">
+      <nav class="workbench-tabs" role="tablist" aria-label="圆桌工作台视图">
         <button
-          v-for="tab in workbenchTabs"
+          v-for="tab in tabs"
           :key="tab.value"
           class="workbench-tab"
           :class="{ active: activeTab === tab.value }"
           type="button"
           role="tab"
           :aria-selected="activeTab === tab.value"
+          :data-test="`workbench-tab-${tab.value}`"
           @click="activeTab = tab.value"
         >
           <v-icon :icon="tab.icon" size="14" />
           <span>{{ tab.label }}</span>
-          <span v-if="tab.count !== undefined" class="workbench-tab-count">{{ formatCount(tab.count) }}</span>
+          <span v-if="tab.count !== undefined" class="workbench-tab-count">{{ tab.count > 99 ? "99+" : tab.count }}</span>
         </button>
       </nav>
 
-      <div class="workbench-body" :class="{ 'workbench-body--activity': activeTab === 'activity' || activeTab === 'messages' }">
-        <section v-if="activeTab === 'tasks'" class="workbench-section">
-          <div class="section-heading">
-            <div>
-              <strong>当前工作</strong>
-              <span>{{ sortedOpenTasks.length }} 项进行中 / {{ teamStore.doneTasks.length }} 项完成</span>
-            </div>
-          </div>
-
-          <div v-if="sortedOpenTasks.length === 0" class="workbench-empty">
-            <v-icon icon="mdi-check-circle-outline" size="24" />
-            <strong>没有待处理任务</strong>
-          </div>
-
-          <div v-else class="task-list">
-            <button
-              v-for="task in sortedOpenTasks"
-              :key="task.id"
-              class="task-row"
-              :class="{ 'task-row--actionable': task.ownerAgentId }"
-              type="button"
-              :disabled="!task.ownerAgentId"
-              @click="focusTaskOwner(task)"
-            >
-              <span class="task-status" :class="`task-status--${taskStatusTone(task.status)}`">
-                {{ taskStatusLabel(task.status) }}
-              </span>
-              <span class="task-copy">
-                <strong>{{ task.subject }}</strong>
-                <span>{{ task.description }}</span>
-                <small v-if="taskEvidenceSummary(task)">{{ taskEvidenceSummary(task) }}</small>
-              </span>
-              <span class="task-meta">
-                <strong>{{ taskOwnerName(task) }}</strong>
-                <span>{{ formatTime(task.updatedAt) }}</span>
-              </span>
-              <v-icon v-if="task.ownerAgentId" icon="mdi-chevron-right" size="15" />
-            </button>
-          </div>
-        </section>
-
-        <section v-else-if="activeTab === 'activity'" class="workbench-section workbench-activity">
-          <div class="activity-toolbar">
-            <div>
-              <strong>成员活动</strong>
-              <span>{{ focusedAgent ? `${focusedAgent.name} / ${roleLabel(focusedAgent.role)}` : "全部成员" }}</span>
-            </div>
-            <div class="activity-toggle" role="group" aria-label="活动流范围">
-              <button
-                type="button"
-                :class="{ active: activityMode === 'focused' }"
-                @click="activityMode = 'focused'"
-              >当前成员</button>
-              <button
-                type="button"
-                :class="{ active: activityMode === 'all' }"
-                @click="activityMode = 'all'"
-              >全部</button>
-            </div>
-          </div>
-          <WorkerDetailCard v-if="activityMode === 'focused' && focusedAgent" />
-          <WorkerSessionView v-if="activityMode === 'focused'" />
-          <AllActivityView v-else />
-        </section>
-
-        <section v-else-if="activeTab === 'changes'" class="workbench-section">
-          <FileChangeSummary />
-        </section>
-
-        <section v-else class="workbench-section workbench-messages">
-          <TeamTimeline
-            :messages="teamStore.workerMessages"
-            :teammates="teammateMap"
-            :team-messages="teamStore.teamMessages"
-            :lead-agent-id="leadAgentId"
-            compact
+      <div v-if="activeTab === 'discussion'" class="workbench-discussion">
+        <section class="workbench-main">
+          <ThreadFilter
+            :items="teamStore.timeline"
+            :selected="selectedThread"
+            @update:selected="selectThread"
+            @locate="onLocated"
           />
+          <TeamTimeline
+            :items="visibleTimeline"
+            :seats="teamStore.seats"
+            :highlight-id="locatedId"
+          />
+          <RoundtableComposer />
         </section>
+
+        <aside class="workbench-rail">
+          <WorkerDetailCard />
+          <AttentionSurface />
+
+          <div class="open-items" data-test="open-items">
+            <div class="oi-heading">
+              <span class="oi-title">
+                <v-icon icon="mdi-format-list-checks" size="14" />
+                未决
+                <span v-if="activeOpenItems.length > 0" class="oi-count">{{ activeOpenItems.length }}</span>
+              </span>
+              <button type="button" class="oi-refresh" @click="teamStore.refreshOpenItems()">刷新</button>
+            </div>
+            <div v-if="openItems.length === 0" class="oi-empty">没有未决项</div>
+            <div
+              v-for="item in openItems.slice(0, 12)"
+              :key="item.id"
+              class="oi-item"
+              :class="`oi-item--${openItemTone(item.status)}`"
+              :data-test="`open-item-${item.id}`"
+            >
+              <div class="oi-subject">{{ item.subject }}</div>
+              <div class="oi-meta">
+                <span class="oi-status">{{ openItemStatusLabel(item.status) }}</span>
+                <span>{{ openItemOwner(item) }}</span>
+                <span class="oi-time">{{ formatClock(item.updatedAt) }}</span>
+              </div>
+            </div>
+          </div>
+
+          <DeliverablePanel />
+        </aside>
+      </div>
+
+      <div v-else-if="activeTab === 'activity'" class="workbench-body">
+        <div class="activity-toolbar">
+          <div>
+            <strong>席位活动</strong>
+            <span>{{ activityScope === "focused" ? "当前席位" : "全部席位" }}</span>
+          </div>
+          <v-btn size="x-small" variant="tonal" @click="toggleActivityScope">
+            {{ activityScope === "focused" ? "看全部" : "看当前席位" }}
+          </v-btn>
+        </div>
+        <template v-if="activityScope === 'focused'">
+          <WorkerSessionView />
+        </template>
+        <AllActivityView v-if="activityScope === 'all'" />
+      </div>
+
+      <div v-else class="workbench-body workbench-body--changes">
+        <FileChangeSummary />
       </div>
     </template>
 
-    <v-dialog v-model="showStopDialog" max-width="400" :persistent="isStoppingTeam">
+    <RosterSetupDialog v-model="showRoster" :mode="rosterMode" @created="showRoster = false" />
+    <RoundtableSettingsDialog v-model="showSettings" />
+
+    <v-dialog v-model="showStopDialog" max-width="420" :persistent="isStopping">
       <v-card class="stop-dialog-card">
-        <div class="stop-dialog-title">停止团队</div>
+        <div class="stop-dialog-title">停止并归档圆桌</div>
         <div class="stop-dialog-text">
-          确定停止团队 <strong>{{ teamStore.teamName }}</strong>？所有成员都会停止，团队将被解散，已完成的工作会保留在项目中。
+          确定停止 <strong>{{ roundtable?.name }}</strong>？席位会全部停下，这一场归档为只读记录，已完成的记录与交付物都保留。
         </div>
+        <label v-if="allowWrapUpOnStop" class="stop-dialog-option">
+          <v-checkbox
+            v-model="stopWithWrapUp"
+            density="compact"
+            hide-details
+            color="primary"
+            label="停止前做一次整理（开场已授权）"
+          />
+        </label>
         <v-card-actions class="stop-dialog-actions">
           <v-spacer />
-          <v-btn variant="text" :disabled="isStoppingTeam" @click="showStopDialog = false">取消</v-btn>
-          <v-btn color="error" variant="tonal" :loading="isStoppingTeam" @click="handleStopTeam">停止团队</v-btn>
+          <v-btn variant="text" :disabled="isStopping" @click="showStopDialog = false">取消</v-btn>
+          <v-btn color="error" variant="tonal" :loading="isStopping" @click="confirmStop">停止并归档</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -375,6 +392,29 @@ function taskEvidenceSummary(task: TeamTask): string {
   margin: var(--pix-space-sm);
 }
 
+.legacy-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: var(--pix-space-sm) var(--pix-space-sm) 0;
+  padding: 6px 9px;
+  border: 1px solid var(--pix-warning-light);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+  font-size: 10px;
+}
+
+.legacy-ack {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 .team-empty {
   display: flex;
   flex: 1;
@@ -383,6 +423,8 @@ function taskEvidenceSummary(task: TeamTask): string {
   justify-content: center;
   gap: var(--pix-space-sm);
   color: var(--pix-text-secondary);
+  padding: var(--pix-space-lg);
+  text-align: center;
 }
 
 .team-empty-icon,
@@ -393,12 +435,17 @@ function taskEvidenceSummary(task: TeamTask): string {
   width: 38px;
   height: 38px;
   border-radius: var(--pix-radius-lg);
-  background: #eef7f2;
-  color: #15805f;
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
 }
 
 .team-empty strong {
   font-size: var(--pix-text-sm);
+}
+
+.team-empty-hint {
+  color: var(--pix-text-muted);
+  font-size: 11px;
 }
 
 .team-loading-icon {
@@ -415,7 +462,7 @@ function taskEvidenceSummary(task: TeamTask): string {
   align-items: center;
   justify-content: space-between;
   gap: var(--pix-space-md);
-  min-height: 62px;
+  min-height: 58px;
   padding: var(--pix-space-sm) var(--pix-space-md);
   border-bottom: 1px solid var(--pix-border-subtle);
   flex-shrink: 0;
@@ -458,47 +505,33 @@ function taskEvidenceSummary(task: TeamTask): string {
   font-size: 10px;
 }
 
-.team-metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  border-bottom: 1px solid var(--pix-border-subtle);
+.workbench-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-xs);
   flex-shrink: 0;
 }
 
-.team-metric {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-  padding: 7px 9px;
-  color: var(--pix-text-secondary);
+.lifecycle-chip,
+.seat-count {
+  padding: 1px 7px;
+  border-radius: 9px;
   font-size: 10px;
+  font-weight: var(--pix-weight-medium);
 }
 
-.team-metric + .team-metric {
-  border-left: 1px solid var(--pix-border-subtle);
-}
+.lifecycle-chip--active { background: var(--pix-success-bg); color: var(--pix-success); }
+.lifecycle-chip--paused { background: var(--pix-warning-bg); color: var(--pix-warning); }
+.lifecycle-chip--stopped,
+.lifecycle-chip--inactive { background: var(--pix-bg-hover); color: var(--pix-text-muted); }
 
-.team-metric span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.seat-count {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
 }
-
-.team-metric strong {
-  color: var(--pix-text-primary);
-  font-size: var(--pix-text-sm);
-}
-
-.team-metric--green { color: var(--pix-success); }
-.team-metric--blue { color: #2563eb; }
-.team-metric--amber { color: var(--pix-warning); }
-.team-metric--red { color: var(--pix-error); }
 
 .workbench-tabs {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  display: flex;
   gap: 3px;
   padding: 5px var(--pix-space-sm);
   border-bottom: 1px solid var(--pix-border-subtle);
@@ -511,9 +544,9 @@ function taskEvidenceSummary(task: TeamTask): string {
   align-items: center;
   justify-content: center;
   gap: 4px;
-  min-width: 0;
-  min-height: 30px;
-  padding: 4px 6px;
+  min-width: 76px;
+  min-height: 28px;
+  padding: 4px 8px;
   border-radius: var(--pix-radius-md);
   color: var(--pix-text-muted);
   font-size: 10px;
@@ -531,12 +564,6 @@ function taskEvidenceSummary(task: TeamTask): string {
   box-shadow: var(--pix-shadow-xs);
 }
 
-.workbench-tab > span:not(.workbench-tab-count) {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .workbench-tab-count {
   min-width: 16px;
   padding: 1px 4px;
@@ -547,23 +574,134 @@ function taskEvidenceSummary(task: TeamTask): string {
   line-height: 14px;
 }
 
-.workbench-body {
+.workbench-discussion {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
   flex: 1;
   min-height: 0;
+}
+
+.workbench-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--pix-border-subtle);
+}
+
+.workbench-rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-sm);
+  padding: var(--pix-space-sm);
+  overflow-y: auto;
+  min-height: 0;
+  background: #fbfcfe;
+}
+
+.open-items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-xs);
+  padding: var(--pix-space-sm);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-lg);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: var(--pix-shadow-xs);
+}
+
+.oi-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.oi-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-semibold);
+}
+
+.oi-count {
+  min-width: 16px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+  font-size: 9px;
+  text-align: center;
+}
+
+.oi-refresh {
+  border: none;
+  background: transparent;
+  color: var(--pix-accent);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.oi-empty {
+  color: var(--pix-text-muted);
+  font-size: 10px;
+}
+
+.oi-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 7px;
+  border-left: 3px solid var(--pix-border);
+  border-radius: var(--pix-radius-sm);
+  background: #ffffff;
+}
+
+.oi-item--open { border-left-color: var(--pix-warning); }
+.oi-item--claimed { border-left-color: var(--pix-accent); }
+.oi-item--resolved { border-left-color: var(--pix-success); opacity: 0.7; }
+.oi-item--dropped { border-left-color: var(--pix-border); opacity: 0.6; }
+
+.oi-subject {
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+  line-height: 1.4;
+}
+
+.oi-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--pix-text-muted);
+  font-size: 9px;
+}
+
+.oi-status {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--pix-bg-hover);
+}
+
+.oi-time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.workbench-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  padding: var(--pix-space-sm);
+}
+
+.workbench-body--changes {
+  padding: var(--pix-space-md);
   overflow-y: auto;
 }
 
-.workbench-body--activity {
-  display: flex;
-  overflow: hidden;
-}
-
-.workbench-section {
-  min-height: 100%;
-  padding: var(--pix-space-md);
-}
-
-.section-heading,
 .activity-toolbar {
   display: flex;
   align-items: center;
@@ -572,161 +710,20 @@ function taskEvidenceSummary(task: TeamTask): string {
   margin-bottom: var(--pix-space-sm);
 }
 
-.section-heading > div,
-.activity-toolbar > div:first-child {
+.activity-toolbar > div {
   display: flex;
   flex-direction: column;
 }
 
-.section-heading strong,
 .activity-toolbar strong {
   color: var(--pix-text-primary);
   font-size: var(--pix-text-sm);
   font-weight: var(--pix-weight-semibold);
 }
 
-.section-heading span,
 .activity-toolbar span {
   color: var(--pix-text-muted);
   font-size: 10px;
-}
-
-.task-list {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.task-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: var(--pix-space-sm);
-  width: 100%;
-  padding: 9px 8px;
-  border: 1px solid var(--pix-border-subtle);
-  border-radius: var(--pix-radius-md);
-  background: #ffffff;
-  text-align: left;
-}
-
-.task-row--actionable:hover {
-  border-color: var(--pix-border);
-  background: var(--pix-bg-hover);
-}
-
-.task-row:disabled {
-  opacity: 1;
-}
-
-.task-copy,
-.task-meta {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.task-copy strong,
-.task-copy span,
-.task-copy small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-copy strong {
-  color: var(--pix-text-primary);
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-semibold);
-}
-
-.task-copy span,
-.task-copy small,
-.task-meta span {
-  color: var(--pix-text-muted);
-  font-size: 9px;
-}
-
-.task-copy small {
-  color: var(--pix-text-secondary);
-}
-
-.task-meta {
-  align-items: flex-end;
-  flex-shrink: 0;
-}
-
-.task-meta strong {
-  color: var(--pix-text-secondary);
-  font-size: 10px;
-  font-weight: var(--pix-weight-medium);
-  text-transform: capitalize;
-}
-
-.task-status {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 54px;
-  min-height: 20px;
-  padding: 2px 6px;
-  border-radius: var(--pix-radius-sm);
-  font-size: 9px;
-  font-weight: var(--pix-weight-semibold);
-}
-
-.task-status--blue { background: #eff6ff; color: #2563eb; }
-.task-status--cyan { background: #ecfeff; color: #0891b2; }
-.task-status--grey { background: var(--pix-bg-hover); color: var(--pix-text-secondary); }
-.task-status--amber { background: var(--pix-warning-bg); color: var(--pix-warning); }
-.task-status--red { background: var(--pix-error-bg); color: var(--pix-error); }
-.task-status--green { background: var(--pix-success-bg); color: var(--pix-success); }
-
-.workbench-empty {
-  display: flex;
-  min-height: 180px;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--pix-space-xs);
-  color: var(--pix-success);
-}
-
-.workbench-empty strong {
-  color: var(--pix-text-secondary);
-  font-size: var(--pix-text-sm);
-}
-
-.workbench-activity,
-.workbench-messages {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.activity-toggle {
-  display: inline-flex;
-  flex-direction: row !important;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--pix-border-subtle);
-  border-radius: var(--pix-radius-md);
-  background: var(--pix-bg-hover);
-}
-
-.activity-toggle button {
-  min-height: 24px;
-  padding: 3px 8px;
-  border-radius: var(--pix-radius-sm);
-  color: var(--pix-text-secondary);
-  font-size: 10px;
-}
-
-.activity-toggle button.active {
-  background: #ffffff;
-  color: var(--pix-accent);
-  box-shadow: var(--pix-shadow-xs);
 }
 
 .stop-dialog-card {
@@ -747,23 +744,18 @@ function taskEvidenceSummary(task: TeamTask): string {
   line-height: 1.5;
 }
 
+.stop-dialog-option {
+  display: block;
+  margin-top: var(--pix-space-xs);
+}
+
 .stop-dialog-actions {
   padding: var(--pix-space-sm) 0 0 !important;
 }
 
-@media (max-width: 1280px) {
-  .workbench-tab {
-    padding-right: 3px;
-    padding-left: 3px;
-  }
-
-  .team-metric span {
-    display: none;
-  }
-
-  .team-metric {
-    grid-template-columns: auto auto;
-    justify-content: center;
+@media (max-width: 1320px) {
+  .workbench-discussion {
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 300px);
   }
 }
 </style>

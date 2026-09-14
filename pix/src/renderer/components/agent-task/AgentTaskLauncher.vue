@@ -13,6 +13,10 @@
  * InputCard 与通知中心保持全局——审批是最短路径,隔离会让后台任务无限期卡死;
  * 完成通知是 app 级语义(瞬时、10 条封顶)。
  *
+ * 会话口径:team 模式取 host 运行时会话(团队模式下 agent-task 的唯一来源)。
+ * 讨论席位的 session 永不进入 agent-task（席位没有 agent/plan/workflow 工具,
+ * H12;席位 id 也不是会话 id）。
+ *
  * subscribeToEvents 的唯一挂载点（AgentTaskPanel 删除后）:onMounted 订阅、
  * onUnmounted 退订——任务镜像、输入请求与 retention task_removed 全部依赖它。
  */
@@ -32,7 +36,10 @@ const store = useAgentTaskStore();
 const projectStore = useProjectStore();
 const teamStore = useTeamStore();
 
-/** 与 TaskCenterView 同源:team 模式取 leader 会话;切换空窗期为 null。 */
+/**
+ * 与 TaskCenterView 同源:team 模式取 host 运行时会话（讨论席位不是 agent-task
+ * 的来源）；切换空窗期为 null。
+ */
 const currentSessionId = computed(
   () => (teamStore.teamMode ? projectStore.currentTeamSession?.id : projectStore.currentSession?.id) ?? null,
 );

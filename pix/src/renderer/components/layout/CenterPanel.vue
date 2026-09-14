@@ -8,6 +8,7 @@ import { computed, ref, watch, nextTick, onMounted } from "vue";
 import { storeToRefs } from "pinia";
 import { useWorkspaceSessionStore } from "../../composables/useWorkspaceSessionStore";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
+import { useRpc } from "../../composables/useRpc";
 import { useComposerStore } from "../../stores/composer-store";
 import { useBtw } from "../../composables/useBtw";
 import { useProjectStore } from "../../stores/project-store";
@@ -33,11 +34,13 @@ import { useAgentTaskStore } from "../../stores/agent-task-store";
 import TaskCenterView from "../agent-task/TaskCenterView.vue";
 import { btwValidateQuestion } from "@shared/types.js";
 import type { PlanStatus } from "@shared/types.js";
+import type { DeliverableVersion } from "@shared/team-types.js";
 import type { RequestUserInputRequest, RequestUserInputQuestion, RpcSlashCommand } from "@/types/rpc";
 import { thinkingLevelLabel } from "../../utils/thinking-labels";
 
 const sessionStore = useWorkspaceSessionStore();
 const rpc = useWorkspaceRpc();
+const soloRpc = useRpc();
 const btw = useBtw();
 const projectStore = useProjectStore();
 const settingsStore = useSettingsStore();
@@ -46,10 +49,12 @@ const planStore = usePlanStore();
 const workflowStore = useWorkflowStore();
 const agentTaskStore = useAgentTaskStore();
 
-/** sessionId -> 会话名（任务中心行/详情来源展示）。 */
+/** sessionId -> 会话名（任务中心行/详情来源展示）。team 模式下任务挂在 host
+ *  运行时会话上，所以取团队会话列表；席位 session 与 agent-task 无关。 */
 const agentTaskSessionNames = computed(() => {
   const names: Record<string, string> = {};
-  for (const session of projectStore.sessions) {
+  const sessions = teamStore.teamMode ? projectStore.teamSessions : projectStore.sessions;
+  for (const session of sessions) {
     if (session.name) names[session.id] = session.name;
   }
   return names;
@@ -151,9 +156,13 @@ const environmentLabel = computed(() => {
   return "Windows";
 });
 const sessionName = computed(() => {
+  if (teamStore.teamMode) {
+    // 圆桌是讨论面；host 会话名不是这一场的标题。
+    return teamStore.roundtable?.name?.trim() || "圆桌讨论";
+  }
   const explicitName = rpc.sessionState.value?.sessionName?.trim();
   if (explicitName) return explicitName;
-  return deriveSessionTitle(teamStore.teamMode ? projectStore.currentTeamSession : projectStore.currentSession);
+  return deriveSessionTitle(projectStore.currentSession);
 });
 const canSend = computed(() =>
   (inputText.value.trim().length > 0 || attachments.value.length > 0) &&
@@ -198,19 +207,15 @@ const btwCommand: RpcSlashCommand = {
   source: "builtin",
   sourceInfo: {},
 };
-/** 命令面板条目：solo 模式在列表头部注入本地 /btw 条目（去重）；团队模式不注入。 */
-const paletteCommands = computed(() =>
-  teamStore.teamMode
-    ? rpc.commands.value
-    : [btwCommand, ...rpc.commands.value.filter((command) => command.name !== "btw")],
-);
+/** 命令面板条目：本地 /btw 注入列表头部（去重）。composer 只在 solo 挂载。 */
+const paletteCommands = computed(() => [
+  btwCommand,
+  ...rpc.commands.value.filter((command) => command.name !== "btw"),
+]);
 
 const composerPlaceholder = computed(() => {
   if (isCompacting.value) return "正在压缩上下文，消息将在压缩后发送...";
   if (rpc.isStreaming.value) return "AI 正在运行，可输入消息调整方向...";
-  if (teamStore.teamMode && teamStore.isTeamActive) {
-    return "向团队负责人发送任务，由其规划并分派...";
-  }
   return "输入任务，或按 / 使用命令...";
 });
 
@@ -277,7 +282,26 @@ const planPillClass = computed(() => {
   return phase ? (PLAN_PHASE_PILL_CLASS[phase] ?? "") : "";
 });
 
+/** team 模式的状态来自圆桌生命周期（host 会话状态不是讨论状态）。 */
+const teamLifecycleText = computed(() => {
+  switch (teamStore.lifecycle) {
+    case "active": return "讨论中";
+    case "paused": return "已暂停";
+    case "stopped": return "已归档";
+    default: return "未开始";
+  }
+});
+
+const teamLifecycleClass = computed(() => {
+  switch (teamStore.lifecycle) {
+    case "active": return "status-running";
+    case "paused": return "status-compacting";
+    default: return "status-idle";
+  }
+});
+
 const statusText = computed(() => {
+  if (teamStore.teamMode) return teamLifecycleText.value;
   const planStatus = planPillText.value;
   if (planStatus) return planStatus;
   if (rpc.isStreaming.value) return streamingEffortLabel.value ? `运行中 · ${streamingEffortLabel.value}` : "运行中";
@@ -286,6 +310,7 @@ const statusText = computed(() => {
 });
 
 const statusClass = computed(() => {
+  if (teamStore.teamMode) return teamLifecycleClass.value;
   const planClass = planPillClass.value;
   if (planClass) return planClass;
   if (rpc.isStreaming.value) return "status-running";
@@ -362,6 +387,7 @@ watch(
 );
 
 watch(canUseTeamMode, (available) => {
+  if (teamStore.isLoading) return;
   if (!available && teamStore.teamMode) {
     void teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
   }
@@ -512,6 +538,106 @@ async function confirmSwitchToSolo(): Promise<void> {
   const ok = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
   if (!ok) {
     alert(`切换到单人模式失败：${teamStore.lastError || "未知错误"}`);
+  }
+}
+
+// ==========================================================================
+// 移交（§4.15 / H15）：绑定一个具体交付物版本，切前台到 solo 后交出
+// ==========================================================================
+
+/** 可移交的交付物版本：整理完成（ready）的最新一版；drafting 不交。 */
+function resolveHandoffVersion(): DeliverableVersion | null {
+  return teamStore.deliverables.find((version) => version.status === "ready") ?? null;
+}
+
+const handoffBusy = ref(false);
+
+/**
+ * 等待单人运行环境就绪。切前台后 single 可能仍在启动（WSL 还要预热），
+ * 就绪前的 newSession / enter_planning 会打到空的运行环境上。
+ */
+async function waitForSingleReady(timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (soloRpc.isConnected.value) return true;
+    const status = soloRpc.piStatus.value;
+    if (status === "error" || status === "stopped") return false;
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  return soloRpc.isConnected.value;
+}
+
+/** 切前台到单人。团队运行环境停下，圆桌记录/未决项/交付物都留在盘上。 */
+async function leaveTeamMode(): Promise<boolean> {
+  const location = projectStore.currentProject;
+  if (!location) {
+    alert("移交前需要先打开项目目录");
+    return false;
+  }
+  const switched = await teamStore.toggleTeamMode(location);
+  if (!switched) {
+    alert(`切换到单人模式失败：${teamStore.lastError || "未知错误"}`);
+    return false;
+  }
+  if (!(await waitForSingleReady())) {
+    alert("单人运行环境未就绪，移交已中止。");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 移交一版交付物（FR-12 / H15）：只走既有出口，绑定一版具体交付物。
+ * solo → 新建单人会话，把该版 Markdown 当第一条用户消息；
+ * plan → 既有 enter_planning，字段名是 `requestText`。
+ * PlanController / AgentTask 不变。
+ */
+async function runHandoff(target: "solo" | "plan"): Promise<void> {
+  if (handoffBusy.value) return;
+  const version = resolveHandoffVersion();
+  if (version === null) {
+    alert("还没有可移交的交付物版本：先「整理」出一版（整理完成后才可移交）。");
+    return;
+  }
+  handoffBusy.value = true;
+  try {
+    const payload = await teamStore.buildHandoff(version.id, target);
+    if (payload === null) {
+      alert(`生成移交失败：${teamStore.lastError || "未知错误"}`);
+      return;
+    }
+    const text = payload.text;
+    if (!(await leaveTeamMode())) return;
+
+    if (target === "plan") {
+      const result = await planStore.enterPlanning({ requestText: text, source: "configured" });
+      if (!result.success) {
+        alert(`进入规划失败：${result.error || "未知错误"}`);
+      }
+      return;
+    }
+
+    const created = await soloRpc.newSession();
+    if (!created || created.cancelled) {
+      alert(`新建单人会话失败：${soloRpc.lastError.value || "未知错误"}`);
+      return;
+    }
+    sessionStore.clearSession();
+    // 新会话文件不在上一次 listSessions 的结果里：先列表再定位当前会话。
+    await projectStore.listSessions();
+    projectStore.syncCurrentSession(
+      soloRpc.sessionState.value?.sessionFile,
+      soloRpc.sessionState.value?.sessionId,
+    );
+    const blockId = sessionStore.appendOptimisticUserMessage(text);
+    try {
+      await soloRpc.sendCommandAsync({ type: "prompt", message: text });
+    } catch (err) {
+      sessionStore.failOptimisticUserMessage(blockId, sendErrorMessage(err));
+      alert(`移交消息发送失败：${sendErrorMessage(err)}`);
+    }
+  } finally {
+    handoffBusy.value = false;
   }
 }
 
@@ -874,21 +1000,14 @@ function autoResize(): void {
   }
 }
 
-// New-session onboarding
-const soloOnboardingHints = [
+// New-session onboarding (solo composer only — the team surface has its own
+// composer and its own empty state inside the roundtable).
+const onboardingHints = [
   { icon: "mdi-code-braces", label: "开发功能", prompt: "实现一个范围明确的功能，并通过测试进行验证。" },
   { icon: "mdi-bug-outline", label: "修复问题", prompt: "查明这个问题的原因，完成修复并说明改动。" },
   { icon: "mdi-file-tree-outline", label: "了解项目", prompt: "阅读项目结构并概述主要架构。" },
   { icon: "mdi-test-tube", label: "补充测试", prompt: "为当前改动新增或完善测试。" },
 ];
-
-const teamOnboardingHints = [
-  { icon: "mdi-map-outline", label: "规划并开发", prompt: "规划这项工作，将可独立执行的部分分派给团队，整合结果并完成验证。" },
-  { icon: "mdi-bug-outline", label: "并行排查问题", prompt: "并行调查这个问题，确认根因、实现修复并完成验证。" },
-  { icon: "mdi-source-branch", label: "并行审查改动", prompt: "并行审查当前改动的正确性、潜在回归和缺失的验证。" },
-];
-
-const onboardingHints = computed(() => teamStore.teamMode ? teamOnboardingHints : soloOnboardingHints);
 
 function sendQuickStart(prompt: string): void {
   inputText.value = prompt;
@@ -935,7 +1054,8 @@ function sendQuickStart(prompt: string): void {
           @click="agentTaskStore.openTaskCenter()"
         >任务</button>
         <button class="topbar-action" @click="showForkDialog = true">创建分支</button>
-        <v-menu v-model="showExportMenu" :close-on-content-click="true" location="bottom end">
+        <!-- 导出走 host 会话（solo）；圆桌的记录导出在交付物面板里。 -->
+        <v-menu v-if="!teamStore.teamMode" v-model="showExportMenu" :close-on-content-click="true" location="bottom end">
           <template #activator="{ props: menuProps }">
             <button class="topbar-action" v-bind="menuProps">导出</button>
           </template>
@@ -947,6 +1067,25 @@ function sendQuickStart(prompt: string): void {
       </div>
 
       <div class="topbar-right">
+        <!-- 移交：绑定最新一版可移交交付物，切前台到 solo 后交出（FR-12 / H15）。 -->
+        <v-menu v-if="teamStore.teamMode" location="bottom end">
+          <template #activator="{ props: menuProps }">
+            <button
+              class="topbar-action handoff-action"
+              type="button"
+              :disabled="handoffBusy"
+              title="把交付物交给单人会话或规划（绑定一版具体交付物）"
+              v-bind="menuProps"
+            >
+              <v-icon icon="mdi-export-variant" size="13" />
+              <span>{{ handoffBusy ? "移交中..." : "移交" }}</span>
+            </button>
+          </template>
+          <v-list density="compact">
+            <v-list-item title="新建单人会话" subtitle="把交付物作为第一条消息" @click="runHandoff('solo')" />
+            <v-list-item title="进入规划" subtitle="作为规划请求文本" @click="runHandoff('plan')" />
+          </v-list>
+        </v-menu>
         <div v-if="canUseTeamMode" class="workspace-mode-toggle" role="group" aria-label="工作区模式">
           <button
             class="workspace-mode-option"
@@ -1017,70 +1156,19 @@ function sendQuickStart(prompt: string): void {
          打开前记住会话视图模式,关闭后回打开前视图(假设 5 期间隐藏 composer 与 PlanPanel)。 -->
     <TaskCenterView v-if="agentTaskStore.centerOpen" :session-names="agentTaskSessionNames" />
 
-    <!-- Team mode keeps Leader conversation and team workbench visible side by side. -->
+    <!-- Team mode: the roundtable itself is the main surface (seat strip +
+         timeline + attention + composer). There is no leader conversation pane
+         and no SessionView here — the host runtime is not a discussion
+         participant. -->
     <template v-else-if="teamStore.teamMode">
-      <!-- Sticky team command bar -->
+      <!-- Sticky seat strip -->
       <WorkerStatusBar />
 
-      <!-- Leader conversation + team workbench -->
       <div class="team-middle">
-        <section class="team-conversation-pane">
-          <header class="team-pane-header">
-            <div class="team-pane-title">
-              <span>负责人对话</span>
-              <strong>{{ sessionName || "新团队会话" }}</strong>
-            </div>
-            <span class="team-leader-state" :class="statusClass">
-              <span class="status-dot"></span>
-              {{ statusText }}
-            </span>
-          </header>
-          <div class="session-pane team-conversation-scroll">
-            <div class="team-conversation" ref="contentArea" @scroll="handleContentScroll">
-              <div v-if="isEmptySession" class="team-conversation-empty">
-                <v-icon icon="mdi-account-star-outline" size="28" />
-                <strong>团队负责人已就绪</strong>
-                <v-switch
-                  v-if="showAcpToggle"
-                  :model-value="acpEnabled"
-                  :disabled="acpLocked"
-                  :readonly="acpLocked"
-                  data-test="acp-session-toggle"
-                  hide-details
-                  density="compact"
-                  color="primary"
-                  label="主动压缩"
-                  @update:model-value="onAcpToggle"
-                />
-              </div>
-              <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
-              <SessionTreeView v-else />
-            </div>
-            <button
-              v-if="!isNearTop"
-              type="button"
-              class="scroll-float-btn scroll-float-top"
-              title="回到顶部"
-              aria-label="回到顶部"
-              @click="jumpToTop"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
-            </button>
-            <button
-              v-if="!isNearBottom"
-              type="button"
-              class="scroll-float-btn scroll-float-bottom"
-              title="回到底部"
-              aria-label="回到底部"
-              @click="jumpToBottom"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-            </button>
-          </div>
-        </section>
-        <div class="team-console-sidebar">
-          <TeamDashboard />
-        </div>
+        <TeamDashboard v-if="sessionViewMode === 'session'" />
+        <!-- The host runtime session is not the discussion tree; SessionTreeView
+             renders that notice for itself in team mode. -->
+        <SessionTreeView v-else />
       </div>
     </template>
 
@@ -1148,9 +1236,10 @@ function sendQuickStart(prompt: string): void {
       class="center-plan-panel"
     />
 
-    <!-- Composer remains visible; in team mode it sends to the Leader.
+    <!-- Composer 只在 solo 渲染：团队模式的输入是圆桌的 RoundtableComposer，
+         它走 TeamCommand，绝不经过 host 会话的 prompt。
          任务中心打开时隐藏(假设 5:任务中心为完整中心视图)。 -->
-    <div v-if="!agentTaskStore.centerOpen" class="center-composer">
+    <div v-if="!agentTaskStore.centerOpen && !teamStore.teamMode" class="center-composer">
       <div
         class="composer-inner"
         :class="{ 'dragging-files': isDraggingFiles }"
@@ -1346,12 +1435,12 @@ function sendQuickStart(prompt: string): void {
       <v-card class="confirm-dialog-card">
         <div class="confirm-dialog-title">切换到单人模式</div>
         <div class="confirm-dialog-text">
-          切换到单人模式将停止并解散当前团队 <strong>{{ teamStore.teamName || "当前团队" }}</strong>，所有成员会被中断，已完成的工作会保留在项目中。确定继续？
+          切换后团队运行环境会停下（<strong>{{ teamStore.teamName || "当前圆桌" }}</strong> 这一场不会解散）：时间线、未决项与交付物都保留在盘上，随时可以回到团队继续。确定继续？
         </div>
         <v-card-actions class="confirm-dialog-actions">
           <v-spacer />
           <v-btn variant="text" @click="showSwitchToSoloConfirmDialog = false">取消</v-btn>
-          <v-btn color="error" variant="tonal" @click="confirmSwitchToSolo">切换并解散团队</v-btn>
+          <v-btn color="primary" variant="tonal" @click="confirmSwitchToSolo">切换到单人</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1558,6 +1647,23 @@ function sendQuickStart(prompt: string): void {
   color: var(--pix-text-primary);
 }
 
+/* 移交：圆桌顶栏入口，与导出/创建分支同级（安静蓝反馈、无边框）。 */
+.handoff-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.handoff-action:disabled {
+  color: var(--pix-text-muted);
+  cursor: not-allowed;
+}
+
+.handoff-action:disabled:hover {
+  background: transparent;
+  color: var(--pix-text-muted);
+}
+
 .topbar-right {
   display: flex;
   align-items: center;
@@ -1726,123 +1832,19 @@ function sendQuickStart(prompt: string): void {
   line-height: 1.35;
 }
 
-/* Team mode layout */
+/* Team mode layout: 圆桌主表面独占中心区（席位条在其上方）。 */
 .team-middle {
   flex: 1;
   display: flex;
-  min-height: 0;
-  overflow: hidden;
-  background: #f8f9fc;
-}
-
-.team-conversation-pane {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--pix-bg-content);
-}
-
-.team-pane-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--pix-space-md);
-  min-height: 48px;
-  padding: 7px var(--pix-space-lg);
-  border-bottom: 1px solid var(--pix-border-subtle);
-  background: rgba(255, 255, 255, 0.88);
-}
-
-.team-pane-title {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.team-pane-title span {
-  color: var(--pix-text-muted);
-  font-size: 10px;
-  font-weight: var(--pix-weight-semibold);
-  text-transform: uppercase;
-  letter-spacing: 0;
-}
-
-.team-pane-title strong {
-  overflow: hidden;
-  color: var(--pix-text-primary);
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.team-leader-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex-shrink: 0;
-  color: var(--pix-text-secondary);
-  font-size: 10px;
-  font-weight: var(--pix-weight-medium);
-}
-
-.team-leader-state .status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--pix-text-muted);
-}
-
-.team-leader-state.status-running {
-  color: var(--pix-accent);
-}
-
-.team-leader-state.status-running .status-dot {
-  background: var(--pix-accent);
-  animation: status-pulse 1.5s ease-in-out infinite;
-}
-
-.team-leader-state.status-compacting {
-  color: var(--pix-warning);
-}
-
-.team-leader-state.status-compacting .status-dot {
-  background: var(--pix-warning);
-}
-
-.team-conversation {
-  flex: 1;
-  min-width: 0;
-  overflow-y: auto;
-  padding: var(--pix-space-xl);
-}
-
-.team-conversation-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--pix-space-xs);
-  min-height: 180px;
-  color: var(--pix-text-muted);
-}
-
-.team-conversation-empty strong {
-  color: var(--pix-text-secondary);
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-medium);
-}
-
-.team-console-sidebar {
-  width: clamp(420px, 34vw, 560px);
-  flex-shrink: 0;
-  border-left: 1px solid var(--pix-border-subtle);
-  display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
   background: var(--pix-bg-content);
+}
+
+.team-middle > * {
+  flex: 1;
+  min-height: 0;
 }
 
 @media (max-width: 1100px) {
@@ -1853,22 +1855,6 @@ function sendQuickStart(prompt: string): void {
 
   .topbar-path:last-of-type {
     display: none;
-  }
-
-  .team-middle {
-    flex-direction: column;
-  }
-
-  .team-conversation-pane {
-    min-height: 280px;
-  }
-
-  .team-console-sidebar {
-    width: 100%;
-    flex: 0 0 44%;
-    min-height: 260px;
-    border-top: 1px solid var(--pix-border-subtle);
-    border-left: 0;
   }
 }
 

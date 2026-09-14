@@ -249,7 +249,9 @@ app.whenReady().then(async () => {
     throw err;
   }
 
-  // Wire TeamManager → SessionBridge so Leader tools are registered on the main session
+  // The team-leader bridge owns the borrowed execution context / auth storage the
+  // roundtable borrows; the host session is not a discussion participant
+  // (plan §3.4 / §4.12). AgentTaskService is deliberately NOT injected into Team.
   try {
     teamLeaderSessionBridge = new SessionBridge({ role: "team-leader", teamManager: teamManager ?? undefined });
   } catch (err) {

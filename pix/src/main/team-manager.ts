@@ -1,242 +1,291 @@
 /**
- * TeamManager
+ * TeamManager —— 圆桌生命周期 facade（plan §4.12 / §4.12b / §4.12c，§5.1–§5.15）。
  *
- * Manages the lifecycle of agent teams in the main process.
- * Coordinates worker agent sessions, in-memory message queues,
- * team state transitions, and Leader orchestration.
+ * 只做三件事：持有本场的全部模块实例、把 TeamCommand 落到模型/记录上、把
+ * 事件与投影推给 IPC。没有 Leader 编排、没有派单、没有任务 gate、没有星型汇报。
+ *
+ * 分层是硬边界：
+ * - 打断**决策**在 `team/interrupt.ts`，执行在 `team/seat-runner.ts`；本文件只
+ *   在"该由谁被打断"这一层调用 controller，绝不自己 abort session。
+ * - 投递态（已记录/待注入/已注入）只由 `SeatInbox` 改；时间线只由 `TimelineLog`
+ *   追加。facade 负责把 `deliveryBySeat` 投影到 IPC 出去的 TimelineItem 上。
+ * - 席位工具只经 `RoundtableToolHost`（§4.12b）回来，不直接 import 本类。
+ *
+ * 公开生命周期名锁定 `initialize` / `createRoundtable` / `pause` / `resume` / `stop`；
+ * 已删除 `setLeaderSession` / `resumeRuntime` / `abortActiveTurns`（S5 改调用方）。
  */
 
 import { randomUUID } from "crypto";
-import { rm } from "fs/promises";
-import { join } from "path";
+import { mkdir, readFile, rename, stat, rm, writeFile } from "fs/promises";
+import { homedir } from "os";
+import { dirname, isAbsolute, join, resolve as resolvePathNode } from "path";
+import { fileURLToPath } from "node:url";
 import {
-	type AgentSession,
-	type ExtensionAPI,
-	type CreateAgentSessionOptions,
-	type CreateAgentSessionResult,
-	type ExecutionBackend,
-	type RuntimeEnvironmentContext,
-	createAgentSession,
-	SessionManager,
-	SettingsManager,
-	AuthStorage,
-	DefaultResourceLoader,
-	getAgentDir,
-	createActiveCompressionExtension,
+  type AgentSession,
+  type CreateAgentSessionOptions,
+  type CreateAgentSessionResult,
+  type ExecutionBackend,
+  type RuntimeEnvironmentContext,
+  AuthStorage,
+  createActiveCompressionExtension,
+  createAgentSession,
+  DefaultResourceLoader,
+  getAgentDir,
+  SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { McpAdapter } from "pi-mcp-adapter";
+import type { AgentSessionEvent, ChatMessageAttachment } from "../shared/types.js";
+import { TeamDebugLogger, summarizeText } from "./team/debug-logger.js";
+import {
+  MAX_SEATS,
+  DEFAULT_ROUNDTABLE_TIER,
+  USER_SEAT_ID,
+  type AttentionItem,
+  type DeliverableVersion,
+  type DeliveryState,
+  type ExitRequest,
+  type InboxEntry,
+  type InterruptLevel,
+  type OpenItem,
+  type PersistedRoundtable,
+  type RoundtableMetricsSnapshot,
+  type RoundtableSettings,
+  type RoundtableState,
+  type RoundtableTier,
+  type SeatConfig,
+  type SeatInfo,
+  type SeatRuntimeStatus,
+  type TeamEvent,
+  type TimelineItem,
+  type ToolAuthTier,
+} from "../shared/team-types.js";
 import type { ProjectExecutionContext } from "./execution-context.js";
-import {
-  formatInternalNotification,
-  INTERNAL_CUSTOM_MESSAGE_TYPES,
-} from "../shared/internal-notification.js";
-import type {
-	TeamState,
-	TeammateInfo,
-	TeammateRole,
-	TeammateStatus,
-	TeamEvent,
-	TeammateChatMessage,
-	TeamMessage,
-	TeamHistory,
-	MessageKind,
-	TeamTask,
-	TeamTaskEvidence,
-	TeamTaskContextPack,
-	TeamTaskGateState,
-	TeamTaskHandoffPacket,
-	TeamTaskFileConflict,
-	TeamTaskStatus,
-	TeamTaskType,
-	AgentSessionEvent as LocalAgentSessionEvent,
-	WorkerConfig,
-} from "../shared/types.js";
-import {
-  DEFAULT_WORKER_CONFIGS,
-  LEADER_AGENT_NAME,
-  PROTOCOL_TIMEOUT_MS,
-  ROLE_PERMISSIONS,
-  ROLE_TASK_CAPABILITIES,
-  SHUTDOWN_TIMEOUT_MS,
-  WORKER_STUCK_TURN_TIMEOUT_MS,
-  LEADER_STUCK_TURN_TIMEOUT_MS,
-  ORCHESTRATION_STALL_RECOVERY_INTERVAL_MS,
-} from "./team-constants.js";
-import { TeamMessageBus } from "./team-message-bus.js";
-import {
-  buildTeamOrchestrationPrompt,
-  buildWorkerUnavailableOrchestrationEvents,
-  classifyTeamResult,
-  MAX_AUTO_COMPLETION_RESULT_LENGTH,
-  MAX_COORDINATION_GENERATION,
-  ORCHESTRATOR_WAKE_BASE_RETRY_MS,
-  OrchestrationEventQueue,
-  planTeamCoordination,
-  processOrchestrationWakeQueue,
-  type OrchestrationEvent,
-  type TeamCoordinationPolicy,
-} from "./team-orchestration.js";
-import {
-  deletePersistedTeamSnapshot,
-  hydratePersistedTeam,
-  isRestorableTeamSnapshot,
-  persistTeamSnapshot,
-  readPersistedTeamSnapshot,
-} from "./team-persistence.js";
 import { TeamProtocolManager } from "./team-protocol-manager.js";
-import { classifyWorkerTurnOutcome, mergeEvidenceItems, mergeTeamTaskEvidence } from "./team-results.js";
-import type { TeamData, TeamEventCallback, WorkerState } from "./team-runtime-types.js";
-import { TeamTaskList, canTransitionTeamTaskStatus } from "./team-task-list.js";
-import { registerLeaderTools } from "./team-leader-tools.js";
-import type { TeamToolHost } from "./team-tool-host.js";
+import { AttentionBus } from "./team/attention-bus.js";
+import { TeamCapacityPool } from "./team/capacity-pool.js";
 import {
-  registerTeamMessagingTool,
-  registerTeamProtocolTool,
-  registerTeamTaskTool,
-  registerWorkerIdentityPrompt,
-} from "./team-worker-tools.js";
-import { TeamDebugLogger, summarizeText } from "./team-debug-logger.js";
-import { formatAgentId, generateTeamName, parseAgentId, pickTeammateColor, sanitizeAgentName, sleep } from "./team-utils.js";
-import { WorkerRunner } from "./team-worker-runner.js";
+  ABORT_TIMEOUT_MS,
+  DEFAULT_L2_BUDGET,
+  EXIT_REQUEST_TIMEOUT_MS,
+  FILE_CHANGE_NOTICE_MAX_KEYS,
+  FILE_CHANGE_NOTICE_WINDOW_MS,
+  MAX_PENDING_PERMISSIONS_PER_SEAT,
+  ORDERED_RELEASE_MS,
+  PERSIST_FAILURE_NOTICE_THROTTLE_MS,
+  STUCK_MS,
+  roundtableFilePath,
+  roundtablePresetsPath,
+  roundtableSessionsDir,
+  seatSessionDir,
+} from "./team/constants.js";
+import { DeliverableStore } from "./team/deliverable-store.js";
+import { archiveNotice, exportRoundtableMarkdown } from "./team/export.js";
+import { buildPlanHandoffRequest, buildSoloHandoffPrompt } from "./team/handoff.js";
+import { RoundtableHealth } from "./team/health.js";
+import { SeatInterruptController } from "./team/interrupt.js";
+import { RoundtableMetrics, type MetricsSessionStats, type MetricsSeatRuntime } from "./team/metrics.js";
+import { OpenItemBoard } from "./team/open-items.js";
+import { OrderedSpeechGate } from "./team/ordered-speech.js";
+import { RoundtablePersistence, resolveCrashRecoveryLifecycle } from "./team/persistence.js";
+import { RoundtableRoster, defaultSeatConfigs } from "./team/roster.js";
+import { SeatInbox, parseMentions } from "./team/seat-inbox.js";
+import { createSeatToolPolicy, SEAT_DENIED_TOOL_NAMES } from "./team/seat-policy.js";
+import { registerSeatIdentity } from "./team/seat-identity.js";
+import { SeatRunner, type SeatExecutionView, type SeatSessionLike } from "./team/seat-runner.js";
+import { registerSeatTools, SEAT_TOOL_NAMES } from "./team/seat-tools.js";
+import { TimelineLog, type TimelineFilter } from "./team/timeline-log.js";
+import { detectLegacyTeamSnapshot } from "./team/legacy-snapshot.js";
+import {
+  runTeamBashCommand,
+  type PostSeatMessageResult,
+  type RoundtableToolHost,
+  type SendTeamMessageParams,
+} from "./team/tool-host.js";
+import { WriteLeaseTable } from "./team/write-lease.js";
 
-// ============================================================================
-// TeamManager
-// ============================================================================
+/**
+ * SDK 自己的 AgentSessionEvent（与 `shared/types.ts` 的同名类型结构等价但分属
+ * 两套 AgentMessage 定义，交付事件时断言一次）。
+ */
+type SdkSessionEvent = Parameters<Parameters<AgentSession["subscribe"]>[0]>[0];
 
-export class TeamManager {
-  private _team: TeamData | null = null;
-  private _eventCallbacks: TeamEventCallback[] = [];
-  /**
-   * Host/bootstrap cwd and snapshot/hash key. Settings/Resource/Session managers
-   * and the debug logger read this; it is always the physical path, never the
-   * model-visible logical path (wsl_plan.md §4.8: snapshot/workspace hash input
-   * MUST be physicalCwd).
-   */
+/** 会话工厂（测试注入；生产用真实的 createAgentSession）。 */
+export interface TeamManagerOptions {
+  sessionFactory?: typeof createAgentSession;
+}
+
+/** 预设文件结构（plan §6.4）。 */
+interface RoundtablePreset {
+  name: string;
+  seats: SeatConfig[];
+}
+
+/** 本场所有模块的打包（`createRoundtable` / 恢复时一次建好）。 */
+interface RoundtableModules {
+  roundtableId: string;
+  roster: RoundtableRoster;
+  timeline: TimelineLog;
+  inbox: SeatInbox;
+  attention: AttentionBus;
+  gate: OrderedSpeechGate;
+  openItems: OpenItemBoard;
+  leases: WriteLeaseTable;
+  interrupts: SeatInterruptController;
+  capacity: TeamCapacityPool;
+  deliverables: DeliverableStore;
+  persistence: RoundtablePersistence;
+  health: RoundtableHealth;
+  metrics: RoundtableMetrics;
+  protocol: TeamProtocolManager;
+  offGate: () => void;
+  offInbox: () => void;
+  /** 时间线追加的统一出口退订（F3-2）：席位自己 append 的记录也走落盘 + 事件。 */
+  offTimelineAppend: () => void;
+}
+
+/** 待整理的整理任务（aux 槽满时排队，绝不借 agent-task 槽）。 */
+interface PendingWrapUp {
+  deliverableId: string;
+  author: "system" | string;
+}
+
+/** 默认圆桌设置（H4/H9：阈值类全部默认关）。 */
+function defaultSettings(): RoundtableSettings {
+  return {
+    orderedMode: false,
+    waitForUserQuestions: false,
+    autoContinueAfterCrash: false,
+    unattendedGuard: false,
+    suggestWrapUp: false,
+    softBudget: undefined,
+    hardStop: undefined,
+    cheaperModel: undefined,
+    orderedReleaseMs: ORDERED_RELEASE_MS,
+    exitRequestTimeoutMs: EXIT_REQUEST_TIMEOUT_MS,
+    l2: { ...DEFAULT_L2_BUDGET },
+  };
+}
+
+/** 合并局部设置（逐字段合并，undefined 一律表示"不改"）。 */
+export function mergeRoundtableSettings(
+  base: RoundtableSettings,
+  partial?: Partial<RoundtableSettings>,
+): RoundtableSettings {
+  const next = partial ?? {};
+  return {
+    orderedMode: next.orderedMode ?? base.orderedMode,
+    waitForUserQuestions: next.waitForUserQuestions ?? base.waitForUserQuestions,
+    autoContinueAfterCrash: next.autoContinueAfterCrash ?? base.autoContinueAfterCrash,
+    unattendedGuard: next.unattendedGuard ?? base.unattendedGuard,
+    suggestWrapUp: next.suggestWrapUp ?? base.suggestWrapUp,
+    softBudget: next.softBudget !== undefined ? { ...next.softBudget } : base.softBudget,
+    hardStop: next.hardStop !== undefined ? { ...next.hardStop } : base.hardStop,
+    cheaperModel: next.cheaperModel ?? base.cheaperModel,
+    orderedReleaseMs: next.orderedReleaseMs ?? base.orderedReleaseMs,
+    exitRequestTimeoutMs: next.exitRequestTimeoutMs ?? base.exitRequestTimeoutMs,
+    l2: { ...base.l2, ...(next.l2 ?? {}) },
+  };
+}
+
+/** 把合并结果写回既有 settings 对象（l2 就地更新：打断 controller 持同一对象）。 */
+function applySettings(target: RoundtableSettings, merged: RoundtableSettings): void {
+  target.orderedMode = merged.orderedMode;
+  target.waitForUserQuestions = merged.waitForUserQuestions;
+  target.autoContinueAfterCrash = merged.autoContinueAfterCrash;
+  target.unattendedGuard = merged.unattendedGuard;
+  target.suggestWrapUp = merged.suggestWrapUp;
+  target.softBudget = merged.softBudget;
+  target.hardStop = merged.hardStop;
+  target.cheaperModel = merged.cheaperModel;
+  target.orderedReleaseMs = merged.orderedReleaseMs;
+  target.exitRequestTimeoutMs = merged.exitRequestTimeoutMs;
+  Object.assign(target.l2, merged.l2);
+}
+
+export class TeamManager implements RoundtableToolHost {
+  private readonly _sessionFactory: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+
+  /** 工作区物理路径：落盘与 hash 的输入（WSL 下与 logical 不同，§6.1）。 */
   private _physicalCwd = "";
-  /**
-   * Runtime/logical cwd passed to createAgentSession as `runtimeCwd` for both
-   * leader and workers. Equals _physicalCwd on Windows; the POSIX path inside
-   * the distro under WSL.
-   */
+  /** 模型可见的逻辑 cwd：`createAgentSession({ runtimeCwd })` 的入参。 */
   private _logicalCwd = "";
-  /**
-   * Shared execution backend borrowed from the leader ProjectExecutionContext.
-   * Workers reuse this exact object (identity) and never dispose it; only the
-   * context owner (SessionBridge) releases the backend (wsl_plan.md §4.8).
-   */
+  /** 从 host 借来的 execution backend（对象身份共享；本类永不 dispose）。 */
   private _executionBackend: ExecutionBackend | null = null;
-  /**
-   * Explicit WSL marker used to decide MCP allowStdio and worker wiring. It is
-   * taken from context.isWsl, NOT inferred from backend existence, so future
-   * non-WSL backends are not misclassified (wsl_plan.md §4.8/§4.10).
-   */
   private _isWsl = false;
-  /** Runtime environment override forwarded to every worker createAgentSession. */
   private _runtimeEnvironmentOverride: Partial<RuntimeEnvironmentContext> | undefined;
   private _authStorage: AuthStorage | null = null;
+
+  private _state: RoundtableState | null = null;
+  private _modules: RoundtableModules | null = null;
+  private _runners = new Map<string, SeatRunner>();
+  private _sessions = new Map<string, AgentSession>();
+  private _unsubscribeSeats = new Map<string, () => void>();
+  /** 每席累计运行时长（metrics 的 durationMs 输入）。 */
+  private _seatDurations = new Map<string, { total: number; startedAt: number | null }>();
   /**
-   * Session factory used by _launchWorkerInner. Defaults to the real
-   * createAgentSession; overridable for tests so the worker bootstrap path can
-   * be asserted without a live distro (wsl_plan.md §9.3.7: real
-   * createAgentSession object-identity is a distro-gated integration test).
+   * 每席 session 退场时记下的用量（F4-3）：`_disposeSeatSession` 之后 `_sessions`
+   * 里就查不到了，而 metrics 的 perSeat / totals 必须保留退出席位**已经花掉**的成本与
+   * token——否则减席会让花掉的钱从成本表上消失（cost 类阈值也跟着回退）。
+   * 与 `_seatDurations` 同构：同一席多次进场/退场按累计值叠加。
    */
-  private readonly _sessionFactory: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
-  private _healthCheckInterval: ReturnType<typeof setInterval> | null = null;
-  /** Timestamp of the last orchestration stall-recovery nudge (health-check throttle). */
-  private _lastStallRecoveryAt = 0;
-  /** Reference to the Leader (main) AgentSession for summary injection. */
-  private _leaderSession: AgentSession | null = null;
-  /** Whether the Leader session is currently in an active turn. */
-  private _leaderTurnActive = false;
-  /** Watchdog that force-resets _leaderTurnActive if agent_end never fires. */
-  private _leaderTurnWatchdog: ReturnType<typeof setTimeout> | null = null;
-  /** Agent IDs whose _launchWorker is in flight (prevents concurrent double-launch). */
-  private _launchingAgents = new Set<string>();
-  /** Pending worker-context-hygiene timers, cleared on team stop/dispose. */
-  private _hygieneTimers = new Set<ReturnType<typeof setTimeout>>();
-  /** Pending leader-steer retry timers, cleared on team stop/dispose. */
-  private _steerRetryTimers = new Set<ReturnType<typeof setTimeout>>();
-  /** Queue of orchestration events waiting to be processed by the Leader. */
-  private _orchestratorEvents = new OrchestrationEventQueue();
-  /** Prevent overlapping Leader wake prompts from racing each other. */
-  private _leaderWakeInFlight = false;
-  private _orchestratorRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  private _orchestratorRetryDueAt = 0;
-  private _persistTimer: ReturnType<typeof setTimeout> | null = null;
-  private _isRestoringTeam = false;
-  /**
-   * Worker->leader messages that were being steered into a leader turn when the
-   * runtime epoch changed (abort). The leader wake path is a no-op while the
-   * runtime is paused, so without deferral these messages would be permanently
-   * lost; resumeRuntime re-delivers them.
-   */
-  private _deferredLeaderMessages: TeamMessage[] = [];
-  /** Runtime execution gate; a restored Team is viewable but paused. */
-  private _executionState: "active" | "paused" = "paused";
-  /** Invalidates all callbacks from work that was aborted or superseded. */
-  private _runtimeEpoch = 0;
+  private _seatUsage = new Map<string, MetricsSessionStats>();
+  /** 上次落盘的指标（崩溃恢复后累计成本不丢，H17）。 */
+  private _metricsBase: RoundtableMetricsSnapshot | null = null;
+  private _mutedThreads = new Set<string>();
+  /** 每席上次已知的投递态（delivery_changed 的 diff 基准，AC-8）。 */
+  private _deliveryStates = new Map<string, Map<string, DeliveryState>>();
+  /** 辅助整理 session（计入辅助槽与团队成本，H13/H17）。 */
+  private _aux: {
+    jobId: string;
+    session: AgentSession;
+    abort: () => void;
+  } | null = null;
+  /** 辅助 session 的累计用量（H17：计入团队成本；host 空转不算）。 */
+  private _auxUsage = { tokensIn: 0, tokensOut: 0, cost: 0 };
+  /** 整理任务队列（aux 槽满时排队，不占席位槽、不借 agent-task）。 */
+  private _pendingWrapUps: PendingWrapUp[] = [];
+  private _eventCallbacks: Array<(event: TeamEvent) => void> = [];
   private _debugLogger = new TeamDebugLogger();
+  private _disposed = false;
   /**
-   * Last contextual state emitted to the debug log. Each logTeamDebug line only
-   * records the fields that changed since the previous line; a reader carries the
-   * previous value forward, which keeps the log fully reconstructable while
-   * dropping the bulk of repeated context.
+   * 时间线 replay 期间置位（F3-2）：replay 只补记录，不再落盘、不发事件
+   * （否则每次重启都会把 timeline.jsonl 翻倍，§4.10 的 replay 语义也被破坏）。
    */
-  private _lastLoggedContext: {
-    teamStatus?: TeamData["status"];
-    leaderTurnActive?: boolean;
-    leaderWakeInFlight?: boolean;
-    pendingOrchestrationEvents?: number;
-  } = {};
+  private _replayingTimeline = false;
+  /**
+   * 建场之前产生的注意力（F4-7）：恢复路径上发现记录损坏时 `_modules === null`
+   * （上一场的模块刚被 teardown，且不会马上装新的），此刻既没有 AttentionBus 也不
+   * 会发 `attention` 事件，只 console.error 的话用户在 App 里完全看不到——Electron
+   * 主进程的 console 不进 UI，而 H36 的私密正文只存在于 inbox.json。
+   * 按工作区暂存，等本工作区下一次建场 / 成功恢复之后再补发（见 _flushDeferredNotices）。
+   */
+  private _deferredNotices: Array<{ physicalCwd: string; text: string }> = [];
+  /** 落盘失败注意力的节流时间戳（key = 写入目标，F3-5）。 */
+  private readonly _persistFailureAt = new Map<string, number>();
+  /** file_change 事后审计的去重时间戳（key = `seatId\u0000path`，F3-7）。 */
+  private readonly _fileChangeNoticeAt = new Map<string, number>();
 
   /**
-   * @param options.sessionFactory Override the AgentSession factory (tests only).
-   *   Production callers omit it; `new TeamManager()` uses the real
-   *   createAgentSession, preserving existing behavior.
+   * 用户 settings 的 shell 配置（F4-9）：建场时读一次，`team_bash` 用它和 solo 的
+   * bash 跑在同一个 shell / 前缀上（否则同一工作区里席位会「命令找不到」）。
    */
-  constructor(options: { sessionFactory?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult> } = {}) {
+  private _shellConfig: { shellPath?: string; shellCommandPrefix?: string } = {};
+
+  /**
+   * @param options.sessionFactory 覆盖 AgentSession 工厂（测试用）。
+   *   生产省略；`new TeamManager()` 使用真实 createAgentSession。
+   */
+  constructor(options: TeamManagerOptions = {}) {
     this._sessionFactory = options.sessionFactory ?? createAgentSession;
   }
 
-  /**
-   * Set the Leader (main) AgentSession reference.
-   * Called by SessionBridge after the main session is activated.
-   * The Leader session is where team tools are registered and where worker
-   * summaries are injected.
-   */
-  setLeaderSession(session: AgentSession | null): void {
-    this.logTeamDebug("leader.session.set", {
-      hasSession: Boolean(session),
-      hadSession: Boolean(this._leaderSession),
-    });
-    this._leaderSession = session;
-    this._setLeaderTurnActive(false);
-    // Do not clear `_leaderWakeInFlight` here. A process may still be awaiting
-    // prompt(); forcing the flag false lets the new session schedule a second
-    // concurrent process. The in-flight finally block releases the flag.
-    if (this._orchestratorRetryTimer) {
-      clearTimeout(this._orchestratorRetryTimer);
-      this._orchestratorRetryTimer = null;
-    }
-    if (session && this.isRuntimeActive() && this._orchestratorEvents.hasPending) {
-      this._scheduleOrchestratorQueue();
-    }
-  }
-
-  /** Register a callback to receive team events (for IPC forwarding). Multiple subscribers supported. */
-  onEvent(callback: TeamEventCallback): () => void {
-    this._eventCallbacks.push(callback);
-    return () => {
-      const idx = this._eventCallbacks.indexOf(callback);
-      if (idx >= 0) this._eventCallbacks.splice(idx, 1);
-    };
-  }
+  // ==========================================================================
+  // 初始化 / 恢复
+  // ==========================================================================
 
   /**
-   * Store the leader ProjectExecutionContext and auth storage, called after the
-   * leader SessionBridge.start succeeds. The borrowed backend is shared with all
-   * workers; TeamManager never disposes it (the context owner does). On failure
-   * the IPC layer stops the leader (wsl_plan.md §4.8).
+   * 记录 host 的 ProjectExecutionContext 与 AuthStorage（wsl_plan §4.8：borrowed
+   * backend，本类永不 dispose），然后尝试恢复本工作区上一场圆桌。
    */
   async initialize(context: ProjectExecutionContext, authStorage: AuthStorage): Promise<void> {
     this._physicalCwd = context.physicalCwd;
@@ -245,639 +294,899 @@ export class TeamManager {
     this._isWsl = context.isWsl;
     this._runtimeEnvironmentOverride = context.runtimeEnvironmentOverride;
     this._authStorage = authStorage;
-    this._executionState = "paused";
-    this._runtimeEpoch++;
     this.logTeamDebug("manager.initialize", {
       physicalCwd: context.physicalCwd,
       logicalCwd: context.logicalCwd,
-      isWsl: context.isWsl,
+      isWsl: this._isWsl,
       hasBackend: Boolean(context.executionBackend),
       hasAuthStorage: Boolean(authStorage),
     });
-    await this._restorePersistedTeamIfPresent();
-  }
-
-  logTeamDebug(event: string, payload: unknown = {}): void {
-    const team = this._team;
-    // Only emit contextual state fields when they change since the last line.
-    // teamName is omitted entirely: the log file is per-team (name is in the
-    // filename and the logger.started event), so repeating it on every line is
-    // pure noise.
-    const context: Record<string, unknown> = {};
-    const teamStatus = team?.status;
-    const pendingOrchestrationEvents = this._orchestratorEvents.length;
-    if (teamStatus !== this._lastLoggedContext.teamStatus) {
-      context.teamStatus = teamStatus;
-      this._lastLoggedContext.teamStatus = teamStatus;
-    }
-    if (this._leaderTurnActive !== this._lastLoggedContext.leaderTurnActive) {
-      context.leaderTurnActive = this._leaderTurnActive;
-      this._lastLoggedContext.leaderTurnActive = this._leaderTurnActive;
-    }
-    if (this._leaderWakeInFlight !== this._lastLoggedContext.leaderWakeInFlight) {
-      context.leaderWakeInFlight = this._leaderWakeInFlight;
-      this._lastLoggedContext.leaderWakeInFlight = this._leaderWakeInFlight;
-    }
-    if (pendingOrchestrationEvents !== this._lastLoggedContext.pendingOrchestrationEvents) {
-      context.pendingOrchestrationEvents = pendingOrchestrationEvents;
-      this._lastLoggedContext.pendingOrchestrationEvents = pendingOrchestrationEvents;
-    }
-    this._debugLogger.log(event, {
-      ...context,
-      ...(
-        payload && typeof payload === "object" && !Array.isArray(payload)
-          ? payload as Record<string, unknown>
-          : { value: payload }
-      ),
-    });
-  }
-
-  // ==========================================================================
-  // Team Lifecycle
-  // ==========================================================================
-
-  /** Create a new team with the default capability roster. */
-  async createTeam(teamName?: string): Promise<TeamState> {
-    if (this._team) {
-      throw new Error("A team is already active. Stop the current team first.");
-    }
-    if (!this._physicalCwd) {
-      throw new Error("TeamManager not initialized. Start a project session first.");
-    }
-
-    const name = teamName ?? generateTeamName();
-    const now = Date.now();
-    const leadAgentId = formatAgentId(LEADER_AGENT_NAME, name);
-    this._executionState = "active";
-    this._runtimeEpoch++;
-
-    const workerConfigs: WorkerConfig[] = DEFAULT_WORKER_CONFIGS;
-
-    const team: TeamData = {
-      name,
-      status: "active",
-      leadAgentId,
-      workers: new Map(),
-      bus: new TeamMessageBus(),
-      taskList: new TeamTaskList(),
-      protocolManager: new TeamProtocolManager(),
-      createdAt: now,
-    };
-
-    // Create worker entries from the roster. customName lets multiple workers share a role.
-    const usedNames = new Set<string>();
-    let colorIndex = 0;
-    for (const wc of workerConfigs) {
-      const worker = this._buildWorkerEntry(name, wc, usedNames, colorIndex++, now);
-      team.workers.set(worker.info.agentId, worker);
-    }
-
-    this._team = team;
-    this._lastLoggedContext = {};
-    this._debugLogger.start(this._physicalCwd, name, "create_team");
-    this.logTeamDebug("team.create", {
-      teamName: name,
-      leadAgentId,
-      workers: Array.from(team.workers.values()).map((worker) => worker.info),
-    });
-
-    // Start health check
-    this._startHealthCheck();
-
-    const state = this.getTeamState()!;
-    this._emitEvent({ type: "team_created", team: state });
-    this._emitEvent({ type: "team_state_changed", team: state });
-    this._schedulePersist();
-
-    // Launch always-on workers. They run autonomously after startup.
-    // Iterate the Map to use the actual (possibly deduplicated) agentIds.
-    for (const [agentId, worker] of team.workers) {
-      if (worker.info.activationPolicy !== "always") continue;
-      void this._launchWorker(agentId).catch((err) => {
-        console.error(`[TeamManager] Failed to launch worker ${agentId}:`, err);
-        this.logTeamDebug("worker.launch.error", { agentId, error: err });
-        this.updateWorkerStatus(agentId, "error", String(err));
-      });
-    }
-
-    return state;
+    await this._hydrateLastRoundtable();
   }
 
   /**
-   * Build a fresh WorkerState from a roster/spawn config. Names are sanitized
-   * and deduplicated by suffix ("coder", "coder-2", ...); every teammate gets
-   * a palette color so same-role teammates stay distinguishable in the UI.
+   * 崩溃/重启恢复（§4.10 / §5.11 / AC-12）：
+   * - 有落盘的场 → 名册/视角/设置/收件箱/未决项/交付物/指标回来，时间线与注意力
+   *   replay；默认回到 `paused`（`autoContinueAfterCrash` 才继续），并发一条
+   *   「确认后继续」的注意力；
+   * - 已 injected 的收件箱条目绝不重新变回待注入；
+   * - 旧 `team.json` **永不**是恢复来源，只产生一次性 `legacy_snapshot_notice`。
    */
-  private _buildWorkerEntry(
-    teamName: string,
-    wc: WorkerConfig,
-    usedNames: Set<string>,
-    colorIndex: number,
-    now: number,
-  ): WorkerState {
-    const baseName = sanitizeAgentName(wc.customName ?? "") || wc.role;
-    let workerName = baseName;
-    let suffix = 2;
-    while (usedNames.has(workerName)) {
-      workerName = `${baseName}-${suffix}`;
-      suffix++;
-    }
-    usedNames.add(workerName);
-
-    const activationPolicy = wc.activationPolicy ?? (wc.mode === "core" ? "always" : "when_needed");
-    return {
-      info: {
-        agentId: formatAgentId(workerName, teamName),
-        name: workerName,
-        role: wc.role,
-        mode: wc.mode ?? (activationPolicy === "always" ? "core" : "on_demand"),
-        activationPolicy,
-        model: wc.model,
-        specialization: wc.specialization,
-        color: pickTeammateColor(colorIndex),
-        status: activationPolicy === "always" ? "idle" : "dormant",
-        createdAt: now,
-        statusChangedAt: now,
-        lastActiveAt: now,
-      },
-      session: null,
-      mcpAdapter: null,
-      lifecycleAbortController: null,
-      workAbortController: null,
-      runner: null,
-      messageHistory: [],
-    };
-  }
-
-  /**
-   * Add a new teammate to the active team at runtime (Leader: spawn_teammate).
-   *
-   * Inspired by Claude Code's dynamic teammate spawning: the leader is not
-   * limited to the initial roster and can add parallel capacity (a second
-   * coder) or a specialized variant of a role. The teammate gets the standard
-   * role toolset/permissions; `specialization` is appended to its identity
-   * system prompt.
-   */
-  async addWorker(options: {
-    name?: string;
-    role: TeammateRole;
-    model?: string;
-    specialization?: string;
-    activateNow?: boolean;
-  }): Promise<TeammateInfo> {
-    const team = this._team;
-    this._assertRuntimeActive("spawn_teammate");
-    if (!team) throw new Error("No active team.");
-
-    const usedNames = new Set(Array.from(team.workers.values()).map((worker) => worker.info.name));
-    const worker = this._buildWorkerEntry(team.name, {
-      role: options.role,
-      customName: options.name,
-      model: options.model,
-      specialization: options.specialization,
-      mode: "on_demand",
-      // "manual": restored snapshots never auto-launch spawned teammates
-      // unless they own open tasks; the leader re-activates them by need.
-      activationPolicy: "manual",
-    }, usedNames, team.workers.size, Date.now());
-    team.workers.set(worker.info.agentId, worker);
-    this.logTeamDebug("worker.spawned", {
-      worker: worker.info,
-      activateNow: options.activateNow ?? true,
-    });
-
-    this._emitEvent({
-      type: "teammate_status_changed",
-      teamName: team.name,
-      agentId: worker.info.agentId,
-      status: worker.info.status,
-      timestamp: worker.info.statusChangedAt,
-    });
-    this._emitTeamStateChanged();
-
-    if (options.activateNow ?? true) {
-      await this.activateMember(worker.info.agentId);
-    }
-    return { ...worker.info };
-  }
-
-  /** Stop the active team and clean up all resources. */
-  async stopTeam(options: { deleteSnapshot?: boolean } = {}): Promise<void> {
-    // deleteSnapshot defaults to true so an explicit user "stop team" disbands
-    // and forgets the team. Graceful shutdown paths (app quit, session stop)
-    // pass false so the team can be restored on reopen.
-    const deleteSnapshot = options.deleteSnapshot ?? true;
-    const team = this._team;
-    if (!team) {
-      throw new Error("No active team to stop.");
-    }
-    if (team.status === "stopping") {
-      console.warn("[TeamManager] stopTeam() called while already stopping");
-      this.logTeamDebug("team.stop.ignored", { reason: "already_stopping" });
+  private async _hydrateLastRoundtable(): Promise<void> {
+    if (this._physicalCwd.length === 0) {
       return;
     }
-
-    // Invalidate worker/Leader callbacks before any teardown or snapshot work.
-    // The TeamData snapshot remains compatible because runtime execution state
-    // is intentionally not persisted.
-    this._executionState = "paused";
-    this._runtimeEpoch++;
-
-    // When preserving, flush a final restorable snapshot while the team is still
-    // "active" (isRestorableTeamSnapshot rejects "stopping"). This captures the
-    // latest worker chat history/tasks/bus that the debounced timer may not have
-    // written yet.
-    if (!deleteSnapshot && this._physicalCwd) {
-      if (this._persistTimer) {
-        clearTimeout(this._persistTimer);
-        this._persistTimer = null;
-      }
-      try {
-        await persistTeamSnapshot(this._physicalCwd, team);
-      } catch (err) {
-        console.warn("[TeamManager] Failed to flush team snapshot before stop:", err);
-      }
+    const physicalCwd = this._physicalCwd;
+    // F3-3：换场（本项目重新 initialize / 新工作区的第一场）之前先把上一场的
+    // session / runner / 定时器 / 订阅收干净，否则每次 team ↔ solo 往返都会泄漏。
+    // 放在这里而不是只放在 install 前：没有可恢复的场时也要停掉旧场。
+    if (this._modules !== null) {
+      await this._teardownModules();
     }
-
-    this.logTeamDebug("team.stop.start", {
-      workers: Array.from(team.workers.values()).map((worker) => worker.info),
-      taskCount: team.taskList.size(),
-      busSize: team.bus.size(),
-      deleteSnapshot,
-    });
-    team.status = "stopping";
-    this._emitTeamStateChanged();
-
-    // Clear intervals and subscriptions
-    this._stopHealthCheck();
-    this._cleanupSubscriptions();
-
-    // Dispose all worker runners and sessions
-    const disposePromises: Promise<void>[] = [];
-    for (const [agentId, worker] of team.workers) {
-      disposePromises.push(
-        (async () => {
-          try {
-            if (worker.runner) {
-              await worker.runner.dispose();
-              worker.runner = null;
-            } else {
-              // Fallback: abort and dispose manually
-              worker.lifecycleAbortController?.abort();
-              worker.workAbortController?.abort();
-              worker.unsubscribeEvents?.();
-              if (worker.session) {
-                await worker.session.dispose({ reason: "quit" });
-              }
-              if (worker.mcpAdapter) {
-                await worker.mcpAdapter.dispose();
-              }
-            }
-            worker.session = null;
-            worker.mcpAdapter = null;
-            worker.lifecycleAbortController = null;
-            worker.workAbortController = null;
-            worker.info.status = "shutdown";
-            worker.info.statusChangedAt = Date.now();
-          } catch (err) {
-            console.error(`[TeamManager] Error disposing worker ${agentId}:`, err);
-            this.logTeamDebug("worker.dispose.error", { agentId, error: err });
-          }
-        })(),
-      );
-    }
-
-    await Promise.allSettled(disposePromises);
-
-    // Remove the workers' session files. Workers always get fresh sessions on
-    // (re)launch — their durable history lives in the team snapshot — so the
-    // per-team session directory is pure garbage once the sessions are disposed.
-    await rm(join(getAgentDir(), "team-sessions", team.name), { recursive: true, force: true })
-      .catch((err) => {
-        console.warn(`[TeamManager] Failed to clean up team session directory for ${team.name}:`, err);
-      });
-
-    // Clear the message bus, task list, and protocol state
-    team.bus.clearAll();
-    team.taskList.clearAll();
-    team.protocolManager.clearAll();
-
-    const teamName = team.name;
-    this._team = null;
-    this._setLeaderTurnActive(false);
-    this._orchestratorEvents.clear();
-    this._leaderWakeInFlight = false;
-    this._deferredLeaderMessages = [];
-    this._clearHygieneTimers();
-    this._clearSteerRetryTimers();
-    if (this._orchestratorRetryTimer) {
-      clearTimeout(this._orchestratorRetryTimer);
-      this._orchestratorRetryTimer = null;
-    }
-
-    this._emitEvent({ type: "team_deleted", teamName });
-    this.logTeamDebug("team.stop.completed", { teamName });
-    this._debugLogger.stop("team_stopped");
-    if (deleteSnapshot) {
-      await this._deletePersistedSnapshot();
-    }
-  }
-
-  /** Get the current team state snapshot. Returns null if no team is active. */
-  getTeamState(): TeamState | null {
-    const team = this._team;
-    if (!team) return null;
-
-    const teammates: Record<string, TeammateInfo> = {};
-    for (const [agentId, worker] of team.workers) {
-      teammates[agentId] = { ...worker.info };
-    }
-
-    return {
-      name: team.name,
-      status: team.status,
-      leadAgentId: team.leadAgentId,
-      teammates,
-      createdAt: team.createdAt,
-    };
-  }
-
-  /** Check if a team is currently active. */
-  hasActiveTeam(): boolean {
-    return this._team !== null && this._team.status === "active";
-  }
-
-  /** Whether Team work is currently allowed to consume messages or mutate tasks. */
-  isRuntimeActive(): boolean {
-    return this.hasActiveTeam() && this._executionState === "active";
-  }
-
-  /** Current internal execution epoch used by workers to reject stale callbacks. */
-  getRuntimeEpoch(): number {
-    return this._runtimeEpoch;
-  }
-
-  isRuntimeEpochCurrent(epoch: number): boolean {
-    return this.isRuntimeActive() && epoch === this._runtimeEpoch;
-  }
-
-  /** Resume a restored or user-paused Team after an explicit Team action. */
-  resumeRuntime(reason = "explicit_action"): void {
-    const team = this._team;
-    if (!team || team.status !== "active") return;
-
-    const wasPaused = this._executionState !== "active";
-    if (wasPaused) {
-      this._executionState = "active";
-      this._runtimeEpoch++;
-      this.logTeamDebug("team.runtime.resumed", {
-        reason,
-        runtimeEpoch: this._runtimeEpoch,
-      });
-    }
-    this._startHealthCheck();
-
-    // Restored workers have roster state but no live sessions. Explicit
-    // activity is the only point at which those sessions may be recreated.
-    for (const [agentId, worker] of team.workers) {
-      const hasOwnedOpenTask = team.taskList.getAll().some((task) =>
-        task.ownerAgentId === agentId && (task.status === "assigned" || task.status === "in_progress"),
-      );
-      if (worker.info.activationPolicy !== "always" && !hasOwnedOpenTask) continue;
-      if (worker.info.status === "shutdown" || worker.info.status === "error") continue;
-      if (worker.session && worker.runner) continue;
-      void this._launchWorker(agentId).catch((err) => {
-        console.error(`[TeamManager] Failed to resume worker ${agentId}:`, err);
-        this.logTeamDebug("worker.resume_launch.error", { agentId, error: err });
-        this.updateWorkerStatus(agentId, "error", String(err));
-      });
-    }
-
-    if (wasPaused) {
-      // Events enqueued after the abort (user Stop) carry the pre-pause epoch;
-      // retag them to the resumed epoch so the canRetry guard does not drop
-      // them as stale on their first delivery failure.
-      this._orchestratorEvents.retag(this._runtimeEpoch);
-      // Re-engage the leader for work paused by an abort or restored from a
-      // snapshot, and flush any messages/events deferred during the pause.
-      this._reengageLeaderAfterResume(team);
-    }
-  }
-
-  private _assertRuntimeActive(operation: string): void {
-    if (!this._team || this._team.status !== "active") {
-      throw new Error("No active team.");
-    }
-    if (this._executionState !== "active") {
-      throw new Error(`Team runtime is paused; ${operation} requires an explicit Team action to resume it.`);
-    }
-  }
-
-  /**
-   * Snapshot the persisted team history (worker chat timelines, pending bus
-   * messages, task list) for the renderer to hydrate after a restore. Returns
-   * null if no team is active.
-   */
-  getTeamHistory(): TeamHistory | null {
-    const team = this._team;
-    if (!team) return null;
-
-    const workerMessages: Record<string, TeammateChatMessage[]> = {};
-    for (const [agentId, worker] of team.workers) {
-      workerMessages[agentId] = worker.messageHistory.map((msg) => ({ ...msg }));
-    }
-
-    // Rebuild the team timeline from the bus's append-only history (which
-    // survives consumption), not from pending queues — otherwise messages a
-    // worker already consumed would be missing after a restore.
-    const seen = new Set<string>();
-    const teamMessages: TeamMessage[] = [];
-    for (const msg of team.bus.history()) {
-      if (seen.has(msg.id)) continue;
-      seen.add(msg.id);
-      teamMessages.push(msg);
-    }
-    teamMessages.sort((a, b) => a.timestamp - b.timestamp);
-
-    return {
-      workerMessages,
-      teamMessages,
-      tasks: team.taskList.getAll(),
-    };
-  }
-
-  /** Get the team name, or null if no team is active. */
-  getTeamName(): string | null {
-    return this._team?.name ?? null;
-  }
-
-  /** Cancel all pending protocol requests for a specific agent. */
-  cancelProtocolRequestsForAgent(agentId: string): void {
-    this.logTeamDebug("protocol.cancel_for_agent", { agentId });
-    this._team?.protocolManager.cancelAllForAgent(agentId);
-  }
-
-  /**
-   * Interrupt the current team turn without shutting the team down.
-   * Used when the user presses Stop in the shared composer: leader work,
-   * worker turns, pending protocol waits, and queued orchestration wakes should
-   * all stop together so stale internal events do not resume as a new turn.
-   */
-  async abortActiveTurns(): Promise<void> {
-    const team = this._team;
-    if (!team || team.status !== "active") return;
-
-    const abortRequestId = randomUUID();
-    this._executionState = "paused";
-    this._runtimeEpoch++;
-    this.logTeamDebug("team.abort_active_turns", {
-      abortRequestId,
-      runtimeEpoch: this._runtimeEpoch,
-      workers: Array.from(team.workers.values()).map((worker) => ({
-        agentId: worker.info.agentId,
-        status: worker.info.status,
-        hasWorkAbortController: Boolean(worker.workAbortController),
-        turnId: worker.activeTurnId,
-        turnEpoch: worker.activeTurnEpoch,
-      })),
-    });
-    this._orchestratorEvents.clear();
-    if (this._orchestratorRetryTimer) {
-      clearTimeout(this._orchestratorRetryTimer);
-      this._orchestratorRetryTimer = null;
-      this._orchestratorRetryDueAt = 0;
-    }
-    this._leaderWakeInFlight = false;
-    this._setLeaderTurnActive(false);
-    const clearedMessages = team.bus.clearPending();
-    this.logTeamDebug("team.abort_pending_messages_cleared", {
-      abortRequestId,
-      clearedMessages,
-      historyLength: team.bus.history().length,
-    });
-
-    // Keep in-progress/assigned tasks with their owners. Releasing them to
-    // pending here would let workers auto-reclaim on the next resume and
-    // silently restart the in-flight work the user just stopped; the leader
-    // re-engages with the paused tasks on resume instead (see resumeRuntime).
-
-    const abortPromises: Promise<void>[] = [];
-    for (const [agentId, worker] of team.workers) {
-      team.protocolManager.cancelAllForAgent(agentId);
-      if (worker.info.status === "running" || worker.workAbortController) {
-        if (worker.runner) {
-          abortPromises.push(worker.runner.abortCurrentTurn());
-        } else {
-          worker.workAbortController?.abort();
-        }
-      }
-    }
-    await Promise.allSettled(abortPromises);
-
-    // Reset worker statuses so the UI does not keep showing "running" workers
-    // with a Stop button that can never succeed while the runtime is paused:
-    // the idle loop's isRuntimeActive() gate prevents the natural "idle" reset
-    // while paused, so without this the statuses stay "running" after Stop.
-    for (const [agentId, worker] of team.workers) {
-      if (worker.info.status === "running") {
-        this.updateWorkerStatus(agentId, "idle");
-      }
-    }
-  }
-
-  // ==========================================================================
-  // Worker Agent Management
-  // ==========================================================================
-
-  /**
-   * Launch a worker agent: create AgentSession, subscribe to events, start execution loop.
-   */
-  private async _launchWorker(agentId: string): Promise<void> {
-    // Concurrency guard: activateMember / _wakeAssignedTask / sendMessageToWorker
-    // can all trigger a launch at nearly the same time. Without this, two calls
-    // could both pass the "already running" check (which only flips after the
-    // session+runner are assigned) and create two sessions/runners for one
-    // worker, leaking the first and double-consuming its messages.
-    if (this._launchingAgents.has(agentId)) {
-      this.logTeamDebug("worker.launch.skipped", { agentId, reason: "already_launching" });
-      return;
-    }
-    this._launchingAgents.add(agentId);
+    // 只用指针读「本工作区最近一场」：实例的 roundtableId 与 loadLatest 无关。
+    const probe = new RoundtablePersistence({ physicalCwd, roundtableId: "bootstrap" });
+    let loaded: Awaited<ReturnType<RoundtablePersistence["loadLatest"]>>;
     try {
-      await this._launchWorkerInner(agentId);
-    } finally {
-      this._launchingAgents.delete(agentId);
+      loaded = await probe.loadLatest(physicalCwd);
+    } catch (err) {
+      // F4-7：记录损坏与「没有可恢复的场」必须分开——损坏时 loadLatest 抛错，
+      // 这里说出来，绝不按空集合静默恢复（H36 私密正文的唯一载体在 inbox.json）。
+      console.error("[TeamManager] roundtable records are corrupted:", err);
+      // 此刻上一场的模块已经拆掉（`_teardownModules` 故意不清 `_modules`，但 session /
+      // 定时器全没了，投进旧 bus 只会写进一个不会再显示的场），所以不直接
+      // `_raiseAttention`：按工作区暂存，等本工作区下一场圆桌建起来、渲染层已经认下
+      // 它之后再由 `_flushDeferredNotices()` 补发，否则这条提示在 App 里永远不可见。
+      const detail = err instanceof Error ? err.message : String(err);
+      const text = `圆桌记录损坏：${detail}。上一场未恢复，原文件保留未改（修好后重启可再试）。`;
+      // 同一个损坏的工作区会被反复 initialize（失败一次就再来一次），提示本身是幂等
+      // 的：不重复暂存，否则补发时用户会看到一叠一模一样的卡片。
+      if (!this._deferredNotices.some((notice) => notice.physicalCwd === physicalCwd && notice.text === text)) {
+        this._deferredNotices.push({ physicalCwd, text });
+      }
+      this._emit({ type: "record_corrupt_notice", text });
+      // 上面的 teardown 已经把上一场的模块拆了：这里把引用也清掉，否则
+      // `getState()` / `hasActiveTeam()` 会继续报一个已经拆掉的场。
+      this._state = null;
+      this._modules = null;
+      this._emitState();
+      return;
+    }
+    if (loaded !== null) {
+      const { meta } = loaded;
+      const settings = mergeRoundtableSettings(defaultSettings(), meta.state.settings);
+      const modules = this._installModules(meta.state.roundtableId, meta.state.tier, settings);
+      modules.roster.restore(meta.state.seats);
+      this._mutedThreads = new Set(meta.mutedThreads);
+      this._replayingTimeline = true;
+      try {
+        for (const item of loaded.timeline) {
+          // replay：只补记录，不改投递态、不发事件；seq 由日志按文件顺序重排。
+          const { seq: _replayedSeq, ...rest } = item;
+          void _replayedSeq;
+          modules.timeline.append(rest);
+        }
+      } finally {
+        this._replayingTimeline = false;
+      }
+      modules.attention.restore(loaded.attention);
+      // F4-5：已确认状态不在 attention.jsonl 里，靠快照本体重放；否则重启后
+      // 已处理过的权限卡会带着失效按钮（requestId 已不在 pendingPermissions）回来。
+      for (const id of meta.attentionAcks) {
+        modules.attention.ack(id);
+      }
+      modules.inbox.restore(meta.inbox);
+      // F1-2 的 id 唯一性半边：inbox.json 里的 messageId 即使没被 replay 回时间线
+      // （时间线写失败过、或条目只在收件箱里），也必须占用 id 名称空间——否则
+      // nextGeneratedId 会重新分配它，SeatInbox.enqueue 按 messageId 去重会让该席
+      // 静默收不到那条消息。
+      modules.timeline.reserveIds(meta.inbox.map((entry) => entry.messageId));
+      modules.openItems.restore(meta.openItems);
+      modules.leases.restore(meta.leases);
+      modules.deliverables.restore(meta.deliverables);
+      modules.protocol.restorePermissions(meta.pendingPermissions);
+      modules.protocol.restoreExits(meta.pendingExits);
+      this._metricsBase = meta.metrics;
+      this._deliveryStates.clear();
+
+      const lifecycle = resolveCrashRecoveryLifecycle(meta);
+      this._state = {
+        roundtableId: meta.state.roundtableId,
+        name: meta.state.name,
+        lifecycle,
+        createdAt: meta.state.createdAt,
+        tier: meta.state.tier,
+        settings,
+        seats: modules.roster.snapshot(),
+        orderedMode: settings.orderedMode,
+        hostSessionId: meta.state.hostSessionId,
+      };
+      this._debugLogger.start(physicalCwd, meta.state.name, "restore_roundtable");
+      this.logTeamDebug("roundtable.restored", {
+        roundtableId: meta.state.roundtableId,
+        lifecycle,
+        seats: modules.roster.size,
+        timeline: loaded.timeline.length,
+        attention: loaded.attention.length,
+        inbox: meta.inbox.length,
+      });
+
+      if (lifecycle === "paused") {
+        // 暂停态：不建 session、不发模型调用；确认后 resume 再开始。
+        // F5-4 / §5.11：这条提示的「知道了」必须真的恢复整场，否则用户以为恢复
+        // 失败、lifecycle 永远停在 paused（renderer 见 action==="resume" 补发命令）。
+        this._raiseAttention({
+          kind: "seat_error",
+          text: "重启后发现上一场圆桌：已恢复到「暂停」，确认后继续（不会自动消耗模型调用）。",
+          refId: meta.state.roundtableId,
+          action: "resume",
+        });
+      }
+      // 与 createRoundtable 同一起点：时长类阈值（软预算 / 硬停止）必须有定时评估，
+      // 否则恢复回来的场只有在下一次消息时才被评估。
+      this._metrics?.start();
+      this._emitState();
+      // 建场之前的注意力（F4-7 的记录损坏）在这一刻才有人看：渲染层刚认下这场圆桌。
+      this._flushDeferredNotices();
+      if (lifecycle === "active") {
+        // autoContinueAfterCrash（H9 默认关）：用户已授权自动继续。
+        void this._startAllSeats();
+      }
+      return;
+    }
+
+    // 本工作区没有可恢复的场：上面的 teardown 已经把上一场（可能是另一个工作区的）
+    // 的 session / runner / 定时器全拆了，但 `_state` 还留着它的记录 → 不清理的话
+    // 换工作区后 `getState()` / `hasActiveTeam()` 会继续报一个所有 session 都已
+    // dispose 的僵尸场（实测：A 场 pause → initialize 到空工作区 B，getState() 仍
+    // 返回 A 的 roundtableId 且 hasActiveTeam() 为 true）。F4-7 的 catch 分支同理。
+    if (this._modules !== null || this._state !== null) {
+      this._state = null;
+      this._modules = null;
+      this._emitState();
+    }
+    await this._emitLegacyNoticeIfNeeded();
+  }
+
+  /** 旧快照只在「存在且用户还没确认过」时提示一次（H14 / AC-13）。 */
+  private async _emitLegacyNoticeIfNeeded(): Promise<void> {
+    if (!detectLegacyTeamSnapshot(this._physicalCwd)) {
+      return;
+    }
+    const ack = await this._legacyAck();
+    if (ack) {
+      return;
+    }
+    this._emit({ type: "legacy_snapshot_notice" });
+  }
+
+  private async _legacyAck(): Promise<boolean> {
+    const probe = new RoundtablePersistence({ physicalCwd: this._physicalCwd, roundtableId: "bootstrap" });
+    const ack = await probe
+      .readAck(this._physicalCwd)
+      .catch((): { legacySnapshotNoticeAck?: boolean } => ({}));
+    return ack.legacySnapshotNoticeAck === true;
+  }
+
+  // ==========================================================================
+  // 读投影
+  // ==========================================================================
+
+  getState(): RoundtableState | null {
+    const state = this._state;
+    if (state === null || this._modules === null) {
+      return null;
+    }
+    return {
+      ...state,
+      // seats 以名册为权威（roster 是唯一改状态的地方）。
+      seats: this._modules.roster.snapshot(),
+      settings: { ...state.settings, l2: state.settings.l2 },
+    };
+  }
+
+  /** 圆桌存在且不是已停止（active / paused 都算有活跃场）。 */
+  hasActiveTeam(): boolean {
+    const lifecycle = this._state?.lifecycle;
+    return lifecycle === "active" || lifecycle === "paused";
+  }
+
+  /** 运行时是否在跑（paused / stopped 都不是）。工具与消息以此为准。 */
+  isRuntimeActive(): boolean {
+    return this._state?.lifecycle === "active";
+  }
+
+  getTimeline(filter?: TimelineFilter): TimelineItem[] {
+    const modules = this._modules;
+    if (modules === null) {
+      return [];
+    }
+    return modules.timeline.list(filter).map((item) => this._projectItem(item));
+  }
+
+  getAttention(): AttentionItem[] {
+    return this._modules?.attention.list() ?? [];
+  }
+
+  getOpenItems(): OpenItem[] {
+    return this._modules?.openItems.list() ?? [];
+  }
+
+  getInbox(seatId?: string): InboxEntry[] {
+    const entries = this._modules?.inbox.snapshot() ?? [];
+    return seatId === undefined ? entries : entries.filter((entry) => entry.seatId === seatId);
+  }
+
+  getDeliverables(): DeliverableVersion[] {
+    return this._modules?.deliverables.list() ?? [];
+  }
+
+  /** 指标 = 落盘基线（崩溃前的累计）+ 当前 session 用量（H17）。 */
+  getMetrics(): RoundtableMetricsSnapshot {
+    const live = this._modules?.metrics.snapshot() ?? emptyMetrics();
+    return mergeMetrics(this._metricsBase, live);
+  }
+
+  // ==========================================================================
+  // 新建圆桌（§5.1）
+  // ==========================================================================
+
+  /**
+   * 建一场新圆桌并开跑：生成 roundtableId（H26）→ 落盘 meta + current.json →
+   * 建名册/时间线/各模块 → 启动 N 个只读政策席位 → 写开场系统消息（议题 + 附件，
+   * 硬停止开启时必须在此告知）→ 各席第一轮 prompt（并行）。
+   */
+  async createRoundtable(input: {
+    name?: string;
+    tier?: RoundtableTier;
+    seats?: SeatConfig[];
+    topic: string;
+    attachments?: ChatMessageAttachment[];
+    settings?: Partial<RoundtableSettings>;
+  }): Promise<RoundtableState> {
+    this._assertReady();
+    const existing = this._state;
+    if (existing !== null && existing.lifecycle !== "stopped") {
+      throw new Error("已有活跃圆桌：先 stop()（会归档当前场）再新建。");
+    }
+
+    const tier = input.tier ?? DEFAULT_ROUNDTABLE_TIER;
+    const settings = mergeRoundtableSettings(defaultSettings(), input.settings);
+    const roundtableId = `rt-${randomUUID()}`;
+    const name = (input.name ?? input.topic).trim().slice(0, 80) || "圆桌讨论";
+    const configs = input.seats ?? defaultSeatConfigs(tier);
+
+    // 上一场的一切必须先收干净：session / runner / 定时器 / 订阅（F3-3）。
+    if (this._modules !== null) {
+      await this._teardownModules();
+    }
+    const modules = this._installModules(roundtableId, tier, settings);
+    const seats = modules.roster.createFrom(configs);
+    this._mutedThreads.clear();
+    this._metricsBase = null;
+    this._state = {
+      roundtableId,
+      name,
+      lifecycle: "active",
+      createdAt: Date.now(),
+      tier,
+      settings,
+      seats: modules.roster.snapshot(),
+      orderedMode: settings.orderedMode,
+    };
+    this._debugLogger.start(this._physicalCwd, name, "create_roundtable");
+    this.logTeamDebug("roundtable.create", {
+      roundtableId,
+      name,
+      tier,
+      seats: seats.map((seat) => ({ seatId: seat.seatId, name: seat.name, auth: seat.auth })),
+      hardStop: settings.hardStop ?? null,
+    });
+
+    await modules.persistence.writeCurrentPointer(roundtableId);
+    this._persistNow();
+    this._emit({ type: "roundtable_created", state: this.getState()! });
+    this._emitState();
+    // 建场之前的注意力（F4-7 的记录损坏）在这一刻才有人看：必须晚于
+    // `roundtable_created`，否则渲染层认下新场时会把早发的条目一起清掉。
+    this._flushDeferredNotices();
+
+    // 席位 session 并行创建；失败只影响该席（§5.14 第一行）。
+    await Promise.all(seats.map((seat) => this._startSeat(seat.seatId)));
+
+    // 开场系统消息：议题 + 附件名（+ 硬停止预告，AC-11）。落盘与事件由
+    // timeline.onAppend 的统一出口负责（F3-2），这里只 append。
+    const opening = this._appendSystem(this._buildOpeningText(input), "*");
+
+    // 各席第一次 prompt：议题 + 本席视角 + 空时间线（并行；投递走收件箱）。
+    for (const seat of seats) {
+      if (!modules.roster.isActive(seat.seatId)) {
+        continue;
+      }
+      modules.inbox.enqueue({ ...opening, text: buildOpeningBrief(opening.text, seat) }, [seat.seatId]);
+    }
+    this._metrics?.start();
+    this._metrics?.evaluate();
+    return this.getState()!;
+  }
+
+  private _buildOpeningText(input: { topic: string; attachments?: ChatMessageAttachment[] }): string {
+    const attachments = input.attachments ?? [];
+    const names = attachments.map((attachment) => attachment.name || attachment.path);
+    const settings = this._state?.settings;
+    const hardStop = settings?.hardStop;
+    const lines = [
+      "圆桌讨论开始。",
+      "",
+      `议题：${input.topic.trim()}`,
+      // F3-8：材料要能被席位真的读到（read 需要路径），只列名字进不了任何席位上下文。
+      ...(names.length > 0
+        ? ["", `抛出的材料（${names.length} 个）：${names.join("、")}`, ...attachmentLines(attachments)]
+        : []),
+    ];
+    if (hardStop !== undefined && hardStop.enabled) {
+      // AC-11：硬停止必须在开场告知，并说明是否授权「停止讨论并整理」。
+      const limits = [
+        ...(hardStop.maxCostUsd !== undefined ? [`成本上限 ${hardStop.maxCostUsd} USD`] : []),
+        ...(hardStop.maxDurationMs !== undefined ? [`时长上限 ${Math.round(hardStop.maxDurationMs / 60_000)} 分钟`] : []),
+      ];
+      lines.push(
+        "",
+        `【硬停止已开启】到达${limits.length > 0 ? limits.join("、") : "用户设定的条件"}后，系统会停止一切团队模型调用；${
+          hardStop.allowWrapUpOnStop
+            ? "已授权「停止讨论并整理」：停止后允许进行一次整理调用（计入团队成本并公告）。"
+            : "未授权整理：停止后不会自动整理，只能取走已有记录与稿件。"
+        }`,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  // ==========================================================================
+  // 用户输入与运行时控制
+  // ==========================================================================
+
+  /**
+   * 用户消息（广播 / @ / 私密），立即记录并进入目标席收件箱（§5.1 步骤 5）。
+   * 私密：正文**只**存进 `InboxEntry.text`，时间线留 `private_stub`（H36 / AC-20）。
+   */
+  async postUserMessage(input: {
+    to: string;
+    text: string;
+    private?: boolean;
+    interrupt?: InterruptLevel;
+    attachments?: ChatMessageAttachment[];
+  }): Promise<TimelineItem> {
+    this._assertCanRecord("post_user_message");
+    const modules = this._modules!;
+    const body = input.text;
+    const mentions = parseMentions(body, modules.roster.list());
+
+    if (input.private === true) {
+      if (input.to === "*" || !modules.roster.isActive(input.to)) {
+        throw new Error("私密消息只能发给单个席位。");
+      }
+      const stub = modules.timeline.append({
+        ts: Date.now(),
+        type: "private_stub",
+        fromId: USER_SEAT_ID,
+        toId: input.to,
+        text: "",
+        summary: `私密消息 → ${modules.roster.get(input.to)?.name ?? input.to}`,
+        privateStub: { fromId: USER_SEAT_ID, toId: input.to },
+        mentionIds: [input.to],
+      });
+      // H36：正文的唯一载体是 InboxEntry.text（落盘在 inbox.json）。落盘与事件由
+      // timeline.onAppend 的统一出口负责（F3-2）。
+      modules.inbox.enqueue({ ...stub, text: body }, [input.to]);
+      this._nudge([input.to], input.interrupt ?? "L1", "user");
+      this._persistSoon();
+      this._metrics?.evaluate();
+      return this._projectItem(stub);
+    }
+
+    const targets = input.to === "*"
+      ? modules.roster.activeIds()
+      : modules.roster.isActive(input.to)
+        ? [input.to]
+        : [];
+    if (input.to !== "*" && targets.length === 0) {
+      throw new Error(`找不到收件席 "${input.to}"。`);
+    }
+    const mentionIds = input.to !== "*" && input.to !== USER_SEAT_ID
+      ? [input.to, ...mentions.filter((id) => id !== input.to)]
+      : mentions;
+
+    const item = modules.timeline.append({
+      ts: Date.now(),
+      type: "user",
+      fromId: USER_SEAT_ID,
+      toId: input.to,
+      text: body,
+      summary: firstLine(body),
+      attachments: input.attachments,
+      mentionIds,
+    });
+    // F3-8：附件只挂在时间线上永远进不了席位上下文（附件-only 还会注入空块），
+    // 所以把附件行并进注入正文；时间线条目仍保留 attachments 字段。
+    const files = attachmentLines(input.attachments ?? []);
+    const inboxText = files.length > 0 ? `${body}\n\n${files.join("\n")}` : body;
+    modules.inbox.enqueue({ ...item, text: inboxText }, targets);
+    this._nudge(targets, input.interrupt ?? "L1", "user");
+    this._persistSoon();
+    this.logTeamDebug("user.message", {
+      to: input.to,
+      private: false,
+      text: summarizeText(body),
+      mentionIds,
+      targets,
+    });
+    this._metrics?.evaluate();
+    return this._projectItem(item);
+  }
+
+  /**
+   * 有序模式开关（H27：只写 settings）。关掉时按排队键放行等待中的 argument
+   * （投递不丢）、并清掉所有 `waiting_turn`（§5.15）。
+   */
+  setOrderedMode(on: boolean): void {
+    const state = this._state;
+    if (state === null || this._modules === null || state.lifecycle === "stopped") {
+      return;
+    }
+    state.settings.orderedMode = on;
+    this._onOrderedModeChanged(on);
+    this.logTeamDebug("ordered_mode.set", { on });
+    this._emitState();
+    this._persistSoon();
+  }
+
+  /**
+   * 暂停（§5.10 / AC-10）：不再发起任何团队模型调用（席位 turn、压缩、摘要、
+   * 整理全部停），abort 正在跑的席位，取消 aux。**不清** pendingPermissions
+   * （H23），也**不丢**未 commit 的收件箱条目（投递态只在 commitInjected 前进）。
+   */
+  async pause(): Promise<void> {
+    const state = this._state;
+    const modules = this._modules;
+    if (state === null || modules === null || state.lifecycle === "stopped" || state.lifecycle === "paused") {
+      return;
+    }
+    state.lifecycle = "paused";
+    // 容量池先停：新的 prompt 一律拿不到席位槽（§4.8）。
+    modules.capacity.pause();
+    this.logTeamDebug("roundtable.pause", { seats: modules.roster.size });
+    for (const [seatId, runner] of this._runners) {
+      // L3 现在是「直接执行」的控制面（F1-1），但一个不回话的 abort 仍可能拖住
+      // apply：加超时兜底，保证 pause 自身在 ABORT_TIMEOUT_MS 内返回（§5.10 暂停
+      // 语义要求暂停立刻生效，之后不再有团队模型调用）。
+      await Promise.race([
+        runner.apply("L3").catch(() => {}),
+        this._sleep(ABORT_TIMEOUT_MS),
+      ]);
+      this._sessions.get(seatId)?.abortCompaction();
+    }
+    this._abortAux();
+    // 写归属在暂停时结束（§4.2：租约覆盖到显式释放或席位退出/暂停）。
+    for (const seat of modules.roster.all()) {
+      modules.leases.release(seat.seatId);
+    }
+    this._setSeatStatusesForPause();
+    this._emitState();
+    await this._flush();
+  }
+
+  /** 恢复（用户确认后继续）：重新调度席位并带上仍待注入的收件箱。 */
+  resume(reason: string): void {
+    const state = this._state;
+    const modules = this._modules;
+    if (state === null || modules === null || state.lifecycle !== "paused") {
+      return;
+    }
+    state.lifecycle = "active";
+    modules.capacity.resume();
+    this.logTeamDebug("roundtable.resume", { reason });
+    // 已有 runner 解除停调度；恢复后没有 session 的席位（崩溃恢复）一并补建。
+    for (const runner of this._runners.values()) {
+      runner.resume();
+    }
+    void this._startAllSeats();
+    this._emitState();
+    this._persistSoon();
+  }
+
+  /**
+   * 停止并归档（§5.10 / §6.3）。`wrapUp` 只在 `hardStop.allowWrapUpOnStop` 时
+   * 允许那一次整理调用（AC-11）；停止后记录保留为只读。
+   */
+  async stop(options: { wrapUp?: boolean } = {}): Promise<void> {
+    const state = this._state;
+    const modules = this._modules;
+    if (state === null || modules === null || state.lifecycle === "stopped") {
+      return;
+    }
+    const wrapUp = options.wrapUp === true && state.settings.hardStop?.allowWrapUpOnStop === true;
+    // 第一步就是暂停：先禁掉一切团队模型调用，再决定是否授权一次整理。
+    await this.pause();
+    state.lifecycle = "stopped";
+    this.logTeamDebug("roundtable.stop", { wrapUp, roundtableId: state.roundtableId });
+
+    if (wrapUp && this._modules !== null) {
+      // AC-11：授权过的那一次整理调用（整场已暂停，绕过 aux 容量池）。
+      try {
+        await this._performWrapUp("system", true);
+        const latest = this._modules.deliverables.latest();
+        if (latest !== undefined) {
+          this._appendSystem(`硬停止后按授权整理了一次：交付物 v${latest.version}（截止 seq=${latest.cutoffSeq}），计入团队成本。`, "*");
+        }
+      } catch (err) {
+        console.warn("[TeamManager] wrap-up on stop failed:", err);
+      }
+    }
+
+    // 拆模块（停定时器 / 退订 / dispose session）之前先把最终态写盘并推给 UI：
+    // 拆掉之后 `_persistNow()` 已经不写盘，最终态就进不了归档目录（F3-3）。
+    this._persistNow();
+    await this._flush();
+    this._emitState();
+    await this._teardownModules();
+    await modules.persistence.archive(state.roundtableId).catch((err) => {
+      console.warn("[TeamManager] Failed to archive roundtable:", err);
+    });
+    this._debugLogger.stop("roundtable_stopped");
+  }
+
+  /** 进程退出（index.ts 仍调此名）。保留快照，不归档：重启可恢复。 */
+  async dispose(): Promise<void> {
+    if (this._disposed) {
+      return;
+    }
+    this._disposed = true;
+    this._persistNow();
+    await this._flush();
+    await this._teardownModules();
+    this._debugLogger.stop("dispose");
+    this._eventCallbacks.length = 0;
+    this.logTeamDebug("manager.dispose", {});
+  }
+
+  // ==========================================================================
+  // 席位管理（§5.12 / FR-1）
+  // ==========================================================================
+
+  /** 加席：不打断其它席的回合；入场给摘要 + 索引，并在主线公布（AC-14）。 */
+  async addSeat(config: SeatConfig): Promise<SeatInfo> {
+    this._assertCanRecord("add_seat");
+    const modules = this._modules!;
+    const state = this._state!;
+    if (modules.roster.size >= MAX_SEATS) {
+      throw new Error(`席位已达上限 ${MAX_SEATS}。`);
+    }
+    const seat = modules.roster.add(config);
+    state.seats = modules.roster.snapshot();
+    this.logTeamDebug("seat.add", { seatId: seat.seatId, name: seat.name, auth: seat.auth });
+
+    const packet = modules.timeline.buildJoinPacket();
+    const announcement = modules.timeline.append({
+      ts: Date.now(),
+      type: "system",
+      fromId: USER_SEAT_ID,
+      toId: "*",
+      text: `席位「${seat.name}」加入圆桌（视角：${seat.perspective}）。当前主线概况：\n${packet.summary}`,
+      summary: `席位加入：${seat.name}`,
+      mentionIds: [],
+    });
+
+    await this._startSeat(seat.seatId);
+    // 新席的入场简报只发给它自己：全员看得见主线公告，不必被别人的行动打断。
+    modules.inbox.enqueue(
+      { ...announcement, text: buildJoinBrief(seat, packet) },
+      [seat.seatId],
+    );
+    this._emit({ type: "seat_status", seatId: seat.seatId, status: seat.status });
+    this._emitState();
+    this._persistSoon();
+    return seat;
+  }
+
+  /**
+   * 减席（§5.12）：该席 L3 + 未决项回到未决 + 释放写租约；**其它席的回合不动**。
+   * 席位记录保留（状态 exited），时间线里的引用仍然有效。
+   */
+  async removeSeat(seatId: string, requestedBy: "user" | "self" | "peer"): Promise<void> {
+    this._assertCanRecord("remove_seat");
+    const modules = this._modules!;
+    const state = this._state!;
+    const seat = modules.roster.get(seatId);
+    if (seat === undefined || seat.status === "exited") {
+      return;
+    }
+    this.logTeamDebug("seat.remove", { seatId, requestedBy });
+
+    const runner = this._runners.get(seatId);
+    if (runner !== undefined) {
+      await runner.apply("L3").catch(() => {});
+      await runner.stop().catch(() => {});
+      this._runners.delete(seatId);
+    }
+    await this._disposeSeatSession(seatId);
+    modules.health.unregisterSeat(seatId);
+    modules.capacity.releaseSeat(seatId);
+    modules.leases.release(seatId);
+    modules.roster.remove(seatId);
+    state.seats = modules.roster.snapshot();
+
+    const released = modules.openItems.releaseOwned(seatId);
+    for (const item of released) {
+      this._emit({ type: "open_item", item });
+    }
+    this._appendSystem(
+      `席位「${seat.name}」退出（${requestedBy}）。${released.length > 0 ? `其认领的 ${released.length} 条未决项回到未决，任何人都可以接着做。` : ""}`,
+      "*",
+    );
+    this._emit({ type: "seat_status", seatId, status: "exited" });
+    this._emitState();
+    this._persistSoon();
+  }
+
+  /** 改授权（讨论中可改；受限档的路径白名单一起换）。升到 write 必须重建 session（tools 白名单开场定死）。 */
+  async updateSeatAuth(seatId: string, auth: ToolAuthTier, pathAllowlist?: string[]): Promise<void> {
+    this._assertCanRecord("update_seat_auth");
+    const modules = this._modules!;
+    const previous = modules.roster.get(seatId);
+    if (previous === null || previous === undefined) {
+      throw new Error(`席位 ${seatId} 不存在。`);
+    }
+    const prevAuth = previous.auth;
+    const updated = modules.roster.updateAuth(seatId, auth, pathAllowlist);
+    if (updated === null) {
+      throw new Error(`席位 ${seatId} 不存在。`);
+    }
+    this._state!.seats = modules.roster.snapshot();
+    this._emit({ type: "seat_status", seatId, status: updated.status });
+    this._emitState();
+    this._persistSoon();
+
+    const session = this._sessions.get(seatId);
+    if (prevAuth === "write" && auth !== "write" && session !== undefined) {
+      session.setActiveToolsByName(seatToolAllowlist(auth));
+      return;
+    }
+    if (prevAuth !== "write" && auth === "write") {
+      await this._rebuildSeatSession(seatId);
     }
   }
 
-  private async _launchWorkerInner(agentId: string): Promise<void> {
-    const team = this._team;
-    if (!team || team.status !== "active") {
-      this.logTeamDebug("worker.launch.skipped", { agentId, reason: "no_active_team" });
+  /** 升到 write 档：continueRecent 重建该席 session，保留对话与时长，不碰 inbox/leases。 */
+  private async _rebuildSeatSession(seatId: string): Promise<void> {
+    const modules = this._modules;
+    if (modules === null) {
       return;
     }
-    if (!this._authStorage) throw new Error("AuthStorage not initialized.");
+    const runner = this._runners.get(seatId);
+    if (runner !== undefined) {
+      await runner.apply("L3");
+      await runner.stop();
+      this._runners.delete(seatId);
+    }
+    modules.health.unregisterSeat(seatId);
+    // 同一份 session 文件马上 continueRecent：用量留在 live stats 里，不能再累进 _seatUsage。
+    await this._disposeSeatSession(seatId, { rememberUsage: false });
+    await this._startSeat(seatId, { resume: true });
+    this._runners.get(seatId)?.resume();
+  }
 
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-    if (worker.session && worker.runner && (worker.info.status === "idle" || worker.info.status === "running")) {
-      this.logTeamDebug("worker.launch.skipped", { agentId, reason: "already_running", status: worker.info.status });
+  /** 唤醒某席：有 pending 就让它开一轮；没有就发一条系统提示（§5.14）。 */
+  async wakeSeat(seatId: string): Promise<void> {
+    this._assertCanRecord("wake_seat");
+    const modules = this._modules!;
+    const runner = this._runners.get(seatId);
+    if (runner === undefined) {
+      throw new Error(`席位 ${seatId} 没有运行中的 session。`);
+    }
+    if (modules.inbox.pending(seatId).length > 0) {
+      runner.resume();
+    } else {
+      runner.wake();
+    }
+    this._persistSoon();
+  }
+
+  /** 线程静音（只看与否；主线永远全员可见，FR-4）。 */
+  muteThread(threadId: string, muted: boolean): void {
+    if (muted) {
+      this._mutedThreads.add(threadId);
+    } else {
+      this._mutedThreads.delete(threadId);
+    }
+    this._persistSoon();
+  }
+
+  /**
+   * 降档续跑（H24）：必须 `settings.cheaperModel` 预授权。
+   * 只写 `session.agent.state.model` + `sessionManager.appendModelChange`，
+   * **禁止** `session.setModel()`（会污染 solo 的全局默认模型）。累计成本不重置。
+   */
+  async downgradeModels(model: string): Promise<void> {
+    this._assertCanRecord("downgrade_models");
+    const state = this._state!;
+    const modules = this._modules!;
+    const preset = state.settings.cheaperModel;
+    if (preset === undefined || preset !== model) {
+      throw new Error("downgrade_models 需要圆桌设置里预授权的 cheaperModel 且必须一致。");
+    }
+    const applied: string[] = [];
+    for (const [seatId, session] of this._sessions) {
+      const resolved = resolveModelSpec(session, model);
+      if (resolved === undefined) {
+        continue;
+      }
+      session.agent.state.model = resolved;
+      session.sessionManager.appendModelChange(resolved.provider, resolved.id);
+      modules.roster.setModel(seatId, `${resolved.provider}/${resolved.id}`);
+      applied.push(seatId);
+    }
+    state.seats = modules.roster.snapshot();
+    if (applied.length > 0) {
+      this._appendSystem(
+        `降档续跑：${applied.length} 个席位切换到 ${model}（已用消耗不重置）。`,
+        "*",
+      );
+    }
+    this.logTeamDebug("models.downgraded", { model, seats: applied });
+    this._emitState();
+    this._persistSoon();
+  }
+
+  /**
+   * 退出协商（§5.12 / H4）：先记录说法，再决定取消还是执行移除。
+   * 超时路径（`settings.exitRequestTimeoutMs`，默认 120s）走同一条应用逻辑。
+   */
+  async respondExit(requestId: string, statement: string, accept?: boolean): Promise<void> {
+    this._assertCanRecord("respond_exit");
+    const modules = this._modules!;
+    const request = modules.protocol.respondExit(requestId, statement, accept);
+    if (request === null) {
       return;
     }
+    this._emit({ type: "exit_request", request });
+    if (request.status === "done") {
+      await this._applyExit(request, "peer");
+    }
+    this._persistSoon();
+  }
 
-    this.logTeamDebug("worker.launch.start", {
-      agentId,
-      worker: worker.info,
-    });
-    worker.info.lastActiveAt = Date.now();
-    // No priming turn is executed at launch (identity lives in the system
-    // prompt), so the worker becomes idle-ready as soon as the runner starts.
-    this.updateWorkerStatus(agentId, "idle");
+  /** 退出协商到点/通过后的实际移除：双方说法入时间线，然后 removeSeat。 */
+  private async _applyExit(request: ExitRequest, requestedBy: "self" | "peer"): Promise<void> {
+    const modules = this._modules;
+    // F3-4：协商的 120s 定时器可能在 stop/dispose 之后才到点，这条路径必须在
+    // 已停止的场上变成 no-op（否则 _appendSystem 会用 mkdir 重建刚被归档的目录）。
+    const state = this._state;
+    if (modules === null || state === null || state.lifecycle === "stopped") {
+      return;
+    }
+    const statements = request.statements
+      .map((statement) => `- ${seatLabel(modules.roster, statement.fromId)}：${statement.text}`)
+      .join("\n");
+    this._appendSystem(
+      `退出协商完成：${seatLabel(modules.roster, request.requestedBy)} 请 ${seatLabel(modules.roster, request.targetSeatId)} 退出。双方说法：\n${statements}`,
+      "*",
+    );
+    await this.removeSeat(request.targetSeatId, requestedBy);
+  }
 
-    // Create AgentSession (same pattern as SessionBridge._createSession)
-    const agentDir = getAgentDir();
-    const sessionDir = join(agentDir, "team-sessions", team.name, worker.info.name);
-    // Bootstrap consumers (Session/Settings/Resource loaders) use the physical
-    // cwd; the Agent runtime uses the logical cwd via runtimeCwd below
-    // (wsl_plan.md §4.8: worker bootstrap uses physical cwd).
-    const sessionManager = SessionManager.create(this._physicalCwd, sessionDir, {
-      acp: this._leaderSession?.sessionManager.getAcp() === true,
+  // ==========================================================================
+  // 交付物与移交（§4.9 / §4.12c / §4.15）
+  // ==========================================================================
+
+  /**
+   * 整理（§4.12c）：钉截止点 → 取 aux 槽（满则排队，绝不借 agent-task 槽）→
+   * 系统整理跑短命 aux session，用户指定主笔则向该席 L1 注入写作请求。
+   * 无人值守「只探索不整理」时直接拒绝。
+   */
+  async requestWrapUp(author: "system" | string = "system"): Promise<DeliverableVersion> {
+    this._assertActive("request_wrap_up");
+    const modules = this._modules!;
+    if (!modules.metrics.isWrapUpAllowed()) {
+      throw new Error("无人值守保护：当前只探索不整理，request_wrap_up 已被拒绝。");
+    }
+    return this._performWrapUp(author, false);
+  }
+
+  /**
+   * 整理的实际执行。`force` 只给 `stop({wrapUp:true})` 用：那是 AC-11 授权过的
+   * 唯一一次整理调用，此时整场已经暂停，所以绕过 aux 容量池（不排队、不占席位槽）。
+   */
+  private async _performWrapUp(author: "system" | string, force: boolean): Promise<DeliverableVersion> {
+    const modules = this._modules!;
+    const deliverable = modules.deliverables.create({ author });
+    this.logTeamDebug("wrapup.create", {
+      deliverableId: deliverable.id,
+      version: deliverable.version,
+      cutoffSeq: deliverable.cutoffSeq,
+      author,
     });
+    this._emit({ type: "deliverable", item: deliverable });
+
+    const jobId = `wrapup:${deliverable.id}`;
+    if (!force) {
+      if (!modules.capacity.acquireAux(jobId)) {
+        // aux 槽满：排队（不占席位槽、不借 agent-task），当前 aux 结束后继续。
+        this._pendingWrapUps.push({ deliverableId: deliverable.id, author });
+        this.logTeamDebug("wrapup.queued", { deliverableId: deliverable.id });
+        this._persistSoon();
+        return deliverable;
+      }
+    }
+    try {
+      await this._runWrapUp(deliverable, author);
+    } finally {
+      if (!force) {
+        modules.capacity.releaseAux(jobId);
+      }
+      void this._drainWrapUpQueue();
+    }
+    this._persistSoon();
+    return modules.deliverables.get(deliverable.id) ?? deliverable;
+  }
+
+  /** 一个整理任务的执行：系统起草（aux session）或指定席主笔（L1 注入）。 */
+  private async _runWrapUp(deliverable: DeliverableVersion, author: "system" | string): Promise<void> {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    if (author !== "system" && modules.roster.isActive(author)) {
+      const seat = modules.roster.get(author)!;
+      const item = this._appendSystem(buildSeatWrapUpRequest(deliverable, seat.name), author);
+      modules.inbox.enqueue(item, [author]);
+      this._nudge([author], "L1", "system");
+      return;
+    }
+    const text = await this._draftWithAuxSession(deliverable);
+    // F3-6：aux 起草失败或被 pause/stop 取消时返回空串；空稿绝不能标 ready
+    // （AC-5：面板与注意力都会宣称可取用、可移交），本版留在 drafting 等重新整理。
+    if (text.trim().length === 0) {
+      this._raiseAttention({
+        kind: "seat_error",
+        text: "整理未产出正文，本版保持整理中；可重新整理。",
+      });
+      return;
+    }
+    // F2-3：系统起草同样走 CAS——带着本版 revision 写，期间被别人改过就放弃覆盖。
+    const result = modules.deliverables.updateMarkdown(deliverable.id, text, "system", deliverable.revision);
+    if (!result.ok) {
+      console.warn("[TeamManager] wrap-up markdown rejected:", result.currentVersion, result.currentRevision);
+      this._raiseAttention({
+        kind: "seat_error",
+        text: `整理写回冲突（当前 v${result.currentVersion} / revision ${result.currentRevision}）：请基于最新版另开一版。`,
+      });
+      return;
+    }
+    const updated = modules.deliverables.get(deliverable.id);
+    if (updated !== undefined) {
+      this._emit({ type: "deliverable", item: updated });
+      this._announceDeliverableReady(updated);
+    }
+  }
+
+  /** 短命 aux session 起草（无写工具、无 team_bash，计入辅助槽与团队成本）。 */
+  private async _draftWithAuxSession(deliverable: DeliverableVersion): Promise<string> {
+    const modules = this._modules;
+    if (modules === null || this._authStorage === null) {
+      return "";
+    }
+    const sessionDir = join(roundtableSessionsDir(modules.roundtableId), "aux");
+    const sessionManager = SessionManager.create(this._physicalCwd, sessionDir);
     const settingsManager = SettingsManager.create(this._physicalCwd);
-    // WSL mode disables Windows-side stdio MCP (decided by _isWsl, not by
-    // backend existence). HTTP/SSE remain configurable (wsl_plan.md §4.10).
-    const mcpAdapter = new McpAdapter({ allowStdio: this._isWsl ? false : true });
-    const bus = team.bus;
     const resourceLoader = new DefaultResourceLoader({
       cwd: this._physicalCwd,
-      agentDir,
+      agentDir: getAgentDir(),
       settingsManager,
-      extensionFactories: [
-        (pi) => { mcpAdapter.register(pi); },
-        (pi) => { registerWorkerIdentityPrompt(this._teamToolHost(), pi, agentId); },
-        (pi) => { this._registerTeamMessagingTool(pi, agentId); },
-        (pi) => { this._registerTeamTaskTool(pi, agentId); },
-        (pi) => { this._registerTeamProtocolTool(pi, agentId); },
-        createActiveCompressionExtension(() => sessionManager),
-      ],
+      extensionFactories: [createActiveCompressionExtension(() => sessionManager)],
     });
     await resourceLoader.reload();
-    this.logTeamDebug("worker.resource_loader.reloaded", {
-      agentId,
-      deniedTools: ROLE_PERMISSIONS[worker.info.role]?.deniedTools ?? [],
-    });
 
-    // Enforce role-based tool restrictions at the SDK level.
-    // Denied tools are stripped from the session's tool registry so workers
-    // physically cannot call them (no need to rely on request_permission alone).
-    const roleDenied = ROLE_PERMISSIONS[worker.info.role]?.deniedTools ?? [];
-
-    // Workers reuse the leader's backend object identity and runtime cwd
-    // (logical). bootstrap cwd above is physical. When no backend is injected
-    // (Windows) runtimeCwd === physicalCwd and behavior is byte-identical to
-    // the previous single-cwd path (wsl_plan.md §4.1/§4.8). The worker never
-    // disposes the shared backend; only the context owner does.
-    const result = await this._sessionFactory({
+    const session = (await this._sessionFactory({
       cwd: this._physicalCwd,
       runtimeCwd: this._logicalCwd,
       executionBackend: this._executionBackend ?? undefined,
@@ -887,3063 +1196,1808 @@ export class TeamManager {
       resourceLoader,
       authStorage: this._authStorage,
       sessionStartEvent: { type: "session_start", reason: "new" },
-      excludeTools: roleDenied.length > 0 ? roleDenied : undefined,
-    });
+      enableBuiltInEnhancementTools: false,
+      // 整理者：只读四工具，没有写工具、没有 team_bash、没有席位工具。
+      tools: ["read", "grep", "find", "ls"],
+      excludeTools: [...SEAT_DENIED_TOOL_NAMES],
+    })).session;
 
-    // Guard: team may have been stopped while we were creating the session
-    if (!this._team || this._team.status !== "active") {
-      this.logTeamDebug("worker.launch.aborted", { agentId, reason: "team_stopped_during_session_create" });
-      await result.session.dispose({ reason: "quit" }).catch(() => {});
-      await mcpAdapter.dispose().catch(() => {});
+    const jobId = `wrapup:${deliverable.id}`;
+    const abort = (): void => {
+      void session.abort().catch(() => {});
+    };
+    this._aux = { jobId, session, abort };
+    try {
+      await session.prompt(buildWrapUpDigest(modules, deliverable));
+      const text = session.getLastAssistantText() ?? "";
+      this._accumulateAuxUsage(session);
+      return text;
+    } catch (err) {
+      this._accumulateAuxUsage(session);
+      console.warn("[TeamManager] aux wrap-up session failed:", err);
+      return "";
+    } finally {
+      this._aux = null;
+      await session.dispose({ reason: "quit" }).catch(() => {});
+    }
+  }
+
+  /** aux 结束/取消时把用量并入累计（H17：辅助 session 计入团队成本）。 */
+  private _accumulateAuxUsage(session: AgentSession): void {
+    const stats = statsOf(session);
+    this._auxUsage = {
+      tokensIn: this._auxUsage.tokensIn + stats.tokens.input,
+      tokensOut: this._auxUsage.tokensOut + stats.tokens.output,
+      cost: this._auxUsage.cost + stats.cost,
+    };
+  }
+
+  private _abortAux(): void {
+    const aux = this._aux;
+    if (aux !== null) {
+      this._accumulateAuxUsage(aux.session);
+      aux.abort();
+      this._modules?.capacity.releaseAux(aux.jobId);
+      this._aux = null;
+    }
+    this._pendingWrapUps.length = 0;
+  }
+
+  /** aux 槽空出来后继续排队的整理任务。 */
+  private async _drainWrapUpQueue(): Promise<void> {
+    const modules = this._modules;
+    if (modules === null || this._state?.lifecycle !== "active") {
       return;
     }
-
-    const session = result.session;
-    worker.session = session;
-    worker.mcpAdapter = mcpAdapter;
-
-    // Apply a per-worker model override ("provider/modelId" or bare model id).
-    // Unset means the worker inherits the default model from settings.
-    const modelSpec = worker.info.model?.trim();
-    if (modelSpec) {
-      const slash = modelSpec.indexOf("/");
-      const model = slash > 0
-        ? session.modelRegistry.find(modelSpec.slice(0, slash), modelSpec.slice(slash + 1))
-        : session.modelRegistry.getAvailable().find((candidate) => candidate.id === modelSpec);
-      if (model) {
-        await session.setModel(model);
-        this.logTeamDebug("worker.model.applied", { agentId, model: `${model.provider}/${model.id}` });
-      } else {
-        console.warn(`[TeamManager] Worker ${agentId} model "${modelSpec}" not found; using default model`);
-        this.logTeamDebug("worker.model.not_found", { agentId, modelSpec });
-      }
-    }
-
-    // Subscribe to session events and forward as team events.
-    // SDK AgentSessionEvent and local AgentSessionEvent are structurally equivalent
-    // but distinct types due to different AgentMessage definitions.
-    // Validate the event has a 'type' field at runtime so SDK changes don't
-    // silently produce malformed events in the renderer.
-    const unsubscribe = session.subscribe((rawEvent) => {
-      if (rawEvent && typeof rawEvent === "object" && "type" in rawEvent && typeof (rawEvent as Record<string, unknown>).type === "string") {
-        worker.info.lastActiveAt = Date.now();
-        this._emitEvent({
-          type: "teammate_event",
-          teamName: team.name,
-          agentId,
-          event: rawEvent as unknown as LocalAgentSessionEvent,
-        } as TeamEvent);
-      } else {
-        console.warn(`[TeamManager] Worker ${agentId} emitted an unrecognized session event shape, skipping:`, typeof rawEvent);
-        this.logTeamDebug("worker.session_event.invalid", { agentId, rawType: typeof rawEvent });
-      }
-    });
-    worker.unsubscribeEvents = unsubscribe;
-
-    // Create lifecycle abort controller
-    const lifecycleAbortController = new AbortController();
-    worker.lifecycleAbortController = lifecycleAbortController;
-
-    // Create and start the worker runner
-    const runner = new WorkerRunner(
-      agentId,
-      team.name,
-      worker.info.role,
-      session,
-      worker,
-      this,
-      bus,
-      lifecycleAbortController,
-    );
-    worker.runner = runner;
-    this.logTeamDebug("worker.runner.created", {
-      agentId,
-      role: worker.info.role,
-      sessionDir,
-    });
-
-    // Start the execution loop (fire-and-forget). The worker idles until a
-    // task or message arrives; role identity is injected via system prompt.
-    runner.start();
-    this.logTeamDebug("worker.runner.started", {
-      agentId,
-      role: worker.info.role,
-    });
-  }
-
-  /**
-   * Send a message to a specific worker. Backward-compatible API that delegates to the bus.
-   */
-  async sendMessageToWorker(agentId: string, message: string): Promise<void> {
-    this.resumeRuntime("send_message_to_worker");
-    const team = this._team;
-    if (!team) throw new Error("No active team.");
-    if (team.status !== "active") throw new Error("Team is not active.");
-
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-    if (worker.info.status === "shutdown" || worker.info.status === "error") {
-      throw new Error(`Worker ${agentId} is ${worker.info.status}.`);
-    }
-    if (worker.info.status === "dormant" || worker.info.status === "standby") {
-      await this.activateMember(agentId);
-    }
-
-    await this.sendTeamMessage(team.leadAgentId, agentId, message, undefined, "leader_message");
-  }
-
-  /**
-   * Send a rich message through the bus. Supports all directions:
-   * leader-to-worker, worker-to-leader, worker-to-worker, and broadcast.
-   */
-  async sendTeamMessage(
-    fromAgentId: string,
-    toAgentId: string,
-    text: string,
-    summary?: string,
-    kind?: MessageKind,
-  ): Promise<void> {
-    const team = this._team;
-    this._assertRuntimeActive("send_team_message");
-    if (!team) throw new Error("No active team.");
-    this.logTeamDebug("message.send.request", {
-      fromAgentId,
-      toAgentId,
-      kind,
-      summary,
-      text: summarizeText(text),
-    });
-
-    // Resolve fromRole and validate that the sender is either the leader or a known worker.
-    const isLeader = fromAgentId === team.leadAgentId;
-    const senderWorker = team.workers.get(fromAgentId);
-    if (!isLeader && !senderWorker) {
-      throw new Error(`Cannot send message: unknown sender "${fromAgentId}". Must be the leader or a team worker.`);
-    }
-    const fromRole: TeammateRole | "leader" = isLeader ? "leader" : senderWorker!.info.role;
-
-    // Default kind based on direction
-    const resolvedKind: MessageKind = kind ?? (
-      toAgentId === "*" ? "broadcast" :
-      fromAgentId === team.leadAgentId ? "leader_message" :
-      "peer_message"
-    );
-
-    if (toAgentId === fromAgentId) {
-      this.logTeamDebug("message.self_ignored", {
-        fromAgentId,
-        toAgentId,
-        kind: resolvedKind,
-        summary,
-      });
+    const next = this._pendingWrapUps.shift();
+    if (next === undefined) {
       return;
     }
-
-    if (toAgentId !== "*" && toAgentId !== team.leadAgentId) {
-      const targetWorker = team.workers.get(toAgentId);
-      if (!targetWorker) {
-        throw new Error(`Cannot send message: unknown recipient "${toAgentId}".`);
-      }
-      if (targetWorker.info.status === "shutdown" || targetWorker.info.status === "error") {
-        throw new Error(`Cannot send message: recipient "${toAgentId}" is ${targetWorker.info.status}.`);
-      }
-      if (targetWorker.info.status === "dormant" || targetWorker.info.status === "standby") {
-        await this.activateMember(toAgentId);
-      }
-    }
-
-    const msg: TeamMessage = {
-      id: randomUUID(),
-      teamName: team.name,
-      fromAgentId,
-      toAgentId,
-      text,
-      timestamp: Date.now(),
-      read: false,
-      delivered: false,
-      summary: summary ?? text.slice(0, 80),
-      kind: resolvedKind,
-      fromRole,
-    };
-
-    // The Leader has no WorkerRunner mailbox. Keep worker-to-Leader messages
-    // in the timeline for history/UI, but only enqueue messages that a worker
-    // can actually consume.
-    if (toAgentId === team.leadAgentId) {
-      team.bus.recordHistoryOnly(msg);
-    } else {
-      team.bus.send(msg);
-    }
-    this.logTeamDebug("message.bus.sent", {
-      message: summarizeTeamMessage(msg),
-      busSize: team.bus.size(),
-    });
-
-    // Emit bus message event (for renderer timeline)
-    this._emitEvent({ type: "team_message", teamName: team.name, message: msg });
-
-    if (!isLeader) {
-      if (toAgentId === team.leadAgentId) {
-        // Direct worker-to-leader message. Surface it to the renderer, then
-        // deliver it to the leader LLM exactly once: steer it into an active
-        // leader turn for mid-turn visibility, or — when the leader is idle —
-        // wake it with an orchestration turn that already carries the text.
-        // Doing both would duplicate the content in the leader's context.
-        const workerName = parseAgentId(fromAgentId)?.agentName ?? fromAgentId;
-        const summaryText = [
-          `<teammate-message from="${workerName}" role="${fromRole}">`,
-          text,
-          `</teammate-message>`,
-        ].join("\n");
-
-        this._emitEvent({
-          type: "worker_summary",
-          teamName: team.name,
-          fromAgentId,
-          summary: summaryText,
-        });
-
-        // This turn delivered content to the leader; record it so the
-        // turn-outcome handler does not emit a duplicate orphan-turn wake.
-        senderWorker!.sentLeaderMessageThisTurn = true;
-        // Only steer into a live stream. `_leaderTurnActive` can stay true after
-        // the turn has stopped streaming (agent_end not yet observed); persist-
-        // steering in that window writes a stale notification that abort cannot
-        // clear. Queue a wake instead so the message is delivered as a turn.
-        if (this._leaderSession?.isStreaming) {
-          this._steerLeaderWithRetry(summaryText, msg);
-        } else {
-          this._wakeLeaderForMessage(msg);
-        }
-      } else if (this._shouldWakeLeaderForMessage(msg)) {
-        // Broadcasts and coordination-relevant peer traffic wake the leader.
-        senderWorker!.sentLeaderMessageThisTurn = true;
-        this._wakeLeaderForMessage(msg);
-      }
-    }
-  }
-
-  /**
-   * Inject text into the Leader session with bounded retries. Fire-and-forget so
-   * it never blocks the worker's tool call. Re-reads _leaderSession each attempt
-   * so it stops cleanly if the team is torn down mid-retry. If every attempt
-   * fails and a source message is provided, fall back to the orchestration wake
-   * so the leader still learns about the report.
-   */
-  private _steerLeaderWithRetry(
-    text: string,
-    sourceMessage?: TeamMessage,
-    attempt = 0,
-    runtimeEpoch = this._runtimeEpoch,
-  ): void {
-    if (!this.isRuntimeEpochCurrent(runtimeEpoch)) {
-      // The runtime epoch changed (typically an abort) while this steer was in
-      // flight or queued for retry. The leader wake path is a no-op while the
-      // runtime is paused, so silently returning here would lose the
-      // worker->leader message forever. Defer it for re-delivery on resume.
-      if (sourceMessage) {
-        this._deferLeaderMessage(sourceMessage);
-      }
-      this.logTeamDebug("leader.steer.skipped_stale", {
-        attempt,
-        runtimeEpoch,
-        currentRuntimeEpoch: this._runtimeEpoch,
-        sourceMessageId: sourceMessage?.id,
-        deferred: Boolean(sourceMessage),
-      });
+    const jobId = `wrapup:${next.deliverableId}`;
+    if (!modules.capacity.acquireAux(jobId)) {
+      this._pendingWrapUps.unshift(next);
       return;
     }
-    const session = this._leaderSession;
-    if (!session) {
-      if (sourceMessage) this._wakeLeaderForMessage(sourceMessage);
-      return;
-    }
-    const internalContent = sourceMessage
-      ? this._formatTeamMessageNotification(sourceMessage, text)
-      : text;
-    const delivery = session.sendCustomMessage
-      ? session.sendCustomMessage(
-        {
-          customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TEAM_NOTIFICATION,
-          content: internalContent,
-          display: false,
-          context: "internal",
-        },
-        { deliverAs: "steer" },
-      )
-      : session.steer(text);
-    void delivery.catch((err) => {
-      const maxAttempts = 3;
-      if (attempt + 1 >= maxAttempts) {
-        console.warn("[TeamManager] Failed to steer worker summary into leader after retries:", err);
-        this.logTeamDebug("leader.steer.failed", { attempt: attempt + 1, error: err });
-        if (sourceMessage) this._wakeLeaderForMessage(sourceMessage);
-        return;
+    try {
+      const deliverable = modules.deliverables.get(next.deliverableId) ?? null;
+      if (deliverable !== null) {
+        await this._runWrapUp(deliverable, next.author);
       }
-      const delayMs = 500 * 2 ** attempt;
-      const timer = setTimeout(() => {
-        this._steerRetryTimers.delete(timer);
-        this._steerLeaderWithRetry(text, sourceMessage, attempt + 1, runtimeEpoch);
-      }, delayMs);
-      this._steerRetryTimers.add(timer);
-    });
-  }
-
-  private _formatTeamMessageNotification(message: TeamMessage, fallbackText: string): string {
-    const team = this._team;
-    const worker = team?.workers.get(message.fromAgentId);
-    const workerName = worker?.info.name ?? parseAgentId(message.fromAgentId)?.agentName ?? message.fromAgentId;
-    const actionable = new Set<MessageKind>([
-      "question",
-      "proposal",
-      "objection",
-      "review_request",
-      "fix_request",
-      "blocked",
-    ]);
-    return formatInternalNotification({
-      notificationId: `team-message:${message.id}`,
-      source: "team",
-      kind: message.kind,
-      agentName: workerName,
-      status: "received",
-      requiresAction: actionable.has(message.kind),
-      result: message.text || fallbackText,
-    });
-  }
-
-  /**
-   * Broadcast a message to all workers in the team.
-   */
-  async broadcastTeamMessage(
-    fromAgentId: string,
-    text: string,
-    summary?: string,
-    kind?: MessageKind,
-  ): Promise<void> {
-    await this.sendTeamMessage(fromAgentId, "*", text, summary, kind ?? "broadcast");
-  }
-
-  // ==========================================================================
-  // Task Management
-  // ==========================================================================
-
-  /**
-   * Create a new task in the team's shared task list.
-   * If assignTo is provided, the task is immediately assigned to that agent.
-   */
-  createTask(
-    subject: string,
-    description: string,
-    assignTo?: string,
-    blockedBy?: string[],
-    taskType?: TeamTaskType,
-    metadata?: Record<string, unknown>,
-  ): TeamTask {
-    const team = this._team;
-    this._assertRuntimeActive("create_task");
-    if (!team) throw new Error("No active team.");
-    this.logTeamDebug("task.create.request", {
-      subject,
-      assignTo,
-      blockedBy,
-      taskType,
-      metadata,
-      description: summarizeText(description),
-    });
-
-    // Resolve blockedBy references. Leader-facing prompts abbreviate task IDs
-    // to 8 characters, so accept full IDs or unique prefixes.
-    const resolvedBlockedBy: string[] = [];
-    for (const depId of blockedBy ?? []) {
-      const resolved = team.taskList.resolveTaskId(depId);
-      if (!resolved) {
-        throw new Error(`Dependency task ${depId} not found.`);
-      }
-      resolvedBlockedBy.push(resolved);
-    }
-
-    // Tasks always start as pending. Status transitions:
-    //   pending -> assigned (via assignTask) -> in_progress (worker claims) -> completed
-    const task = team.taskList.create({
-      id: randomUUID(),
-      teamName: team.name,
-      subject,
-      description,
-      taskType,
-      status: "pending",
-      blockedBy: resolvedBlockedBy,
-      blocks: [],
-      metadata,
-      gateState: this._createInitialGateState(taskType, metadata),
-    });
-
-    // Register this task as a downstream dependent in each blocking task's blocks array
-    for (const depId of resolvedBlockedBy) {
-      const dep = team.taskList.get(depId);
-      if (dep) {
-        team.taskList.update(depId, { blocks: [...dep.blocks, task.id] });
-      }
-    }
-
-    this._refreshFileConflicts();
-    const createdTask = team.taskList.get(task.id) ?? task;
-    this.logTeamDebug("task.created", { task: summarizeTeamTask(createdTask) });
-    this._emitEvent({ type: "task_created", teamName: team.name, task: createdTask });
-    this._emitTeamStateChanged();
-
-    if (!assignTo && taskType) {
-      assignTo = this._selectWorkerForTaskType(taskType)?.info.agentId;
-    }
-
-    // If assigned to a specific worker, use assignTask to transition to "assigned"
-    // and send the wake message.
-    if (assignTo) {
-      try {
-        const assigned = this.assignTask(task.id, assignTo);
-        if (assigned) {
-          return assigned;
-        }
-      } catch (err) {
-        console.warn(`[TeamManager] Task created but assignment to ${assignTo} failed:`, err);
-      }
-    }
-
-    return createdTask;
-  }
-
-  /**
-   * Get all tasks, optionally filtered by status.
-   */
-  getTasks(status?: TeamTaskStatus): TeamTask[] {
-    const team = this._team;
-    if (!team) return [];
-    return team.taskList.getAll(status);
-  }
-
-  /**
-   * Update a task's status, result, or owner.
-   */
-  updateTask(taskId: string, changes: {
-    status?: TeamTaskStatus;
-    result?: string;
-    evidence?: TeamTaskEvidence;
-    contextPack?: TeamTaskContextPack;
-    handoff?: TeamTaskHandoffPacket;
-    gateState?: TeamTaskGateState;
-    fileConflicts?: TeamTaskFileConflict[];
-    ownerAgentId?: string;
-  }): TeamTask {
-    const team = this._team;
-    this._assertRuntimeActive("update_task");
-    if (!team) throw new Error("No active team.");
-
-    taskId = team.taskList.resolveTaskId(taskId) ?? taskId;
-    const current = team.taskList.get(taskId);
-    if (!current) throw new Error(`Task ${taskId} not found.`);
-    this.logTeamDebug("task.update.request", {
-      taskId,
-      before: summarizeTeamTask(current),
-      changes,
-    });
-    if (changes.status && !canTransitionTeamTaskStatus(current.status, changes.status)) {
-      throw new Error(`Invalid task status transition: ${current.status} -> ${changes.status}.`);
-    }
-
-    const updated = team.taskList.update(taskId, changes);
-    if (!updated) throw new Error(`Task ${taskId} not found.`);
-    this._refreshFileConflicts();
-    const finalTask = team.taskList.get(taskId) ?? updated;
-    this.logTeamDebug("task.updated", { task: summarizeTeamTask(finalTask) });
-
-    this._emitEvent({ type: "task_updated", teamName: team.name, task: finalTask });
-    this._emitTeamStateChanged();
-
-    if (changes.status === "completed") {
-      this._wakeTasksUnblockedBy(finalTask.id);
-    }
-
-    return finalTask;
-  }
-
-  /**
-   * Delete a task from the team's task list.
-   */
-  deleteTask(taskId: string): void {
-    const team = this._team;
-    this._assertRuntimeActive("delete_task");
-    if (!team) throw new Error("No active team.");
-
-    taskId = team.taskList.resolveTaskId(taskId) ?? taskId;
-    team.taskList.delete(taskId);
-    this._refreshFileConflicts();
-    this.logTeamDebug("task.deleted", { taskId });
-    this._emitEvent({ type: "task_deleted", teamName: team.name, taskId });
-    this._emitTeamStateChanged();
-
-  }
-
-  /**
-   * Assign a specific task to a specific worker (Leader tool).
-   * Only works for pending, unassigned tasks.
-   */
-  assignTask(taskId: string, agentId: string): TeamTask | null {
-    const team = this._team;
-    this._assertRuntimeActive("assign_task");
-    if (!team) throw new Error("No active team.");
-    this.logTeamDebug("task.assign.request", { taskId, agentId });
-
-    // Verify agent exists
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-    if (worker.info.status === "shutdown" || worker.info.status === "error") {
-      throw new Error(`Worker ${agentId} is ${worker.info.status}.`);
-    }
-
-    taskId = team.taskList.resolveTaskId(taskId) ?? taskId;
-    const task = team.taskList.get(taskId);
-    if (!task) throw new Error(`Task ${taskId} not found.`);
-    if (task.status !== "pending") throw new Error(`Task ${taskId} is not pending (current: ${task.status}).`);
-    if (task.ownerAgentId) throw new Error(`Task ${taskId} already assigned to ${task.ownerAgentId}.`);
-
-    // Check role capability if taskType is set
-    if (task.taskType && worker.info.role) {
-      const capabilities = ROLE_TASK_CAPABILITIES[worker.info.role];
-      if (!capabilities.includes(task.taskType)) {
-        throw new Error(
-          `Role "${worker.info.role}" cannot handle task type "${task.taskType}". ` +
-          `Capabilities: ${capabilities.join(", ")}`,
-        );
-      }
-    }
-
-    const openDependencies = team.taskList.getOpenDependencies(taskId);
-
-    // Set owner and transition to "assigned". The worker will transition
-    // to "in_progress" when it actually claims and starts executing the task.
-    const updated = team.taskList.update(taskId, {
-      ownerAgentId: agentId,
-      status: "assigned",
-    });
-    if (!updated) return null;
-    this._refreshFileConflicts();
-    const assignedTask = team.taskList.get(taskId) ?? updated;
-    this.logTeamDebug("task.assigned", {
-      task: summarizeTeamTask(assignedTask),
-      agentId,
-    });
-
-    this._emitEvent({ type: "task_updated", teamName: team.name, task: assignedTask });
-    this._emitTeamStateChanged();
-
-    if (openDependencies.length > 0) {
-      this.logTeamDebug("task.assigned.waiting_for_dependencies", {
-        task: summarizeTeamTask(assignedTask),
-        agentId,
-        openDependencies,
-      });
-      return assignedTask;
-    }
-
-    this._wakeAssignedTask(assignedTask, agentId, "assigned_ready");
-
-    return assignedTask;
-  }
-
-  private _wakeTasksUnblockedBy(completedTaskId: string): void {
-    const team = this._team;
-    if (!team || team.status !== "active") return;
-
-    for (const task of team.taskList.getAll("assigned")) {
-      if (!task.ownerAgentId || !task.blockedBy.includes(completedTaskId)) continue;
-      const openDependencies = team.taskList.getOpenDependencies(task.id);
-      if (openDependencies.length > 0) continue;
-      this._wakeAssignedTask(task, task.ownerAgentId, "dependencies_completed");
+    } finally {
+      modules.capacity.releaseAux(jobId);
+      void this._drainWrapUpQueue();
     }
   }
 
-  private _wakeAssignedTask(task: TeamTask, agentId: string, reason: string): void {
-    const team = this._team;
-    if (!team || team.status !== "active") return;
-
-    const worker = team.workers.get(agentId);
-    if (!worker) return;
-    if (worker.info.status === "shutdown" || worker.info.status === "error") {
-      this.logTeamDebug("task.assign.wake_skipped", {
-        task: summarizeTeamTask(task),
-        agentId,
-        reason: "worker_unavailable",
-        workerStatus: worker.info.status,
-      });
-      return;
+  reviseDeliverable(
+    id: string,
+    markdown: string,
+    actor: string,
+    expectedRevision?: number,
+  ): { ok: true } | { ok: false; conflict: true; currentVersion: number; currentRevision: number } {
+    const modules = this._modules;
+    if (modules === null) {
+      return { ok: false, conflict: true, currentVersion: 0, currentRevision: 0 };
     }
-
-    if (worker.info.status === "dormant" || worker.info.status === "standby") {
-      void this.activateMember(agentId).catch((err) => {
-        console.error(`[TeamManager] Failed to activate ${agentId} for assigned task ${task.id}:`, err);
-        this.updateWorkerStatus(agentId, "error", String(err));
-      });
-    }
-
-    const wakeMsg: TeamMessage = {
-      id: randomUUID(),
-      teamName: team.name,
-      fromAgentId: team.leadAgentId,
-      toAgentId: agentId,
-      text: this._formatTaskPrompt(task),
-      timestamp: Date.now(),
-      read: false,
-      delivered: false,
-      summary: `Task assigned: ${task.subject}`,
-      kind: "task_message",
-      fromRole: "leader",
-    };
-    team.bus.send(wakeMsg);
-    this.logTeamDebug("task.assign.wake_message_sent", {
-      reason,
-      message: summarizeTeamMessage(wakeMsg),
-      busSize: team.bus.size(),
-    });
-    this._emitEvent({ type: "team_message", teamName: team.name, message: wakeMsg });
-  }
-
-  /**
-   * Attempt to claim the next available task for the given agent.
-   * Returns the claimed task (with formatted prompt) or null.
-   * This is called by workers during their idle loop.
-   *
-   * Role-based filtering: if a task has a taskType, only workers whose
-   * ROLE_TASK_CAPABILITIES include that type can claim it. Tasks without
-   * a taskType are claimable by any role (backward compat).
-   */
-  tryClaimNextTask(agentId: string): { task: TeamTask; prompt: string } | null {
-    const team = this._team;
-    if (!team || team.status !== "active" || !this.isRuntimeActive()) return null;
-
-    // Get worker role for capability check
-    const worker = team.workers.get(agentId);
-
-    const task = team.taskList.tryClaimNextTask(agentId, worker?.info.role);
-    if (!task) {
-      return null;
-    }
-
-    const contextPack = this._buildTaskContextPack(task);
-    const claimGateState = this._updateGateStatus(task, "active", "Task claimed by worker.");
-    const enrichedTask = team.taskList.update(task.id, {
-      contextPack,
-      gateState: claimGateState,
-    }) ?? { ...task, contextPack, gateState: claimGateState };
-    this._refreshFileConflicts();
-    const finalTask = team.taskList.get(task.id) ?? enrichedTask;
-    this.logTeamDebug("task.claimed", {
-      agentId,
-      role: worker?.info.role,
-      task: summarizeTeamTask(finalTask),
-    });
-
-    // Emit task_updated event (status changed to in_progress)
-    this._emitEvent({ type: "task_updated", teamName: team.name, task: finalTask });
-    this._emitTeamStateChanged();
-
-    const prompt = this._formatTaskPrompt(finalTask);
-
-    return { task: finalTask, prompt };
-  }
-
-  /**
-   * Claim a specific task by ID for the given agent.
-   * Returns the claimed task (with formatted prompt) or null if not claimable.
-   */
-  claimTask(taskId: string, agentId: string): { task: TeamTask; prompt: string } | null {
-    const team = this._team;
-    if (!team || team.status !== "active" || !this.isRuntimeActive()) return null;
-
-    const task = team.taskList.claimTask(taskId, agentId);
-    if (!task) {
-      this.logTeamDebug("task.claim_specific.none", { taskId, agentId });
-      return null;
-    }
-
-    const contextPack = this._buildTaskContextPack(task);
-    const claimGateState = this._updateGateStatus(task, "active", "Task claimed by worker.");
-    const enrichedTask = team.taskList.update(task.id, {
-      contextPack,
-      gateState: claimGateState,
-    }) ?? { ...task, contextPack, gateState: claimGateState };
-    this._refreshFileConflicts();
-    const finalTask = team.taskList.get(task.id) ?? enrichedTask;
-    this.logTeamDebug("task.claim_specific", {
-      agentId,
-      task: summarizeTeamTask(finalTask),
-    });
-
-    // Emit both task_updated and team_state_changed so the renderer
-    // sees the status transition from pending to in_progress.
-    this._emitEvent({ type: "task_updated", teamName: team.name, task: finalTask });
-    this._emitTeamStateChanged();
-
-    const prompt = this._formatTaskPrompt(finalTask);
-
-    return { task: finalTask, prompt };
-  }
-
-  private _formatTaskPrompt(task: TeamTask): string {
-    const contextPack = task.contextPack ? this._formatTaskContextPack(task.contextPack) : "";
-    return [
-      `You have been assigned a new task (Task #${task.id.slice(0, 8)}):`,
-      "",
-      `**${task.subject}**`,
-      "",
-      task.description,
-      ...(contextPack ? ["", contextPack] : []),
-      "",
-      "Complete this task as your current unit of work.",
-      "If you need a decision, find a risk, or need another role, use send_team_message with kind question, objection, review_request, fix_request, blocked, handoff, or proposal.",
-      "When you finish successfully, call mark_task_complete as your final action. Include a concise result plus structured evidence:",
-      "- changedFiles: files or important paths you changed",
-      "- completedScope: assigned scope items you believe are complete",
-      "- missingScope: scope items not completed, uncertain, or intentionally deferred",
-      "- verification: tests, commands, builds, or manual checks performed",
-      "- risks: known risks, assumptions, fragile areas, or gaps",
-      "- followUps: suggested next work, if any",
-      "- confidence: low, medium, or high",
-      "Be honest about missingScope and risks; the reviewer will compare your evidence with the repository state.",
-      "If you are blocked or cannot complete it, call update_task_status with status \"blocked\" or \"failed\" and explain why.",
-      "Do not just stop after writing a normal assistant response; the team workflow only advances when the task status is updated.",
-    ].join("\n");
-  }
-
-  private _buildTaskContextPack(task: TeamTask): TeamTaskContextPack {
-    const team = this._team;
-    const dependencyEvidence = (team ? task.blockedBy.map((depId) => team.taskList.get(depId)).filter((dep): dep is TeamTask => Boolean(dep)) : [])
-      .map((dep) => ({
-        taskId: dep.id,
-        subject: dep.subject,
-        result: dep.result,
-        evidence: dep.evidence,
-      }));
-
-    const parentTaskId = typeof task.metadata?.parentTaskId === "string" ? task.metadata.parentTaskId : undefined;
-    const parentTask = parentTaskId && team ? team.taskList.get(parentTaskId) : undefined;
-    const relatedTasks = team?.taskList.getAll().filter((candidate) =>
-      candidate.id !== task.id &&
-      (candidate.status === "completed" || candidate.status === "failed" || candidate.status === "blocked"),
-    ) ?? [];
-
-    const relevantRisks = mergeEvidenceItems(
-      dependencyEvidence.flatMap((dep) => dep.evidence?.risks ?? []),
-      [
-        ...(parentTask?.evidence?.risks ?? []),
-        ...relatedTasks.flatMap((candidate) => candidate.evidence?.risks ?? []),
-      ],
-    ).slice(0, 12);
-    const touchedFiles = mergeEvidenceItems(
-      dependencyEvidence.flatMap((dep) => dep.evidence?.changedFiles ?? []),
-      [
-        ...(parentTask?.evidence?.changedFiles ?? []),
-        ...relatedTasks.flatMap((candidate) => candidate.evidence?.changedFiles ?? []),
-      ],
-    ).slice(0, 30);
-    const openQuestions = mergeEvidenceItems(
-      dependencyEvidence.flatMap((dep) => dep.evidence?.followUps ?? []),
-      [
-        ...(parentTask?.evidence?.followUps ?? []),
-        ...relatedTasks.flatMap((candidate) => candidate.evidence?.followUps ?? []),
-      ],
-    ).slice(0, 12);
-
-    return {
-      taskId: task.id,
-      generatedAt: Date.now(),
-      objective: task.subject,
-      assignedScope: task.description,
-      dependencyEvidence,
-      parentEvidence: parentTask ? {
-        taskId: parentTask.id,
-        subject: parentTask.subject,
-        result: parentTask.result,
-        evidence: parentTask.evidence,
-      } : undefined,
-      relevantRisks,
-      touchedFiles,
-      openQuestions,
-      coordinationHints: this._buildTaskCoordinationHints(task),
-    };
-  }
-
-  private _buildTaskCoordinationHints(task: TeamTask): string[] {
-    switch (task.taskType) {
-      case "implement":
-      case "fix":
-        return [
-          "Treat the assigned scope as the acceptance contract; do not claim completion for unimplemented modules.",
-          "Expect a separate reviewer to compare your evidence with the repository state.",
-          "Report missingScope and risks explicitly when anything is incomplete or uncertain.",
-        ];
-      case "review":
-      case "audit":
-        return [
-          "Audit completeness before style: compare assigned scope, worker evidence, and actual repository files.",
-          "Look for promised files or modules that were not created, unwired entry points, placeholders, and skipped verification.",
-          "State pass/fail clearly so the coordinator can decide whether to create a fix task.",
-        ];
-      case "test":
-        return [
-          "Prefer executable verification when possible and report exact commands and outcomes.",
-          "If tests cannot run, explain the blocker and what evidence is still missing.",
-        ];
-      case "plan":
-      case "research":
-        return [
-          "Produce decision-ready findings that other workers can act on without rereading the whole codebase.",
-          "Call out unknowns, risks, and dependencies that should block implementation.",
-        ];
-      case "summarize":
-        return [
-          "Summarize accepted work, unresolved risks, and user-facing next steps.",
-        ];
-      default:
-        return [
-          "Keep the task boundary explicit and report uncertainty instead of assuming completion.",
-        ];
-    }
-  }
-
-  private _formatTaskContextPack(contextPack: TeamTaskContextPack): string {
-    const lines = [
-      "<task-context-pack>",
-      `Objective: ${contextPack.objective}`,
-      "",
-      "Assigned scope:",
-      contextPack.assignedScope,
-    ];
-
-    if (contextPack.parentEvidence) {
-      lines.push(
-        "",
-        `Parent task: ${contextPack.parentEvidence.subject} (${contextPack.parentEvidence.taskId.slice(0, 8)})`,
-        this._formatEvidenceBlock(contextPack.parentEvidence.evidence, contextPack.parentEvidence.result),
-      );
-    }
-
-    if (contextPack.dependencyEvidence.length > 0) {
-      lines.push("", "Dependency evidence:");
-      for (const dep of contextPack.dependencyEvidence) {
-        lines.push(`- ${dep.subject} (${dep.taskId.slice(0, 8)}): ${dep.evidence?.summary ?? dep.result ?? "No result reported."}`);
-      }
-    }
-
-    lines.push(
-      "",
-      "Touched files from related work:",
-      ...(contextPack.touchedFiles.length ? contextPack.touchedFiles.map((file) => `- ${file}`) : ["- (none reported)"]),
-      "Known risks:",
-      ...(contextPack.relevantRisks.length ? contextPack.relevantRisks.map((risk) => `- ${risk}`) : ["- (none reported)"]),
-      "Open questions / follow-ups:",
-      ...(contextPack.openQuestions.length ? contextPack.openQuestions.map((question) => `- ${question}`) : ["- (none reported)"]),
-      "Coordination hints:",
-      ...(contextPack.coordinationHints?.length ? contextPack.coordinationHints.map((hint) => `- ${hint}`) : ["- (none)"]),
-      "</task-context-pack>",
-    );
-
-    return lines.join("\n");
-  }
-
-  private _formatEvidenceBlock(evidence?: TeamTaskEvidence, result?: string): string {
-    if (!evidence) return result ?? "No evidence reported.";
-    return [
-      `Summary: ${evidence.summary}`,
-      `Changed files: ${evidence.changedFiles.length ? evidence.changedFiles.join(", ") : "(none reported)"}`,
-      `Missing scope: ${evidence.missingScope.length ? evidence.missingScope.join("; ") : "(none reported)"}`,
-      `Verification: ${evidence.verification.length ? evidence.verification.join("; ") : "(none reported)"}`,
-      `Risks: ${evidence.risks.length ? evidence.risks.join("; ") : "(none reported)"}`,
-    ].join("\n");
-  }
-
-  private _createInitialGateState(taskType?: TeamTaskType, metadata?: Record<string, unknown>): TeamTaskGateState {
-    const gateFromMetadata = metadata?.gate;
-    const gate = gateFromMetadata === "review" ? "review" :
-      gateFromMetadata === "fix" ? "fix" :
-      taskType === "review" || taskType === "audit" ? "review" :
-      taskType === "fix" ? "fix" :
-      taskType === "test" ? "verification" :
-      taskType === "implement" ? "implementation" :
-      taskType === "summarize" ? "summary" :
-      "none";
-    return {
-      gate,
-      status: "waiting",
-      parentTaskId: typeof metadata?.parentTaskId === "string" ? metadata.parentTaskId : undefined,
-      updatedAt: Date.now(),
-    };
-  }
-
-  private _updateGateStatus(task: TeamTask, status: TeamTaskGateState["status"], reason?: string): TeamTaskGateState {
-    return {
-      ...(task.gateState ?? this._createInitialGateState(task.taskType, task.metadata)),
-      status,
-      reason,
-      updatedAt: Date.now(),
-    };
-  }
-
-  private _completionGateState(task: TeamTask, result: string): TeamTaskGateState {
-    const signal = classifyTeamResult(result);
-    const status: TeamTaskGateState["status"] =
-      task.taskType === "review" || task.taskType === "test" || task.taskType === "audit"
-        ? (signal === "issues" ? "issues" : "passed")
-        : "passed";
-    return this._updateGateStatus(task, status, status === "issues" ? "Completion result reported issues." : "Task completed.");
-  }
-
-  private _createTaskHandoff(
-    task: TeamTask,
-    workerAgentId: string,
-    result: string,
-    evidence: TeamTaskEvidence,
-  ): TeamTaskHandoffPacket {
-    return {
-      taskId: task.id,
-      createdAt: Date.now(),
-      workerAgentId,
-      summary: evidence.summary || result,
-      evidence,
-      contextPack: task.contextPack,
-    };
-  }
-
-  private _refreshFileConflicts(): void {
-    const team = this._team;
-    if (!team) return;
-
-    const tasks = team.taskList.getAll().map((task) => ({ ...task, fileConflicts: [] as TeamTaskFileConflict[] }));
-    const openStatuses = new Set<TeamTaskStatus>(["assigned", "in_progress"]);
-    const fileMap = new Map<string, string[]>();
-
-    for (const task of tasks) {
-      if (!openStatuses.has(task.status)) continue;
-      for (const file of this._taskTouchedFiles(task)) {
-        const normalized = this._normalizeTaskFile(file);
-        if (!normalized) continue;
-        const owners = fileMap.get(normalized) ?? [];
-        owners.push(task.id);
-        fileMap.set(normalized, owners);
-      }
-    }
-
-    const byId = new Map(tasks.map((task) => [task.id, task]));
-    for (const [file, taskIds] of fileMap) {
-      if (taskIds.length < 2) continue;
-      for (const taskId of taskIds) {
-        const task = byId.get(taskId);
-        if (!task) continue;
-        for (const otherId of taskIds) {
-          if (otherId === taskId) continue;
-          const other = byId.get(otherId);
-          if (!other) continue;
-          const existing = task.fileConflicts?.find((conflict) => conflict.withTaskId === otherId);
-          if (existing) {
-            if (!existing.files.includes(file)) existing.files.push(file);
-          } else {
-            task.fileConflicts = [
-              ...(task.fileConflicts ?? []),
-              {
-                withTaskId: otherId,
-                withSubject: other.subject,
-                files: [file],
-                severity: "warning",
-                reason: "Concurrent open tasks reference the same touched file.",
-              },
-            ];
-          }
-        }
-      }
-    }
-
-    team.taskList.setFileConflicts(new Map(tasks.map((task) => [task.id, task.fileConflicts ?? []])));
-  }
-
-  private _taskTouchedFiles(task: TeamTask): string[] {
-    const metadataFiles = Array.isArray(task.metadata?.touchedFiles)
-      ? task.metadata.touchedFiles.filter((file): file is string => typeof file === "string")
-      : [];
-    return mergeEvidenceItems(
-      [
-        ...(task.evidence?.changedFiles ?? []),
-        ...(task.handoff?.evidence.changedFiles ?? []),
-        ...(task.contextPack?.touchedFiles ?? []),
-      ],
-      metadataFiles,
-    );
-  }
-
-  private _normalizeTaskFile(file: string): string {
-    const trimmed = file.trim();
-    if (!trimmed || trimmed.startsWith("(")) return "";
-    return trimmed.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
-  }
-
-  private _selectWorkerForTaskType(taskType: TeamTaskType): WorkerState | null {
-    const team = this._team;
-    if (!team) return null;
-
-    const candidates = Array.from(team.workers.values()).filter((worker) => {
-      if (worker.info.status === "shutdown" || worker.info.status === "error") return false;
-      return ROLE_TASK_CAPABILITIES[worker.info.role]?.includes(taskType) ?? false;
-    });
-    return this._selectBestWorker(candidates);
-  }
-
-  private _selectWorkerForRole(role: TeammateRole): WorkerState | null {
-    const team = this._team;
-    if (!team) return null;
-
-    const candidates = Array.from(team.workers.values()).filter((worker) => {
-      if (worker.info.status === "shutdown" || worker.info.status === "error") return false;
-      return worker.info.role === role;
-    });
-    return this._selectBestWorker(candidates);
-  }
-
-  private _selectBestWorker(candidates: WorkerState[]): WorkerState | null {
-    if (candidates.length === 0) return null;
-
-    const statusRank: Record<TeammateStatus, number> = {
-      idle: 0,
-      standby: 1,
-      dormant: 2,
-      running: 3,
-      shutdown: 4,
-      error: 5,
-    };
-    candidates.sort((a, b) => {
-      const rank = statusRank[a.info.status] - statusRank[b.info.status];
-      if (rank !== 0) return rank;
-      return (a.info.lastActiveAt ?? 0) - (b.info.lastActiveAt ?? 0);
-    });
-    return candidates[0] ?? null;
-  }
-
-  // ==========================================================================
-  // Protocol: Shutdown Negotiation
-  // ==========================================================================
-
-  /**
-   * Request graceful shutdown for a specific worker (or all workers if no agentId).
-   * Sends a shutdown message via the bus and waits for the worker to confirm.
-   * Returns a promise that resolves to true if confirmed, false if rejected/timeout.
-   */
-  async requestShutdown(agentId?: string): Promise<{ agentId: string; confirmed: boolean }[]> {
-    const team = this._team;
-    this._assertRuntimeActive("request_shutdown");
-    if (!team) throw new Error("No active team.");
-    this.logTeamDebug("protocol.shutdown.request", { agentId });
-
-    const targetIds = agentId
-      ? [agentId]
-      : Array.from(team.workers.keys()).filter((id) => {
-          const w = team.workers.get(id);
-          return w && w.info.status !== "shutdown" && w.info.status !== "error";
-        });
-
-    const results: { agentId: string; confirmed: boolean }[] = [];
-
-    for (const targetId of targetIds) {
-      const worker = team.workers.get(targetId);
-      if (!worker || worker.info.status === "shutdown" || worker.info.status === "error") {
-        results.push({ agentId: targetId, confirmed: false });
-        continue;
-      }
-      if (worker.info.status === "dormant" || worker.info.status === "standby") {
-        await this.stopWorker(targetId);
-        results.push({ agentId: targetId, confirmed: true });
-        this._emitEvent({
-          type: "protocol_shutdown_response",
-          teamName: team.name,
-          agentId: targetId,
-          confirmed: true,
-          reason: "No active session",
-        });
-        continue;
-      }
-
-      // Create protocol request
-      const { request, promise } = team.protocolManager.requestShutdown(targetId);
-      this.logTeamDebug("protocol.shutdown.pending", { targetId, request });
-
-      // Emit protocol event for UI
-      this._emitEvent({
-        type: "protocol_shutdown_request",
-        teamName: team.name,
-        agentId: targetId,
-      });
-
-      // Send shutdown message via bus
-      const shutdownMsg: TeamMessage = {
-        id: randomUUID(),
-        teamName: team.name,
-        fromAgentId: team.leadAgentId,
-        toAgentId: targetId,
-        text: "Graceful shutdown requested. Please finish your current work and confirm shutdown.",
-        timestamp: Date.now(),
-        read: false,
-        delivered: false,
-        summary: "Shutdown requested",
-        kind: "shutdown",
-        fromRole: "leader",
+    const current = modules.deliverables.get(id);
+    const wasDrafting = current?.status === "drafting";
+    if (current !== undefined && current.status === "drafting" && actor !== current.author && actor !== "system") {
+      return {
+        ok: false,
+        conflict: true,
+        currentVersion: current.version,
+        currentRevision: current.revision,
       };
-      team.bus.send(shutdownMsg);
-      this.logTeamDebug("protocol.shutdown.message_sent", {
-        targetId,
-        message: summarizeTeamMessage(shutdownMsg),
-        busSize: team.bus.size(),
-      });
-
-      // Wait for response with timeout
-      const timeoutController = new AbortController();
-      type ShutdownRaceResult =
-        | { type: "response"; confirmed: boolean }
-        | { type: "timeout" };
-      const responsePromise: Promise<ShutdownRaceResult> = promise.then((confirmed) => ({ type: "response", confirmed }));
-      const timeoutPromise: Promise<ShutdownRaceResult> = sleep(SHUTDOWN_TIMEOUT_MS, timeoutController.signal)
-        .then(() => ({ type: "timeout" }));
-      const raceResult = await Promise.race([responsePromise, timeoutPromise]);
-      timeoutController.abort(); // Clean up the sleep timer
-      this.logTeamDebug("protocol.shutdown.race_result", { targetId, raceResult });
-
-      // TOCTOU guard: if the timeout won the race but the real response arrived
-      // between the race resolving and this check, the protocol entry will have
-      // been responded to (state !== "pending"). Trust the real response in that case.
-      const staleRequest = team.protocolManager.getShutdownStates().find((s) => s.agentId === targetId);
-      const confirmed = (raceResult.type === "timeout" && staleRequest && staleRequest.state !== "pending")
-        ? staleRequest.state === "confirmed"
-        : raceResult.type === "response" && raceResult.confirmed;
-
-      // Clean up stale protocol entry on timeout (the promise resolved via timeout,
-      // but the protocol manager still holds the request and dangling resolve callback)
-      if (!confirmed) {
-        team.protocolManager.cancelShutdownRequest(targetId);
-      }
-
-      results.push({ agentId: targetId, confirmed });
-      this.logTeamDebug("protocol.shutdown.completed", {
-        targetId,
-        confirmed,
-        staleRequest,
-      });
-
-      // Emit response event
-      this._emitEvent({
-        type: "protocol_shutdown_response",
-        teamName: team.name,
-        agentId: targetId,
-        confirmed,
-        reason: request.reason,
-      });
-
-      // If confirmed, dispose the worker
-      if (confirmed) {
-        await this.stopWorker(targetId);
-      }
     }
-
-    return results;
+    // 席位/用户必须带自己读到的 revision。缺省只允许 drafting 的首次 publish（aux / 主笔）。
+    const token = expectedRevision ?? (current?.status === "drafting" ? current.revision : undefined);
+    if (token === undefined) {
+      const newest = modules.deliverables.latest();
+      return {
+        ok: false,
+        conflict: true,
+        currentVersion: newest?.version ?? 0,
+        currentRevision: newest?.revision ?? 0,
+      };
+    }
+    const result = modules.deliverables.updateMarkdown(id, markdown, actor, token);
+    if (result.ok) {
+      const updated = modules.deliverables.get(id);
+      if (updated !== undefined) {
+        this._emit({ type: "deliverable", item: updated });
+        if (wasDrafting && updated.status === "ready") {
+          this._announceDeliverableReady(updated);
+        }
+      }
+      this._persistSoon();
+    }
+    return result;
   }
 
-  /**
-   * Worker responds to a shutdown request. Returns false when no request is
-   * pending (e.g. it already timed out), so the caller can tell the model
-   * the response had no effect.
-   */
-  respondShutdown(agentId: string, confirmed: boolean, reason?: string): boolean {
-    const team = this._team;
-    this._assertRuntimeActive("respond_to_shutdown");
-    if (!team) throw new Error("No active team.");
-
-    const request = team.protocolManager.respondShutdown(agentId, confirmed, reason);
-    if (!request) {
-      console.warn(`[TeamManager] No pending shutdown request for ${agentId}`);
-      return false;
+  private _announceDeliverableReady(deliverable: DeliverableVersion): void {
+    if (deliverable.status !== "ready") {
+      return;
     }
-
-    this._emitEvent({
-      type: "protocol_shutdown_response",
-      teamName: team.name,
-      agentId,
-      confirmed,
-      reason,
+    this._raiseAttention({
+      kind: "deliverable_ready",
+      refId: deliverable.id,
+      text: `交付物 v${deliverable.version} 已就绪（截止 seq=${deliverable.cutoffSeq}）：可取用、可修订、可移交。`,
     });
-    return true;
+  }
+
+  stanceOnDeliverable(
+    id: string,
+    seatId: string,
+    stance: "support" | "oppose" | "conditional",
+    reason?: string,
+    confidence?: "low" | "medium" | "high",
+  ): { ok: true } | { ok: false; error: string } {
+    const modules = this._modules;
+    if (modules === null) {
+      return { ok: false, error: "当前没有活跃圆桌。" };
+    }
+    const result = modules.deliverables.setStance(id, seatId, stance, reason, confidence);
+    if (result.ok) {
+      const updated = modules.deliverables.get(id);
+      if (updated !== undefined) {
+        this._emit({ type: "deliverable", item: updated });
+      }
+      this._persistSoon();
+    }
+    return result;
+  }
+
+  /** Markdown 导出（AC-21）+ H8 归档提示（只提示，不静默丢场）。 */
+  async exportMarkdown(): Promise<string> {
+    const modules = this._modules;
+    if (modules === null || this._state === null) {
+      throw new Error("没有圆桌可导出。");
+    }
+    const state = this.getState()!;
+    const timeline = modules.timeline.list();
+    const notice = archiveNotice({
+      timelineBytes: await this._timelineFileSize(modules.roundtableId),
+      timelineEntries: timeline.length,
+    });
+    if (notice !== null) {
+      this._appendSystem(notice.text, "*");
+    }
+    const markdown = exportRoundtableMarkdown({
+      state,
+      timeline,
+      openItems: modules.openItems.list(),
+      deliverables: modules.deliverables.list(),
+      attention: modules.attention.list(),
+      inbox: modules.inbox.snapshot(),
+      metrics: this.getMetrics(),
+      mutedThreads: [...this._mutedThreads],
+      archived: state.lifecycle === "stopped",
+    });
+    return notice === null ? markdown : `> ${notice.text}\n\n${markdown}`;
+  }
+
+  /** 移交 payload（§4.15）：绑具体交付物版本；只产文本，不碰 solo。 */
+  async buildHandoff(deliverableId: string, target: "solo" | "plan"): Promise<{ text: string }> {
+    const modules = this._modules;
+    const state = this._state;
+    if (modules === null || state === null) {
+      throw new Error("没有圆桌可移交。");
+    }
+    const deliverable = modules.deliverables.get(deliverableId);
+    if (deliverable === undefined) {
+      throw new Error(`交付物 ${deliverableId} 不存在。`);
+    }
+    const input = { state: this.getState()!, deliverable };
+    return target === "plan"
+      ? { text: buildPlanHandoffRequest(input).requestText }
+      : { text: buildSoloHandoffPrompt(input) };
   }
 
   // ==========================================================================
-  // Protocol: Permission Requests
+  // 注意力 / 设置 / 预设 / 事件
+  // ==========================================================================
+
+  ackAttention(id: string): void {
+    this._modules?.attention.ack(id);
+    this._persistNow();
+  }
+
+  /** 用户批/拒权限：写回该席 inbox（L1），不复活已 abort 的 tool call（H23）。 */
+  respondPermission(requestId: string, approved: boolean, reason?: string): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    const request = modules.protocol.respondPermission(requestId, approved, reason);
+    if (request === null) {
+      return;
+    }
+    this.logTeamDebug("permission.responded", { requestId, approved, reason, seatId: request.agentId });
+    const item = this._appendSystem(
+      `权限${approved ? "已批准" : "已拒绝"}：${request.tool}${reason !== undefined && reason.length > 0 ? `（${reason}）` : ""}`,
+      request.agentId,
+    );
+    if (modules.roster.isActive(request.agentId)) {
+      modules.inbox.enqueue(item, [request.agentId]);
+      this._nudge([request.agentId], "L1", "user");
+    }
+    this._persistSoon();
+  }
+
+  /** 改圆桌设置。l2 预算就地更新（打断 controller 持有同一对象，H5 可实时改）。 */
+  setSettings(settings: Partial<RoundtableSettings>): void {
+    const state = this._state;
+    const modules = this._modules;
+    if (state === null || modules === null || state.lifecycle === "stopped") {
+      return;
+    }
+    applySettings(state.settings, mergeRoundtableSettings(state.settings, settings));
+    this._onOrderedModeChanged(state.settings.orderedMode);
+    this.logTeamDebug("settings.set", { settings });
+    this._emitState();
+    this._persistSoon();
+  }
+
+  /** 预设（plan §6.4）：存在 `getAgentDir()/roundtable-presets.json`，不属于工作区 hash。 */
+  async listPresets(): Promise<RoundtablePreset[]> {
+    return readPresets();
+  }
+
+  async savePreset(name: string, seats: SeatConfig[]): Promise<void> {
+    const trimmed = name.trim();
+    if (trimmed.length === 0) {
+      throw new Error("预设名不能为空。");
+    }
+    const presets = await readPresets();
+    const next = presets.filter((preset) => preset.name !== trimmed);
+    next.push({ name: trimmed, seats: seats.map((seat) => ({ ...seat })) });
+    await writePresets(next);
+  }
+
+  async deletePreset(name: string): Promise<void> {
+    const presets = await readPresets();
+    await writePresets(presets.filter((preset) => preset.name !== name));
+  }
+
+  /** 订阅圆桌事件（IPC 转发）。多个订阅者；返回退订函数。 */
+  onEvent(callback: (event: TeamEvent) => void): () => void {
+    this._eventCallbacks.push(callback);
+    return () => {
+      const index = this._eventCallbacks.indexOf(callback);
+      if (index >= 0) {
+        this._eventCallbacks.splice(index, 1);
+      }
+    };
+  }
+
+  logTeamDebug(event: string, payload: unknown = {}): void {
+    this._debugLogger.log(event, {
+      roundtableId: this._state?.roundtableId,
+      lifecycle: this._state?.lifecycle,
+      seats: this._modules?.roster.size,
+      ...(
+        payload && typeof payload === "object" && !Array.isArray(payload)
+          ? payload as Record<string, unknown>
+          : { value: payload }
+      ),
+    });
+  }
+
+  // ==========================================================================
+  // RoundtableToolHost（§4.12b：席位工具的唯一接缝）
   // ==========================================================================
 
   /**
-   * Worker requests permission for a tool operation.
-   * Returns a promise that resolves when the user approves or rejects.
+   * 席位发言：`timeline.append`（已记录）→ 有序门。
+   * - 门收下 argument（H28）：工具立刻得到 `queued: true`，投递在放行时发生，
+   *   该席状态投影为 `waiting_turn`；
+   * - 否则立即 inbox + L1，并广播投递态变化。
    */
-  async requestPermission(
-    agentId: string,
+  async postSeatMessage(fromSeatId: string, params: SendTeamMessageParams): Promise<PostSeatMessageResult> {
+    const modules = this._modules;
+    const state = this._state;
+    if (modules === null || state === null) {
+      return { ok: false, error: "当前没有活跃圆桌。" };
+    }
+    if (!modules.roster.isActive(fromSeatId)) {
+      return { ok: false, error: `席位 ${fromSeatId} 不在圆桌上（可能已退出）。` };
+    }
+    if (params.to !== "*" && params.to !== USER_SEAT_ID && !modules.roster.isActive(params.to)) {
+      return { ok: false, error: `找不到收件席 "${params.to}"。` };
+    }
+
+    const item = modules.timeline.append({
+      ts: Date.now(),
+      type: params.type,
+      fromId: fromSeatId,
+      toId: params.to,
+      text: params.text,
+      summary: params.summary ?? firstLine(params.text),
+      utteranceKind: params.utteranceKind,
+      threadId: params.threadId,
+      replyToId: params.replyToId,
+      basedOnId: params.basedOnId,
+      knowledgeCard: params.knowledgeCard,
+      interrupt: params.interrupt ?? "L1",
+      mentionIds: params.mentionIds,
+    });
+    modules.roster.markSpoke(fromSeatId);
+    modules.roster.touch(fromSeatId);
+    // 落盘 + 事件由 timeline.onAppend 的统一出口负责（F3-2）。
+    // 状态由该席 run 的事件驱动（不发消息改状态），这里只更新发言时间。
+
+    // H44：公开消息 @ 到用户（或直接发给用户）→ 注意力面（H21 的 mentionIds）。
+    if (item.mentionIds.includes(USER_SEAT_ID) || item.toId === USER_SEAT_ID) {
+      this._raiseAttention({
+        kind: "user_mentioned",
+        seatId: fromSeatId,
+        refId: item.id,
+        text: `${seatLabel(modules.roster, fromSeatId)} 在讨论中点名了用户：${firstLine(params.text)}`,
+      });
+    }
+
+    const admission = modules.gate.admit({
+      messageId: item.id,
+      fromId: fromSeatId,
+      utteranceKind: item.utteranceKind ?? "note",
+      mentionIds: item.mentionIds,
+    });
+    if (!admission.ok) {
+      // 已记录、未投递（H28）：放行由 gate.onReleased 触发。
+      this._setSeatStatus(fromSeatId, "waiting_turn");
+      this.logTeamDebug("seat.message.queued", {
+        seatId: fromSeatId,
+        messageId: item.id,
+        position: admission.position,
+        waitMs: admission.waitMs,
+      });
+      return { ok: true, messageId: item.id, queued: true };
+    }
+
+    const targets = this._messageTargets(item.toId);
+    modules.inbox.enqueue(item, targets);
+    this._nudge(targets, params.interrupt ?? "L1", "seat", fromSeatId, params.reason);
+    this._persistSoon();
+    this._metrics?.evaluate();
+    return { ok: true, messageId: item.id };
+  }
+
+  claimWritePaths(
+    seatId: string,
+    paths: string[],
+  ): { ok: true; acquired: string[] } | { ok: false; conflicts: Array<{ path: string; ownerSeatId: string }> } {
+    const modules = this._modules;
+    if (modules === null) {
+      return { ok: false, conflicts: [] };
+    }
+    const acquired: string[] = [];
+    const conflicts: Array<{ path: string; ownerSeatId: string }> = [];
+    if (modules.roster.get(seatId)?.auth !== "write") {
+      return { ok: false, conflicts: paths.map((path) => ({ path, ownerSeatId: "" })) };
+    }
+    for (const path of paths) {
+      const result = modules.leases.acquire(seatId, path);
+      if (result.ok) {
+        acquired.push(path);
+        continue;
+      }
+      conflicts.push({ path, ownerSeatId: modules.leases.ownerOf(path) ?? "" });
+    }
+    if (conflicts.length === 0) {
+      return { ok: true, acquired };
+    }
+    return { ok: false, conflicts };
+  }
+
+  releaseWritePaths(seatId: string, paths?: string[]): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    if (paths === undefined) {
+      modules.leases.release(seatId);
+      return;
+    }
+    for (const path of paths) {
+      modules.leases.release(seatId, path);
+    }
+  }
+
+  openItem(seatId: string, subject: string, body: string): OpenItem {
+    const modules = this._modules;
+    if (modules === null) {
+      throw new Error("当前没有活跃圆桌。");
+    }
+    const item = modules.openItems.open({ subject, body, createdBy: seatId });
+    this._emit({ type: "open_item", item });
+    this._persistSoon();
+    return item;
+  }
+
+  claimOpenItem(seatId: string, id: string, note?: string): OpenItem | null {
+    const modules = this._modules;
+    if (modules === null) {
+      return null;
+    }
+    const item = modules.openItems.claim(id, seatId, note);
+    if (item !== null) {
+      this._emit({ type: "open_item", item });
+      this._persistSoon();
+    }
+    return item;
+  }
+
+  resolveOpenItem(seatId: string, id: string, note?: string): OpenItem | null {
+    const modules = this._modules;
+    if (modules === null) {
+      return null;
+    }
+    const item = modules.openItems.resolve(id, seatId, note);
+    if (item !== null) {
+      this._emit({ type: "open_item", item });
+      this._persistSoon();
+    }
+    return item;
+  }
+
+  /** 线程结论上浮到主线（FR-4）：主线记录 + 全员可见。 */
+  promoteThread(seatId: string, threadId: string, conclusion: string): TimelineItem {
+    const modules = this._modules;
+    if (modules === null) {
+      throw new Error("当前没有活跃圆桌。");
+    }
+    const item = modules.timeline.append({
+      ts: Date.now(),
+      type: "thread_promo",
+      fromId: seatId,
+      toId: "*",
+      text: conclusion,
+      summary: `线程 ${threadId} 结论上浮：${firstLine(conclusion)}`,
+      mentionIds: [],
+    });
+    modules.inbox.enqueue(item, modules.roster.activeIds());
+    this._nudge(modules.roster.activeIds(), "L0", "seat", seatId);
+    this._persistSoon();
+    return item;
+  }
+
+  /** 对等请求（不派单）：发一条公开的 question 给目标席。 */
+  async requestPeerExplore(fromSeatId: string, to: string, ask: string, scope?: string): Promise<void> {
+    const modules = this._modules;
+    if (modules === null) {
+      throw new Error("当前没有活跃圆桌。");
+    }
+    const target = to === "*" ? "*" : modules.roster.isActive(to) ? to : null;
+    if (target === null || target === USER_SEAT_ID) {
+      throw new Error(`对等请求的目标必须是席位："${to}"。`);
+    }
+    const text = scope === undefined || scope.trim().length === 0
+      ? ask
+      : `${ask}\n\n建议范围：${scope}`;
+    const result = await this.postSeatMessage(fromSeatId, {
+      to: target,
+      text,
+      summary: `对等请求：${firstLine(ask)}`,
+      utteranceKind: "question",
+      type: "question",
+      interrupt: "L1",
+      mentionIds: target === "*" ? [] : [target],
+    });
+    if (!result.ok) {
+      throw new Error(result.error);
+    }
+  }
+
+  /**
+   * 唯一权限生产者（H1/H23）：同步记录 + 立即返回 submitted；注意力面 + 协议事件
+   * 同刻发出。**禁止**返回等待用户的 Promise。
+   */
+  requestPermission(
+    seatId: string,
     tool: string,
     args: Record<string, unknown>,
-    signal?: AbortSignal,
-  ): Promise<{ approved: boolean; reason?: string }> {
-    const team = this._team;
-    this._assertRuntimeActive("request_permission");
-    if (!team) throw new Error("No active team.");
-    this.logTeamDebug("protocol.permission.request", {
-      agentId,
+    reason?: string,
+  ): { requestId: string; submitted: true } {
+    const modules = this._modules;
+    if (modules === null || this._state === null) {
+      throw new Error("当前没有活跃圆桌。");
+    }
+    // F3-10：同席同 (tool,args) 幂等（不新增记录/注意力/落盘），每席 pending 有上限
+    // （否则循环调用或被诱导的席位可以无限刷注意力面与 meta.json）。
+    const argsJson = JSON.stringify(args ?? {});
+    const existing = modules.protocol.findPendingPermission(seatId, tool, argsJson);
+    if (existing !== null) {
+      this.logTeamDebug("permission.deduped", { seatId, tool, requestId: existing.id });
+      return { requestId: existing.id, submitted: true };
+    }
+    if (modules.protocol.countPendingPermissions(seatId) >= MAX_PENDING_PERMISSIONS_PER_SEAT) {
+      throw new Error(
+        `本席待批权限已达上限 ${MAX_PENDING_PERMISSIONS_PER_SEAT}：等用户答复后再申请，或改用已有请求。`,
+      );
+    }
+    const request = modules.protocol.requestPermission({
+      seatId,
+      roundtableName: this._state.name,
       tool,
       args,
-      signalAborted: signal?.aborted ?? false,
+      reason,
     });
-
-    const { request, promise } = team.protocolManager.requestPermission(
-      agentId,
-      team.name,
-      tool,
-      args,
-    );
-    this.logTeamDebug("protocol.permission.pending", { request });
-
-    // Emit protocol event for UI
-    this._emitEvent({
-      type: "protocol_permission_request",
-      teamName: team.name,
-      request,
+    this.logTeamDebug("permission.request", { seatId, tool, requestId: request.id, reason });
+    this._emit({ type: "protocol_permission_request", request });
+    this._raiseAttention({
+      kind: "permission",
+      seatId,
+      refId: request.id,
+      text: `${seatLabel(modules.roster, seatId)} 请求权限：${tool}${reason !== undefined ? `（${reason}）` : ""}`,
     });
+    this._persistSoon();
+    return { requestId: request.id, submitted: true };
+  }
 
-    // Also emit as a team_message for the timeline
-    const timelineMsg: TeamMessage = {
-      id: request.id,
-      teamName: team.name,
-      fromAgentId: agentId,
-      toAgentId: team.leadAgentId,
-      text: `Permission request: ${tool}(${JSON.stringify(args).slice(0, 200)})`,
-      timestamp: request.createdAt,
-      read: false,
-      delivered: false,
-      summary: `Permission requested: ${tool}`,
-      kind: "permission_request",
-      fromRole: team.workers.get(agentId)?.info.role ?? "leader",
-    };
-    this._emitEvent({ type: "team_message", teamName: team.name, message: timelineMsg });
-
-    // Race: permission response vs timeout vs abort signal
-    const timeoutController = new AbortController();
-    const timeoutPromise = sleep(PROTOCOL_TIMEOUT_MS, timeoutController.signal).then(() => ({
-      approved: false,
-      reason: "Timed out waiting for permission",
-    }));
-
-    const abortPromise = signal
-      ? new Promise<{ approved: boolean; reason?: string }>((resolve) => {
-          if (signal.aborted) { resolve({ approved: false, reason: "Aborted" }); return; }
-          signal.addEventListener("abort", () => {
-            resolve({ approved: false, reason: "Aborted" });
-          }, { once: true });
-        })
-      : null;
-
-    const result = await Promise.race(
-      [promise, timeoutPromise, abortPromise].filter(Boolean) as Promise<{ approved: boolean; reason?: string }>[],
-    );
-    timeoutController.abort(); // Clean up the sleep timer
-    this.logTeamDebug("protocol.permission.result", {
+  /**
+   * 退出请求（§5.12）：自己请自己退出立即执行；请他人退出只开启协商
+   * （`settings.exitRequestTimeoutMs` 到点后按请求执行并记录双方说法）。
+   */
+  async requestExit(fromSeatId: string, targetSeatId: string | undefined, reason: string): Promise<void> {
+    const modules = this._modules;
+    if (modules === null) {
+      throw new Error("当前没有活跃圆桌。");
+    }
+    const target = targetSeatId === undefined || targetSeatId === fromSeatId ? fromSeatId : targetSeatId;
+    if (!modules.roster.isActive(target)) {
+      throw new Error(`席位 ${target} 不在圆桌上。`);
+    }
+    const request = modules.protocol.requestExit({
+      targetSeatId: target,
+      requestedBy: fromSeatId,
+      reason,
+      timeoutMs: this._state?.settings.exitRequestTimeoutMs,
+    });
+    this.logTeamDebug("exit.request", {
       requestId: request.id,
-      agentId,
-      tool,
-      result,
+      targetSeatId: target,
+      requestedBy: fromSeatId,
+      status: request.status,
     });
-
-    // Clean up stale protocol entry on timeout/abort
-    if (!result.approved && (result.reason === "Timed out waiting for permission" || result.reason === "Aborted")) {
-      team.protocolManager.cancelPermissionRequest(request.id);
-      this.logTeamDebug("protocol.permission.cancelled", {
-        requestId: request.id,
-        reason: result.reason,
-      });
+    this._emit({ type: "exit_request", request });
+    this._raiseAttention({
+      kind: "exit_request",
+      seatId: target,
+      refId: request.id,
+      text: target === fromSeatId
+        ? `${seatLabel(modules.roster, fromSeatId)} 自愿退出：${reason}`
+        : `${seatLabel(modules.roster, fromSeatId)} 请 ${seatLabel(modules.roster, target)} 退出：${reason}`,
+    });
+    if (request.status === "done") {
+      await this._applyExit(request, "self");
     }
-
-    return result;
+    this._persistSoon();
   }
 
-  /**
-   * User responds to a permission request via the UI.
-   */
-  respondPermission(requestId: string, approved: boolean, reason?: string): void {
-    const team = this._team;
-    this._assertRuntimeActive("respond_permission");
-    if (!team) throw new Error("No active team.");
-
-    const request = team.protocolManager.respondPermission(requestId, approved, reason);
-    if (!request) {
-      console.warn(`[TeamManager] Permission request ${requestId} not found`);
-      this.logTeamDebug("protocol.permission.respond_missing", { requestId, approved, reason });
-      return;
-    }
-    this.logTeamDebug("protocol.permission.responded", { requestId, approved, reason, request });
-
-    this._emitEvent({
-      type: "protocol_permission_response",
-      teamName: team.name,
-      requestId,
-      approved,
-      reason,
-    });
-
-    // Timeline message
-    const timelineMsg: TeamMessage = {
-      id: randomUUID(),
-      teamName: team.name,
-      fromAgentId: team.leadAgentId,
-      toAgentId: request.agentId,
-      text: `Permission ${approved ? "approved" : "rejected"}: ${request.tool}${reason ? ` - ${reason}` : ""}`,
-      timestamp: Date.now(),
-      read: false,
-      delivered: false,
-      summary: `Permission ${approved ? "approved" : "rejected"}: ${request.tool}`,
-      kind: "permission_response",
-      fromRole: "leader",
-    };
-    this._emitEvent({ type: "team_message", teamName: team.name, message: timelineMsg });
-
-  }
-
-  // ==========================================================================
-  // Protocol: Plan Approval
-  // ==========================================================================
-
-  /**
-   * Worker submits a plan for Leader approval before executing.
-   * Returns a promise that resolves when the Leader approves or rejects.
-   */
-  async requestPlanApproval(
-    agentId: string,
-    plan: string,
-    files: string[],
-    signal?: AbortSignal,
-  ): Promise<{ approved: boolean; feedback?: string }> {
-    const team = this._team;
-    this._assertRuntimeActive("submit_plan");
-    if (!team) throw new Error("No active team.");
-    this.logTeamDebug("protocol.plan.request", {
-      agentId,
-      files,
-      signalAborted: signal?.aborted ?? false,
-      plan: summarizeText(plan),
-    });
-
-    const { approval, promise } = team.protocolManager.requestPlanApproval(
-      agentId,
-      team.name,
-      plan,
-      files,
+  /** team_bash：cwd 只来自 `SeatExecutionView.getCwd()`，backend 为 host 的对象身份。 */
+  async runTeamBash(
+    _seatId: string,
+    command: string,
+    _paths: string[] | undefined,
+    timeout: number | undefined,
+    signal: AbortSignal,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+    // paths 只服务于 policy 的租约校验（S2b 已在放行前查过），执行阶段不再解析。
+    return runTeamBashCommand(
+      {
+        exec: this._seatExecView(),
+        backend: this._executionBackend ?? undefined,
+        // F4-9：与 solo 的 bash 跑在同一个 shell 上（settings 在建场时读一次）。
+        shellPath: this._shellConfig.shellPath,
+        shellCommandPrefix: this._shellConfig.shellCommandPrefix,
+      },
+      command,
+      timeout,
+      signal,
     );
-    this.logTeamDebug("protocol.plan.pending", { approval });
+  }
 
-    const worker = team.workers.get(agentId);
-    const workerName = worker?.info.name ?? agentId;
-    const workerRole = worker?.info.role ?? "coder";
+  /** 本场指标实例（未建场时为 null）。 */
+  private get _metrics(): RoundtableMetrics | null {
+    return this._modules?.metrics ?? null;
+  }
 
-    // Timeline message visible to the user as team activity. The decision is
-    // made by the Leader through respond_to_plan_approval, not by a worker
-    // directly asking the user.
-    const timelineMsg: TeamMessage = {
-      id: approval.id,
-      teamName: team.name,
-      fromAgentId: agentId,
-      toAgentId: team.leadAgentId,
-      text: [
-        `Worker ${workerName} submitted a plan for Leader review.`,
-        "",
-        plan,
-        files.length ? `\nFiles: ${files.join(", ")}` : "",
-      ].join("\n"),
-      timestamp: approval.createdAt,
-      read: false,
-      delivered: false,
-      summary: `Plan submitted for Leader review: ${plan.slice(0, 80)}`,
-      kind: "plan_approval",
-      fromRole: workerRole,
+  // ==========================================================================
+  // 内部：模块装配
+  // ==========================================================================
+
+  /** 建齐本场全部模块并接好注意力/投递/放行三条订阅（一场一次）。 */
+  private _installModules(
+    roundtableId: string,
+    tier: RoundtableTier,
+    settings: RoundtableSettings,
+  ): RoundtableModules {
+    const roster = new RoundtableRoster(roundtableId, tier);
+    const timeline = new TimelineLog();
+    const inbox = new SeatInbox({ getActiveSeatIds: () => roster.activeIds() });
+    const attention = new AttentionBus();
+    // F4-9：席位 team_bash 必须和 solo 的 bash 用同一个 shell（settings 只在这里读
+    // 一次，`runTeamBash` 直接用；不在每次调用时重新读盘）。
+    const settingsManager = SettingsManager.create(this._physicalCwd);
+    this._shellConfig = {
+      shellPath: settingsManager.getShellPath(),
+      shellCommandPrefix: settingsManager.getShellCommandPrefix(),
     };
-    this._emitEvent({ type: "team_message", teamName: team.name, message: timelineMsg });
-    this._wakeLeaderForOrchestration({
-      type: "plan_submitted",
-      sourceId: approval.id,
-      runtimeEpoch: this._runtimeEpoch,
-      workerName,
-      workerRole,
-      fromAgentId: agentId,
-      toAgentId: team.leadAgentId,
-      messageKind: "plan_approval",
-      messageText: `Approval ID: ${approval.id}\nFiles: ${files.join(", ") || "none"}\n\n${plan}`,
-    });
-
-    // Race: approval response vs timeout vs abort signal
-    const timeoutController = new AbortController();
-    const timeoutPromise = sleep(PROTOCOL_TIMEOUT_MS, timeoutController.signal).then(() => ({
-      approved: false,
-      feedback: "Timed out waiting for plan approval",
-    }));
-
-    const abortPromise = signal
-      ? new Promise<{ approved: boolean; feedback?: string }>((resolve) => {
-          if (signal.aborted) { resolve({ approved: false, feedback: "Aborted" }); return; }
-          signal.addEventListener("abort", () => {
-            resolve({ approved: false, feedback: "Aborted" });
-          }, { once: true });
-        })
-      : null;
-
-    const result = await Promise.race(
-      [promise, timeoutPromise, abortPromise].filter(Boolean) as Promise<{ approved: boolean; feedback?: string }>[],
+    const gate = new OrderedSpeechGate(
+      () => this._state?.settings.orderedMode === true,
+      () => this._state?.settings.orderedReleaseMs ?? ORDERED_RELEASE_MS,
+      (seatId) => roster.get(seatId)?.lastSpokeAt,
     );
-    timeoutController.abort(); // Clean up the sleep timer
-    this.logTeamDebug("protocol.plan.result", {
-      approvalId: approval.id,
-      agentId,
-      result,
-    });
-
-    // Clean up stale protocol entry on timeout/abort (the promise resolved via race,
-    // but the protocol manager still holds the request and dangling resolve callback)
-    if (!result.approved && (result.feedback === "Timed out waiting for plan approval" || result.feedback === "Aborted")) {
-      team.protocolManager.cancelPlanApproval(approval.id);
-      this.logTeamDebug("protocol.plan.cancelled", {
-        approvalId: approval.id,
-        reason: result.feedback,
-      });
-    }
-
-    return result;
-  }
-
-  /**
-   * User responds to a plan approval request.
-   */
-  respondPlanApproval(approvalId: string, approved: boolean, feedback?: string): boolean {
-    const team = this._team;
-    this._assertRuntimeActive("respond_to_plan_approval");
-    if (!team) throw new Error("No active team.");
-
-    const approval = team.protocolManager.respondPlanApproval(approvalId, approved, feedback);
-    if (!approval) {
-      console.warn(`[TeamManager] Plan approval ${approvalId} not found`);
-      this.logTeamDebug("protocol.plan.respond_missing", { approvalId, approved, feedback });
-      return false;
-    }
-    this.logTeamDebug("protocol.plan.responded", { approvalId, approved, feedback, approval });
-
-    this._emitEvent({
-      type: "protocol_plan_response",
-      teamName: team.name,
-      approvalId,
-      approved,
-      feedback,
-    });
-
-    // Timeline message
-    const timelineMsg: TeamMessage = {
-      id: randomUUID(),
-      teamName: team.name,
-      fromAgentId: team.leadAgentId,
-      toAgentId: approval.agentId,
-      text: `Plan ${approved ? "approved" : "rejected"}${feedback ? `: ${feedback}` : ""}`,
-      timestamp: Date.now(),
-      read: false,
-      delivered: false,
-      summary: `Plan ${approved ? "approved" : "rejected"}`,
-      kind: "plan_approval",
-      fromRole: "leader",
-    };
-    this._emitEvent({ type: "team_message", teamName: team.name, message: timelineMsg });
-
-    return true;
-  }
-
-  // ==========================================================================
-  // Worker Management
-  // ==========================================================================
-
-  /**
-   * Bring a dormant or standby team member into active participation.
-   * Existing active members are left untouched.
-   */
-  async activateMember(agentId: string): Promise<void> {
-    const team = this._team;
-    this._assertRuntimeActive("activate_member");
-    if (!team) throw new Error("No active team.");
-
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-    if (worker.info.status === "error") throw new Error(`Worker ${agentId} is in error state. Restart it first.`);
-    if (worker.info.status === "idle" || worker.info.status === "running") return;
-
-    worker.info.status = "idle";
-    worker.info.statusChangedAt = Date.now();
-    worker.info.error = undefined;
-    this._emitEvent({
-      type: "teammate_status_changed",
-      teamName: team.name,
-      agentId,
-      status: "idle",
-      timestamp: worker.info.statusChangedAt,
-    });
-    this._emitTeamStateChanged();
-
-    await this._launchWorker(agentId);
-  }
-
-  /**
-   * Pause a member after its current turn. The member remains on the roster and
-   * keeps message/task history, but its session is disposed until reactivated.
-   */
-  async pauseMember(agentId: string): Promise<void> {
-    const team = this._team;
-    this._assertRuntimeActive("pause_member");
-    if (!team) throw new Error("No active team.");
-
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-    if (worker.info.status === "dormant" || worker.info.status === "standby") return;
-    if (worker.info.status === "shutdown") throw new Error(`Worker ${agentId} has been shut down.`);
-
-    if (worker.runner) {
-      await worker.runner.dispose();
-      worker.runner = null;
-    } else {
-      worker.lifecycleAbortController?.abort();
-      worker.workAbortController?.abort();
-      worker.unsubscribeEvents?.();
-      if (worker.session) {
-        await worker.session.dispose({ reason: "quit" }).catch(() => {});
-      }
-      if (worker.mcpAdapter) {
-        await worker.mcpAdapter.dispose().catch(() => {});
-      }
-    }
-
-    worker.session = null;
-    worker.mcpAdapter = null;
-    worker.lifecycleAbortController = null;
-    worker.workAbortController = null;
-    this._releaseWorkerOpenTasks(agentId, "worker was paused");
-    worker.info.status = "standby";
-    worker.info.statusChangedAt = Date.now();
-    team.bus.clearAgent(agentId);
-
-    this._emitEvent({
-      type: "teammate_status_changed",
-      teamName: team.name,
-      agentId,
-      status: "standby",
-      timestamp: worker.info.statusChangedAt,
-    });
-    this._emitTeamStateChanged();
-  }
-
-  /**
-   * Abort a specific worker's current turn (does not kill the worker).
-   * After abort, the worker returns to idle and can receive new messages.
-   */
-  async abortWorker(agentId: string): Promise<void> {
-    const team = this._team;
-    this._assertRuntimeActive("abort_worker");
-    if (!team) throw new Error("No active team.");
-
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-    if (worker.info.status !== "running") {
-      console.warn(`[TeamManager] abortWorker called on non-running worker ${agentId} (status: ${worker.info.status})`);
-    }
-
-    // Abort the in-flight turn only. Do NOT release the worker's open tasks to
-    // pending: the runtime stays active, so the worker would immediately
-    // re-claim and re-execute the turn the user just stopped. The worker's
-    // work_aborted path calls handleWorkerTurnFailed, which marks the active
-    // task blocked and wakes the leader to decide whether to reassign; tasks
-    // the worker already resolved during the turn are left untouched.
-    team.bus.clearAgent(agentId);
-    if (worker.runner) {
-      await worker.runner.abortCurrentTurn();
-    } else {
-      worker.workAbortController?.abort();
-    }
-
-  }
-
-  /**
-   * Stop a specific worker (graceful shutdown).
-   * The worker will be disposed and enter "shutdown" status.
-   */
-  async stopWorker(agentId: string): Promise<void> {
-    const team = this._team;
-    this._assertRuntimeActive("stop_worker");
-    if (!team) throw new Error("No active team.");
-
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-    if (worker.info.status === "shutdown") {
-      console.warn(`[TeamManager] stopWorker called on already-shutdown worker ${agentId}`);
-      return;
-    }
-
-    if (worker.runner) {
-      await worker.runner.dispose();
-      worker.runner = null;
-    } else {
-      worker.lifecycleAbortController?.abort();
-      worker.workAbortController?.abort();
-      worker.unsubscribeEvents?.();
-      if (worker.session) {
-        await worker.session.dispose({ reason: "quit" }).catch(() => {});
-      }
-      if (worker.mcpAdapter) {
-        await worker.mcpAdapter.dispose().catch(() => {});
-      }
-    }
-
-    worker.session = null;
-    worker.mcpAdapter = null;
-    worker.lifecycleAbortController = null;
-    worker.workAbortController = null;
-    this._releaseWorkerOpenTasks(agentId, "worker was stopped");
-    worker.info.status = "shutdown";
-    worker.info.statusChangedAt = Date.now();
-
-    // Clean up the worker's message bus entries to prevent memory leaks
-    team.bus.clearAgent(agentId);
-
-    this._emitEvent({
-      type: "teammate_status_changed",
-      teamName: team.name,
-      agentId,
-      status: "shutdown",
-      timestamp: worker.info.statusChangedAt,
-    });
-    this._emitTeamStateChanged();
-
-  }
-
-  /**
-   * Update a worker's status and emit a status change event.
-   */
-  updateWorkerStatus(agentId: string, status: TeammateStatus, error?: string): void {
-    const team = this._team;
-    if (!team) return;
-
-    const worker = team.workers.get(agentId);
-    if (!worker) return;
-
-    const previousStatus = worker.info.status;
-    worker.info.status = status;
-    worker.info.statusChangedAt = Date.now();
-    if (error !== undefined) {
-      worker.info.error = error;
-    } else if (status !== "error") {
-      worker.info.error = undefined;
-    }
-
-    if (status === "error" || status === "shutdown") {
-      this._releaseWorkerOpenTasks(agentId, error ?? `worker status changed to ${status}`);
-    }
-    this.logTeamDebug("worker.status.changed", {
-      agentId,
-      previousStatus,
-      status,
-      error,
-      worker: worker.info,
-    });
-
-    this._emitEvent({
-      type: "teammate_status_changed",
-      teamName: team.name,
-      agentId,
-      status,
-      error,
-      timestamp: worker.info.statusChangedAt,
-    });
-    this._emitTeamStateChanged();
-  }
-
-  /**
-   * Emit a teammate message event (called by WorkerRunner).
-   */
-  emitTeammateMessage(agentId: string, message: TeammateChatMessage): void {
-    const team = this._team;
-    if (!team) return;
-
-    this._emitEvent({
-      type: "teammate_message",
-      teamName: team.name,
-      agentId,
-      message,
-    });
-  }
-
-  private _isCurrentWorkerTurn(agentId: string, turnEpoch: number, turnId?: string): boolean {
-    const worker = this._team?.workers.get(agentId);
-    return this.isRuntimeEpochCurrent(turnEpoch) && (!turnId || worker?.activeTurnId === turnId);
-  }
-
-  /**
-   * Called after a worker turn finishes. If the worker forgot to call the
-   * task-status tool, close its current task using the final assistant text so
-   * the leader workflow does not stall with everyone idle.
-   */
-  handleWorkerTurnFinished(
-    agentId: string,
-    assistantText?: string,
-    taskId?: string | null,
-    turnEpoch = this._runtimeEpoch,
-    turnId?: string,
-  ): void {
-    const team = this._team;
-    if (!team || team.status !== "active") {
-      this.logTeamDebug("worker.turn_finished.skipped", { agentId, reason: "no_active_team" });
-      return;
-    }
-    if (!this._isCurrentWorkerTurn(agentId, turnEpoch, turnId)) {
-      this.logTeamDebug("worker.turn_finished.stale", {
-        agentId,
-        taskId: taskId ?? null,
-        turnId,
-        turnEpoch,
-        currentRuntimeEpoch: this._runtimeEpoch,
-      });
-      return;
-    }
-
-    // Resolve the task this turn was actually executing. Keying off the turn's
-    // own taskId (rather than "any in_progress task owned by the agent") means a
-    // message-driven turn cannot be mis-attributed to an unrelated task.
-    const turnTask = taskId ? team.taskList.get(taskId) : undefined;
-    const activeTask = turnTask && turnTask.ownerAgentId === agentId && turnTask.status === "in_progress"
-      ? turnTask
-      : undefined;
-
-    if (!activeTask) {
-      // taskId given but no longer in_progress: the worker already resolved it
-      // during the turn (mark_task_complete / update_task_status), which already
-      // woke the leader. Stay silent to avoid double-handling.
-      if (taskId && turnTask) {
-        this.logTeamDebug("worker.turn_finished.task_already_resolved", {
-          agentId,
-          taskId,
-          status: turnTask.status,
+    const openItems = new OpenItemBoard();
+    const leases = new WriteLeaseTable(
+      (input) => this._seatExecView().resolvePath(input),
+      (info) => {
+        this._raiseAttention({
+          kind: "write_conflict",
+          seatId: info.requestedBy,
+          refId: info.ownerSeatId,
+          text: info.staleRead === true
+            ? `写冲突：${seatLabel(roster, info.requestedBy)} 想写 ${info.path}，但它读到的副本已被别的席位改写，必须先重新 read。`
+            : `写冲突：${info.path} 已租给 ${info.ownerSeatId === undefined ? "他人" : seatLabel(roster, info.ownerSeatId)}，${seatLabel(roster, info.requestedBy)} 的申请被拒绝。`,
         });
+      },
+    );
+    const capacity = new TeamCapacityPool();
+    const deliverables = new DeliverableStore({ getCutoffSeq: () => timeline.lastSeq() });
+    const persistence = new RoundtablePersistence({ physicalCwd: this._physicalCwd, roundtableId });
+    const protocol = new TeamProtocolManager({
+      onExitDue: (request) => {
+        // 超时路径与 respondExit 应用方式一致：记录双方说法后执行移除。
+        this.logTeamDebug("exit.timeout", { requestId: request.id, targetSeatId: request.targetSeatId });
+        this._emit({ type: "exit_request", request });
+        // F3-4：定时器可能在 stop/dispose 之后才到点；applyExit 自身已守 lifecycle，
+        // 这里再兜住 Promise（否则主进程会吃到 unhandledRejection）。
+        void this._applyExit(request, "peer").catch((err) => {
+          console.warn("[TeamManager] exit timeout apply failed:", err);
+        });
+      },
+    });
+    /**
+     * 三个生产者模块只 push、不落盘也不发事件（F3-1）：把它们的 attention 参数
+     * 统一收口到 `_raiseAttention`（push + `attention` 事件 + attention.jsonl）。
+     * 直接接裸 AttentionBus 会让 l2_fused / seat_stuck / soft_budget / wrap_up_ready
+     * / hard_stop 五类既不实时到渲染层、也不落盘（FR-8 / §4.6b / H44）。
+     * `modules.attention` 仍是裸 bus：facade 自己用它做 push/ack/list/restore。
+     */
+    const attentionSink = {
+      push: (item: { kind: AttentionItem["kind"]; text: string; seatId?: string; refId?: string }) =>
+        this._raiseAttention(item),
+    };
+    const interrupts = new SeatInterruptController({
+      attention: attentionSink,
+      budget: settings.l2,
+      isToolBatchInProgress: (seatId) => this._runners.get(seatId)?.isToolBatchInProgress() ?? false,
+    });
+    const health = new RoundtableHealth({
+      attention: attentionSink,
+      onRecovered: (seatId) => {
+        this._setSeatStatus(seatId, "exploring", { currentActivity: "卡死恢复：分段续跑" });
+      },
+    });
+    const metrics = new RoundtableMetrics({
+      getSeats: () => this._metricsSeats(),
+      getTimeline: () => timeline.list(),
+      getSettings: () => settings,
+      getLifecycle: () => this._state?.lifecycle ?? "inactive",
+      getCreatedAt: () => this._state?.createdAt ?? Date.now(),
+      getAuxStats: () => this._auxStats(),
+      attention: attentionSink,
+      onPauseRequested: () => {
+        void this.pause();
+      },
+      onHardStop: () => {
+        void this.pause();
+      },
+      getThresholdTotals: () => {
+        const snapshot = this.getMetrics();
+        return { cost: snapshot.totals.cost, durationMs: snapshot.totals.durationMs };
+      },
+    });
+
+    const offGate = gate.onReleased((messageId) => {
+      this._onArgumentReleased(messageId);
+    });
+    const offInbox = inbox.onChange((seatId) => {
+      this._syncDelivery(seatId);
+      this._persistSoon();
+    });
+    // F3-2：时间线的落盘 + 事件只有一个出口。SeatRunner 直接持有的 TimelineLog
+    // （唤醒提示、半成品标注）也由此进 timeline.jsonl 并发 timeline_item。
+    const offTimelineAppend = timeline.onAppend((item) => {
+      if (this._replayingTimeline) {
         return;
       }
-      // No task at all is a normal outcome for a peer-message turn. The message
-      // send path already wakes the Leader when the message is actionable, so a
-      // turn that already delivered a worker->leader message must not wake again
-      // (that would duplicate the content and feedback-loop ordinary peer
-      // conversation). A turn that produced output WITHOUT reaching the leader,
-      // however, deadlocks an idle leader that never learns the work happened -
-      // surface it as an orphaned turn so the leader can record, route, or fold
-      // it into the plan.
-      const workerState = team.workers.get(agentId);
-      if (!workerState?.sentLeaderMessageThisTurn) {
-        this._reportOrphanedWorkerTurn(agentId, assistantText, false, turnId);
+      this._appendTimelinePersist(item);
+      this._emitTimeline(item);
+    });
+
+    this._modules = {
+      roundtableId,
+      roster,
+      timeline,
+      inbox,
+      attention,
+      gate,
+      openItems,
+      leases,
+      interrupts,
+      capacity,
+      deliverables,
+      persistence,
+      health,
+      metrics,
+      protocol,
+      offGate,
+      offInbox,
+      offTimelineAppend,
+    };
+    this._runners.clear();
+    this._sessions.clear();
+    this._unsubscribeSeats.clear();
+    this._seatDurations.clear();
+    this._seatUsage.clear();
+    this._deliveryStates.clear();
+    this._auxUsage = { tokensIn: 0, tokensOut: 0, cost: 0 };
+    this._pendingWrapUps.length = 0;
+    health.start();
+    return this._modules;
+  }
+
+  // ==========================================================================
+  // 内部：席位 session 与事件
+  // ==========================================================================
+
+  /** 启动所有还没有 runner 的活跃席（恢复后 resume 用）。 */
+  private async _startAllSeats(): Promise<void> {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    await Promise.all(modules.roster.list().map((seat) => this._startSeat(seat.seatId)));
+    for (const seat of modules.roster.list()) {
+      this._runners.get(seat.seatId)?.resume();
+    }
+  }
+
+  /**
+   * 建立一席的 AgentSession + SeatRunner（plan §4.13 / §6.3）。
+   * 失败只把该席标成 error 并发 `seat_error`：圆桌其余部分继续（§5.14 第一行）。
+   */
+  private async _startSeat(seatId: string, options: { resume?: boolean } = {}): Promise<void> {
+    const modules = this._modules;
+    const state = this._state;
+    if (modules === null || state === null || this._runners.has(seatId)) {
+      return;
+    }
+    const seat = modules.roster.get(seatId);
+    if (seat === undefined || seat.status === "exited") {
+      return;
+    }
+    try {
+      const session = await this._createSeatSession(seat, options.resume === true);
+      if (this._modules !== modules) {
+        // 建 session 期间圆桌已经换场：把刚建的 session 收干净。
+        await session.dispose({ reason: "quit" }).catch(() => {});
+        return;
+      }
+      const runner = new SeatRunner({
+        seatId,
+        // SDK 的 AgentSessionEvent 与 shared/types 的 AgentSessionEvent 结构等价但
+        // 分属两套 AgentMessage 定义（历史原因），这里按既有做法断言一次。
+        session: session as unknown as SeatSessionLike,
+        exec: this._seatExecView(),
+        inbox: modules.inbox,
+        timeline: modules.timeline,
+        interrupts: modules.interrupts,
+        capacity: modules.capacity,
+        host: this,
+        stuckMs: STUCK_MS,
+        // H20/H43：无人值守降速由 metrics 决定（S3 只留了注入点）。
+        getMinIdleMs: () => this._metrics?.getMinIdleMs() ?? 0,
+      });
+      runner.start();
+      this._sessions.set(seatId, session);
+      this._runners.set(seatId, runner);
+      if (!this._seatDurations.has(seatId)) {
+        this._seatDurations.set(seatId, { total: 0, startedAt: null });
       } else {
-        this.logTeamDebug("worker.turn_finished.no_active_task", {
-          agentId,
-          taskId: taskId ?? null,
-          assistantText: summarizeText(assistantText),
-          alreadyWokeLeader: true,
-        });
+        const duration = this._seatDurations.get(seatId)!;
+        duration.startedAt = null;
       }
-      return;
-    }
-
-    const workerInfo = team.workers.get(agentId)?.info;
-    const workerName = workerInfo?.name ?? parseAgentId(agentId)?.agentName ?? agentId;
-    const workerRole = workerInfo?.role ?? "coder";
-    const result = assistantText?.trim()
-      ? assistantText.trim().slice(0, MAX_AUTO_COMPLETION_RESULT_LENGTH)
-      : "Worker turn finished without a textual summary.";
-    const evidence = mergeTeamTaskEvidence(result);
-
-    const outcome = classifyWorkerTurnOutcome(result);
-    this.logTeamDebug("worker.turn_finished", {
-      agentId,
-      workerName,
-      workerRole,
-      task: summarizeTeamTask(activeTask),
-      outcome,
-      result: summarizeText(result),
-    });
-    if (outcome !== "complete") {
-      const reason = outcome === "blocked"
-        ? "Worker turn ended with a blocking or incomplete signal."
-        : "Worker turn ended without an explicit completion signal.";
-      const blockedTask = this.updateTask(activeTask.id, {
-        status: "blocked",
-        result,
-        evidence,
-        gateState: this._updateGateStatus(activeTask, "blocked", reason),
+      this._unsubscribeSeats.set(
+        seatId,
+        session.subscribe((event) => {
+          this._onSeatEvent(seatId, event);
+        }),
+      );
+      modules.health.registerSeat(runner);
+      modules.capacity.acquireSeat(seatId);
+      this._setSeatStatus(seatId, "idle");
+      this.logTeamDebug("seat.session.created", {
+        seatId,
+        slug: seat.slug,
+        auth: seat.auth,
+        sessionDir: seatSessionDir(modules.roundtableId, seat.slug),
       });
-      this._wakeLeaderForOrchestration({
-        type: "task_blocked",
-        sourceId: `${activeTask.id}:blocked`,
-        runtimeEpoch: turnEpoch,
-        taskId: blockedTask.id,
-        taskSubject: blockedTask.subject,
-        taskType: blockedTask.taskType,
-        workerName,
-        workerRole,
-        result: `${reason}\n\nWorker output:\n${result}`,
-      });
-      return;
-    }
-
-    const handoff = this._createTaskHandoff(activeTask, agentId, result, evidence);
-
-    const completedTask = this.updateTask(activeTask.id, {
-      status: "completed",
-      result,
-      evidence,
-      handoff,
-      gateState: this._completionGateState(activeTask, result),
-    });
-    this._emitWorkerCompletionSummary(agentId, completedTask, workerName, workerRole, result);
-    this._coordinateAfterTaskCompletion(completedTask, agentId, result);
-  }
-
-  handleWorkerTurnFailed(
-    agentId: string,
-    error: string,
-    taskId?: string | null,
-    turnEpoch = this._runtimeEpoch,
-    turnId?: string,
-  ): void {
-    const team = this._team;
-    if (!team || team.status !== "active") {
-      this.logTeamDebug("worker.turn_failed.skipped", { agentId, error, reason: "no_active_team" });
-      return;
-    }
-    if (!this._isCurrentWorkerTurn(agentId, turnEpoch, turnId)) {
-      this.logTeamDebug("worker.turn_failed.stale", {
-        agentId,
-        taskId: taskId ?? null,
-        turnId,
-        turnEpoch,
-        currentRuntimeEpoch: this._runtimeEpoch,
-      });
-      return;
-    }
-
-    const turnTask = taskId ? team.taskList.get(taskId) : undefined;
-    const activeTask = turnTask && turnTask.ownerAgentId === agentId && turnTask.status === "in_progress"
-      ? turnTask
-      : undefined;
-
-    if (!activeTask) {
-      // Task already resolved during the turn: the resolving tool already woke
-      // the leader; do not double-report the interruption.
-      if (taskId && turnTask) {
-        this.logTeamDebug("worker.turn_failed.task_already_resolved", {
-          agentId,
-          taskId,
-          status: turnTask.status,
-          error,
-        });
-        return;
-      }
-      // A failure of a message-only turn (timeout, abort, thrown error) is not
-      // task progress, but it can still stall an idle leader that never learns
-      // the turn did not complete. Surface it as an orphaned failure so the
-      // leader can react; the originating message path carries intent, not the
-      // failure outcome.
-      this._reportOrphanedWorkerTurn(agentId, error, true, turnId);
-      return;
-    }
-
-    const workerInfo = team.workers.get(agentId)?.info;
-    const workerName = workerInfo?.name ?? parseAgentId(agentId)?.agentName ?? agentId;
-    const workerRole = workerInfo?.role ?? "coder";
-    const result = `Worker turn failed before completion: ${error || "unknown error"}`.slice(0, MAX_AUTO_COMPLETION_RESULT_LENGTH);
-    this.logTeamDebug("worker.turn_failed", {
-      agentId,
-      workerName,
-      workerRole,
-      task: summarizeTeamTask(activeTask),
-      error,
-    });
-    const blockedTask = this.updateTask(activeTask.id, {
-      status: "blocked",
-      result,
-      gateState: this._updateGateStatus(activeTask, "blocked", "Worker turn failed before completion."),
-    });
-    this._wakeLeaderForOrchestration({
-      type: "task_blocked",
-      sourceId: `${activeTask.id}:failed`,
-      runtimeEpoch: turnEpoch,
-      taskId: blockedTask.id,
-      taskSubject: blockedTask.subject,
-      taskType: blockedTask.taskType,
-      workerName,
-      workerRole,
-      result,
-    });
-  }
-
-  /**
-   * Surface a worker turn that finished/failed without being tied to a task.
-   *
-   * Workers can run substantial turns driven by a plain message (or the initial
-   * prompt) rather than a claimed task. Those turns bypass the task lifecycle, so
-   * their completion never reaches the leader through task_completed/task_blocked.
-   * Without this, the leader (already idle) is never re-engaged and the team
-   * deadlocks — exactly the "leader and worker both stop" stall. We wake the
-   * leader with a team_message event carrying the worker's latest output so it
-   * can record, route, or fold the work into the plan.
-   */
-  private _reportOrphanedWorkerTurn(agentId: string, text: string | undefined, failed: boolean, turnId?: string): void {
-    const team = this._team;
-    if (!team || team.status !== "active") return;
-
-    const workerInfo = team.workers.get(agentId)?.info;
-    const workerName = workerInfo?.name ?? parseAgentId(agentId)?.agentName ?? agentId;
-    const workerRole = workerInfo?.role ?? "coder";
-    const trimmed = text?.trim();
-
-    // A finished turn with no output is not actionable; skip it to avoid waking
-    // the leader for nothing. Failures are always reported so a silent
-    // timeout/abort on a non-task turn cannot vanish.
-    if (!failed && !trimmed) {
-      this.logTeamDebug("worker.orphaned_turn.skipped_empty", { agentId });
-      return;
-    }
-
-    const detail = (trimmed ?? "(no textual output)").slice(0, MAX_AUTO_COMPLETION_RESULT_LENGTH);
-    const messageText = failed
-      ? `${workerName} (${workerRole}) ended a turn that was not tied to any task after an interruption or failure. Latest output:\n${detail}`
-      : `${workerName} (${workerRole}) finished a turn that ran from a direct message rather than a task assignment, so it is not tracked as task progress. Decide whether this work needs a tracked task, review, follow-up, or can be folded into the plan. Latest output:\n${detail}`;
-
-    this.logTeamDebug("worker.orphaned_turn.wake_leader", {
-      agentId,
-      failed,
-      text: summarizeText(detail),
-    });
-    this._wakeLeaderForOrchestration({
-      type: "team_message",
-      sourceId: `orphan:${turnId ?? randomUUID()}`,
-      fromAgentId: agentId,
-      workerName,
-      workerRole,
-      messageText,
-      result: failed
-        ? "Worker turn ended outside task tracking after a failure."
-        : "Worker produced output outside task tracking.",
-    });
-  }
-
-  /**
-   * Queue a worker->leader message that could not be delivered because the
-   * runtime epoch changed (abort paused the runtime). resumeRuntime drains the
-   * list so the message is not permanently lost.
-   */
-  private _deferLeaderMessage(message: TeamMessage): void {
-    // No active team: the message belongs to a team that was stopped. Deferring
-    // it would leak a stale worker->leader message into the next team created in
-    // this manager (createTeam does not clear _deferredLeaderMessages).
-    if (!this._team) return;
-    if (this._deferredLeaderMessages.some((m) => m.id === message.id)) return;
-    this._deferredLeaderMessages.push(message);
-    this.logTeamDebug("leader.deferred_message.queued", {
-      messageId: message.id,
-      count: this._deferredLeaderMessages.length,
-    });
-  }
-
-  /**
-   * Re-engage the leader after the runtime resumes from a pause. Work paused by
-   * an abort (in-progress tasks whose owner is no longer running) or restored
-   * from a snapshot (blocked/failed tasks) has no event-driven wake of its own:
-   * workers cannot re-claim in_progress tasks they own, and the stall heartbeat
-   * does not cover blocked/failed tasks. Wake the leader once per resume so it
-   * decides whether to resume, reassign, or finalize - rather than silently
-   * restarting or stranding the work. Also flush messages/events deferred
-   * during the pause.
-   */
-  private _reengageLeaderAfterResume(team: TeamData): void {
-    const blockedOrFailed = team.taskList.getAll().filter((task) =>
-      task.status === "blocked" || task.status === "failed",
-    );
-    const staleInProgress = team.taskList.getAll("in_progress").filter((task) => {
-      const owner = task.ownerAgentId ? team.workers.get(task.ownerAgentId) : undefined;
-      return !owner || owner.info.status !== "running";
-    });
-
-    if (blockedOrFailed.length > 0 || staleInProgress.length > 0) {
-      this._wakeLeaderForOrchestration({
-        type: "team_message",
-        sourceId: `resume:${blockedOrFailed.map((t) => t.id).join(",")}:${staleInProgress.map((t) => t.id).join(",")}`,
-        runtimeEpoch: this._runtimeEpoch,
-        messageText:
-          "Team runtime resumed after being paused. The following work was in flight and needs a decision: " +
-          `${blockedOrFailed.length} blocked/failed task(s) and ${staleInProgress.length} in-progress task(s) with no active worker. ` +
-          "Review the task list and decide whether to resume, reassign, split, or finalize each item; do not silently restart interrupted work.",
-        result: "Resumed after pause with in-flight work requiring a leader decision.",
-      });
-    }
-
-    if (this._deferredLeaderMessages.length > 0) {
-      const deferred = this._deferredLeaderMessages;
-      this._deferredLeaderMessages = [];
-      this.logTeamDebug("leader.deferred_messages.redelivered", { count: deferred.length });
-      for (const msg of deferred) {
-        this._wakeLeaderForMessage(msg);
-      }
-    }
-
-    if (this._orchestratorEvents.hasPending) {
-      this._scheduleOrchestratorQueue();
+    } catch (err) {
+      this._markSeatError(seatId, err);
     }
   }
 
-  private _releaseWorkerOpenTasks(agentId: string, reason: string): TeamTask[] {
-    const team = this._team;
-    if (!team || team.status !== "active") return [];
-
-    const workerInfo = team.workers.get(agentId)?.info;
-    const workerName = workerInfo?.name ?? parseAgentId(agentId)?.agentName ?? agentId;
-    const workerRole = workerInfo?.role ?? "coder";
-    const releaseResult = `Released from ${workerName}: ${reason}`;
-    const released = team.taskList
-      .releaseOwnedOpenTasks(agentId, releaseResult)
-      .map((task) => this.updateTask(task.id, {
-        gateState: this._updateGateStatus(task, "waiting", reason),
-      }));
-
-    for (const event of buildWorkerUnavailableOrchestrationEvents({
-      releasedTasks: released,
-      workerName,
-      workerRole,
-      reason,
-    })) {
-      this._wakeLeaderForOrchestration({
-        ...event,
-        sourceId: `${event.taskId ?? agentId}:released`,
-        runtimeEpoch: this._runtimeEpoch,
-      });
+  /** 席位 createAgentSession 的全部入参（plan §4.13：一条都不能少）。 */
+  private async _createSeatSession(seat: SeatInfo, resume = false): Promise<AgentSession> {
+    if (this._authStorage === null || this._modules === null) {
+      throw new Error("TeamManager not initialized.");
     }
-
-    return released;
-  }
-
-  private _emitWorkerCompletionSummary(
-    agentId: string,
-    task: TeamTask,
-    workerName: string,
-    workerRole: TeammateRole,
-    result: string,
-  ): void {
-    const team = this._team;
-    if (!team) return;
-
-    const summaryText = [
-      `<worker-summary agent="${workerName}" role="${workerRole}" taskId="${task.id}">`,
-      `**${workerName}** completed task **${task.subject}**`,
-      "",
-      `Result: ${result}`,
-      ...(task.evidence ? ["", "Evidence:"] : []),
-      ...(task.evidence ? this._formatTaskEvidenceForPrompt(task, result).split("\n") : []),
-      `</worker-summary>`,
-    ].join("\n");
-
-    this._emitEvent({
-      type: "worker_summary",
-      teamName: team.name,
-      fromAgentId: agentId,
-      summary: summaryText,
-      taskId: task.id,
-    });
-  }
-
-  private _coordinateAfterTaskCompletion(task: TeamTask, agentId: string, result: string): void {
-    const team = this._team;
-    if (!team || team.status !== "active") return;
-
-    const workerInfo = team.workers.get(agentId)?.info;
-    const workerName = workerInfo?.name ?? parseAgentId(agentId)?.agentName ?? agentId;
-    const workerRole = workerInfo?.role ?? "coder";
-    const policy = this._coordinationPolicyForTask(task, result);
-    const followUps = this._createCoordinatorFollowUps(task, result);
-    const followUpSummary = followUps.length > 0
-      ? [
-        "",
-        "Coordinator-created follow-up tasks:",
-        ...followUps.map((followUp) => `- ${followUp.subject} (${followUp.id.slice(0, 8)}) [${followUp.taskType ?? "general"}]`),
-      ].join("\n")
-      : "";
-
-    this._wakeLeaderForOrchestration({
-      type: "task_completed",
-      sourceId: `${task.id}:completed`,
-      runtimeEpoch: this._runtimeEpoch,
-      taskId: task.id,
-      taskSubject: task.subject,
-      taskType: task.taskType,
-      workerName,
-      workerRole,
-      result: `${result}\n\nCoordination decision: ${policy.leaderInstruction}${followUpSummary}`,
-    });
-    this._scheduleWorkerContextHygiene(agentId, task);
-  }
-
-  private _coordinationPolicyForTask(task: TeamTask, result: string): TeamCoordinationPolicy {
-    return planTeamCoordination({ taskType: task.taskType, result }, {
-      hasReviewChild: this._hasCoordinatorChild(task.id, "review"),
-      hasFixChild: this._hasCoordinatorChild(task.id, "fix"),
-    });
-  }
-
-  private _createCoordinatorFollowUps(task: TeamTask, result: string): TeamTask[] {
-    const team = this._team;
-    if (!team || team.status !== "active") return [];
-
-    const followUps: TeamTask[] = [];
-    const policy = this._coordinationPolicyForTask(task, result);
-    const generation = this._coordinationGeneration(task);
-    const rootTaskId = this._coordinationRootTaskId(task);
-    const canCreateFollowUp = generation < MAX_COORDINATION_GENERATION;
-
-    if (!canCreateFollowUp && (policy.needsReview || policy.needsFix)) {
-      this.logTeamDebug("coordination.followup.limit_reached", {
-        taskId: task.id,
-        rootTaskId,
-        generation,
-        maxGeneration: MAX_COORDINATION_GENERATION,
-        signal: policy.signal,
-      });
-    }
-
-    if (policy.needsReview && canCreateFollowUp) {
-      const evidenceText = this._formatTaskEvidenceForPrompt(task, result);
-      const handoffText = this._formatTaskHandoffForPrompt(task, result);
-      followUps.push(this.createTask(
-        `Review: ${task.subject}`,
-        [
-          `Review the completed ${task.taskType} task: ${task.subject}.`,
-          "",
-          "Audit completeness before style: compare the assigned scope, the worker's claimed result, and the actual repository state.",
-          "Look specifically for missing modules, files that were promised but not created, unwired entry points, placeholder code, skipped tests, and unsupported completion claims.",
-          "Then check correctness, integration risks, missing tests, and file-level issues.",
-          "Report pass/fail clearly. If issues exist, include specific files, missing scope, and actionable fix guidance.",
-          "",
-          "Assigned scope:",
-          task.description,
-          "",
-          "Handoff packet:",
-          handoffText,
-          "",
-          "Worker evidence ledger:",
-          evidenceText,
-        ].join("\n"),
-        undefined,
-        [],
-        "review",
-        {
-          generatedBy: "coordinator",
-          parentTaskId: task.id,
-          rootTaskId,
-          coordinationGeneration: generation + 1,
-          gate: "review",
+    const agentDir = getAgentDir();
+    const sessionDir = seatSessionDir(this._modules.roundtableId, seat.slug);
+    const sessionManager = resume
+      ? SessionManager.continueRecent(this._physicalCwd, sessionDir)
+      : SessionManager.create(this._physicalCwd, sessionDir);
+    const settingsManager = SettingsManager.create(this._physicalCwd);
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: this._physicalCwd,
+      agentDir,
+      settingsManager,
+      extensionFactories: [
+        (pi) => {
+          registerSeatIdentity(this, pi, seat.seatId);
         },
-      ));
-    }
+        createActiveCompressionExtension(() => sessionManager),
+      ],
+    });
+    await resourceLoader.reload();
 
-    if (policy.needsFix && canCreateFollowUp) {
-      followUps.push(this.createTask(
-        `Fix: ${task.subject}`,
-        [
-          `Address the issues found by the ${task.taskType} task: ${task.subject}.`,
-          "",
-          "Make the smallest safe code changes needed, then summarize exactly what changed.",
-          "",
-          `Review/test result:\n${result}`,
-        ].join("\n"),
-        undefined,
-        [],
-        "fix",
-        {
-          generatedBy: "coordinator",
-          parentTaskId: task.id,
-          rootTaskId,
-          coordinationGeneration: generation + 1,
-          gate: "fix",
+    const result = await this._sessionFactory({
+      cwd: this._physicalCwd,
+      // H34：runtimeCwd 用逻辑 cwd；席位读不到 session 的私有 _runtimeCwd。
+      runtimeCwd: this._logicalCwd,
+      executionBackend: this._executionBackend ?? undefined,
+      runtimeEnvironmentOverride: this._runtimeEnvironmentOverride,
+      sessionManager,
+      settingsManager,
+      resourceLoader,
+      authStorage: this._authStorage,
+      sessionStartEvent: { type: "session_start", reason: resume ? "resume" : "new" },
+      // H29/H35：增强工具关掉，tools 白名单必须含只读四工具 + 席位工具。
+      enableBuiltInEnhancementTools: false,
+      shouldStopAfterTurn: () => this._modules?.interrupts.shouldStopAfterTurn(seat.seatId) ?? false,
+      tools: seatToolAllowlist(seat.auth),
+      excludeTools: [...SEAT_DENIED_TOOL_NAMES],
+      customTools: registerSeatTools({ seatId: seat.seatId, host: this }),
+      // §4.6：永不 undefined；忽略 input.mode，只看席位档位。
+      hostToolPolicyOverride: createSeatToolPolicy({
+        getAuth: (targetSeatId) => this._modules?.roster.get(targetSeatId)?.auth ?? "restricted",
+        getAllowlist: (targetSeatId) => this._modules?.roster.get(targetSeatId)?.pathAllowlist,
+        getReadonlyCommands: (targetSeatId) => this._modules?.roster.get(targetSeatId)?.readonlyCommandAllowlist ?? [],
+        bashEnabled: (targetSeatId) => this._modules?.roster.get(targetSeatId)?.bashEnabled === true,
+        leases: this._modules.leases,
+        logicalCwd: this._logicalCwd,
+        seatId: seat.seatId,
+        teamToolNames: [...SEAT_TOOL_NAMES],
+        // §5.7：被拒的写入在时间线上留一条系统提示。
+        onDenied: (info) => {
+          this._onPolicyDenied(info);
         },
-      ));
-    }
-
-    return followUps;
-  }
-
-  private _coordinationGeneration(task: TeamTask): number {
-    const value = task.metadata?.coordinationGeneration;
-    return typeof value === "number" && Number.isFinite(value) && value >= 0
-      ? Math.floor(value)
-      : 0;
-  }
-
-  private _coordinationRootTaskId(task: TeamTask): string {
-    const rootTaskId = task.metadata?.rootTaskId;
-    if (typeof rootTaskId === "string" && rootTaskId) return rootTaskId;
-    return task.id;
-  }
-
-  private _hasCoordinatorChild(parentTaskId: string, gate: "review" | "fix"): boolean {
-    const team = this._team;
-    if (!team) return false;
-
-    return team.taskList.getAll().some((task) =>
-      task.metadata?.generatedBy === "coordinator" &&
-      task.metadata?.parentTaskId === parentTaskId &&
-      task.metadata?.gate === gate &&
-      task.status !== "cancelled",
-    );
-  }
-
-  private _formatTaskEvidenceForPrompt(task: TeamTask, fallbackResult: string): string {
-    const evidence = task.evidence ?? mergeTeamTaskEvidence(fallbackResult);
-    const lines = [
-      `Summary: ${evidence.summary || fallbackResult}`,
-      `Changed files: ${evidence.changedFiles.length ? evidence.changedFiles.join(", ") : "(none reported)"}`,
-      "Completed scope:",
-      ...(evidence.completedScope.length ? evidence.completedScope.map((item) => `- ${item}`) : ["- (none reported)"]),
-      "Missing scope:",
-      ...(evidence.missingScope.length ? evidence.missingScope.map((item) => `- ${item}`) : ["- (none reported)"]),
-      "Verification:",
-      ...(evidence.verification.length ? evidence.verification.map((item) => `- ${item}`) : ["- (none reported)"]),
-      "Risks:",
-      ...(evidence.risks.length ? evidence.risks.map((item) => `- ${item}`) : ["- (none reported)"]),
-      "Follow-ups:",
-      ...(evidence.followUps.length ? evidence.followUps.map((item) => `- ${item}`) : ["- (none reported)"]),
-    ];
-    if (evidence.confidence) lines.push(`Confidence: ${evidence.confidence}`);
-    return lines.join("\n");
-  }
-
-  private _formatTaskHandoffForPrompt(task: TeamTask, fallbackResult: string): string {
-    const handoff = task.handoff ?? this._createTaskHandoff(
-      task,
-      task.ownerAgentId ?? "unknown",
-      fallbackResult,
-      task.evidence ?? mergeTeamTaskEvidence(fallbackResult),
-    );
-    return [
-      `Task: ${task.subject} (${handoff.taskId.slice(0, 8)})`,
-      `Worker: ${handoff.workerAgentId ?? "unknown"}`,
-      `Summary: ${handoff.summary}`,
-      `Context pack generated: ${handoff.contextPack ? new Date(handoff.contextPack.generatedAt).toISOString() : "none"}`,
-      `Gate: ${task.gateState?.gate ?? "none"} / ${task.gateState?.status ?? "unknown"}`,
-    ].join("\n");
-  }
-
-  private _scheduleWorkerContextHygiene(agentId: string, completedTask: TeamTask, attempt = 0): void {
-    const team = this._team;
-    const worker = team?.workers.get(agentId);
-    if (!team || !worker?.session) return;
-
-    const delayMs = attempt === 0 ? 2_500 : 8_000;
-    const timer = setTimeout(() => {
-      this._hygieneTimers.delete(timer);
-      const currentTeam = this._team;
-      const currentWorker = currentTeam?.workers.get(agentId);
-      const session = currentWorker?.session;
-      if (!currentTeam || !currentWorker || !session) return;
-      if (currentWorker.info.status === "shutdown" || currentWorker.info.status === "error") return;
-
-      const workerBusy = currentWorker.info.status === "running" || session.isStreaming || session.isCompacting;
-      if (workerBusy) {
-        if (attempt < 1) this._scheduleWorkerContextHygiene(agentId, completedTask, attempt + 1);
-        return;
-      }
-
-      const readyForWorker = currentTeam.taskList.getReadyTasks(currentWorker.info.role)
-        .some((task) => !task.ownerAgentId || task.ownerAgentId === agentId);
-      if (readyForWorker) return;
-      if (session.sessionManager.getAcp()) return;
-
-      const instructions = [
-        "Compact this teammate session after completing a team task.",
-        "Preserve the teammate identity, role, team name, and active project facts.",
-        "Preserve only durable engineering facts, the latest task handoff, changed files, completed scope, missing scope, verification, risks, and follow-ups.",
-        "Drop transient tool logs, repetitive status chatter, and resolved discussion details.",
-        "",
-        "Latest task handoff:",
-        this._formatTaskHandoffForPrompt(completedTask, completedTask.result ?? ""),
-        "",
-        this._formatTaskEvidenceForPrompt(completedTask, completedTask.result ?? ""),
-      ].join("\n");
-
-      void session.compact(instructions).catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!msg.includes("Nothing to compact") && !msg.includes("Already compacted")) {
-          console.warn(`[TeamManager] Context hygiene compaction failed for ${agentId}:`, err);
-        }
-      });
-    }, delayMs);
-    this._hygieneTimers.add(timer);
-  }
-
-  /** Cancel all pending worker-context-hygiene timers (team stop / dispose). */
-  private _clearHygieneTimers(): void {
-    for (const timer of this._hygieneTimers) {
-      clearTimeout(timer);
-    }
-    this._hygieneTimers.clear();
-  }
-
-  /** Cancel all pending leader-steer retry timers (team stop / dispose). */
-  private _clearSteerRetryTimers(): void {
-    for (const timer of this._steerRetryTimers) {
-      clearTimeout(timer);
-    }
-    this._steerRetryTimers.clear();
-  }
-
-  // ==========================================================================
-  // Cleanup
-  // ==========================================================================
-
-  /** Dispose all resources. Called on app quit. */
-  async dispose(): Promise<void> {
-    this._stopHealthCheck();
-    if (this._team) {
-      try {
-        // Preserve the snapshot: app quit / shutdown should allow restore on reopen.
-        await this.stopTeam({ deleteSnapshot: false });
-      } catch (err) {
-        console.error("[TeamManager] Error during dispose:", err);
-      }
-    }
-    this._leaderSession = null;
-    this._setLeaderTurnActive(false);
-    this._orchestratorEvents.clear();
-    this._leaderWakeInFlight = false;
-    this._deferredLeaderMessages = [];
-    this._clearHygieneTimers();
-    this._clearSteerRetryTimers();
-    if (this._orchestratorRetryTimer) {
-      clearTimeout(this._orchestratorRetryTimer);
-      this._orchestratorRetryTimer = null;
-      this._orchestratorRetryDueAt = 0;
-    }
-    this._eventCallbacks.length = 0;
-  }
-
-  // ==========================================================================
-  // Health Check & Cleanup
-  // ==========================================================================
-
-  /** Start periodic health check for failed workers. */
-  private _startHealthCheck(): void {
-    if (this._healthCheckInterval) return;
-    this._healthCheckInterval = setInterval(() => {
-      this._checkWorkerHealth();
-    }, 30_000); // Check every 30 seconds
-  }
-
-  /** Stop periodic health check. */
-  private _stopHealthCheck(): void {
-    if (this._healthCheckInterval) {
-      clearInterval(this._healthCheckInterval);
-      this._healthCheckInterval = null;
-    }
-  }
-
-  /** Check worker health and auto-recover stuck workers. */
-  private _checkWorkerHealth(): void {
-    const team = this._team;
-    if (!team || !this.isRuntimeActive()) return;
-
-    // Prune fully-delivered broadcasts to prevent unbounded memory growth
-    const activeAgentIds = Array.from(team.workers.entries())
-      .filter(([, worker]) => worker.info.status === "idle" || worker.info.status === "running")
-      .map(([agentId]) => agentId);
-    const prunedBroadcasts = team.bus.pruneBroadcasts(activeAgentIds);
-    this.logTeamDebug("health_check", {
-      activeAgentIds,
-      prunedBroadcasts,
-      busSize: team.bus.size(),
-      workers: Array.from(team.workers.values()).map((worker) => worker.info),
+      }),
     });
 
-    const now = Date.now();
-    for (const [agentId, worker] of team.workers) {
-      // Check for workers stuck in error state
-      if (worker.info.status === "error") {
-        const errorDuration = now - worker.info.statusChangedAt;
-        if (errorDuration > 300_000) { // 5 minutes
-          console.warn(`[TeamManager] Worker ${agentId} has been in error state for ${Math.floor(errorDuration / 60_000)} minutes, restarting`);
-          this.logTeamDebug("health_check.worker_restart", { agentId, errorDuration });
-          void this.restartWorker(agentId).catch((err) => {
-            console.error(`[TeamManager] Error restarting stuck worker ${agentId}:`, err);
-            this.logTeamDebug("health_check.worker_restart.error", { agentId, error: err });
-          });
-        }
-      }
-
-      // Check for workers that haven't been active for a long time (stuck on tool call)
-      if (worker.info.status === "running" && worker.info.lastActiveAt) {
-        const inactiveDuration = now - worker.info.lastActiveAt;
-        if (inactiveDuration > WORKER_STUCK_TURN_TIMEOUT_MS) {
-          console.warn(`[TeamManager] Worker ${agentId} has been inactive for ${Math.floor(inactiveDuration / 60_000)} minutes, aborting stuck turn`);
-          this.logTeamDebug("health_check.worker_abort_stuck_turn", {
-            agentId,
-            inactiveDuration,
-            timeoutMs: WORKER_STUCK_TURN_TIMEOUT_MS,
-          });
-          // Abort the stuck turn to unblock any pending protocol requests
-          worker.runner?.abortCurrentTurn();
-        }
+    // 席位模型（可选）走 H24 的赋值路径，绝不 setModel()。
+    const modelSpec = seat.model?.trim();
+    if (modelSpec !== undefined && modelSpec.length > 0) {
+      const resolved = resolveModelSpec(result.session, modelSpec);
+      if (resolved !== undefined) {
+        result.session.agent.state.model = resolved;
+        result.session.sessionManager.appendModelChange(resolved.provider, resolved.id);
+      } else {
+        console.warn(`[TeamManager] Seat ${seat.seatId} model "${modelSpec}" not found; using default`);
       }
     }
+    return result.session;
+  }
 
-    // Orchestration safety-net: catch a silently-stalled team that the
-    // event-driven wakes missed.
-    this._maybeRecoverOrchestrationStall();
+  /** 席位 session 事件：转发 `seat_event` + 状态/活动投影 + 统计（K / AC-22）。 */
+  private _onSeatEvent(seatId: string, event: SdkSessionEvent): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    this._emit({ type: "seat_event", seatId, event: event as unknown as AgentSessionEvent });
+    modules.roster.touch(seatId);
+    switch (event.type) {
+      case "agent_start": {
+        const duration = this._seatDurations.get(seatId) ?? { total: 0, startedAt: null };
+        duration.startedAt = Date.now();
+        this._seatDurations.set(seatId, duration);
+        this._setSeatStatus(seatId, "speaking");
+        break;
+      }
+      case "tool_execution_start":
+        this._setSeatStatus(seatId, "exploring", { currentActivity: event.toolName });
+        break;
+      case "agent_end": {
+        this._finishSeatDuration(seatId);
+        this._setSeatStatus(seatId, "idle");
+        this._persistSoon();
+        this._emit({ type: "metrics", snapshot: this.getMetrics() });
+        this._metrics?.evaluate();
+        break;
+      }
+      case "api_error": {
+        if (event.retryable === false) {
+          this._markSeatError(seatId, event.errorMessage);
+        }
+        break;
+      }
+      case "file_change": {
+        // §4.6 末段：落到未持约路径 → Attention write_conflict（事后审计，不代替事前 deny）。
+        this._reportUnleasedFileChange(seatId, event.change?.path);
+        break;
+      }
+      default:
+        break;
+    }
   }
 
   /**
-   * Detect and recover an orchestration stall.
+   * §4.6 末段的事后审计：席位在未持约路径上产生了文件变更就报一条 `write_conflict`。
+   * 事前 deny 挡不住 team_bash 之类的旁路，所以这条路径必须存在；去重按
+   * `(seatId, path)` 30 秒一次，表有界（F3-7）。
+   */
+  private _reportUnleasedFileChange(seatId: string, path: string | undefined): void {
+    const modules = this._modules;
+    if (modules === null || path === undefined || path.length === 0) {
+      return;
+    }
+    if (modules.leases.ownerOf(path) === seatId) {
+      return;
+    }
+    const key = `${seatId}\u0000${path}`;
+    const now = Date.now();
+    if (now - (this._fileChangeNoticeAt.get(key) ?? 0) < FILE_CHANGE_NOTICE_WINDOW_MS) {
+      return;
+    }
+    if (this._fileChangeNoticeAt.size >= FILE_CHANGE_NOTICE_MAX_KEYS) {
+      const oldest = this._fileChangeNoticeAt.keys().next().value;
+      if (oldest !== undefined) {
+        this._fileChangeNoticeAt.delete(oldest);
+      }
+    }
+    this._fileChangeNoticeAt.set(key, now);
+    this.logTeamDebug("seat.file_change.unleased", { seatId, path });
+    this._raiseAttention({
+      kind: "write_conflict",
+      seatId,
+      text: `席位在未持约路径上产生了文件变更：${path}`,
+    });
+  }
+
+  private _finishSeatDuration(seatId: string): void {
+    const duration = this._seatDurations.get(seatId);
+    if (duration === undefined || duration.startedAt === null) {
+      return;
+    }
+    duration.total += Date.now() - duration.startedAt;
+    duration.startedAt = null;
+  }
+
+  /** 席位不可用（session 创建失败 / 崩溃）：该席 error + 注意力；圆桌继续。 */
+  private _markSeatError(seatId: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const modules = this._modules;
+    this.logTeamDebug("seat.error", { seatId, error });
+    this._setSeatStatus(seatId, "error", { error: message });
+    this._raiseAttention({
+      kind: "seat_error",
+      seatId,
+      text: `席位 ${seatLabel(modules?.roster ?? null, seatId)} 出错（${message}）：其余席位继续讨论，可 wake_seat 或重新加入。`,
+    });
+    this._persistSoon();
+  }
+
+  private async _disposeSeatSession(seatId: string, options: { rememberUsage?: boolean } = {}): Promise<void> {
+    const unsubscribe = this._unsubscribeSeats.get(seatId);
+    if (unsubscribe !== undefined) {
+      unsubscribe();
+      this._unsubscribeSeats.delete(seatId);
+    }
+    this._finishSeatDuration(seatId);
+    const session = this._sessions.get(seatId);
+    this._sessions.delete(seatId);
+    if (session !== undefined) {
+      // 先记用量再 dispose（F4-3）：退出席位已产生的消耗要留在成本表上。
+      // 升档重建走 continueRecent，同一份 transcript 的用量会回到 live session，不能再累加。
+      if (options.rememberUsage !== false) {
+        this._rememberSeatUsage(seatId, session);
+      }
+      await session.dispose({ reason: "quit" }).catch(() => {});
+    }
+  }
+
+  /** 累计记下该席 session 的用量（同一席多次进场/退场与 `_seatDurations` 同构叠加）。 */
+  private _rememberSeatUsage(seatId: string, session: AgentSession): void {
+    const stats = statsOf(session);
+    const previous = this._seatUsage.get(seatId);
+    this._seatUsage.set(seatId, {
+      tokens: {
+        input: (previous?.tokens.input ?? 0) + stats.tokens.input,
+        output: (previous?.tokens.output ?? 0) + stats.tokens.output,
+        cacheRead: (previous?.tokens.cacheRead ?? 0) + stats.tokens.cacheRead,
+        cacheWrite: (previous?.tokens.cacheWrite ?? 0) + stats.tokens.cacheWrite,
+      },
+      cost: (previous?.cost ?? 0) + stats.cost,
+    });
+  }
+
+  private async _teardownSeats(): Promise<void> {
+    for (const [seatId, runner] of [...this._runners]) {
+      await runner.stop().catch(() => {});
+      this._runners.delete(seatId);
+    }
+    for (const seatId of [...this._sessions.keys()]) {
+      await this._disposeSeatSession(seatId);
+    }
+  }
+
+  /**
+   * 把本场的一切收干净（F3-3）：停健康检查与指标定时器、退订三条订阅、dispose
+   * 全部席位 session + runner、清掉协议定时器（退出协商的 120s 定时器在整场拆掉
+   * 之后不该再触发，F3-4）。换场（initialize / createRoundtable）与 stop / dispose
+   * 都走这里，否则 team ↔ solo 往返每次都会泄漏 session 与定时器，旧场的迟到事件
+   * 还会写进新场。
    *
-   * The leader is woken purely by events. If every wake path misses (e.g. a
-   * worker's output never reached the task system and no wake-eligible message
-   * was sent), an idle leader can sit forever while runnable work is stranded.
-   * This heartbeat — driven by the 30s health check — nudges the leader when:
-   *   - the leader is fully idle (no active turn, no wake in flight, empty queue,
-   *     not streaming), AND
-   *   - no worker is currently executing, AND
-   *   - there is runnable work: a ready task nobody picked up, or an in_progress
-   *     task whose owner is not actually running.
-   * It is throttled so a leader legitimately waiting on the user is not spammed.
+   * 故意**不**清 `this._modules`：stop() 之后 `getState()` / `getDeliverables()` /
+   * `getAttention()` / `exportMarkdown()` 仍要以只读方式可读（停止后记录保留），
+   * 清掉会让 stopped 场变成空视图。换场路径紧接着就会装上新的模块实例。
    */
-  private _maybeRecoverOrchestrationStall(): void {
-    const team = this._team;
-    if (!team || !this.isRuntimeActive()) return;
-    const leaderSession = this._leaderSession;
-    if (!leaderSession) return;
-
-    // Leader must be fully idle, or there is no stall to recover.
-    if (this._leaderTurnActive || this._leaderWakeInFlight) return;
-    if (this._orchestratorEvents.hasPending) return;
-    if (leaderSession.isStreaming) return;
-
-    // If any worker is executing, progress is still happening.
-    const anyWorkerRunning = Array.from(team.workers.values())
-      .some((worker) => worker.info.status === "running");
-    if (anyWorkerRunning) return;
-
-    // Is there work that should be moving but isn't?
-    const readyTasks = team.taskList.getReadyTasks();
-    const stuckInProgress = team.taskList.getAll("in_progress").filter((task) => {
-      const owner = task.ownerAgentId ? team.workers.get(task.ownerAgentId) : undefined;
-      return !owner || owner.info.status !== "running";
-    });
-    if (readyTasks.length === 0 && stuckInProgress.length === 0) return;
-
-    const now = Date.now();
-    if (now - this._lastStallRecoveryAt < ORCHESTRATION_STALL_RECOVERY_INTERVAL_MS) return;
-    this._lastStallRecoveryAt = now;
-
-    this.logTeamDebug("orchestrator.stall_recovery", {
-      readyTaskCount: readyTasks.length,
-      stuckInProgressCount: stuckInProgress.length,
-      workers: Array.from(team.workers.values()).map((worker) => ({
-        agentId: worker.info.agentId,
-        status: worker.info.status,
-      })),
-    });
-    this._wakeLeaderForOrchestration({
-      type: "team_message",
-      sourceId: `stall:${readyTasks.map((task) => task.id).join(",")}:${stuckInProgress.map((task) => task.id).join(",")}`,
-      runtimeEpoch: this._runtimeEpoch,
-      messageText:
-        "Orchestration heartbeat: the team is idle but runnable work is stranded " +
-        `(${readyTasks.length} ready task(s), ${stuckInProgress.length} in-progress task(s) with no active worker). ` +
-        "Review task and worker state and take the next coordination step: activate or assign a teammate, " +
-        "reassign or split the work, or — if you are blocked on a user decision — summarize and ask the user. " +
-        "If all meaningful work is genuinely complete, summarize results and stop.",
-      result: "Idle team with stranded runnable work detected by the health check.",
-    });
+  private async _teardownModules(): Promise<void> {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    modules.metrics.stop();
+    modules.health.stop();
+    modules.protocol.clearAll();
+    modules.offGate();
+    modules.offInbox();
+    modules.offTimelineAppend();
+    this._abortAux();
+    await this._teardownSeats();
   }
 
-  /** Clean up event subscriptions for all workers. */
-  private _cleanupSubscriptions(): void {
-    const team = this._team;
-    if (!team) return;
+  // ==========================================================================
+  // 内部：投递 / 状态 / 事件
+  // ==========================================================================
 
-    for (const [, worker] of team.workers) {
-      if (worker.unsubscribeEvents) {
-        worker.unsubscribeEvents();
-        worker.unsubscribeEvents = undefined;
+  /** 一条 argument 被有序门放行：投递 + L1 + 清 waiting_turn（H28）。 */
+  private _onArgumentReleased(messageId: string): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    const item = modules.timeline.getById(messageId);
+    if (item === undefined) {
+      return;
+    }
+    const targets = this._messageTargets(item.toId);
+    modules.inbox.enqueue(item, targets);
+    this._clearWaitingTurn(item.fromId);
+    this._nudge(targets, "L1", "seat", item.fromId);
+    this.logTeamDebug("ordered.released", { messageId, fromId: item.fromId, targets });
+    this._persistSoon();
+  }
+
+  /** 消息目标席：`*` 展开为活跃席；user 没有收件箱。 */
+  private _messageTargets(toId: string): string[] {
+    const modules = this._modules;
+    if (modules === null) {
+      return [];
+    }
+    if (toId === USER_SEAT_ID) {
+      return [];
+    }
+    if (toId === "*") {
+      // @ 的席位在收件箱里优先级更高（priority 由 SeatInbox 按 mentionIds 算）。
+      return modules.roster.activeIds();
+    }
+    return [toId];
+  }
+
+  /** 打断决策（执行在 SeatRunner；本类只决定"谁被打断"）。 */
+  private _nudge(
+    targets: string[],
+    level: InterruptLevel,
+    actor: "user" | "seat" | "system",
+    fromSeatId?: string,
+    reason?: string,
+  ): void {
+    const modules = this._modules;
+    if (modules === null || this._state?.lifecycle !== "active") {
+      // 暂停/停止期间不发起任何团队模型调用（§5.10）。
+      return;
+    }
+    for (const target of targets) {
+      if (target === USER_SEAT_ID || !modules.roster.isActive(target)) {
+        continue;
+      }
+      const result = modules.interrupts.request({ targetSeatId: target, level, actor, fromSeatId, reason });
+      if (!result.accepted) {
+        this.logTeamDebug("interrupt.rejected", { target, level, actor, reason: result.reason });
       }
     }
   }
 
-  // ==========================================================================
-  // Worker Restart
-  // ==========================================================================
+  /** 席位状态投影 + `seat_status` 事件。 */
+  private _setSeatStatus(seatId: string, status: SeatRuntimeStatus, extra: { currentActivity?: string; error?: string } = {}): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    const seat = modules.roster.get(seatId);
+    if (seat === undefined || seat.status === "exited") {
+      return;
+    }
+    if (seat.status === status && extra.error === undefined && extra.currentActivity === undefined) {
+      return;
+    }
+    modules.roster.setStatus(seatId, status, extra);
+    if (this._state !== null) {
+      this._state.seats = modules.roster.snapshot();
+    }
+    this._emit({ type: "seat_status", seatId, status, activity: extra.currentActivity, error: extra.error });
+    this._persistSoon();
+  }
 
   /**
-   * Restart a failed or shutdown worker.
-   * Disposes the old worker state and launches a fresh session.
+   * 有序模式变化：关掉时按排队键放行等待中的 argument（投递不丢）并清掉所有
+   * `waiting_turn`（§5.15）；`RoundtableState.orderedMode` 只是 settings 的投影（H27）。
    */
-  async restartWorker(agentId: string): Promise<void> {
-    const team = this._team;
-    this._assertRuntimeActive("restart_worker");
-    if (!team) throw new Error("No active team.");
-
-    const worker = team.workers.get(agentId);
-    if (!worker) throw new Error(`Worker ${agentId} not found in team.`);
-
-    // Only restart workers that are in error or shutdown state
-    if (worker.info.status !== "error" && worker.info.status !== "shutdown") {
-      throw new Error(`Worker ${agentId} is ${worker.info.status}. Only error/shutdown workers can be restarted.`);
+  private _onOrderedModeChanged(on: boolean): void {
+    const modules = this._modules;
+    const state = this._state;
+    if (modules === null || state === null) {
+      return;
     }
-    // Dispose old resources
-    if (worker.runner) {
-      await worker.runner.dispose().catch(() => {});
-      worker.runner = null;
+    state.orderedMode = on;
+    if (on) {
+      return;
     }
-    worker.lifecycleAbortController?.abort();
-    worker.workAbortController?.abort();
-    worker.unsubscribeEvents?.();
-    if (worker.session) {
-      await worker.session.dispose({ reason: "quit" }).catch(() => {});
+    modules.gate.reset();
+    for (const seat of modules.roster.list()) {
+      if (seat.status === "waiting_turn") {
+        this._clearWaitingTurn(seat.seatId);
+      }
     }
-    if (worker.mcpAdapter) {
-      await worker.mcpAdapter.dispose().catch(() => {});
+  }
+
+  /** 放行/退出/关有序模式后清掉 waiting_turn（§4.1 / §5.15）。 */
+  private _clearWaitingTurn(seatId: string): void {
+    const modules = this._modules;
+    const seat = modules?.roster.get(seatId);
+    if (modules === null || seat === undefined || seat.status !== "waiting_turn") {
+      return;
     }
+    const streaming = this._sessions.get(seatId)?.isStreaming === true;
+    this._setSeatStatus(seatId, streaming ? "speaking" : "idle");
+  }
 
-    // Reset worker state
-    worker.session = null;
-    worker.mcpAdapter = null;
-    worker.lifecycleAbortController = null;
-    worker.workAbortController = null;
-    worker.messageHistory = [];
-    worker.info.status = "idle";
-    worker.info.error = undefined;
-    worker.info.statusChangedAt = Date.now();
+  private _setSeatStatusesForPause(): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    for (const seat of modules.roster.list()) {
+      if (seat.status === "waiting_turn" || seat.status === "speaking" || seat.status === "exploring") {
+        this._setSeatStatus(seat.seatId, "idle");
+      }
+    }
+  }
 
-    this._emitEvent({
-      type: "teammate_status_changed",
-      teamName: team.name,
-      agentId,
-      status: "idle",
-      timestamp: worker.info.statusChangedAt,
-    });
-    this._emitTeamStateChanged();
+  /** 投递态 diff → `delivery_changed`（AC-8：UI 不必轮询）。 */
+  private _syncDelivery(seatId: string): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    const previous = this._deliveryStates.get(seatId) ?? new Map<string, DeliveryState>();
+    const next = new Map<string, DeliveryState>();
+    for (const entry of modules.inbox.snapshot()) {
+      if (entry.seatId === seatId) {
+        next.set(entry.messageId, entry.state);
+      }
+    }
+    for (const [messageId, state] of next) {
+      if (previous.get(messageId) !== state) {
+        this._emit({ type: "delivery_changed", messageId, seatId, state });
+      }
+    }
+    this._deliveryStates.set(seatId, next);
+  }
 
-    // Relaunch the worker
-    void this._launchWorker(agentId).catch((err) => {
-      console.error(`[TeamManager] Failed to restart worker ${agentId}:`, err);
-      this.updateWorkerStatus(agentId, "error", String(err));
+  /** 时间线条目投影：IPC 出去的 TimelineItem 必须带 deliveryBySeat（§4.3）。 */
+  private _projectItem(item: TimelineItem): TimelineItem {
+    const modules = this._modules;
+    const deliveryBySeat: Record<string, DeliveryState> = {};
+    if (modules !== null) {
+      for (const entry of modules.inbox.snapshot()) {
+        if (entry.messageId === item.id) {
+          deliveryBySeat[entry.seatId] = entry.state;
+        }
+      }
+    }
+    return { ...item, deliveryBySeat };
+  }
+
+  /**
+   * 追加一条 system 时间线记录（开场/公告/系统提示都走这里）。落盘与事件由
+   * `timeline.onAppend` 的统一出口负责（F3-2）——jsonl 是「已记录」的唯一长期
+   * 载体（§4.10），所以这里不再各自调 persist/emit。
+   */
+  private _appendSystem(text: string, toId: string): TimelineItem {
+    const modules = this._modules!;
+    return modules.timeline.append({
+      ts: Date.now(),
+      type: "system",
+      fromId: USER_SEAT_ID,
+      toId,
+      text,
+      summary: firstLine(text),
+      mentionIds: toId === "*" || toId === USER_SEAT_ID ? [] : [toId],
     });
   }
 
-  // ==========================================================================
-  // Private Helpers
-  // ==========================================================================
+  private _appendTimelinePersist(item: TimelineItem): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
+    }
+    void modules.persistence.appendTimeline(item).catch((err) => {
+      this._raisePersistFailure("timeline.jsonl", err);
+    });
+  }
 
-  private _emitEvent(event: TeamEvent): void {
-    for (const cb of [...this._eventCallbacks]) {
+  private _emitTimeline(item: TimelineItem): void {
+    this._emit({ type: "timeline_item", item: this._projectItem(item) });
+  }
+
+  /** 计时兜底（pause 的 L3 超时）：不拖住进程退出，也不需要外部时钟。 */
+  private _sleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
+  }
+
+  private _emit(event: TeamEvent): void {
+    for (const callback of [...this._eventCallbacks]) {
       try {
-        cb(event);
+        callback(event);
       } catch (err) {
         console.error("[TeamManager] Event callback error:", err);
       }
     }
-    if (event.type !== "team_deleted") {
-      this._schedulePersist();
+  }
+
+  private _emitState(): void {
+    const state = this.getState();
+    if (state !== null) {
+      this._emit({ type: "roundtable_state", state });
     }
   }
 
-  private _emitTeamStateChanged(): void {
-    const state = this.getTeamState();
-    if (state) {
-      this._emitEvent({ type: "team_state_changed", team: state });
+  /**
+   * 注意力面：真实 AttentionBus + `attention` 事件 + attention.jsonl 落盘（H44）。
+   * `action` 必须原样透传（F5-4）：它不在快照本体里，只靠 `attention` 事件与
+   * `get_attention` 投影到渲染层，renderer 据此在 ack 之后补发 `resume`。
+   */
+  private _raiseAttention(item: {
+    kind: AttentionItem["kind"];
+    text: string;
+    seatId?: string;
+    refId?: string;
+    action?: AttentionItem["action"];
+  }): AttentionItem {
+    const modules = this._modules;
+    if (modules === null) {
+      // 建场之前（例如 legacy 提示）没有注意力面：忽略即可。**用户可见的提示不能
+      // 指望这条路径**——它只返回一个没人接收的合成条目（F4-7 的损坏提示因此改为
+      // 走 `_deferredNotices` + `_flushDeferredNotices()`）。
+      return {
+        id: "",
+        ts: Date.now(),
+        kind: item.kind,
+        text: item.text,
+        seatId: item.seatId,
+        refId: item.refId,
+        action: item.action,
+        acked: false,
+      };
     }
+    const created = modules.attention.push(item);
+    this._emit({ type: "attention", item: created });
+    void modules.persistence.appendAttention(created).catch(() => {});
+    this._persistSoon();
+    return created;
   }
 
-  markStateDirtyForPersistence(): void {
-    this._schedulePersist();
-  }
-
-  private _schedulePersist(): void {
-    if (this._isRestoringTeam || !this._team || !this._physicalCwd) return;
-    // Never persist during teardown: a "stopping" snapshot is non-restorable and
-    // would clobber the final "active" snapshot flushed at the start of stopTeam.
-    if (this._team.status === "stopping") return;
-    if (this._persistTimer) clearTimeout(this._persistTimer);
-    this._persistTimer = setTimeout(() => {
-      this._persistTimer = null;
-      void this._persistTeamSnapshot().catch((err) => {
-        console.warn("[TeamManager] Failed to persist team snapshot:", err);
-      });
-    }, 250);
-  }
-
-  private async _persistTeamSnapshot(): Promise<void> {
-    if (!this._team || !this._physicalCwd || this._team.status === "stopping") return;
-    await persistTeamSnapshot(this._physicalCwd, this._team);
-  }
-
-  private async _deletePersistedSnapshot(): Promise<void> {
-    if (this._persistTimer) {
-      clearTimeout(this._persistTimer);
-      this._persistTimer = null;
-    }
-    if (!this._physicalCwd) return;
-    await deletePersistedTeamSnapshot(this._physicalCwd);
-  }
-
-  private async _restorePersistedTeamIfPresent(): Promise<void> {
-    if (this._team || !this._physicalCwd || !this._authStorage) return;
-
-    const snapshot = await readPersistedTeamSnapshot(this._physicalCwd);
-    if (!snapshot || !isRestorableTeamSnapshot(snapshot, this._physicalCwd)) {
+  /**
+   * 补发建场之前暂存的注意力（F4-7）。必须在 `roundtable_created` / `roundtable_state`
+   * 之后调用：渲染层收到建场事件会清空上一场的投影（`attentionItems`），早于它的
+   * `attention` 事件会被那次清空抹掉，用户依旧看不到。
+   * 只补发当前工作区的条目：暂存发生在 `initialize` 之后，若期间换过工作区，把别的
+   * 工作区的损坏提示显示在这一场里会误导用户。
+   */
+  private _flushDeferredNotices(): void {
+    if (this._modules === null || this._state === null || this._deferredNotices.length === 0) {
       return;
     }
-
-    this._isRestoringTeam = true;
-    try {
-      const team = hydratePersistedTeam(snapshot);
-      this._team = team;
-      this._executionState = "paused";
-      this._runtimeEpoch++;
-      this._lastLoggedContext = {};
-      this._debugLogger.start(this._physicalCwd, team.name, "restore_persisted_team");
-      this.logTeamDebug("team.restore.start", {
-        snapshotSavedAt: snapshot.savedAt,
-        teamCreatedAt: snapshot.team.createdAt,
-        workerCount: team.workers.size,
-        taskCount: team.taskList.size(),
-        executionState: this._executionState,
-        runtimeEpoch: this._runtimeEpoch,
-      });
-      this._refreshFileConflicts();
-
-      const openTasks = team.taskList.getAll().filter((task) =>
-        task.status === "assigned" || task.status === "pending" || task.status === "blocked" || task.status === "failed",
-      );
-      for (const [, worker] of team.workers) {
-        const hasOwnedOpenTask = openTasks.some((task) =>
-          task.ownerAgentId === worker.info.agentId && task.status !== "blocked",
-        );
-        if (worker.info.activationPolicy !== "always" && !hasOwnedOpenTask && worker.info.status === "idle") {
-          // The roster is restored for viewing, but no session exists yet.
-          // Standby makes the lack of a live worker explicit until resume.
-          worker.info.status = "standby";
-          worker.info.statusChangedAt = Date.now();
-        }
-      }
-
-      const state = this.getTeamState();
-      if (state) {
-        this._emitEvent({ type: "team_created", team: state });
-        this._emitEvent({ type: "team_state_changed", team: state });
-      }
-      // Restore is deliberately history-only. A user viewing a completed Team
-      // must not start a new Leader turn or revive workers just by opening it.
-    } finally {
-      this._isRestoringTeam = false;
-      this._schedulePersist();
+    const physicalCwd = this._physicalCwd;
+    const pending = this._deferredNotices.filter((notice) => notice.physicalCwd === physicalCwd);
+    if (pending.length === 0) {
+      return;
+    }
+    this._deferredNotices = this._deferredNotices.filter((notice) => notice.physicalCwd !== physicalCwd);
+    for (const notice of pending) {
+      this._raiseAttention({ kind: "seat_error", text: notice.text });
     }
   }
 
-  private _shouldWakeLeaderForMessage(message: TeamMessage): boolean {
-    if (!this._team) return false;
-    if (message.toAgentId === this._team.leadAgentId) return true;
-    if (message.toAgentId === "*") {
-      // Broadcasts the leader must coordinate on: questions, proposals, and
-      // objections that may change the plan; review/fix requests; blocked
-      // signals; and — critically — completion-style announcements
-      // (broadcast/decision/handoff/task_result). Without the latter, a worker
-      // announcing finished work to the team never re-engages the leader.
-      return message.kind === "question" ||
-        message.kind === "proposal" ||
-        message.kind === "objection" ||
-        message.kind === "review_request" ||
-        message.kind === "fix_request" ||
-        message.kind === "blocked" ||
-        message.kind === "broadcast" ||
-        message.kind === "decision" ||
-        message.kind === "handoff" ||
-        message.kind === "task_result";
+  /** §5.7：被策略拒绝的写入在时间线上留一条系统提示（模型侧另有工具错误）。 */
+  private _onPolicyDenied(info: {
+    seatId: string;
+    toolName: string;
+    reason: string;
+    path?: string;
+  }): void {
+    const modules = this._modules;
+    if (modules === null) {
+      return;
     }
-    return false;
-  }
-
-  private _wakeLeaderForMessage(message: TeamMessage): void {
-    const fromWorker = this._team?.workers.get(message.fromAgentId);
-    const workerName = fromWorker?.info.name ?? parseAgentId(message.fromAgentId)?.agentName ?? message.fromAgentId;
-    const workerRole = fromWorker?.info.role;
-    const eventType: OrchestrationEvent["type"] =
-      message.kind === "proposal" || message.kind === "task_message" ? "task_proposed" :
-      message.kind === "question" ? "question_asked" :
-      message.kind === "objection" ? "objection_raised" :
-      message.kind === "review_request" ? "review_requested" :
-      message.kind === "fix_request" ? "fix_requested" :
-      message.kind === "blocked" ? "task_blocked" :
-      "team_message";
-
-    this._wakeLeaderForOrchestration({
-      type: eventType,
-      sourceId: message.id,
-      runtimeEpoch: this._runtimeEpoch,
-      fromAgentId: message.fromAgentId,
-      toAgentId: message.toAgentId,
-      messageKind: message.kind,
-      messageText: message.text,
-      workerName,
-      workerRole,
-      result: message.summary,
-    });
-    this.logTeamDebug("message.wake_leader", {
-      message: summarizeTeamMessage(message),
-      eventType,
-      workerName,
-      workerRole,
-    });
+    this._appendSystem(
+      `席位「${seatLabel(modules.roster, info.seatId)}」的写入被拒绝：${info.toolName}${info.path !== undefined ? ` → ${info.path}` : ""}。${info.reason}`,
+      info.seatId,
+    );
   }
 
   // ==========================================================================
-  // LeaderOrchestrator: Event-Driven Wake Mechanism
+  // 内部：持久化 / 路径 / 断言
   // ==========================================================================
 
-  /**
-   * Set the Leader-turn-active flag with a safety watchdog.
-   *
-   * _leaderTurnActive gates all orchestration processing. It is normally flipped
-   * true on agent_start and false on agent_end. If the SDK ever fails to emit
-   * agent_end (turn swallowed or errored without an end event), the flag would
-   * stick true and every queued orchestration event would be stranded behind the
-   * guard in _processOrchestratorQueue — the team silently stops dispatching.
-   * The watchdog force-clears the flag after LEADER_STUCK_TURN_TIMEOUT_MS and
-   * drains any pending events.
-   */
-  private _setLeaderTurnActive(active: boolean): void {
-    if (active && this._team && !this.isRuntimeActive()) {
-      this.logTeamDebug("orchestrator.leader_turn.ignored", {
-        reason: "team_runtime_paused",
-        runtimeEpoch: this._runtimeEpoch,
-      });
-      return;
+  private _snapshot(): PersistedRoundtable | null {
+    const modules = this._modules;
+    const state = this._state;
+    if (modules === null || state === null) {
+      return null;
     }
-    this._leaderTurnActive = active;
-    if (this._leaderTurnWatchdog) {
-      clearTimeout(this._leaderTurnWatchdog);
-      this._leaderTurnWatchdog = null;
-    }
-    if (active) {
-      this._leaderTurnWatchdog = setTimeout(() => {
-        this._leaderTurnWatchdog = null;
-        if (!this._leaderTurnActive) return;
-        console.warn("[TeamManager] Leader turn watchdog fired; forcing leaderTurnActive=false");
-        this.logTeamDebug("orchestrator.leader_turn.watchdog_reset", {
-          timeoutMs: LEADER_STUCK_TURN_TIMEOUT_MS,
-        });
-        this._leaderTurnActive = false;
-        if (this.isRuntimeActive() && this._orchestratorEvents.hasPending && this._leaderSession) {
-          this._scheduleOrchestratorQueue();
-        }
-      }, LEADER_STUCK_TURN_TIMEOUT_MS);
-    }
-  }
-
-  /**
-   * Queue an orchestration event and wake the Leader for a decision turn.
-   * If the Leader is idle, processes immediately. If busy, queues for agent_end.
-   */
-  private _wakeLeaderForOrchestration(event: OrchestrationEvent): void {
-    if (!this._team) {
-      this.logTeamDebug("orchestrator.wake.skipped", {
-        reason: "no_team",
-        event,
-      });
-      return;
-    }
-
-    const queuedEvent = {
-      ...event,
-      runtimeEpoch: event.runtimeEpoch ?? this._runtimeEpoch,
-    };
-    const accepted = this._orchestratorEvents.enqueue(queuedEvent);
-    if (!this.isRuntimeActive() || !this._leaderSession) {
-      this.logTeamDebug("orchestrator.event.queued_without_dispatch", {
-        event: queuedEvent,
-        accepted,
-        queueLength: this._orchestratorEvents.length,
-        reason: this._executionState !== "active" ? "runtime_paused" : "no_leader_session",
-      });
-      return;
-    }
-    this.logTeamDebug("orchestrator.event.enqueued", {
-      event: queuedEvent,
-      accepted,
-      queueLength: this._orchestratorEvents.length,
-      leaderTurnActive: this._leaderTurnActive,
-      leaderStreaming: this._leaderSession.isStreaming,
-    });
-
-    // If leader is idle, process immediately
-    if (!this._leaderTurnActive) {
-      this._scheduleOrchestratorQueue();
-    }
-    // Otherwise, queue will be drained on agent_end hook
-  }
-
-  private _scheduleOrchestratorQueue(delayMs = 0): void {
-    if (!this.isRuntimeActive()) return;
-    const normalizedDelay = Math.max(0, delayMs);
-    const dueAt = Date.now() + normalizedDelay;
-    if (this._orchestratorRetryTimer) {
-      if (this._orchestratorRetryDueAt <= dueAt) {
-        this.logTeamDebug("orchestrator.schedule.ignored", {
-          delayMs: normalizedDelay,
-          existingDueAt: this._orchestratorRetryDueAt,
-          requestedDueAt: dueAt,
-        });
-        return;
-      }
-      clearTimeout(this._orchestratorRetryTimer);
-      this._orchestratorRetryTimer = null;
-      this._orchestratorRetryDueAt = 0;
-      this.logTeamDebug("orchestrator.schedule.replaced", {
-        delayMs: normalizedDelay,
-        requestedDueAt: dueAt,
-      });
-    }
-    this._orchestratorRetryDueAt = dueAt;
-    this.logTeamDebug("orchestrator.schedule", {
-      delayMs: normalizedDelay,
-      dueAt,
-    });
-    this._orchestratorRetryTimer = setTimeout(() => {
-      this._orchestratorRetryTimer = null;
-      this._orchestratorRetryDueAt = 0;
-      void this._processOrchestratorQueue();
-    }, normalizedDelay);
-  }
-
-  /**
-   * Process all pending orchestration events by waking the Leader session.
-   * Batches multiple events into a single prompt for efficiency.
-   */
-  private async _processOrchestratorQueue(): Promise<void> {
-    if (!this.isRuntimeActive()) {
-      this.logTeamDebug("orchestrator.process.skipped", { reason: "runtime_paused" });
-      return;
-    }
-    if (this._leaderWakeInFlight || this._leaderTurnActive) {
-      this.logTeamDebug("orchestrator.process.skipped", {
-        reason: this._leaderWakeInFlight ? "wake_in_flight" : "leader_turn_active",
-      });
-      // If a turn is active and events are still pending, keep a retry armed.
-      // agent_end normally drains the queue, but an event enqueued just after
-      // that drain (or a swallowed agent_end) would otherwise sit here forever.
-      // A wake-in-flight call reschedules itself in its own finally block.
-      if (this._leaderTurnActive && !this._leaderWakeInFlight && this._orchestratorEvents.hasPending) {
-        this._scheduleOrchestratorQueue(ORCHESTRATOR_WAKE_BASE_RETRY_MS);
-      }
-      return;
-    }
-    if (!this._leaderSession || !this._team) {
-      this.logTeamDebug("orchestrator.process.skipped", {
-        reason: !this._leaderSession ? "no_leader_session" : "no_team",
-      });
-      return;
-    }
-    if (!this._orchestratorEvents.hasPending) {
-      this.logTeamDebug("orchestrator.process.skipped", { reason: "empty_queue" });
-      return;
-    }
-    if (this._leaderSession.isStreaming) {
-      this.logTeamDebug("orchestrator.process.deferred", { reason: "leader_streaming" });
-      this._scheduleOrchestratorQueue(ORCHESTRATOR_WAKE_BASE_RETRY_MS);
-      return;
-    }
-
-    this._leaderWakeInFlight = true;
-    this.logTeamDebug("orchestrator.process.start", {
-      queueLength: this._orchestratorEvents.length,
-    });
-    try {
-      const result = await processOrchestrationWakeQueue({
-        queue: this._orchestratorEvents,
-        session: this._leaderSession,
-        canProcess: () => this.isRuntimeActive() && !this._leaderTurnActive && Boolean(this._leaderSession && this._team),
-        buildPrompt: (events) => this._buildOrchestrationPrompt(events),
-        scheduleRetry: (delayMs) => this._scheduleOrchestratorQueue(delayMs),
-        canRetry: (events) => this.isRuntimeActive() && events.every((event) => event.runtimeEpoch === this._runtimeEpoch),
-        onWakeFailed: (err, retry) => {
-          console.error("[TeamManager] Orchestrator wake failed, re-queuing events:", err);
-          this.logTeamDebug("orchestrator.process.wake_failed", { error: err, retry });
-          if (retry.circuitOpen) {
-            console.error(`[TeamManager] Orchestrator wake circuit opened after ${retry.attempts} attempts; retrying in ${retry.delayMs}ms`);
-          }
-        },
-      });
-      this.logTeamDebug("orchestrator.process.result", result);
-    } finally {
-      this._leaderWakeInFlight = false;
-      if (
-        this.isRuntimeActive() &&
-        this._orchestratorEvents.hasPending &&
-        !this._leaderTurnActive &&
-        this._leaderSession
-      ) {
-        this._scheduleOrchestratorQueue(this._leaderSession.isStreaming ? ORCHESTRATOR_WAKE_BASE_RETRY_MS : 0);
-      }
-    }
-  }
-
-  /**
-   * Build a structured orchestration prompt from a batch of events.
-   * Includes event details, current task/worker status, and action guidance.
-   */
-  private _buildOrchestrationPrompt(events: OrchestrationEvent[]): string {
-    const team = this._team!;
-    const allTasks = team.taskList.getAll();
-    const readyTasks = team.taskList.getReadyTasks();
-    const dependencyBlocked = team.taskList.getBlockedByDependencies();
-    const workers = Array.from(team.workers.values()).map((worker) => worker.info);
-    const prompt = buildTeamOrchestrationPrompt(events, {
-      allTasks,
-      readyTasks,
-      dependencyBlockedTasks: dependencyBlocked,
-      workers,
-      getOpenDependencies: (task) => team.taskList.getOpenDependencies(task.id),
-    });
-    this.logTeamDebug("orchestrator.prompt.built", {
-      eventCount: events.length,
-      events,
-      taskCount: allTasks.length,
-      readyTaskCount: readyTasks.length,
-      dependencyBlockedTaskCount: dependencyBlocked.length,
-      prompt: summarizeText(prompt),
-    });
-    return prompt;
-  }
-
-  private _teamToolHost(): TeamToolHost {
     return {
-      getTeam: () => this._team,
-      isRuntimeActive: () => this.isRuntimeActive(),
-      setLeaderTurnActive: (active) => { this._setLeaderTurnActive(active); },
-      scheduleOrchestratorQueue: (delayMs) => this._scheduleOrchestratorQueue(delayMs),
-      sendTeamMessage: (fromAgentId, toAgentId, text, summary, kind) =>
-        this.sendTeamMessage(fromAgentId, toAgentId, text, summary, kind),
-      createTask: (subject, description, assignTo, blockedBy, taskType) =>
-        this.createTask(subject, description, assignTo, blockedBy, taskType),
-      assignTask: (taskId, agentId) => this.assignTask(taskId, agentId),
-      activateMember: (agentId) => this.activateMember(agentId),
-      pauseMember: (agentId) => this.pauseMember(agentId),
-      addWorker: (options) => this.addWorker(options),
-      requestShutdown: (agentId) => this.requestShutdown(agentId),
-      respondShutdown: (agentId, confirmed, reason) => this.respondShutdown(agentId, confirmed, reason),
-      requestPermission: (agentId, tool, args, signal) => this.requestPermission(agentId, tool, args, signal),
-      requestPlanApproval: (agentId, plan, files, signal) => this.requestPlanApproval(agentId, plan, files, signal),
-      respondPlanApproval: (approvalId, approved, feedback) => this.respondPlanApproval(approvalId, approved, feedback),
-      updateTask: (taskId, changes) => this.updateTask(taskId, changes),
-      createTaskHandoff: (task, agentId, result, evidence) => this._createTaskHandoff(task, agentId, result, evidence),
-      completionGateState: (task, result) => this._completionGateState(task, result),
-      emitWorkerCompletionSummary: (agentId, task, workerName, workerRole, result) =>
-        this._emitWorkerCompletionSummary(agentId, task, workerName, workerRole, result),
-      coordinateAfterTaskCompletion: (task, agentId, result) =>
-        this._coordinateAfterTaskCompletion(task, agentId, result),
-      wakeLeaderForOrchestration: (event) => this._wakeLeaderForOrchestration(event),
-      selectWorkerForRole: (role) => this._selectWorkerForRole(role),
+      version: 2,
+      roundtableId: state.roundtableId,
+      physicalCwd: this._physicalCwd,
+      savedAt: Date.now(),
+      state: this.getState()!,
+      inbox: modules.inbox.snapshot(),
+      openItems: modules.openItems.list(),
+      leases: modules.leases.list(),
+      deliverables: modules.deliverables.list(),
+      mutedThreads: [...this._mutedThreads],
+      metrics: this.getMetrics(),
+      pendingPermissions: modules.protocol.getPendingPermissionRequests(),
+      pendingExits: modules.protocol.getPendingExits(),
+      // F4-5：attention.jsonl 只在 push 时追加（写入时恒 false），已确认状态只能
+      // 走快照本体，否则重启后已处理条目复活（权限卡变成死按钮）。
+      attentionAcks: modules.attention
+        .list()
+        .filter((item) => item.acked)
+        .map((item) => item.id),
     };
   }
 
-  private _registerTeamMessagingTool(pi: ExtensionAPI, agentId: string): void {
-    registerTeamMessagingTool(this._teamToolHost(), pi, agentId);
+  /** 增量落盘（合并窗口在 RoundtablePersistence 内，≤200ms）。 */
+  private _persistSoon(): void {
+    const snapshot = this._snapshot();
+    const modules = this._modules;
+    if (snapshot === null || modules === null) {
+      return;
+    }
+    void modules.persistence.saveSnapshot(snapshot).catch((err) => {
+      this._raisePersistFailure("snapshot", err);
+    });
   }
 
-  private _registerTeamTaskTool(pi: ExtensionAPI, agentId: string): void {
-    registerTeamTaskTool(this._teamToolHost(), pi, agentId);
+  private _persistNow(): void {
+    this._persistSoon();
   }
 
-  private _registerTeamProtocolTool(pi: ExtensionAPI, agentId: string): void {
-    registerTeamProtocolTool(this._teamToolHost(), pi, agentId);
+  /**
+   * §5.14：jsonl / 快照写失败（persistence 内部已重试一次）→ 发一条注意力，
+   * 内存里已记录的不丢但用户必须知道「这些记录重启后会消失」。同一个写入目标
+   * 30 秒内只发一次，否则 200ms 一次的快照刷新会把注意力面刷爆（F3-5）。
+   */
+  private _raisePersistFailure(what: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[TeamManager] roundtable persist failed (${what}):`, err);
+    const now = Date.now();
+    if (now - (this._persistFailureAt.get(what) ?? 0) < PERSIST_FAILURE_NOTICE_THROTTLE_MS) {
+      return;
+    }
+    this._persistFailureAt.set(what, now);
+    this._raiseAttention({
+      kind: "seat_error",
+      text: `圆桌记录落盘失败（${what}）：${message}`,
+    });
   }
 
-  registerLeaderTools(pi: ExtensionAPI): void {
-    registerLeaderTools(this._teamToolHost(), pi);
+  private async _flush(): Promise<void> {
+    await this._modules?.persistence.flush().catch(() => {});
   }
 
+  private async _timelineFileSize(roundtableId: string): Promise<number> {
+    try {
+      const info = await stat(roundtableFilePath(this._physicalCwd, roundtableId, "timeline.jsonl"));
+      return info.size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** 席位 cwd 视图（H34）：logicalCwd + backend.getCwd + backend.paths.resolvePath。 */
+  private _seatExecView(): SeatExecutionView {
+    const logicalCwd = this._logicalCwd;
+    const backend = this._executionBackend;
+    return {
+      logicalCwd,
+      getCwd: () => backend?.getCwd?.() ?? logicalCwd,
+      resolvePath: (input) => backend?.paths.resolvePath(input, logicalCwd) ?? localResolvePath(input, logicalCwd),
+    };
+  }
+
+  /**
+   * metrics 的席位口径（F4-3）：**exited 也计入**，避免分子分母 population 不一致——
+   * `speakShare` / `evidenceDensity` / `interruptRate` 的分子来自覆盖全时间线的统计，
+   * 分母若在这里过滤掉退出席位，移除一席后 `speakShare` 之和就会 >1（`formatShare`
+   * 把 3.0 当 3%），退出席位在时间线里的发言仍在但该行显示 0 条。
+   * 渲染层对 `status === "exited"` 的行单独标注（G6 的 F6-12）。
+   * 退出席位的**消耗也保留**（`_seatUsage`，F4-3）：perSeat / totals 都不会因为减席回退。
+   */
+  private _metricsSeats(): MetricsSeatRuntime[] {
+    const modules = this._modules;
+    if (modules === null) {
+      return [];
+    }
+    return modules.roster.all().map((seat) => ({
+      seatId: seat.seatId,
+      getSessionStats: () => {
+        const session = this._sessions.get(seat.seatId);
+        if (session !== undefined) {
+          return session.getSessionStats();
+        }
+        // 退出席位（session 已 dispose）：返回退场那一刻记下的用量，不能归零——
+        // 否则 perSeat 显示「有时长、没成本」的混合行，totals.cost 还会随减席回退（F4-3）。
+        const remembered = this._seatUsage.get(seat.seatId);
+        if (remembered !== undefined) {
+          return remembered;
+        }
+        return { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 };
+      },
+      durationMs: () => this._seatDurationMs(seat.seatId),
+    }));
+  }
+
+  private _seatDurationMs(seatId: string): number {
+    const duration = this._seatDurations.get(seatId);
+    if (duration === undefined) {
+      return 0;
+    }
+    return duration.total + (duration.startedAt === null ? 0 : Date.now() - duration.startedAt);
+  }
+
+  /** 辅助 session 用量（运行中的 aux + 已结束的累计）。 */
+  private _auxStats(): MetricsSessionStats | null {
+    const aux = this._aux;
+    const base = this._auxUsage;
+    const live = aux === null ? null : statsOf(aux.session);
+    if (aux === null && base.tokensIn === 0 && base.tokensOut === 0 && base.cost === 0) {
+      return null;
+    }
+    return {
+      tokens: {
+        input: base.tokensIn + (live?.tokens.input ?? 0),
+        output: base.tokensOut + (live?.tokens.output ?? 0),
+        cacheRead: live?.tokens.cacheRead ?? 0,
+        cacheWrite: live?.tokens.cacheWrite ?? 0,
+      },
+      cost: base.cost + (live?.cost ?? 0),
+    };
+  }
+
+  private _assertReady(): void {
+    if (this._physicalCwd.length === 0) {
+      throw new Error("TeamManager not initialized. Start a project session first.");
+    }
+  }
+
+  /** 允许 active / paused（记录不产生模型调用；暂停由容量池挡住）。 */
+  private _assertCanRecord(operation: string): void {
+    this._assertReady();
+    const lifecycle = this._state?.lifecycle;
+    if (lifecycle === undefined || lifecycle === "stopped" || lifecycle === "inactive") {
+      throw new Error(`当前没有活跃圆桌；${operation} 需要先 createRoundtable。`);
+    }
+  }
+
+  private _assertActive(operation: string): void {
+    this._assertCanRecord(operation);
+    if (this._state?.lifecycle !== "active") {
+      throw new Error(`圆桌已暂停；${operation} 需要先 resume。`);
+    }
+  }
 }
 
-function summarizeTeamTask(task: TeamTask): Record<string, unknown> {
+// ============================================================================
+// 模块级工具函数
+// ============================================================================
+
+/** 席位 tools 白名单（H35）：只读四工具 + 席位工具；write 档再加 edit/write。 */
+export function seatToolAllowlist(auth: ToolAuthTier): string[] {
+  const tools = ["read", "grep", "find", "ls", ...SEAT_TOOL_NAMES];
+  if (auth === "write") {
+    tools.push("edit", "write");
+  }
+  return tools;
+}
+
+/** `provider/id` 或裸 id 解析成模型对象（找不到返回 undefined，绝不抛）。 */
+function resolveModelSpec(
+  session: AgentSession,
+  spec: string,
+): NonNullable<AgentSession["model"]> | undefined {
+  const slash = spec.indexOf("/");
+  if (slash > 0) {
+    return session.modelRegistry.find(spec.slice(0, slash), spec.slice(slash + 1));
+  }
+  return session.modelRegistry.getAvailable().find((candidate) => candidate.id === spec);
+}
+
+function statsOf(session: AgentSession): MetricsSessionStats {
+  try {
+    const stats = session.getSessionStats();
+    return {
+      tokens: {
+        input: stats.tokens.input,
+        output: stats.tokens.output,
+        cacheRead: stats.tokens.cacheRead,
+        cacheWrite: stats.tokens.cacheWrite,
+      },
+      cost: stats.cost,
+    };
+  } catch {
+    return { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 };
+  }
+}
+
+function emptyMetrics(): RoundtableMetricsSnapshot {
   return {
-    id: task.id,
-    subject: task.subject,
-    taskType: task.taskType,
-    status: task.status,
-    ownerAgentId: task.ownerAgentId,
-    blockedBy: task.blockedBy,
-    blocks: task.blocks,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    result: summarizeText(task.result, 2_000),
-    evidence: task.evidence ? {
-      summary: summarizeText(task.evidence.summary, 1_000),
-      changedFiles: task.evidence.changedFiles,
-      completedScope: task.evidence.completedScope,
-      missingScope: task.evidence.missingScope,
-      verification: task.evidence.verification,
-      risks: task.evidence.risks,
-      followUps: task.evidence.followUps,
-      confidence: task.evidence.confidence,
-    } : undefined,
-    gateState: task.gateState,
-    fileConflicts: task.fileConflicts,
-    contextPack: task.contextPack ? {
-      generatedAt: task.contextPack.generatedAt,
-      objective: task.contextPack.objective,
-      assignedScope: summarizeText(task.contextPack.assignedScope, 1_000),
-      touchedFiles: task.contextPack.touchedFiles,
-      relevantRisks: task.contextPack.relevantRisks,
-      openQuestions: task.contextPack.openQuestions,
-      coordinationHints: task.contextPack.coordinationHints,
-      dependencyEvidence: task.contextPack.dependencyEvidence.map((dep) => ({
-        taskId: dep.taskId,
-        subject: dep.subject,
-        result: summarizeText(dep.result, 1_000),
-        evidenceSummary: summarizeText(dep.evidence?.summary, 1_000),
-      })),
-      parentEvidence: task.contextPack.parentEvidence ? {
-        taskId: task.contextPack.parentEvidence.taskId,
-        subject: task.contextPack.parentEvidence.subject,
-        result: summarizeText(task.contextPack.parentEvidence.result, 1_000),
-        evidenceSummary: summarizeText(task.contextPack.parentEvidence.evidence?.summary, 1_000),
-      } : undefined,
-    } : undefined,
+    perSeat: {},
+    totals: { utterances: 0, tokens: 0, cost: 0, durationMs: 0 },
+    health: { speakShare: {}, evidenceDensity: 0, interruptRate: 0 },
   };
 }
 
-function summarizeTeamMessage(message: TeamMessage): Record<string, unknown> {
+/** 落盘基线 + 当前用量（崩溃前的累计成本不丢）。 */
+function mergeMetrics(
+  base: RoundtableMetricsSnapshot | null,
+  live: RoundtableMetricsSnapshot,
+): RoundtableMetricsSnapshot {
+  if (base === null) {
+    return live;
+  }
+  const perSeat: RoundtableMetricsSnapshot["perSeat"] = {};
+  const seatIds = new Set([...Object.keys(base.perSeat), ...Object.keys(live.perSeat)]);
+  let tokens = 0;
+  let cost = 0;
+  let durationMs = 0;
+  let utterances = 0;
+  for (const seatId of seatIds) {
+    const before = base.perSeat[seatId] ?? { utterances: 0, tokensIn: 0, tokensOut: 0, cost: 0, durationMs: 0 };
+    const after = live.perSeat[seatId] ?? { utterances: 0, tokensIn: 0, tokensOut: 0, cost: 0, durationMs: 0 };
+    const merged = {
+      // 发言数来自时间线 replay，本身已是累计值。
+      utterances: Math.max(before.utterances, after.utterances),
+      tokensIn: before.tokensIn + after.tokensIn,
+      tokensOut: before.tokensOut + after.tokensOut,
+      cost: before.cost + after.cost,
+      durationMs: before.durationMs + after.durationMs,
+    };
+    perSeat[seatId] = merged;
+    tokens += merged.tokensIn + merged.tokensOut;
+    cost += merged.cost;
+    durationMs += merged.durationMs;
+    utterances += merged.utterances;
+  }
+  // 席位槽之外的用量（辅助整理 session）只出现在 totals 里：按差值保留。
+  const baseAux = outsideSeatTotals(base);
+  const liveAux = outsideSeatTotals(live);
   return {
-    id: message.id,
-    teamName: message.teamName,
-    fromAgentId: message.fromAgentId,
-    toAgentId: message.toAgentId,
-    fromRole: message.fromRole,
-    kind: message.kind,
-    summary: message.summary,
-    timestamp: message.timestamp,
-    read: message.read,
-    delivered: message.delivered,
-    text: summarizeText(message.text, 2_000),
+    perSeat,
+    totals: {
+      utterances,
+      tokens: tokens + baseAux.tokens + liveAux.tokens,
+      cost: cost + baseAux.cost + liveAux.cost,
+      durationMs: durationMs + baseAux.durationMs + liveAux.durationMs,
+    },
+    health: live.health,
   };
 }
+
+/** totals 里不属于任何席位的部分（aux session 用量）。 */
+function outsideSeatTotals(snapshot: RoundtableMetricsSnapshot): { tokens: number; cost: number; durationMs: number } {
+  let seatTokens = 0;
+  let seatCost = 0;
+  let seatDuration = 0;
+  for (const seat of Object.values(snapshot.perSeat)) {
+    seatTokens += seat.tokensIn + seat.tokensOut;
+    seatCost += seat.cost;
+    seatDuration += seat.durationMs;
+  }
+  return {
+    tokens: Math.max(0, snapshot.totals.tokens - seatTokens),
+    cost: Math.max(0, snapshot.totals.cost - seatCost),
+    durationMs: Math.max(0, snapshot.totals.durationMs - seatDuration),
+  };
+}
+
+/** 席位展示名（找不到就退回 id）。 */
+function seatLabel(roster: RoundtableRoster | null, seatId: string): string {
+  return roster?.get(seatId)?.name ?? seatId;
+}
+
+/**
+ * 抛材料的附件行（F3-8 / FR-9）：进注入正文的一行一条，模型据此用 read 打开。
+ * 时间线条目本身仍保留 `attachments` 字段，不改时间线形状。
+ */
+function attachmentLines(attachments: ChatMessageAttachment[]): string[] {
+  return attachments.map((attachment) => {
+    const label = attachment.name.length > 0 ? attachment.name : attachment.path;
+    return `[附件] ${label}（${attachment.path.length > 0 ? attachment.path : attachment.kind}）`;
+  });
+}
+
+/** 开场简报：议题 + 本席视角 + 空时间线（§5.1 步骤 4，各席起点相同但不共享历史）。 */
+function buildOpeningBrief(openingText: string, seat: SeatInfo): string {
+  return [
+    openingText,
+    "",
+    `你是本场席位「${seat.name}」，视角：${seat.perspective}。`,
+    "讨论刚开始，时间线里还没有别人的发言：请直接从你的视角出发说第一轮判断，用 send_team_message 公开发言。",
+  ].join("\n");
+}
+
+/** 新席入场简报：摘要 + 知识卡/关键结论索引，不重放全文（AC-14）。 */
+function buildJoinBrief(seat: SeatInfo, packet: { summary: string; index: Array<{ id: string; title: string }> }): string {
+  return [
+    `席位「${seat.name}」入场（视角：${seat.perspective}）。`,
+    "",
+    "主线摘要：",
+    packet.summary,
+    "",
+    "知识卡 / 关键结论索引（需要细节时用 read 或直接问相关席位，不必重读全部记录）：",
+    ...(packet.index.length > 0 ? packet.index.map((entry) => `- ${entry.id}: ${entry.title}`) : ["- （暂时没有）"]),
+    "",
+    "接着讨论：用 send_team_message 公开发言；对齐结论前先看上面的索引。",
+  ].join("\n");
+}
+
+/** 指定席主笔的写作请求（L1 注入，§4.12c 第 3 步）。 */
+function buildSeatWrapUpRequest(deliverable: DeliverableVersion, seatName: string): string {
+  return [
+    `请你作为主笔整理一版交付物（席位「${seatName}」）。`,
+    "",
+    `- 交付物 id: ${deliverable.id}`,
+    `- 版本: v${deliverable.version}`,
+    `- revision（CAS 令牌，revise_deliverable 必须带上）: ${deliverable.revision}`,
+    `- 截止点 cutoffSeq: ${deliverable.cutoffSeq}（只整理这条之前的内容，之后的新发现留给下一版）`,
+    "",
+    "请把这个版本的完整 Markdown 用 revise_deliverable 写回（id 用上面的 id）。必须包含这些小节：",
+    "## 结论与建议（带置信度）",
+    "## 依据入口（时间线 id / 知识卡 id；追溯不到就标「未验证」，禁止伪造来源）",
+    "## 分歧与未决",
+    "## 后续动作",
+    "## 过程索引（关键转折）",
+  ].join("\n");
+}
+
+/** 系统整理的 prompt：截止点之前的时间线摘要 + 知识卡索引（§4.12c）。 */
+function buildWrapUpDigest(modules: RoundtableModules, deliverable: DeliverableVersion): string {
+  const packet = modules.timeline.buildJoinPacket();
+  const deliverables = modules.deliverables.list();
+  return [
+    "你是一轮圆桌讨论的整理者（不是讨论参与者，不要发起新的讨论）。",
+    "",
+    `整理范围：截止 seq=${deliverable.cutoffSeq} 之前的记录，版本 v${deliverable.version}。`,
+    "",
+    "讨论摘要：",
+    packet.summary,
+    "",
+    "知识卡 / 关键结论索引：",
+    ...(packet.index.length > 0 ? packet.index.map((entry) => `- ${entry.id}: ${entry.title}`) : ["- （无）"]),
+    "",
+    "已整理过的版本：",
+    ...(deliverables.length > 0 ? deliverables.map((item) => `- v${item.version}（${item.author}）`) : ["- （无）"]),
+    "",
+    "请只输出 Markdown 正文，必须包含这些小节：",
+    "## 结论与建议（每条带置信度）",
+    "## 依据入口（时间线 id / 知识卡 id；追溯不到的条目标「未验证」，禁止伪造来源）",
+    "## 分歧与未决",
+    "## 后续动作",
+    "## 过程索引",
+  ].join("\n");
+}
+
+function firstLine(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= 80 ? flat : `${flat.slice(0, 80)}…`;
+}
+
+/** 预设读取（文件缺失/损坏都返回空数组；不因预设文件坏了打不开圆桌）。 */
+async function readPresets(): Promise<RoundtablePreset[]> {
+  try {
+    const raw = await readFile(roundtablePresetsPath(), "utf-8");
+    const parsed = JSON.parse(raw) as { presets?: unknown } | unknown[];
+    const entries = Array.isArray(parsed) ? parsed : Array.isArray(parsed.presets) ? parsed.presets : [];
+    return entries
+      .filter((entry): entry is RoundtablePreset =>
+        typeof entry === "object" && entry !== null &&
+        typeof (entry as RoundtablePreset).name === "string" &&
+        Array.isArray((entry as RoundtablePreset).seats))
+      .map((entry) => ({ name: entry.name, seats: entry.seats.map((seat) => ({ ...seat })) }));
+  } catch {
+    return [];
+  }
+}
+
+/** 预设写入（原子写：临时文件 + rename）。 */
+async function writePresets(presets: RoundtablePreset[]): Promise<void> {
+  const path = roundtablePresetsPath();
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify({ version: 1, presets }, null, 2), "utf-8");
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * 无 backend 时的路径解析（H31 允许的回退）：与 coding-agent
+ * `resolvePath(input, cwd, { normalizeUnicodeSpaces: true, stripAtPrefix: true })`
+ * 同语义。有 backend（WSL）时永远走 `backend.paths.resolvePath`。
+ *
+ * F3-9 / S5：工具侧的 `resolvePath` 走 `normalizePath`，其中 `/^file:\/\//` 会经
+ * `fileURLToPath` 变成平台路径。这里少了这一步，策略层与执行层的 pathKey 就是两个
+ * 不同字符串（`file:///C:/...` vs `C:\...`），受限档白名单与写租约都能被 `file:///`
+ * 前缀绕过。分支顺序照抄 `packages/coding-agent/src/utils/paths.ts`：unicode 空格
+ * → 去 `@` 前缀 → `~` 展开 → `file://` → 绝对/相对 resolve。禁止异步解析与
+ * `realpath`（H31）。
+ */
+function localResolvePath(input: string, cwd: string): string {
+  const normalized = input
+    .replace(/[  -   　]/g, " ")
+    .replace(/^@/, "");
+  const home = homedir();
+  if (normalized === "~") {
+    return home;
+  }
+  if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
+    return join(home, normalized.slice(2));
+  }
+  const target = /^file:\/\//.test(normalized) ? fileURLToPath(normalized) : normalized;
+  return isAbsolute(target) ? resolvePathNode(target) : resolvePathNode(cwd, target);
+}
+

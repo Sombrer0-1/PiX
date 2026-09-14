@@ -1,13 +1,13 @@
 <script setup lang="ts">
 /**
- * FileChangeSummary - Aggregated file change list from all workers.
+ * FileChangeSummary - Aggregated file change list from all seats.
  *
- * Extracts file_change events from workerEvents, deduplicates by file path,
- * aggregates diff stats, and shows the most recent changes first.
+ * Extracts file_change events from the per-seat buffers, deduplicates by file
+ * path, aggregates diff stats, and shows the most recent changes first.
  */
 import { computed, ref } from "vue";
 import { useTeamStore } from "../../stores/team-store";
-import type { AgentSessionEvent } from "@shared/types.js";
+import { seatLabel } from "./roundtable-display";
 
 const teamStore = useTeamStore();
 
@@ -25,7 +25,7 @@ const MAX_ITEMS = 15;
 const fileChanges = computed<AggregatedChange[]>(() => {
   const byPath = new Map<string, AggregatedChange>();
 
-  for (const [agentId, events] of Object.entries(teamStore.workerEvents)) {
+  for (const [seatId, events] of Object.entries(teamStore.seatEvents)) {
     for (const tagged of events) {
       const ev = tagged.event;
       if (ev.type !== "file_change") continue;
@@ -40,7 +40,7 @@ const fileChanges = computed<AggregatedChange[]>(() => {
         existing.removed += change.removed;
         if (tagged.timestamp > existing.lastModifiedAt) {
           existing.lastModifiedAt = tagged.timestamp;
-          existing.changedBy = agentName(agentId);
+          existing.changedBy = nameOf(seatId);
           existing.toolName = ev.toolName;
         }
       } else {
@@ -49,7 +49,7 @@ const fileChanges = computed<AggregatedChange[]>(() => {
           added: change.added,
           removed: change.removed,
           lastModifiedAt: tagged.timestamp,
-          changedBy: agentName(agentId),
+          changedBy: nameOf(seatId),
           toolName: ev.toolName,
         });
       }
@@ -80,8 +80,8 @@ const totals = computed(() => fileChanges.value.reduce(
   { added: 0, removed: 0 },
 ));
 
-function agentName(agentId: string): string {
-  return teamStore.teamState?.teammates[agentId]?.name ?? agentId.split("::")[0];
+function nameOf(seatId: string): string {
+  return seatLabel(seatId, teamStore.seats);
 }
 
 function fileName(path: string | undefined): string {
@@ -98,7 +98,7 @@ function dirName(path: string | undefined): string {
 </script>
 
 <template>
-  <div class="file-change-summary">
+  <div class="file-change-summary" data-test="file-change-summary">
     <div class="card-title-row">
       <span class="card-title-copy">
         <strong>文件变更</strong>
@@ -264,7 +264,6 @@ function dirName(path: string | undefined): string {
 .fc-by {
   font-size: 9px;
   color: var(--pix-accent);
-  text-transform: capitalize;
 }
 
 .fc-diff {

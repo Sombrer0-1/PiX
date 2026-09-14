@@ -1,3 +1,14 @@
+/**
+ * Team debug logger（S4 从 `pix/src/main/team-debug-logger.ts` 迁入，见 plan §3.3）。
+ *
+ * 行为与迁移前一致：每次 `start()` 开一份 `<agentDir>/team-logs/team-<ts>-<name>.jsonl`，
+ * 每行一条 JSON；`log()` 在 stop 之后是 no-op。日志写在 agent 目录而不是用户工作区，
+ * 避免污染项目（也避免被提交）。
+ *
+ * 迁移动机：旧文件被 `team-manager.ts` 与已删除的 `team-worker-runner.ts` 共用；
+ * 圆桌侧只保留这一个实现，不留 re-export shim（plan §2.2 的删除语义）。
+ */
+
 import { appendFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";

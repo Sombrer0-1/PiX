@@ -1,12 +1,15 @@
 <script setup lang="ts">
 /**
- * AllActivityView - Merged event stream from all workers.
+ * AllActivityView - Merged tool/stream activity of every seat.
  *
- * Shows a chronological feed of what every worker is doing, with
- * colored worker labels for quick identification.
+ * This is the "what is everyone doing right now" surface, not the discussion
+ * record: the group chat lives in TeamTimeline. Events come from the store's
+ * per-seat buffers (keyed by seatId) and are labelled with the seat colour and
+ * display name.
  */
 import { computed, ref, watch, nextTick, onMounted } from "vue";
 import { useTeamStore, type TaggedSessionEvent } from "../../stores/team-store";
+import { seatColor, seatLabel } from "./roundtable-display";
 import type { AgentSessionEvent } from "@shared/types.js";
 
 const teamStore = useTeamStore();
@@ -14,10 +17,10 @@ const teamStore = useTeamStore();
 const scrollContainer = ref<HTMLElement | null>(null);
 const shouldAutoScroll = ref(true);
 
-/** All events from all workers, sorted by timestamp. Skips message_update/message_start/message_end (streaming noise). */
+/** All seat events, sorted by arrival. Skips streaming fragments (noise). */
 const allEvents = computed<TaggedSessionEvent[]>(() => {
   const merged: TaggedSessionEvent[] = [];
-  for (const events of Object.values(teamStore.workerEvents)) {
+  for (const events of Object.values(teamStore.seatEvents)) {
     for (const ev of events) {
       // Skip streaming message fragments — only show actionable events
       if (ev.event.type === "message_update" || ev.event.type === "message_start" || ev.event.type === "message_end") continue;
@@ -60,21 +63,12 @@ function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-function agentName(agentId: string): string {
-  return teamStore.teamState?.teammates[agentId]?.name ?? agentId.split("::")[0];
+function nameOf(seatId: string): string {
+  return seatLabel(seatId, teamStore.seats);
 }
 
-function agentColor(agentId: string): string {
-  const teammate = teamStore.teamState?.teammates[agentId];
-  if (teammate?.color) return teammate.color;
-  switch (teammate?.role) {
-    case "planner": return "#6356f3";
-    case "coder": return "#16a34a";
-    case "reviewer": return "#f59e0b";
-    case "tester": return "#0ea5e9";
-    case "researcher": return "#a855f7";
-    default: return "#7d859a";
-  }
+function colorOf(seatId: string): string {
+  return seatColor(seatId, teamStore.seats);
 }
 
 function eventSummary(tagged: TaggedSessionEvent): string {
@@ -89,8 +83,8 @@ function eventSummary(tagged: TaggedSessionEvent): string {
     case "file_change": return `${ev.toolName}: ${ev.change.path || "(未知文件)"} (+${ev.change.added}/-${ev.change.removed})`;
     case "turn_start": return "新一轮开始";
     case "turn_end": return "本轮完成";
-    case "agent_start": return "Agent 已启动";
-    case "agent_end": return "Agent 已结束";
+    case "agent_start": return "席位开始工作";
+    case "agent_end": return "席位结束本轮";
     case "compaction_start": return "正在压缩上下文...";
     case "compaction_end": return "上下文压缩完成";
     case "verification_gate": return "等待完成前验证";
@@ -118,10 +112,10 @@ function isToolEnd(ev: AgentSessionEvent): ev is { type: "tool_execution_end"; t
 </script>
 
 <template>
-  <div class="all-activity-view">
+  <div class="all-activity-view" data-test="all-activity">
     <div v-if="allEvents.length === 0" class="aav-empty">
       <v-icon icon="mdi-clock-outline" size="36" color="grey-lighten-1" />
-      <p>暂无活动，正在等待团队成员...</p>
+      <p>暂无活动，正在等待席位开始探索...</p>
     </div>
 
     <div
@@ -131,8 +125,8 @@ function isToolEnd(ev: AgentSessionEvent): ev is { type: "tool_execution_end"; t
       @scroll="handleScroll"
     >
       <div
-        v-for="tagged in allEvents"
-        :key="`${tagged.agentId}-${tagged.timestamp}`"
+        v-for="(tagged, index) in allEvents"
+        :key="`${tagged.seatId}-${index}`"
         class="aav-entry"
         :class="{
           'aav-entry--tool': isToolStart(tagged.event) || isToolEnd(tagged.event),
@@ -140,15 +134,13 @@ function isToolEnd(ev: AgentSessionEvent): ev is { type: "tool_execution_end"; t
           'aav-entry--error': tagged.event.type === 'tool_execution_end' && tagged.event.isError,
         }"
       >
-        <!-- Worker label chip -->
+        <!-- Seat label chip -->
         <span
-          class="aav-agent-chip"
-          :style="{
-            color: agentColor(tagged.agentId),
-            borderColor: agentColor(tagged.agentId),
-          }"
+          class="aav-seat-chip"
+          :style="{ color: colorOf(tagged.seatId), borderColor: colorOf(tagged.seatId) }"
+          :title="tagged.seatId"
         >
-          {{ agentName(tagged.agentId) }}
+          {{ nameOf(tagged.seatId) }}
         </span>
 
         <!-- Event icon -->
@@ -252,10 +244,9 @@ function isToolEnd(ev: AgentSessionEvent): ev is { type: "tool_execution_end"; t
   background: var(--pix-bg-hover);
 }
 
-.aav-agent-chip {
+.aav-seat-chip {
   font-size: 10px;
   font-weight: var(--pix-weight-semibold);
-  text-transform: capitalize;
   padding: 0 4px;
   border: 1px solid;
   border-radius: 3px;

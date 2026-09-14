@@ -530,22 +530,18 @@ describe("CenterPanel /btw interception", () => {
     });
   });
 
-  it("does not intercept in team mode: /btw goes through the normal prompt path", async () => {
+  it("does not intercept in team mode: the host composer is not rendered", async () => {
+    // 团队模式的输入是 RoundtableComposer(走 TeamCommand),CenterPanel 的 solo
+    // composer 不渲染,因此 /btw 永远到不了 host prompt / 乐观消息路径。
     teamStoreMock.state.teamMode.value = true;
     const w = await mountAndFlush();
-    await typeAndSubmit(w, "/btw 团队问题");
     await flushPromises();
+
+    expect(w.find(".composer-textarea").exists()).toBe(false);
+    expect(w.find(".btw-card").exists()).toBe(false);
     expect(btwAsk).not.toHaveBeenCalled();
-    expect(rpcMock.state.sendCommandAsync).toHaveBeenCalledWith({
-      type: "prompt",
-      message: "/btw 团队问题",
-      filePaths: undefined,
-      images: undefined,
-    });
-    // sendMessage always materializes empty attachment arrays; the assertion
-    // previously expected a bare single-argument call that no longer matches
-    // the composer contract.
-    expect(sessionMock.state.appendOptimisticUserMessage).toHaveBeenCalledWith("/btw 团队问题", [], []);
+    expect(rpcMock.state.sendCommandAsync).not.toHaveBeenCalled();
+    expect(sessionMock.state.appendOptimisticUserMessage).not.toHaveBeenCalled();
   });
 
   it("shows the usage card for a bare /btw without sending a request", async () => {
@@ -699,12 +695,12 @@ describe("palette commands", () => {
     ];
     teamStoreMock.state.teamMode.value = true;
     const w = await mountAndFlush();
-    await w.get(".composer-textarea").setValue("/");
+    await flushPromises();
 
-    const names = paletteNames(w);
-    expect(names).toEqual(["compact", "btw"]);
-    const commands = w.findComponent(CommandPaletteStub).props("commands") as RpcSlashCommand[];
-    expect(commands.find((command) => command.name === "btw")?.source).toBe("extension");
+    // 团队模式没有 solo 的 slash palette,内置 /btw 条目不会被注入;
+    // 远端(extension)列表保持原样,圆桌 composer 自己决定可用命令。
+    expect(w.find(".palette-stub").exists()).toBe(false);
+    expect(w.findComponent(CommandPaletteStub).exists()).toBe(false);
   });
 
   it("injects /btw when the remote list has no btw entry", async () => {

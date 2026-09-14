@@ -1,32 +1,33 @@
 import { computed } from "vue";
-import { useSessionStore, useTeamLeaderSessionStore } from "../stores/session-store";
-import { useTeamStore } from "../stores/team-store";
+import { useSessionStore } from "../stores/session-store";
 import type { AgentMessage } from "@/types/rpc";
 
 /**
- * Selects one of the two independent conversation stores for workspace UI.
- * The stores themselves never share events or mutable session data.
+ * The workspace's session conversation store.
+ *
+ * This is the **solo** conversation: the host SessionBridge that used to back
+ * team mode is not a discussion participant any more (dev plan §9), so it is
+ * never selected here. In team mode the discussion surface is the roundtable
+ * (`useTeamStore()`: timeline + attention + deliverables) — this composable
+ * keeps serving the solo pane and the BottomBar-style input only.
  */
 export function useWorkspaceSessionStore() {
-  const teamStore = useTeamStore();
-  const singleStore = useSessionStore();
-  const teamLeaderStore = useTeamLeaderSessionStore();
-  const activeStore = computed(() => (teamStore.teamMode ? teamLeaderStore : singleStore));
+  const store = useSessionStore();
 
   return {
-    displayBlocks: computed(() => activeStore.value.displayBlocks),
-    isStreaming: computed(() => activeStore.value.isStreaming),
-    errorMessage: computed(() => activeStore.value.errorMessage),
-    lastRetryableError: computed(() => activeStore.value.lastRetryableError),
+    displayBlocks: computed(() => store.displayBlocks),
+    isStreaming: computed(() => store.isStreaming),
+    errorMessage: computed(() => store.errorMessage),
+    lastRetryableError: computed(() => store.lastRetryableError),
     appendOptimisticUserMessage: (
       text: string,
       filePaths?: string[],
       clipboardImages?: Array<{ mimeType: string }>,
     ): string | null =>
-      activeStore.value.appendOptimisticUserMessage(text, filePaths, clipboardImages),
+      store.appendOptimisticUserMessage(text, filePaths, clipboardImages),
     failOptimisticUserMessage: (blockId: string | null, message: string): void =>
-      activeStore.value.failOptimisticUserMessage(blockId, message),
-    loadMessages: (messages: AgentMessage[]): void => activeStore.value.loadMessages(messages),
-    clearSession: (): void => activeStore.value.clearSession(),
+      store.failOptimisticUserMessage(blockId, message),
+    loadMessages: (messages: AgentMessage[]): void => store.loadMessages(messages),
+    clearSession: (): void => store.clearSession(),
   };
 }

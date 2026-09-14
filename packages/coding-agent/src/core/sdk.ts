@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentLoopConfig, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -81,6 +81,17 @@ export interface CreateAgentSessionOptions {
 	customTools?: ToolDefinition[];
 	/** Optional host callback for the model-initiated request_user_input tool. */
 	requestUserInput?: RequestUserInputHandler;
+	/**
+	 * Whether built-in enhancement tools (goal tools, request_user_input, background
+	 * tools) should be registered. Default: derived from `tools`/`noTools`, i.e.
+	 * enabled unless a tools allowlist or `noTools` replaces the built-in defaults.
+	 */
+	enableBuiltInEnhancementTools?: boolean;
+	/**
+	 * Optional hook called after each turn's tool batch finishes. Returning true
+	 * ends the run without starting another provider request.
+	 */
+	shouldStopAfterTurn?: AgentLoopConfig["shouldStopAfterTurn"];
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
@@ -309,7 +320,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames
 	).filter((name) => !excludedToolNameSet?.has(name));
 	const enableBuiltInEnhancementTools =
-		options.tools !== undefined ? true : options.noTools !== "all" && options.noTools !== "builtin";
+		options.enableBuiltInEnhancementTools ??
+		(options.tools !== undefined ? true : options.noTools !== "all" && options.noTools !== "builtin");
 
 	let agent: Agent;
 
@@ -410,6 +422,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!runner) return messages;
 			return runner.emitContext(messages);
 		},
+		shouldStopAfterTurn: options.shouldStopAfterTurn,
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
 		transport: settingsManager.getTransport(),

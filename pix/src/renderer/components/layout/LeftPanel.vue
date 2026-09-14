@@ -9,6 +9,7 @@ import { useTeamLeaderRpc } from "../../composables/useTeamLeaderRpc";
 import { useProjectStore } from "../../stores/project-store";
 import { useSessionStore, useTeamLeaderSessionStore } from "../../stores/session-store";
 import { useTeamStore } from "../../stores/team-store";
+import RosterSetupDialog from "../team/RosterSetupDialog.vue";
 import { deriveSessionTitle, formatSessionTime } from "@/utils/session-title";
 import type { AgentMessage } from "@/types/rpc";
 import type { SessionInfo } from "@/types/session";
@@ -28,6 +29,8 @@ const showDeleteDialog = ref(false);
 const confirmDeleteSession = ref<SessionInfo | null>(null);
 const deleteError = ref<string | null>(null);
 const showNewTeamDialog = ref(false);
+const showRosterDialog = ref(false);
+const showSwitchToSoloConfirmDialog = ref(false);
 const isCreatingTeamSession = ref(false);
 
 const projectPath = computed(() => projectStore.currentProject?.path || "");
@@ -88,9 +91,27 @@ async function refreshCurrentTeamSession(): Promise<void> {
 
 async function newSession(): Promise<void> {
   if (teamStore.teamMode) {
+    if (teamStore.isTeamActive) {
+      showSwitchToSoloConfirmDialog.value = true;
+      return;
+    }
     const switched = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
     if (!switched) return;
   }
+  await createSoloSession();
+}
+
+async function confirmSwitchToSoloAndCreate(): Promise<void> {
+  showSwitchToSoloConfirmDialog.value = false;
+  const ok = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
+  if (!ok) {
+    alert(`切换到单人模式失败：${teamStore.lastError || "未知错误"}`);
+    return;
+  }
+  await createSoloSession();
+}
+
+async function createSoloSession(): Promise<void> {
   const result = await rpc.newSession();
   if (!result || result.cancelled) return;
   sessionStore.clearSession();
@@ -101,26 +122,30 @@ async function newTeamSession(): Promise<void> {
   if (!teamStore.teamMode) {
     const switched = await teamStore.toggleTeamMode(projectStore.currentProject ?? undefined);
     if (!switched) {
-      // TeamDashboard only mounts once teamMode is true, so while still in
-      // solo mode teamStore.lastError is invisible. Surface the failure here
-      // so the button does not appear non-functional. Mirrors the alert used
-      // by HomePage.startFreshWorkspace on toggle failure.
+      // The roundtable surface only mounts once teamMode is true, so while
+      // still in solo mode teamStore.lastError is invisible. Surface the
+      // failure here so the button does not appear non-functional. Mirrors the
+      // alert used by HomePage.startFreshWorkspace on toggle failure.
       alert(`启动团队失败：${teamStore.lastError || "未知错误"}`);
       return;
     }
   }
 
-  // Team runtime startup may restore a snapshot before the renderer receives
-  // its team event. Query the authoritative state before deciding whether to
-  // create a fresh team.
-  await teamStore.fetchTeamState();
+  // 团队运行环境可能带回上一场（崩溃恢复/切换回来的场）：先读权威状态，
+  // 再决定是直接建新场还是先停当前场。
+  await teamStore.refresh();
 
   if (teamStore.isTeamActive) {
     showNewTeamDialog.value = true;
     return;
   }
 
-  await createFreshTeamSession();
+  openRoundtableSetup();
+}
+
+/** 组建新圆桌（档位/视角/预设都在 RosterSetupDialog 里，入口沿用左侧骨架）。 */
+function openRoundtableSetup(): void {
+  showRosterDialog.value = true;
 }
 
 async function createFreshTeamSession(): Promise<void> {
@@ -129,22 +154,12 @@ async function createFreshTeamSession(): Promise<void> {
 
   try {
     if (teamStore.isTeamActive) {
-      const stopped = await teamStore.stopTeam();
-      if (!stopped) return;
-      await teamStore.fetchTeamState();
+      // 停止即归档当前场（时间线/未决项/交付物保留在盘上），再开新场。
+      await teamStore.stopRoundtable();
+      await teamStore.refresh();
     }
-    const result = await teamLeaderRpc.newSession();
-    if (!result || result.cancelled) return;
-    teamLeaderSessionStore.clearSession();
-    await Promise.all([
-      teamLeaderRpc.refreshState(),
-      teamLeaderRpc.refreshCommands(),
-      teamLeaderRpc.refreshModels(),
-      teamLeaderRpc.refreshSessionStats(),
-    ]);
-    await refreshCurrentTeamSession();
-    await teamStore.createTeam();
     showNewTeamDialog.value = false;
+    openRoundtableSetup();
   } finally {
     isCreatingTeamSession.value = false;
   }
@@ -374,21 +389,38 @@ function goSettings(): void { void router.push("/settings"); }
       </button>
     </div>
 
+    <v-dialog v-model="showSwitchToSoloConfirmDialog" max-width="400">
+      <v-card class="delete-dialog-card">
+        <div class="delete-dialog-title">切换到单人模式</div>
+        <div class="delete-dialog-text">
+          切换后团队运行环境会停下（<strong class="delete-session-name">{{ teamStore.teamName || "当前圆桌" }}</strong> 这一场不会解散）：时间线、未决项与交付物都保留在盘上，随时可以回到团队继续。确定继续？
+        </div>
+        <v-card-actions class="delete-dialog-actions">
+          <v-spacer />
+          <v-btn variant="text" @click="showSwitchToSoloConfirmDialog = false">取消</v-btn>
+          <v-btn color="primary" variant="tonal" @click="confirmSwitchToSoloAndCreate">切换到单人</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="showNewTeamDialog" max-width="420" :persistent="isCreatingTeamSession">
       <v-card class="delete-dialog-card">
         <div class="delete-dialog-title">新建团队会话</div>
         <div class="delete-dialog-text">
-          当前团队 <strong class="delete-session-name">{{ teamStore.teamName }}</strong> 将停止并解散，已完成的工作会保留在项目中。
+          当前圆桌 <strong class="delete-session-name">{{ teamStore.teamName }}</strong> 将停止并归档：时间线、未决项与交付物都保留在盘上。确定继续？
         </div>
         <v-card-actions class="delete-dialog-actions">
           <v-spacer />
           <v-btn variant="text" :disabled="isCreatingTeamSession" @click="showNewTeamDialog = false">取消</v-btn>
-          <v-btn color="error" variant="tonal" :loading="isCreatingTeamSession" @click="createFreshTeamSession">
+          <v-btn color="primary" variant="tonal" :loading="isCreatingTeamSession" @click="createFreshTeamSession">
             停止并新建
           </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <!-- 组建圆桌（圆桌主表面的入口；档位/视角/预设都在这个对话框里） -->
+    <RosterSetupDialog v-model="showRosterDialog" />
 
     <v-dialog v-model="showDeleteDialog" max-width="400">
       <v-card class="delete-dialog-card">

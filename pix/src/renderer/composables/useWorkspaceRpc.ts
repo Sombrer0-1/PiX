@@ -21,6 +21,47 @@ import type {
   UserMessageForForking,
 } from "@/types/rpc";
 import type { CustomProviderConfig } from "@shared/custom-providers";
+import type { RoundtableMetricsSnapshot, RoundtableState } from "@shared/team-types.js";
+
+/**
+ * team 模式的 token/成本聚合（H17）：按席相加，绝不把 host 会话的用量当成整场。
+ * 圆桌没有「一个」上下文窗口——每席各有自己的 session，所以不冒充上下文占用。
+ */
+function roundtableSessionStats(
+  metrics: RoundtableMetricsSnapshot,
+  roundtable: RoundtableState | null,
+): SessionStats {
+  // 口径（F5-5）：input / output / total 三者同源——都是 perSeat 的席位用量之和，
+  // 所以「总计 = 输入 + 输出」永远成立。cost 取 `metrics.totals.cost`（含 aux 整理
+  // 会话），遵循 FR-10「整场成本」，因此它比席位分项之和大，这是刻意的。
+  let tokensIn = 0;
+  let tokensOut = 0;
+  for (const seat of Object.values(metrics.perSeat)) {
+    tokensIn += seat.tokensIn;
+    tokensOut += seat.tokensOut;
+  }
+  const utterances = metrics.totals.utterances;
+  return {
+    sessionFile: undefined,
+    // 这一场圆桌的身份，不是任何一条席位 session。
+    sessionId: roundtable?.roundtableId ?? "",
+    userMessages: 0,
+    assistantMessages: utterances,
+    // 席位内部的工具调用不计入圆桌指标（metrics 只统计发言、token、成本、时长）。
+    toolCalls: 0,
+    toolResults: 0,
+    totalMessages: utterances,
+    tokens: {
+      input: tokensIn,
+      output: tokensOut,
+      cacheRead: 0,
+      cacheWrite: 0,
+      // 分项自洽优先：total 必须是 input + output，否则同一张卡片「总计 ≠ 输入+输出」。
+      total: tokensIn + tokensOut,
+    },
+    cost: metrics.totals.cost,
+  };
+}
 
 export function useWorkspaceRpc() {
   const teamStore = useTeamStore();
@@ -33,7 +74,11 @@ export function useWorkspaceRpc() {
     sessionState: computed<RpcSessionState | null>(() => activeRpc.value.sessionState.value),
     availableModels: computed<ModelInfo[]>(() => activeRpc.value.availableModels.value),
     commands: computed<RpcSlashCommand[]>(() => activeRpc.value.commands.value),
-    sessionStats: computed<SessionStats | null>(() => activeRpc.value.sessionStats.value),
+    sessionStats: computed<SessionStats | null>(() =>
+      teamStore.teamMode
+        ? roundtableSessionStats(teamStore.metrics, teamStore.roundtable)
+        : singleRpc.sessionStats.value,
+    ),
     stderr: computed(() => activeRpc.value.stderr.value),
     lastError: computed(() => activeRpc.value.lastError.value),
     isRunning: computed(() => activeRpc.value.isRunning.value),

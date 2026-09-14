@@ -37,6 +37,11 @@
  * auto-switches the scope to 全部; the launcher status line counts only the
  * current session and surfaces other-session active tasks via the hint row.
  *
+ * Roundtable S7 acceptance: in team mode the center surface is the roundtable
+ * (TeamDashboard), never a leader-oriented SessionView — with TaskCenter closed
+ * there is no session-view-stub and .team-middle carries TeamDashboard; opening
+ * the task center still renders TaskCenterView above both branches.
+ *
  * The component tree talks to main only through window.pixApi
  * (sendAgentTaskCommand / onAgentTaskEvent / onAgentTaskInputRequest) and the
  * mocked stores/composables, so no Electron runtime is loaded; the agent-task
@@ -125,6 +130,7 @@ const projectStoreMock = vi.hoisted(() => ({
     currentSession: { value: null as SessionInfo | null },
     currentTeamSession: { value: null as SessionInfo | null },
     sessions: { value: [] as Array<{ id: string; name?: string }> },
+    teamSessions: { value: [] as Array<{ id: string; name?: string }> },
     listSessions: vi.fn().mockResolvedValue(undefined),
     syncCurrentSession: vi.fn(),
     listTeamLeaderSessions: vi.fn().mockResolvedValue(undefined),
@@ -140,6 +146,10 @@ const teamStoreMock = vi.hoisted(() => ({
     pendingProtocolCount: { value: 0 },
     teamName: { value: null as string | null },
     lastError: { value: null as string | null },
+    /** 圆桌主表面读取（CenterPanel team 分支）。 */
+    roundtable: { value: null as unknown },
+    lifecycle: { value: null as string | null },
+    deliverables: { value: [] as Array<{ id: string; version: number; status: string }> },
     toggleTeamMode: vi.fn().mockResolvedValue(true),
   },
 }));
@@ -205,6 +215,7 @@ vi.mock("../stores/project-store", () => ({
     currentSession: projectStoreMock.state.currentSession.value,
     currentTeamSession: projectStoreMock.state.currentTeamSession.value,
     sessions: projectStoreMock.state.sessions.value,
+    teamSessions: projectStoreMock.state.teamSessions.value,
     listSessions: projectStoreMock.state.listSessions,
     syncCurrentSession: projectStoreMock.state.syncCurrentSession,
     listTeamLeaderSessions: projectStoreMock.state.listTeamLeaderSessions,
@@ -220,6 +231,9 @@ vi.mock("../stores/team-store", () => ({
     pendingProtocolCount: teamStoreMock.state.pendingProtocolCount.value,
     teamName: teamStoreMock.state.teamName.value,
     lastError: teamStoreMock.state.lastError.value,
+    roundtable: teamStoreMock.state.roundtable.value,
+    lifecycle: teamStoreMock.state.lifecycle.value,
+    deliverables: teamStoreMock.state.deliverables.value,
     toggleTeamMode: teamStoreMock.state.toggleTeamMode,
   }),
 }));
@@ -2158,25 +2172,30 @@ describe("CenterPanel task center", () => {
     expect(w.find(".center-composer").exists()).toBe(true);
   });
 
-  it("team 模式下打开中心渲染 TaskCenterView 不落会话视图，关闭后回 team split 视图", async () => {
+  it("team 模式下打开中心渲染 TaskCenterView 不落会话视图，关闭后回圆桌主表面", async () => {
     teamStoreMock.state.teamMode.value = true;
     const w = mountCenterPanel();
     await flushPromises();
 
+    // 主表面是圆桌（TeamDashboard），没有任何 Leader SessionView。
     expect(w.find(".team-middle").exists()).toBe(true);
+    expect(w.find("team-dashboard-stub").exists()).toBe(true);
+    expect(w.find("session-view-stub").exists()).toBe(false);
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(false);
 
     useAgentTaskStore().openTaskCenter();
     await nextTick();
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(true);
-    expect(w.find("session-view-stub").exists()).toBe(false);
     expect(w.find(".team-middle").exists()).toBe(false);
+    expect(w.find("session-view-stub").exists()).toBe(false);
     expect(w.find(".center-composer").exists()).toBe(false);
 
     await tabButton(w, "会话").trigger("click");
     await nextTick();
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(false);
+    // 关闭后回圆桌主表面：仍然是 TeamDashboard，不是会话视图。
     expect(w.find(".team-middle").exists()).toBe(true);
-    expect(w.find("session-view-stub").exists()).toBe(true);
+    expect(w.find("team-dashboard-stub").exists()).toBe(true);
+    expect(w.find("session-view-stub").exists()).toBe(false);
   });
 });

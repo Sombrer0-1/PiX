@@ -1,6 +1,10 @@
 <script setup lang="ts">
 /**
  * ForkDialog - Choose a user message to fork from.
+ *
+ * Solo only: a branch belongs to a solo session. In team mode the host runtime
+ * session is not a discussion participant (dev plan §9), so the dialog explains
+ * why there is nothing to fork instead of listing the host's messages.
  */
 import { ref, onMounted } from "vue";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
@@ -20,6 +24,11 @@ const forkLabel = ref("");
 
 onMounted(async () => {
   const mode = teamStore.teamMode;
+  if (mode) {
+    // 团队模式：不读 host 会话的用户消息（分支不是讨论面的操作）。
+    loading.value = false;
+    return;
+  }
   try {
     const result = await rpc.getUserMessagesForForking();
     if (teamStore.teamMode !== mode) return;
@@ -51,32 +60,40 @@ function truncate(text: string, maxLen: number): string {
         <button class="dialog-close" title="关闭" aria-label="关闭" @click="emit('close')">&times;</button>
       </div>
 
-      <p class="dialog-desc">
-        选择分支起点。新会话将保留该消息之前的历史记录。
-      </p>
-
-      <div class="dialog-label-input">
-        <input
-          v-model="forkLabel"
-          type="text"
-          class="form-input"
-          placeholder="可选：为分支点添加标签"
-          spellcheck="false"
-        />
+      <!-- 团队模式：分支属于单人会话，这里给出原因而不是列表。 -->
+      <div v-if="teamStore.teamMode" class="fork-team-notice" data-test="fork-team-notice">
+        <v-icon icon="mdi-source-branch-off" size="16" />
+        <span>团队模式下不能创建分支：宿主运行时会话不是讨论面。要用讨论结果继续工作时走交付物的「移交」。</span>
       </div>
 
-      <div class="dialog-list">
-        <div v-if="loading" class="loading-state">正在加载消息...</div>
-        <div v-else-if="messages.length === 0" class="empty-state">此会话中没有用户消息。</div>
-        <button
-          v-for="msg in messages"
-          :key="msg.entryId"
-          class="fork-item"
-          @click="selectMessage(msg.entryId)"
-        >
-          <span class="fork-text">{{ truncate(msg.text, 120) }}</span>
-        </button>
-      </div>
+      <template v-else>
+        <p class="dialog-desc">
+          选择分支起点。新会话将保留该消息之前的历史记录。
+        </p>
+
+        <div class="dialog-label-input">
+          <input
+            v-model="forkLabel"
+            type="text"
+            class="form-input"
+            placeholder="可选：为分支点添加标签"
+            spellcheck="false"
+          />
+        </div>
+
+        <div class="dialog-list">
+          <div v-if="loading" class="loading-state">正在加载消息...</div>
+          <div v-else-if="messages.length === 0" class="empty-state">此会话中没有用户消息。</div>
+          <button
+            v-for="msg in messages"
+            :key="msg.entryId"
+            class="fork-item"
+            @click="selectMessage(msg.entryId)"
+          >
+            <span class="fork-text">{{ truncate(msg.text, 120) }}</span>
+          </button>
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -136,6 +153,22 @@ function truncate(text: string, maxLen: number): string {
   font-size: var(--pix-text-sm);
   color: var(--pix-text-secondary);
   margin: 0;
+}
+
+/* 团队模式：说明分支不可用的原因（安静蓝反馈）。 */
+.fork-team-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--pix-space-sm);
+  padding: var(--pix-space-lg) var(--pix-space-xl);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-sm);
+  line-height: var(--pix-leading-base);
+}
+
+.fork-team-notice .v-icon {
+  flex-shrink: 0;
+  color: var(--pix-accent);
 }
 
 .dialog-label-input {

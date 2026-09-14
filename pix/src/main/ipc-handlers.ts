@@ -7,7 +7,7 @@
  * v2: Uses SessionBridge for direct AgentSession integration (no RPC subprocess).
  */
 
-import { createReadStream, existsSync, rmSync } from "fs";
+import { createReadStream, existsSync, readFileSync, rmSync } from "fs";
 import { createInterface } from "readline";
 import { isAbsolute, join, relative, resolve } from "path";
 import { BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from "electron";
@@ -26,9 +26,11 @@ import type {
   ProjectLocationInput,
   RpcCommand,
   TeamCommand,
+  TeamEvent,
   ThinkingLevel,
   WslSettings,
 } from "../shared/types.js";
+import { USER_SEAT_ID } from "../shared/team-types.js";
 import type { AgentTaskService } from "./agent-task/agent-task-service.js";
 import { parseAgentTaskMaxConcurrent } from "../shared/agent-task-types.js";
 // Plan/agent-task command registration and dispatch live in pure modules that
@@ -52,7 +54,10 @@ import {
   subscribeWorkflowEventForwarding,
 } from "./ipc-workflow-adapters.js";
 import type { TeamManager } from "./team-manager.js";
-import { readWorkspaceMode, teamSnapshotPath, writeWorkspaceMode } from "./team-persistence.js";
+import { readWorkspaceMode, writeWorkspaceMode } from "./team-persistence.js";
+import { ROUNDTABLE_FILES, roundtableFilePath } from "./team/constants.js";
+import { detectLegacyTeamSnapshot } from "./team/legacy-snapshot.js";
+import { RoundtablePersistence, SNAPSHOT_DEBOUNCE_MS } from "./team/persistence.js";
 import { WslDistroResolver } from "./wsl/wsl-distro.js";
 
 const { autoUpdater } = electronUpdater;
@@ -345,6 +350,61 @@ async function readSessionHeaderId(sessionPath: string): Promise<string | undefi
   return undefined;
 }
 
+/**
+ * 读一场的 meta.json lifecycle。`null` = 文件此刻还读不到/损坏/roundtableId 不符，
+ * 与「读到了但 lifecycle 是 stopped」明确区分：只有前者才值得等下一次重试。
+ */
+function readRoundtableLifecycle(physicalCwd: string, roundtableId: string): string | null {
+  try {
+    const raw = readFileSync(roundtableFilePath(physicalCwd, roundtableId, ROUNDTABLE_FILES.meta), "utf8");
+    const meta = JSON.parse(raw) as { roundtableId?: unknown; state?: { lifecycle?: unknown } };
+    if (meta.roundtableId !== roundtableId) {
+      return null;
+    }
+    return typeof meta.state?.lifecycle === "string" ? meta.state.lifecycle : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * H33: 本工作区是否存在可恢复的圆桌。读 `roundtables/<sha1(physicalCwd)>/current.json`
+ * 拿到 roundtableId，再读该场 `meta.json` 的 `state.lifecycle`：只有 `active` /
+ * `paused` 才算可恢复（归档场在 archive/ 下，指针也已清，永远读不到）。禁止
+ * `existsSync` 带 `*`，禁止把旧 `team-state/<sha1>/team.json` 当作可恢复场（H14）。
+ *
+ * 指针解析复用 RoundtablePersistence（与 TeamManager 同一套容错）；meta.json 只读
+ * 这一份小文件，不走 loadLatest（后者会 replay 整条 timeline.jsonl）。
+ */
+async function hasResumableRoundtable(physicalCwd: string): Promise<boolean> {
+  // 工作区级探针：实例的 roundtableId 不参与指针读取（TeamManager 同理）。
+  const probe = new RoundtablePersistence({ physicalCwd, roundtableId: "bootstrap" });
+  const roundtableId = await probe.readCurrentPointer().catch((): string | null => null);
+  if (roundtableId === null) {
+    return false;
+  }
+  // TeamManager 的快照写盘是 debounce 的（SNAPSHOT_DEBOUNCE_MS，且窗口不会被后续
+  // 写入推后），所以「刚建出来的场」可能只有指针、meta.json 还没落盘。等一个窗口
+  // 再读，免得把正在跑的场报成不可恢复；窗口过后仍读不到才是真正的悬空指针
+  // （崩溃在两次写之间、目录被删），照旧 false。
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, SNAPSHOT_DEBOUNCE_MS + 20));
+    }
+    const lifecycle = readRoundtableLifecycle(physicalCwd, roundtableId);
+    if (lifecycle !== null) {
+      return lifecycle === "active" || lifecycle === "paused";
+    }
+  }
+  return false;
+}
+
+/** 工作区级 legacy ack（H14）：`roundtables/<sha1>/ack.json`，与 roundtableId 无关。 */
+async function writeLegacySnapshotAck(physicalCwd: string): Promise<void> {
+  const probe = new RoundtablePersistence({ physicalCwd, roundtableId: "bootstrap" });
+  await probe.writeAck(physicalCwd, { legacySnapshotNoticeAck: true });
+}
+
 export function registerIpcHandlers(
   win: BrowserWindow,
   singleSessionBridge: SessionBridge,
@@ -401,7 +461,13 @@ export function registerIpcHandlers(
   async function disposeTeamRuntime(preserveSnapshot: boolean): Promise<void> {
     try {
       if (teamManager.hasActiveTeam()) {
-        await teamManager.stopTeam({ deleteSnapshot: !preserveSnapshot });
+        if (preserveSnapshot) {
+          // 保留快照 = 暂停：停一切团队模型调用，指针与 snapshot 都不动，下次进入
+          // team 模式仍能恢复（§7.4）。归档是显式 stop 的语义（§6.3）。
+          await teamManager.pause();
+        } else {
+          await teamManager.stop();
+        }
       }
     } finally {
       // Always detach the leader bridge even if worker shutdown reports an
@@ -469,7 +535,7 @@ export function registerIpcHandlers(
     } catch (err: unknown) {
       try {
         if (teamManager.hasActiveTeam()) {
-          await teamManager.stopTeam({ deleteSnapshot: false });
+          await teamManager.pause();
         }
       } catch (stopErr) {
         console.error("[ipc] TeamManager rollback failed:", stopErr);
@@ -493,11 +559,37 @@ export function registerIpcHandlers(
     return { success: true };
   });
 
-  ipcMain.handle("has-team-snapshot", (_event, location: unknown) => {
-    // Snapshot existence is keyed by the physical cwd hash (team-persistence.ts);
-    // the logical path never participates in the key (wsl_plan.md §4.8).
+  ipcMain.handle("has-team-snapshot", async (_event, location: unknown) => {
+    // H33: the active-roundtable pointer is keyed by the physical cwd hash
+    // (team/persistence.ts); the logical path never participates in the key
+    // (wsl_plan.md §4.8). The old team.json is NOT a snapshot (H14).
     if (!isProjectLocation(location)) return false;
-    return existsSync(teamSnapshotPath(location.physicalPath));
+    return hasResumableRoundtable(location.physicalPath);
+  });
+
+  ipcMain.handle("has-legacy-team-snapshot", async (_event, location: unknown) => {
+    // H14 / AC-13: only probes the old `team-state/<sha1>/team.json`; it never
+    // counts as a restorable roundtable (LEGACY_SNAPSHOT_RESTORABLE === false).
+    if (!isProjectLocation(location)) return false;
+    if (!detectLegacyTeamSnapshot(location.physicalPath)) return false;
+    // AC-13「只提示一次」的判定必须在主进程：ack 落盘（ack-legacy-team-snapshot）
+    // 之后探针就得是 false，否则每次从首页打开这个工作区都会再弹一次确认框。
+    // ack.json 是工作区级的，与 roundtableId 无关（readAck 自身容错，读不出来=没确认）。
+    const probe = new RoundtablePersistence({ physicalCwd: location.physicalPath, roundtableId: "bootstrap" });
+    const ack = await probe.readAck(location.physicalPath);
+    return ack.legacySnapshotNoticeAck !== true;
+  });
+
+  ipcMain.handle("ack-legacy-team-snapshot", async (_event, location: unknown) => {
+    if (!isProjectLocation(location)) {
+      return { success: false, error: "Invalid project location." };
+    }
+    try {
+      await writeLegacySnapshotAck(location.physicalPath);
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
   });
 
   ipcMain.handle("get-workspace-mode", async (_event, location: unknown) => {
@@ -1118,6 +1210,13 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
 // ===========================================================================
 
 /**
+ * §4.12 的 seat_event 载荷。TeamEvent 用的是 shared/types.ts 的 AgentSessionEvent，
+ * 而 SDK 事件（消息更新合并器的入参）是 pi-coding-agent 自己的结构等价类型：两套
+ * AgentMessage 定义只有 index signature 的差别，跨界沿用既有的一次性断言约定。
+ */
+type TeamSeatEvent = Extract<TeamEvent, { type: "seat_event" }>;
+
+/**
  * Set up event forwarding from SessionBridge to renderer.
  *
  * Uses a getter for the current window so that forwarding survives
@@ -1134,14 +1233,52 @@ export function setupEventForwarding(
   if (eventForwardingSetup) return;
   eventForwardingSetup = true;
 
-  // Forward TeamManager worker/task/protocol events independently from the
-  // leader AgentSession event stream.
+  // Forward TeamManager roundtable events. Only the `seat_event` stream (a seat
+  // AgentSession's raw events) is coalesced, and it gets its OWN coalescer
+  // instance(s) - never the pi-event one (plan §7.2). `timeline_item` and every
+  // other roundtable event reach the renderer immediately (AC-2 / §5.2: the
+  // timeline has a 2s budget and must not wait for a 50ms merge window).
+  //
+  // One coalescer per seat: a single shared instance would merge the
+  // thinking/text deltas of two seats that stream concurrently (the class holds
+  // exactly one pending message_update), mis-attributing one seat's tokens to
+  // another. Per-seat instances keep the documented merge rules inside one
+  // seat's own stream. DEFAULT_COALESCE_INTERVAL_MS is untouched.
+  const seatEventCoalescers = new Map<string, MessageUpdateCoalescer>();
+  function seatEventCoalescer(seatId: string): MessageUpdateCoalescer {
+    let coalescer = seatEventCoalescers.get(seatId);
+    if (coalescer === undefined) {
+      coalescer = new MessageUpdateCoalescer((event) => {
+        const win = getWin();
+        if (win && !win.isDestroyed()) {
+          const seatEvent: TeamSeatEvent = {
+            type: "seat_event",
+            seatId,
+            event: event as unknown as TeamSeatEvent["event"],
+          };
+          win.webContents.send("team-event", seatEvent);
+        }
+      });
+      seatEventCoalescers.set(seatId, coalescer);
+    }
+    return coalescer;
+  }
   eventForwardingUnsubscribes.push(teamManager.onEvent((event) => {
+    if (event.type === "seat_event") {
+      seatEventCoalescer(event.seatId).push(event.event as AgentSessionEvent);
+      return;
+    }
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("team-event", event);
     }
   }));
+  eventForwardingUnsubscribes.push(() => {
+    for (const coalescer of seatEventCoalescers.values()) {
+      coalescer.dispose();
+    }
+    seatEventCoalescers.clear();
+  });
 
   // Forward ordinary session events. message_update events are coalesced on a
   // fixed 50ms window before crossing the IPC boundary (perf SDD §4.2); markers
@@ -1314,103 +1451,232 @@ export function teardownEventForwarding(): void {
 // ===========================================================================
 
 const VALID_TEAM_COMMAND_TYPES = new Set([
-  "create_team",
-  "get_team_state",
-  "get_team_history",
-  "stop_team",
-  "send_message",
-  "abort_worker",
-  "activate_member",
-  "pause_member",
-  "create_task",
-  "delete_task",
-  "request_shutdown",
+  "create_roundtable",
+  "get_state",
+  "get_timeline",
+  "get_attention",
+  "get_open_items",
+  "get_deliverables",
+  "get_metrics",
+  "post_user_message",
+  "set_ordered_mode",
+  "pause",
+  "resume",
+  "stop",
+  "add_seat",
+  "remove_seat",
+  "update_seat_auth",
+  "wake_seat",
+  "mute_thread",
+  "request_wrap_up",
+  "revise_deliverable",
+  "stance_on_deliverable",
+  "export_markdown",
+  "build_handoff",
+  "get_inbox",
+  "ack_attention",
   "respond_permission",
-  "respond_plan_approval",
-  "restart_worker",
+  "respond_exit",
+  "set_settings",
+  "downgrade_models",
+  "list_presets",
+  "save_preset",
+  "delete_preset",
 ]);
 
+/**
+ * Runtime guard for the roundtable command union (plan §4.12). The switch is
+ * exhaustive: adding a TeamCommand member without a case here (and without the
+ * required sub-field checks) fails to compile.
+ */
 function isTeamCommand(cmd: unknown): cmd is TeamCommand {
   if (typeof cmd !== "object" || cmd === null || !("type" in cmd)) return false;
-  const type = (cmd as Record<string, unknown>).type;
-  if (typeof type !== "string" || !VALID_TEAM_COMMAND_TYPES.has(type)) return false;
+  const c = cmd as Record<string, unknown>;
+  const type = c.type as TeamCommand["type"];
+  if (typeof c.type !== "string" || !VALID_TEAM_COMMAND_TYPES.has(c.type)) return false;
 
   // Validate required sub-fields per command type
-  const c = cmd as Record<string, unknown>;
   switch (type) {
-    case "send_message":
-      return typeof c.agentId === "string" && typeof c.message === "string";
-    case "abort_worker":
-    case "activate_member":
-    case "pause_member":
-      return typeof c.agentId === "string";
-    case "create_task":
-      return typeof c.subject === "string" && typeof c.description === "string";
-    case "delete_task":
-      return typeof c.taskId === "string";
-    case "request_shutdown":
-      return true; // agentId is optional (all workers if omitted)
+    case "create_roundtable":
+      return typeof c.topic === "string";
+    case "get_state":
+    case "get_attention":
+    case "get_open_items":
+    case "get_deliverables":
+    case "get_metrics":
+    case "pause":
+    case "resume":
+    case "request_wrap_up":
+    case "export_markdown":
+    case "get_inbox":
+    case "list_presets":
+      return true;
+    case "get_timeline":
+      return c.filter === undefined || (typeof c.filter === "object" && c.filter !== null);
+    case "post_user_message":
+      return typeof c.to === "string" && typeof c.text === "string";
+    case "set_ordered_mode":
+      return typeof c.on === "boolean";
+    case "stop":
+      return c.wrapUp === undefined || typeof c.wrapUp === "boolean";
+    case "add_seat":
+      return typeof c.config === "object" && c.config !== null;
+    case "remove_seat":
+      return typeof c.seatId === "string" &&
+        (c.requestedBy === "user" || c.requestedBy === "self" || c.requestedBy === "peer");
+    case "update_seat_auth":
+      return typeof c.seatId === "string" &&
+        (c.auth === "read_only" || c.auth === "write" || c.auth === "restricted") &&
+        (c.pathAllowlist === undefined || Array.isArray(c.pathAllowlist));
+    case "wake_seat":
+      return typeof c.seatId === "string";
+    case "mute_thread":
+      return typeof c.threadId === "string" && typeof c.muted === "boolean";
+    case "revise_deliverable":
+      return typeof c.id === "string" && typeof c.markdown === "string" &&
+        (c.expectedRevision === undefined || typeof c.expectedRevision === "number");
+    case "stance_on_deliverable":
+      return typeof c.id === "string" &&
+        (c.stance === "support" || c.stance === "oppose" || c.stance === "conditional") &&
+        (c.seatId === undefined || typeof c.seatId === "string");
+    case "build_handoff":
+      return typeof c.deliverableId === "string" && (c.target === "solo" || c.target === "plan");
+    case "ack_attention":
+      return typeof c.id === "string";
     case "respond_permission":
       return typeof c.requestId === "string" && typeof c.approved === "boolean";
-    case "respond_plan_approval":
-      return typeof c.approvalId === "string" && typeof c.approved === "boolean";
-    case "restart_worker":
-      return typeof c.agentId === "string";
-    default:
-      return true;
+    case "respond_exit":
+      return typeof c.requestId === "string" && typeof c.statement === "string";
+    case "set_settings":
+      return typeof c.settings === "object" && c.settings !== null;
+    case "downgrade_models":
+      return typeof c.model === "string";
+    case "save_preset":
+      return typeof c.name === "string" && Array.isArray(c.seats);
+    case "delete_preset":
+      return typeof c.name === "string";
+    default: {
+      // Compile-time exhaustiveness: a new TeamCommand member without a case
+      // above leaves `type` non-never and fails this assignment.
+      const exhaustive: never = type;
+      void exhaustive;
+      return false;
+    }
   }
 }
 
+/**
+ * Dispatch one roundtable command onto the TeamManager facade (plan §4.12).
+ * Plan / AgentTask / RPC commands never come through here.
+ */
 async function executeTeamCommand(teamManager: TeamManager, cmd: TeamCommand): Promise<unknown> {
   switch (cmd.type) {
-    case "create_team":
-      return teamManager.createTeam(cmd.teamName);
-    case "get_team_state":
-      return teamManager.getTeamState();
-    case "get_team_history":
-      return teamManager.getTeamHistory();
-    case "stop_team":
-      await teamManager.stopTeam();
+    case "create_roundtable":
+      return teamManager.createRoundtable({
+        topic: cmd.topic,
+        name: cmd.name,
+        tier: cmd.tier,
+        seats: cmd.seats,
+        settings: cmd.settings,
+        attachments: cmd.attachments,
+      });
+    case "get_state":
+      return teamManager.getState();
+    case "get_timeline":
+      return teamManager.getTimeline(cmd.filter);
+    case "get_attention":
+      return teamManager.getAttention();
+    case "get_open_items":
+      return teamManager.getOpenItems();
+    case "get_deliverables":
+      return teamManager.getDeliverables();
+    case "get_metrics":
+      return teamManager.getMetrics();
+    case "get_inbox":
+      return teamManager.getInbox(cmd.seatId);
+    case "post_user_message":
+      return teamManager.postUserMessage({
+        to: cmd.to,
+        text: cmd.text,
+        private: cmd.private,
+        interrupt: cmd.interrupt,
+        attachments: cmd.attachments,
+      });
+    case "set_ordered_mode":
+      // H27: only writes settings.orderedMode; RoundtableState.orderedMode is a
+      // read-only projection the facade re-emits with `roundtable_state`.
+      teamManager.setOrderedMode(cmd.on);
       return null;
-    case "send_message":
-      await teamManager.sendMessageToWorker(cmd.agentId, cmd.message);
+    case "pause":
+      await teamManager.pause();
       return null;
-    case "abort_worker":
-      teamManager.resumeRuntime("renderer_abort_worker");
-      await teamManager.abortWorker(cmd.agentId);
+    case "resume":
+      teamManager.resume("renderer_resume");
       return null;
-    case "activate_member":
-      teamManager.resumeRuntime("renderer_activate_member");
-      await teamManager.activateMember(cmd.agentId);
+    case "stop":
+      await teamManager.stop({ wrapUp: cmd.wrapUp });
       return null;
-    case "pause_member":
-      teamManager.resumeRuntime("renderer_pause_member");
-      await teamManager.pauseMember(cmd.agentId);
+    case "add_seat":
+      return teamManager.addSeat(cmd.config);
+    case "remove_seat":
+      await teamManager.removeSeat(cmd.seatId, cmd.requestedBy);
       return null;
-    case "create_task":
-      teamManager.resumeRuntime("renderer_create_task");
-      return teamManager.createTask(cmd.subject, cmd.description, cmd.assignTo, cmd.blockedBy, cmd.taskType);
-    case "delete_task":
-      teamManager.resumeRuntime("renderer_delete_task");
-      teamManager.deleteTask(cmd.taskId);
+    case "update_seat_auth":
+      await teamManager.updateSeatAuth(cmd.seatId, cmd.auth, cmd.pathAllowlist);
       return null;
-    case "request_shutdown":
-      teamManager.resumeRuntime("renderer_request_shutdown");
-      return teamManager.requestShutdown(cmd.agentId);
+    case "wake_seat":
+      await teamManager.wakeSeat(cmd.seatId);
+      return null;
+    case "mute_thread":
+      teamManager.muteThread(cmd.threadId, cmd.muted);
+      return null;
+    case "request_wrap_up":
+      return teamManager.requestWrapUp(cmd.author);
+    case "revise_deliverable":
+      // 用户经 IPC 修订：以 USER_SEAT_ID 记名（用户不是席位，但时间线/交付物
+      // 里用户的固定 id 就是它）。revision 令牌必须是面板打开时读到的值。
+      return teamManager.reviseDeliverable(cmd.id, cmd.markdown, USER_SEAT_ID, cmd.expectedRevision);
+    case "stance_on_deliverable":
+      return teamManager.stanceOnDeliverable(
+        cmd.id,
+        cmd.seatId ?? USER_SEAT_ID,
+        cmd.stance,
+        cmd.reason,
+        cmd.confidence,
+      );
+    case "export_markdown":
+      return teamManager.exportMarkdown();
+    case "build_handoff":
+      return teamManager.buildHandoff(cmd.deliverableId, cmd.target);
+    case "ack_attention":
+      teamManager.ackAttention(cmd.id);
+      return null;
     case "respond_permission":
-      teamManager.resumeRuntime("renderer_respond_permission");
       teamManager.respondPermission(cmd.requestId, cmd.approved, cmd.reason);
       return null;
-    case "respond_plan_approval":
-      teamManager.resumeRuntime("renderer_respond_plan_approval");
-      teamManager.respondPlanApproval(cmd.approvalId, cmd.approved, cmd.feedback);
+    case "respond_exit":
+      await teamManager.respondExit(cmd.requestId, cmd.statement, cmd.accept);
       return null;
-    case "restart_worker":
-      teamManager.resumeRuntime("renderer_restart_worker");
-      await teamManager.restartWorker(cmd.agentId);
+    case "set_settings":
+      teamManager.setSettings(cmd.settings);
       return null;
-    default:
-      throw new Error(`Unknown team command type: ${(cmd as { type: string }).type}`);
+    case "downgrade_models":
+      await teamManager.downgradeModels(cmd.model);
+      return null;
+    case "list_presets":
+      return teamManager.listPresets();
+    case "save_preset":
+      await teamManager.savePreset(cmd.name, cmd.seats);
+      return null;
+    case "delete_preset":
+      await teamManager.deletePreset(cmd.name);
+      return null;
+    default: {
+      // Compile-time exhaustiveness: a new TeamCommand member without a case
+      // above leaves `cmd` non-never and fails this assignment.
+      const exhaustive: never = cmd;
+      throw new Error(`Unknown team command type: ${JSON.stringify(exhaustive)}`);
+    }
   }
 }
 

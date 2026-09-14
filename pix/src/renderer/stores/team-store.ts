@@ -1,52 +1,75 @@
 /**
- * Team Store
+ * Team store — the renderer projection of the roundtable runtime.
  *
- * Pinia store that manages team state in the renderer process.
- * Subscribes to team events from the main process and maintains
- * a reactive team state snapshot.
+ * The main process (`TeamManager`) is the authority: this store never decides
+ * discussion state, it only mirrors what `TeamEvent`s pushed over IPC say
+ * (dev plan §6.2). Every discussion collection below (roundtable, timeline,
+ * attention, open items, deliverables, metrics, seat activity, protocol
+ * queues) is written exclusively from `handleTeamEvent`; the pull paths
+ * (`refresh`) exist only to rehydrate after a mount/restart.
+ *
+ * Public surface frozen for S7 (case-for-case): teamMode, isLoading,
+ * isTeamActive, roundtable, timeline, attention, metrics, startTeamRuntime,
+ * stopTeamRuntime, toggleTeamMode, refresh(), TaggedSessionEvent, and the
+ * discussion commands the roundtable surfaces call.
  */
 
 import { defineStore } from "pinia";
-import { ref, computed, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useRpc } from "../composables/useRpc";
 import { useTeamLeaderRpc } from "../composables/useTeamLeaderRpc";
 import { useProjectStore } from "./project-store";
-import type {
-  TeamState,
-  TeamEvent,
-  TeamHistory,
-  TeammateInfo,
-  TeammateStatus,
-  TeammateChatMessage,
-  TeamMessage,
-  TeamTask,
-  AgentSessionEvent,
-  PermissionRequest,
-  PlanApproval,
-  ProjectLocation,
-} from "@shared/types.js";
 import { toPlain } from "../utils/plain";
+import {
+  USER_SEAT_ID,
+  type AttentionItem,
+  type DeliverableVersion,
+  type DeliveryState,
+  type ExitRequest,
+  type InboxEntry,
+  type InterruptLevel,
+  type OpenItem,
+  type RoundtableMetricsSnapshot,
+  type RoundtableSettings,
+  type RoundtableState,
+  type RoundtableTier,
+  type SeatConfig,
+  type SeatInfo,
+  type SeatRuntimeStatus,
+  type TeamCommand,
+  type TeamEvent,
+  type TimelineItem,
+  type ToolAuthTier,
+} from "@shared/team-types.js";
+import type { AgentSessionEvent, ChatMessageAttachment, PermissionRequest, ProjectLocation } from "@shared/types.js";
 
-/** Wrapper for a worker's raw AgentSessionEvent, tagged with agentId. */
+/** Wrapper for a seat's raw AgentSessionEvent, tagged with seatId. */
 export interface TaggedSessionEvent {
-  agentId: string;
+  seatId: string;
   event: AgentSessionEvent;
   timestamp: number;
 }
 
-/** Truncate a string to maxLen characters, appending "..." if truncated. */
-function truncate(s: string, maxLen: number): string {
-  return s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
+/** Per-seat raw event buffer cap (streaming noise only; the timeline is the record). */
+const MAX_SEAT_EVENTS = 200;
+
+/** Empty metrics snapshot (no roundtable / nothing measured yet). */
+export function emptyMetrics(): RoundtableMetricsSnapshot {
+  return {
+    perSeat: {},
+    totals: { utterances: 0, tokens: 0, cost: 0, durationMs: 0 },
+    health: { speakShare: {}, evidenceDensity: 0, interruptRate: 0 },
+  };
 }
 
-/** Extract plain text from an AgentMessage content field. */
-function extractText(content: string | Array<{ type: string; text?: string }>): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((b) => b.type === "text" && b.text)
-    .map((b) => b.text!)
-    .join("");
+/** Replace-or-append a record by id (pushed events are idempotent replays). */
+function upsertById<T extends { id: string }>(list: T[], item: T): void {
+  const index = list.findIndex((existing) => existing.id === item.id);
+  if (index >= 0) {
+    list.splice(index, 1, item);
+  } else {
+    list.push(item);
+  }
 }
 
 export const useTeamStore = defineStore("team", () => {
@@ -55,130 +78,289 @@ export const useTeamStore = defineStore("team", () => {
   const projectStore = useProjectStore();
 
   // ==========================================================================
-  // State
+  // Projected state (written only by handleTeamEvent / refresh)
   // ==========================================================================
 
-  /** Current team state, null if no team is active. */
-  const teamState = ref<TeamState | null>(null);
+  const roundtableState = ref<RoundtableState | null>(null);
+  const timelineItems = ref<TimelineItem[]>([]);
+  const deliveries = ref<Record<string, Record<string, DeliveryState>>>({});
+  const attentionItems = ref<AttentionItem[]>([]);
+  const openItems = ref<OpenItem[]>([]);
+  const deliverables = ref<DeliverableVersion[]>([]);
+  const metricsSnapshot = ref<RoundtableMetricsSnapshot>(emptyMetrics());
+  const seatEventBuffers = ref<Record<string, TaggedSessionEvent[]>>({});
+  const pendingPermissions = ref<PermissionRequest[]>([]);
+  const exitRequests = ref<ExitRequest[]>([]);
 
-  /** Whether a team operation is in progress. */
-  const isLoading = ref(false);
-
-  /** Last error message from a team operation. */
-  const lastError = ref<string | null>(null);
-
-  /** Per-worker message timelines. Keyed by agentId. */
-  const workerMessages = ref<Record<string, TeammateChatMessage[]>>({});
-
-  /** Per-worker raw session events (capped at 200 per worker). Keyed by agentId. */
-  const workerEvents = ref<Record<string, TaggedSessionEvent[]>>({});
-
-  /** Rich message bus messages for the team timeline. */
-  const teamMessages = ref<TeamMessage[]>([]);
-
-  /** Shared team task list. */
-  const teamTasks = ref<TeamTask[]>([]);
-
-  /** Pending permission requests from workers. */
-  const permissionRequests = ref<PermissionRequest[]>([]);
-
-  /** Pending plan approval requests from workers. */
-  const planApprovals = ref<PlanApproval[]>([]);
-
-  /** Whether the Team Dashboard view is active (user toggled team mode on). */
+  // View state (never a discussion authority)
   const teamMode = ref(false);
+  const isLoading = ref(false);
+  const lastError = ref<string | null>(null);
+  const focusedSeatId = ref<string | null>(null);
+  const mutedThreads = ref<string[]>([]);
+  const legacyNotice = ref(false);
+  const recordCorruptNotice = ref<string | null>(null);
 
-  /** Currently focused worker agent ID. null = no worker focused. */
-  const focusedAgentId = ref<string | null>(null);
-
-  /** Worker summary messages injected by the Leader (displayed in Leader chat context). */
-  const workerSummaries = ref<Array<{ fromAgentId: string; summary: string; taskId?: string; timestamp: number }>>([]);
-
-  // ==========================================================================
-  // Computed
-  // ==========================================================================
-
-  /** Whether a team is currently active. */
-  const isTeamActive = computed(() => teamState.value?.status === "active");
-
-  /** Team name, or null. */
-  const teamName = computed(() => teamState.value?.name ?? null);
-
-  /** Array of teammate info objects. */
-  const teammates = computed<TeammateInfo[]>(() => {
-    if (!teamState.value) return [];
-    return Object.values(teamState.value.teammates);
-  });
-
-  const completedTaskIds = computed(() =>
-    new Set(teamTasks.value.filter((task) => task.status === "completed").map((task) => task.id)),
-  );
-
-  const readyTasks = computed(() =>
-    teamTasks.value.filter((task) => {
-      if (task.status !== "pending" && task.status !== "assigned") return false;
-      return task.blockedBy.every((depId) => completedTaskIds.value.has(depId));
-    }),
-  );
-
-  const activeTasks = computed(() => teamTasks.value.filter((task) => task.status === "in_progress"));
-
-  const waitingTasks = computed(() =>
-    teamTasks.value.filter((task) => {
-      if (task.status !== "pending" && task.status !== "assigned") return false;
-      return task.blockedBy.some((depId) => !completedTaskIds.value.has(depId));
-    }),
-  );
-
-  const problemTasks = computed(() => teamTasks.value.filter((task) => task.status === "blocked" || task.status === "failed"));
-
-  const doneTasks = computed(() => teamTasks.value.filter((task) => task.status === "completed"));
-
-  /** Protocol items that need user attention (permission approvals). */
-  const pendingProtocolCount = computed(() => permissionRequests.value.length + planApprovals.value.length);
-
-  /** Per-agent current activity summary derived from the latest session event. */
-  const currentActivity = computed<Record<string, string>>(() => {
-    const result: Record<string, string> = {};
-    for (const [agentId, events] of Object.entries(workerEvents.value)) {
-      if (events.length === 0) continue;
-      // Walk backwards to find the most recent meaningful event
-      for (let i = events.length - 1; i >= 0; i--) {
-        const tagged = events[i];
-        const ev = tagged.event;
-        if (ev.type === "tool_execution_start") {
-          result[agentId] = ev.toolName === "bash" ? `正在运行：${truncate(String(ev.args), 60)}` : `正在使用：${ev.toolName}`;
-          break;
-        }
-        if (ev.type === "message_update" || ev.type === "message_start") {
-          const text = extractText(ev.message.content);
-          if (text) {
-            result[agentId] = truncate(text, 80);
-            break;
-          }
-        }
-        if (ev.type === "tool_execution_end") {
-          result[agentId] = ev.isError ? `${ev.toolName} 执行出错` : `已完成：${ev.toolName}`;
-          break;
-        }
-      }
-    }
-    return result;
-  });
-
-  // ==========================================================================
-  // Actions
-  // ==========================================================================
-
-  /** Active team-event unsubscribe handle (the store is a singleton, so only one
-   * subscription may be live at a time; a second subscribe replaces the first). */
+  /** Active team-event unsubscribe handle (singleton store → one live subscription). */
   let unsubscribeTeamEvents: (() => void) | null = null;
 
-  /** Subscribe to team events from main process. Must be called once on app init. */
+  // ==========================================================================
+  // Computed (frozen surface + component inputs)
+  // ==========================================================================
+
+  /** There is a roundtable to show (any lifecycle except none, incl. archived/read-only). */
+  const roundtable = computed<RoundtableState | null>(() => roundtableState.value);
+
+  /** A running roundtable (active or paused) — mirrors `TeamManager.hasActiveTeam()`. */
+  const isTeamActive = computed(() => {
+    const lifecycle = roundtableState.value?.lifecycle;
+    return lifecycle === "active" || lifecycle === "paused";
+  });
+
+  const teamName = computed(() => roundtableState.value?.name ?? null);
+  const orderedMode = computed(() => roundtableState.value?.orderedMode === true);
+  const lifecycle = computed(() => roundtableState.value?.lifecycle ?? null);
+
+  /** All seats keyed by seatId (exited seats kept: the timeline still points at them). */
+  const seats = computed<Record<string, SeatInfo>>(() => roundtableState.value?.seats ?? {});
+
+  /** Seats in creation order, exited included. */
+  const seatList = computed<SeatInfo[]>(() => Object.values(seats.value));
+
+  /** Seats that can still speak. */
+  const activeSeats = computed<SeatInfo[]>(() => seatList.value.filter((seat) => seat.status !== "exited"));
+
+  /** Timeline with the pushed delivery states merged in (delivery_changed may lead the item). */
+  const timeline = computed<TimelineItem[]>(() =>
+    timelineItems.value.map((item) => {
+      const pushed = deliveries.value[item.id];
+      if (pushed === undefined) return item;
+      return { ...item, deliveryBySeat: { ...item.deliveryBySeat, ...pushed } };
+    }),
+  );
+
+  /** Attention items, unacked first then by time (the surface order). */
+  const attention = computed<AttentionItem[]>(() =>
+    [...attentionItems.value].sort((a, b) => Number(a.acked) - Number(b.acked) || a.ts - b.ts),
+  );
+
+  const unackedAttention = computed(() => attention.value.filter((item) => !item.acked));
+
+  const metrics = computed<RoundtableMetricsSnapshot>(() => metricsSnapshot.value);
+
+  /** Deliverable versions, newest first. */
+  const deliverableVersions = computed<DeliverableVersion[]>(() =>
+    [...deliverables.value].sort((a, b) => b.version - a.version),
+  );
+
+  /** Open items: unresolved first, then by recency. */
+  const openItemList = computed<OpenItem[]>(() =>
+    [...openItems.value].sort((a, b) => {
+      const openA = a.status === "open" || a.status === "claimed" ? 0 : 1;
+      const openB = b.status === "open" || b.status === "claimed" ? 0 : 1;
+      return openA - openB || b.updatedAt - a.updatedAt;
+    }),
+  );
+
+  const pendingProtocolCount = computed(() => pendingPermissions.value.length + exitRequests.value.length);
+
+  /** Per-seat "正在做什么" (last activity pushed with a seat_status). */
+  const currentActivity = computed<Record<string, string>>(() => {
+    const out: Record<string, string> = {};
+    for (const seat of seatList.value) {
+      if (seat.currentActivity) out[seat.seatId] = seat.currentActivity;
+    }
+    return out;
+  });
+
+  const focusedSeat = computed<SeatInfo | null>(() => {
+    const id = focusedSeatId.value;
+    return id === null ? null : seats.value[id] ?? null;
+  });
+
+  /** Seat raw event streams, keyed by seatId (tool activity surfaces read this). */
+  const seatEvents = computed<Record<string, TaggedSessionEvent[]>>(() => seatEventBuffers.value);
+
+  // ==========================================================================
+  // IPC plumbing
+  // ==========================================================================
+
+  /**
+   * Send one TeamCommand. Failures are recorded in `lastError` and returned as
+   * null — the renderer surfaces never throw on a rejected command, and no
+   * discussion state is written from a command result (events are the only
+   * writer; `refresh` is the explicit pull path).
+   */
+  async function send<T>(command: TeamCommand): Promise<T | null> {
+    if (!window.pixApi) {
+      lastError.value = "PiX 预加载 API 不可用。";
+      return null;
+    }
+    // Every command clears the previous failure, so `lastError !== null` after a
+    // call always describes *this* call (used by the command wrappers below).
+    lastError.value = null;
+    try {
+      const result = await window.pixApi.sendTeamCommand<T>(command);
+      if (!result.success) {
+        lastError.value = result.error ?? "团队命令失败";
+        return null;
+      }
+      return (result.data ?? null) as T | null;
+    } catch (err) {
+      lastError.value = err instanceof Error ? err.message : String(err);
+      return null;
+    }
+  }
+
+  // ==========================================================================
+  // Event projection
+  // ==========================================================================
+
+  function clearRoundtable(): void {
+    roundtableState.value = null;
+    resetRoundtableCollections();
+  }
+
+  /** Drop everything that belongs to one roundtable (new场 or no场). */
+  function resetRoundtableCollections(): void {
+    timelineItems.value = [];
+    deliveries.value = {};
+    attentionItems.value = [];
+    openItems.value = [];
+    deliverables.value = [];
+    metricsSnapshot.value = emptyMetrics();
+    seatEventBuffers.value = {};
+    pendingPermissions.value = [];
+    exitRequests.value = [];
+    mutedThreads.value = [];
+    focusedSeatId.value = null;
+  }
+
+  function setRoundtable(next: RoundtableState): void {
+    const previous = roundtableState.value;
+    if (previous !== null && previous.roundtableId !== next.roundtableId) {
+      resetRoundtableCollections();
+    }
+    roundtableState.value = next;
+  }
+
+  /** Insert/replace one timeline record, keeping the list seq-ordered. */
+  function upsertTimelineItem(item: TimelineItem): void {
+    const items = timelineItems.value;
+    const index = items.findIndex((existing) => existing.id === item.id);
+    if (index >= 0) {
+      items.splice(index, 1, item);
+      return;
+    }
+    const last = items[items.length - 1];
+    if (last === undefined || last.seq <= item.seq) {
+      items.push(item);
+      return;
+    }
+    const at = items.findIndex((existing) => existing.seq > item.seq);
+    items.splice(at < 0 ? items.length : at, 0, item);
+  }
+
+  function applySeatStatus(
+    seatId: string,
+    status: SeatRuntimeStatus,
+    activity?: string,
+    error?: string,
+  ): void {
+    const state = roundtableState.value;
+    const seat = state?.seats[seatId];
+    if (state === null || seat === undefined) return;
+    const updated: SeatInfo = {
+      ...seat,
+      status,
+      statusChangedAt: Date.now(),
+      // Mirror the main-process roster semantics: the event carries the new
+      // activity/error, and error only survives on the error status.
+      currentActivity: activity,
+      error: status === "error" ? error : undefined,
+    };
+    state.seats = { ...state.seats, [seatId]: updated };
+  }
+
+  function appendSeatEvent(seatId: string, event: AgentSessionEvent): void {
+    // Ignore events from unknown seats: after a roundtable switch the previous
+    // run's tail must not bleed into the new one's activity surfaces.
+    if (roundtableState.value?.seats[seatId] === undefined) return;
+    const buffer = seatEventBuffers.value[seatId] ?? [];
+    buffer.push({ seatId, event, timestamp: Date.now() });
+    if (buffer.length > MAX_SEAT_EVENTS) {
+      buffer.splice(0, buffer.length - MAX_SEAT_EVENTS);
+    }
+    seatEventBuffers.value = { ...seatEventBuffers.value, [seatId]: buffer };
+  }
+
+  function applyDeliveryChanged(messageId: string, seatId: string, state: DeliveryState): void {
+    const current = deliveries.value[messageId] ?? {};
+    deliveries.value = { ...deliveries.value, [messageId]: { ...current, [seatId]: state } };
+  }
+
+  function handleTeamEvent(event: TeamEvent): void {
+    switch (event.type) {
+      case "roundtable_created":
+        setRoundtable(event.state);
+        // A live roundtable should always be visible: created ones come from the
+        // setup dialog, restored ones should reopen the workbench by themselves.
+        teamMode.value = true;
+        break;
+      case "roundtable_state":
+        setRoundtable(event.state);
+        break;
+      case "timeline_item":
+        upsertTimelineItem(event.item);
+        break;
+      case "seat_status":
+        applySeatStatus(event.seatId, event.status, event.activity, event.error);
+        break;
+      case "seat_event":
+        appendSeatEvent(event.seatId, event.event);
+        break;
+      case "attention":
+        upsertById(attentionItems.value, event.item);
+        break;
+      case "open_item":
+        upsertById(openItems.value, event.item);
+        break;
+      case "deliverable":
+        upsertById(deliverables.value, event.item);
+        break;
+      case "delivery_changed":
+        applyDeliveryChanged(event.messageId, event.seatId, event.state);
+        break;
+      case "metrics":
+        metricsSnapshot.value = event.snapshot;
+        break;
+      case "legacy_snapshot_notice":
+        legacyNotice.value = true;
+        break;
+      case "record_corrupt_notice":
+        recordCorruptNotice.value = event.text;
+        break;
+      case "protocol_permission_request":
+        upsertById(pendingPermissions.value, event.request);
+        break;
+      case "exit_request":
+        if (event.request.status === "pending") {
+          upsertById(exitRequests.value, event.request);
+        } else {
+          exitRequests.value = exitRequests.value.filter((request) => request.id !== event.request.id);
+        }
+        break;
+      default: {
+        const exhaustive: never = event;
+        void exhaustive;
+      }
+    }
+  }
+
+  /** Subscribe to pushed roundtable events. Must be called once on app init. */
   function subscribeToEvents(): () => void {
-    // Guard against duplicate subscriptions: a re-subscribe (window reopen,
-    // component remount) would otherwise register a second handler and every
-    // event would be processed twice (duplicating un-deduped events/summaries).
+    // Guard against duplicate subscriptions (window reopen, component remount):
+    // a second handler would process every event twice.
     if (unsubscribeTeamEvents) {
       unsubscribeTeamEvents();
     }
@@ -192,135 +374,99 @@ export const useTeamStore = defineStore("team", () => {
     return unsubscribeTeamEvents;
   }
 
-  /** Create a new team. */
-  async function createTeam(teamName?: string): Promise<boolean> {
+  // ==========================================================================
+  // Pull (rehydrate after mount/restart — the explicit refresh path)
+  // ==========================================================================
+
+  /** Re-read the current roundtable snapshot: state + timeline + metrics + attention. */
+  async function refresh(): Promise<void> {
     isLoading.value = true;
-    lastError.value = null;
     try {
-      const result = await window.pixApi.sendTeamCommand<TeamState>({
-        type: "create_team",
-        teamName,
-      });
-      if (result.success && result.data) {
-        // Fresh team: drop any collections left over from a previous team
-        // (the team_deleted event skips clearing when names differ).
-        resetTeamCollections();
-        teamState.value = result.data;
-        // Initialize message/event stores for each worker
-        for (const agentId of Object.keys(result.data.teammates)) {
-          workerMessages.value[agentId] = [];
-          workerEvents.value[agentId] = [];
-        }
-        return true;
-      }
-      lastError.value = result.error ?? "创建团队失败";
-      return false;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    } finally {
-      isLoading.value = false;
-    }
-  }
+      const [state, items, snapshot, attentions] = await Promise.all([
+        send<RoundtableState | null>({ type: "get_state" }),
+        send<TimelineItem[]>({ type: "get_timeline" }),
+        send<RoundtableMetricsSnapshot>({ type: "get_metrics" }),
+        send<AttentionItem[]>({ type: "get_attention" }),
+      ]);
 
-  /** Clear all per-team collections (messages, events, tasks, protocol state). */
-  function resetTeamCollections(): void {
-    workerMessages.value = {};
-    workerEvents.value = {};
-    teamMessages.value = [];
-    teamTasks.value = [];
-    workerSummaries.value = [];
-    permissionRequests.value = [];
-    planApprovals.value = [];
-    focusedAgentId.value = null;
-  }
-
-  /** Query the current team state from main process. */
-  async function fetchTeamState(): Promise<void> {
-    try {
-      const result = await window.pixApi.sendTeamCommand<TeamState | null>({
-        type: "get_team_state",
-      });
-      if (result.success) {
-        const next = result.data ?? null;
-        // When the team identity changes (switching sessions, or no team in the
-        // newly-opened session), drop the previous team's messages/tasks/events
-        // so they don't bleed into — or merge with — the new session's data.
-        if ((next?.name ?? null) !== (teamState.value?.name ?? null)) {
-          resetTeamCollections();
+      if (state === null) {
+        // 没有场（运行环境刚起来、还没 create_roundtable）或命令失败：只清圆桌投影。
+        // teamMode 是用户选的前台模式（FR-13），不能由「有没有场」推导——在这里置
+        // false 会让「新建团队会话」在 create_roundtable 之前弹回 solo，订阅随之断掉，
+        // 于是 5 席在后台开跑而界面永远收不到 roundtable_created（AC-1 主入口不可达）。
+        // 运行环境真的停了由 stopHostRuntime() 与下面的 piStatus watcher 负责。
+        if (roundtableState.value !== null) {
+          clearRoundtable();
         }
-        // An active team discovered on mount (e.g. restored after app restart)
-        // should open the team workbench without requiring a manual toggle.
-        if (next?.status === "active" && !teamState.value) {
+      } else {
+        setRoundtable(state);
+        if (items !== null) {
+          timelineItems.value = [...items].sort((a, b) => a.seq - b.seq);
+        }
+        if (snapshot !== null) {
+          metricsSnapshot.value = snapshot;
+        }
+        if (attentions !== null) {
+          attentionItems.value = attentions;
+        }
+        if (isTeamActive.value) {
+          // A live roundtable discovered on mount (restored after a restart)
+          // opens the workbench without a manual toggle.
           teamMode.value = true;
         }
-        // If the team is gone but teamMode is still on (e.g. leader crashed
-        // while the workbench was unmounted and the watcher that would
-        // auto-recover was disposed), drop out of team mode so the workspace
-        // falls back to solo instead of showing a dead team UI.
-        if (next === null && teamMode.value) {
-          teamMode.value = false;
-        }
-        teamState.value = next;
       }
-    } catch (err) {
-      console.error("[team-store] Failed to fetch team state:", err);
+    } finally {
+      isLoading.value = false;
     }
   }
 
-  /**
-   * Hydrate persisted history (worker chats, bus messages, tasks) into the
-   * store. Called after a team is created/restored so a reopened project shows
-   * the previous teammate conversations instead of empty panels. Live events
-   * may race this; everything is merged and deduped by id.
-   */
-  async function fetchTeamHistory(): Promise<void> {
-    try {
-      const result = await window.pixApi.sendTeamCommand<TeamHistory | null>({
-        type: "get_team_history",
-      });
-      if (!result.success || !result.data) return;
-      const history = result.data;
-
-      for (const [agentId, messages] of Object.entries(history.workerMessages)) {
-        const existing = workerMessages.value[agentId] ?? [];
-        const byId = new Map(existing.map((m) => [m.id, m]));
-        for (const msg of messages) {
-          if (!byId.has(msg.id)) byId.set(msg.id, msg);
-        }
-        workerMessages.value[agentId] = [...byId.values()].sort((a, b) => a.timestamp - b.timestamp);
-      }
-
-      const teamById = new Map(teamMessages.value.map((m) => [m.id, m]));
-      for (const msg of history.teamMessages) {
-        if (!teamById.has(msg.id)) teamById.set(msg.id, msg);
-      }
-      teamMessages.value = [...teamById.values()].sort((a, b) => a.timestamp - b.timestamp);
-
-      const taskById = new Map(teamTasks.value.map((t) => [t.id, t]));
-      for (const task of history.tasks) {
-        if (!taskById.has(task.id)) taskById.set(task.id, task);
-      }
-      teamTasks.value = [...taskById.values()];
-    } catch (err) {
-      console.error("[team-store] Failed to fetch team history:", err);
-    }
+  /** 未决项 / 交付物 are not part of the frozen refresh: load them on demand. */
+  async function refreshOpenItems(): Promise<void> {
+    const items = await send<OpenItem[]>({ type: "get_open_items" });
+    if (items !== null) openItems.value = items;
   }
 
-  /** Stop the active team. */
-  async function stopTeam(): Promise<boolean> {
+  async function refreshDeliverables(): Promise<void> {
+    const items = await send<DeliverableVersion[]>({ type: "get_deliverables" });
+    if (items !== null) deliverables.value = items;
+  }
+
+  async function refreshInbox(seatId?: string): Promise<InboxEntry[]> {
+    return (await send<InboxEntry[]>({ type: "get_inbox", seatId })) ?? [];
+  }
+
+  // ==========================================================================
+  // Runtime start/stop (host SessionBridge only — never the discussion engine)
+  // ==========================================================================
+
+  async function startHostRuntime(target: ProjectLocation): Promise<boolean> {
+    const started = await teamLeaderRpc.startTeamRuntime(target);
+    if (!started) {
+      lastError.value = teamLeaderRpc.lastError.value || "启动团队运行环境失败";
+      return false;
+    }
+    teamMode.value = true;
+    void window.pixApi.setWorkspaceMode(target, "team");
+    return true;
+  }
+
+  async function stopHostRuntime(): Promise<boolean> {
+    await teamLeaderRpc.stopTeamRuntime();
+    teamMode.value = false;
+    focusedSeatId.value = null;
+    return true;
+  }
+
+  /** Start the team runtime (host session); the discussion runs through TeamCommand. */
+  async function startTeamRuntime(location?: ProjectLocation): Promise<boolean> {
+    if (!location) {
+      lastError.value = "启动团队运行环境前需要先打开项目目录";
+      return false;
+    }
     isLoading.value = true;
     lastError.value = null;
     try {
-      const result = await window.pixApi.sendTeamCommand({ type: "stop_team" });
-      if (result.success) {
-        // Don't clear state here — the team_deleted event from main process
-        // will clear all state atomically, avoiding a window where late events
-        // re-populate already-cleared stores.
-        return true;
-      }
-      lastError.value = result.error ?? "停止团队失败";
-      return false;
+      return await startHostRuntime(toPlain(location));
     } catch (err) {
       lastError.value = err instanceof Error ? err.message : String(err);
       return false;
@@ -329,89 +475,21 @@ export const useTeamStore = defineStore("team", () => {
     }
   }
 
-  /** Send a message to a specific worker. */
-  async function sendMessageToWorker(agentId: string, message: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "send_message",
-        agentId,
-        message,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "发送消息失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
-  }
-
-  /** Abort a specific worker's current turn. Worker returns to idle. */
-  async function abortWorker(agentId: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "abort_worker",
-        agentId,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "停止成员当前任务失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
-  }
-
-  /** Bring a dormant/standby member into the current team work. */
-  async function activateMember(agentId: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "activate_member",
-        agentId,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "唤醒团队成员失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
-  }
-
-  /** Pause a member while keeping their roster identity and history. */
-  async function pauseMember(agentId: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "pause_member",
-        agentId,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "暂停团队成员失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
-  }
-
-  /** Clear error state. */
-  function clearError(): void {
+  /** Stop the team runtime. */
+  async function stopTeamRuntime(): Promise<boolean> {
+    isLoading.value = true;
     lastError.value = null;
+    try {
+      return await stopHostRuntime();
+    } catch (err) {
+      lastError.value = err instanceof Error ? err.message : String(err);
+      return false;
+    } finally {
+      isLoading.value = false;
+    }
   }
 
-  /** Switch the workspace between the independent single and Team runtimes.
-   *  The full ProjectLocation is passed so the main process can validate the
-   *  execution environment and reject leader/worker environment mismatch;
-   *  switching environment (e.g. Windows <-> WSL) requires a stop + new runtime,
-   *  which the main process enforces via SessionBridge.start candidate-then-takeover. */
+  /** Switch the workspace between the single and team runtimes (mutually exclusive). */
   async function toggleTeamMode(location?: ProjectLocation): Promise<boolean> {
     if (isLoading.value) return false;
     if (!location) {
@@ -427,44 +505,36 @@ export const useTeamStore = defineStore("team", () => {
     lastError.value = null;
     try {
       if (teamMode.value) {
-        await teamLeaderRpc.stopTeamRuntime();
+        await stopHostRuntime();
         const started = await singleRpc.startRuntime(target);
         if (!started) {
           lastError.value = singleRpc.lastError.value || "启动单人运行环境失败";
           // Solo failed to start; restore the team runtime so the workspace is
           // not left with both runtimes down while the UI still shows team mode.
-          const restored = await teamLeaderRpc.startTeamRuntime(target);
+          const restored = await startHostRuntime(target);
           if (!restored) {
             lastError.value = `${lastError.value}\n恢复团队运行环境也失败：${teamLeaderRpc.lastError.value || "未知错误"}`;
-            // Both runtimes are down. Drop to solo mode so the workspace shows a
-            // retryable solo error state instead of a dead team workspace. The
-            // piStatus recovery watch below does not fire here because
-            // stopTeamRuntime already set piStatus to "stopped" during this
-            // isLoading-guarded toggle, so there is no later status change to
-            // react to.
             teamMode.value = false;
           }
           return false;
         }
-        teamMode.value = false;
+        // FR-13：切到单人必须写回 mode.json，否则下一次挂载 / 重启时
+        // `getWorkspaceMode() === "team" && hasTeamSnapshot()` 会把用户重新拉回团队。
         void window.pixApi.setWorkspaceMode(target, "solo");
-        focusedAgentId.value = null;
+        focusedSeatId.value = null;
         return true;
       }
 
-      const started = await teamLeaderRpc.startTeamRuntime(target);
+      const started = await startHostRuntime(target);
       if (!started) {
-        lastError.value = teamLeaderRpc.lastError.value || "启动团队运行环境失败";
-        // start-team-runtime stops the single runtime before starting the
-        // leader, so restore ordinary mode if Team startup fails.
+        // start-team-runtime stops the single runtime before starting the team
+        // runtime, so restore ordinary mode if Team startup fails.
         const restored = await singleRpc.startRuntime(target);
         if (!restored) {
           lastError.value = `${lastError.value}\n恢复单人运行环境也失败：${singleRpc.lastError.value || "未知错误"}`;
         }
         return false;
       }
-      teamMode.value = true;
-      void window.pixApi.setWorkspaceMode(target, "team");
       return true;
     } catch (err) {
       lastError.value = err instanceof Error ? err.message : String(err);
@@ -474,428 +544,291 @@ export const useTeamStore = defineStore("team", () => {
     }
   }
 
-  // If the team leader runtime exits while the workspace is in team mode
-  // (e.g. it crashed while the user was on another page and the CenterPanel
-  // canUseTeamMode auto-recovery watcher had been disposed with the
-  // component), recover to a functional solo workspace from the store: stop the
-  // dead leader and start the single runtime. Running this in the singleton
-  // store means it fires even when WorkspacePage/CenterPanel are unmounted, so
-  // navigating back lands in a working solo workspace instead of a dead team
-  // UI. This matters because a crash does not clear TeamManager._team, so
-  // fetchTeamState still returns non-null stale state and the canUseTeamMode
-  // watcher (no immediate, and disposed while away) never re-fires.
-  //
-  // The isLoading guard inside toggleTeamMode prevents a double switch when
-  // CenterPanel's canUseTeamMode watcher fires at the same time, and also
-  // blocks this callback during a normal team->solo toggle - whose
-  // stopTeamRuntime also flips piStatus to "stopped" while teamMode is still
-  // true. Only an unsolicited leader exit (status becomes "stopped" outside a
-  // toggle) triggers recovery.
+  // If the team runtime exits while team mode is on (e.g. it crashed while the
+  // user was on another page and CenterPanel's watcher had been disposed with
+  // the component), recover to a functional solo workspace from the singleton
+  // store. The isLoading guard prevents a double switch when CenterPanel's
+  // watcher fires at the same time, and blocks this callback during a normal
+  // team→solo toggle (whose stopTeamRuntime flips piStatus to "stopped" while
+  // teamMode is still true). Only an unsolicited exit triggers recovery.
   watch(teamLeaderRpc.piStatus, (status) => {
     if (status !== "stopped" || !teamMode.value || isLoading.value) return;
     const location = projectStore.currentProject;
     if (location) {
       void toggleTeamMode(location);
     } else {
-      // Team mode requires an open project, so this branch is defensive: at
-      // least drop team mode so the UI does not render a dead team workspace.
       teamMode.value = false;
     }
   });
 
-  /** Focus on a specific worker. Auto-creates event buffer if missing. */
-  function focusWorker(agentId: string): void {
-    focusedAgentId.value = agentId;
-    // Ensure buffer exists (may not if worker was just created)
-    if (!workerEvents.value[agentId]) {
-      workerEvents.value[agentId] = [];
-    }
-  }
-
-  /** Clear worker focus. */
-  function clearFocus(): void {
-    focusedAgentId.value = null;
-  }
-
   // ==========================================================================
-  // Event Handling
+  // Discussion commands (state comes back through events)
   // ==========================================================================
 
-  const MAX_EVENTS_PER_WORKER = 200;
-
-  function pickInitialFocus(team: TeamState): string | null {
-    const entries = Object.entries(team.teammates);
-    const preferred = entries.find(([, teammate]) => teammate.status === "running") ??
-      entries.find(([, teammate]) => teammate.status === "idle" || teammate.status === "standby") ??
-      entries[0];
-    return preferred?.[0] ?? null;
-  }
-
-  function handleTeamEvent(event: TeamEvent): void {
-    switch (event.type) {
-      case "team_created":
-        teamState.value = event.team;
-        focusedAgentId.value = pickInitialFocus(event.team);
-        // A live team should always be visible: created teams come from team
-        // UI flows, and restored teams (app restart) should reopen the
-        // workbench automatically.
-        teamMode.value = true;
-        // Hydrate persisted history so a restored team shows prior teammate
-        // conversations and tasks instead of empty panels.
-        void fetchTeamHistory();
-        break;
-      case "team_state_changed":
-        teamState.value = event.team;
-        break;
-      case "team_deleted":
-        if (teamState.value && teamState.value.name !== event.teamName) {
-          break;
-        }
-        teamState.value = null;
-        resetTeamCollections();
-        teamMode.value = false;
-        break;
-      case "teammate_status_changed":
-        if (teamState.value && teamState.value.teammates[event.agentId]) {
-          teamState.value = {
-            ...teamState.value,
-            teammates: {
-              ...teamState.value.teammates,
-              [event.agentId]: {
-                ...teamState.value.teammates[event.agentId],
-                status: event.status,
-                error: event.error,
-                // Use main-process timestamp to avoid renderer clock skew
-                statusChangedAt: event.timestamp ?? Date.now(),
-              },
-            },
-          };
-        }
-        if (event.status === "running" && !focusedAgentId.value) {
-          focusedAgentId.value = event.agentId;
-        }
-        break;
-      case "teammate_event":
-        handleTeammateEvent(event.agentId, event.event);
-        break;
-      case "teammate_message":
-        handleTeammateMessage(event.agentId, event.message);
-        break;
-      case "team_message":
-        handleTeamMessageEvent(event.message);
-        break;
-      case "task_created":
-        handleTaskCreated(event.task);
-        break;
-      case "task_updated":
-        handleTaskUpdated(event.task);
-        break;
-      case "task_deleted":
-        handleTaskDeleted(event.taskId);
-        break;
-      case "protocol_permission_request":
-        handlePermissionRequest(event.request);
-        break;
-      case "protocol_permission_response":
-        handlePermissionResponse(event.requestId, event.approved, event.reason);
-        break;
-      case "protocol_plan_approval":
-        handlePlanApprovalEvent(event.approval);
-        break;
-      case "protocol_plan_response":
-        handlePlanResponse(event.approvalId, event.approved, event.feedback);
-        break;
-      case "worker_summary":
-        handleWorkerSummary(event.fromAgentId, event.summary, event.taskId);
-        break;
+  async function createRoundtable(input: {
+    topic: string;
+    name?: string;
+    tier?: RoundtableTier;
+    seats?: SeatConfig[];
+    settings?: Partial<RoundtableSettings>;
+    attachments?: ChatMessageAttachment[];
+  }): Promise<RoundtableState | null> {
+    isLoading.value = true;
+    lastError.value = null;
+    try {
+      return await send<RoundtableState>({ type: "create_roundtable", ...input });
+    } finally {
+      isLoading.value = false;
     }
   }
 
-  const MAX_WORKER_SUMMARIES = 100;
+  async function postUserMessage(input: {
+    to: string;
+    text: string;
+    private?: boolean;
+    interrupt?: InterruptLevel;
+    attachments?: ChatMessageAttachment[];
+  }): Promise<TimelineItem | null> {
+    return await send<TimelineItem>({ type: "post_user_message", ...input });
+  }
 
-  function handleWorkerSummary(fromAgentId: string, summary: string, taskId?: string): void {
-    workerSummaries.value = [
-      ...workerSummaries.value,
-      { fromAgentId, summary, taskId, timestamp: Date.now() },
-    ];
-    if (workerSummaries.value.length > MAX_WORKER_SUMMARIES) {
-      workerSummaries.value = workerSummaries.value.slice(-MAX_WORKER_SUMMARIES);
+  async function setOrderedMode(on: boolean): Promise<void> {
+    await send({ type: "set_ordered_mode", on });
+  }
+
+  /** Pause forbids every team model call but keeps pending permissions and inbox. */
+  async function pause(): Promise<void> {
+    await send({ type: "pause" });
+  }
+
+  async function resume(): Promise<void> {
+    await send({ type: "resume" });
+  }
+
+  async function stopRoundtable(opts?: { wrapUp?: boolean }): Promise<void> {
+    isLoading.value = true;
+    try {
+      await send({ type: "stop", wrapUp: opts?.wrapUp });
+    } finally {
+      isLoading.value = false;
     }
   }
 
-  function handleTeammateEvent(agentId: string, sessionEvent: AgentSessionEvent): void {
-    // Skip events for agents that don't exist in current team state
-    if (!teamState.value?.teammates[agentId]) return;
-    const events = workerEvents.value[agentId] ?? [];
-    events.push({
-      agentId,
-      event: sessionEvent,
-      timestamp: Date.now(),
+  async function addSeat(config: SeatConfig): Promise<SeatInfo | null> {
+    return await send<SeatInfo>({ type: "add_seat", config });
+  }
+
+  async function removeSeat(seatId: string, requestedBy: "user" | "self" | "peer" = "user"): Promise<void> {
+    await send({ type: "remove_seat", seatId, requestedBy });
+  }
+
+  async function updateSeatAuth(seatId: string, auth: ToolAuthTier, pathAllowlist?: string[]): Promise<void> {
+    await send({ type: "update_seat_auth", seatId, auth, pathAllowlist });
+  }
+
+  async function wakeSeat(seatId: string): Promise<void> {
+    await send({ type: "wake_seat", seatId });
+  }
+
+  /** Mute is workspace-local view state; the main process keeps it for the snapshot. */
+  async function muteThread(threadId: string, muted: boolean): Promise<void> {
+    mutedThreads.value = muted
+      ? [...mutedThreads.value.filter((id) => id !== threadId), threadId]
+      : mutedThreads.value.filter((id) => id !== threadId);
+    await send({ type: "mute_thread", threadId, muted });
+  }
+
+  async function requestWrapUp(author?: "system" | string): Promise<DeliverableVersion | null> {
+    lastError.value = null;
+    const version = await send<DeliverableVersion>({ type: "request_wrap_up", author });
+    if (version === null && lastError.value === null) {
+      lastError.value = "整理失败";
+    }
+    return version;
+  }
+
+  async function reviseDeliverable(
+    id: string,
+    markdown: string,
+    expectedRevision: number,
+  ): Promise<{ ok: true } | { ok: false; conflict: true; currentVersion: number; currentRevision: number } | null> {
+    return await send({ type: "revise_deliverable", id, markdown, expectedRevision });
+  }
+
+  async function stanceOnDeliverable(
+    id: string,
+    stance: "support" | "oppose" | "conditional",
+    opts?: { seatId?: string; reason?: string; confidence?: "low" | "medium" | "high" },
+  ): Promise<{ ok: true } | { ok: false; error: string } | null> {
+    // seatId omitted = the user (the IPC layer maps it to USER_SEAT_ID).
+    return await send({
+      type: "stance_on_deliverable",
+      id,
+      seatId: opts?.seatId,
+      stance,
+      reason: opts?.reason,
+      confidence: opts?.confidence,
     });
-    // Cap at max events per worker
-    if (events.length > MAX_EVENTS_PER_WORKER) {
-      events.splice(0, events.length - MAX_EVENTS_PER_WORKER);
-    }
-    workerEvents.value[agentId] = events;
   }
 
-  const MAX_MESSAGES_PER_WORKER = 200;
-
-  function handleTeammateMessage(agentId: string, message: TeammateChatMessage): void {
-    // Skip messages for agents that don't exist in current team state
-    if (!teamState.value?.teammates[agentId]) return;
-    const messages = workerMessages.value[agentId] ?? [];
-    // Deduplicate by id
-    if (!messages.some((m) => m.id === message.id)) {
-      messages.push(message);
-      // Evict oldest messages to prevent unbounded growth
-      if (messages.length > MAX_MESSAGES_PER_WORKER) {
-        messages.splice(0, messages.length - MAX_MESSAGES_PER_WORKER);
-      }
-    }
-    workerMessages.value[agentId] = messages;
+  async function exportMarkdown(): Promise<string | null> {
+    return await send<string>({ type: "export_markdown" });
   }
 
-  const MAX_TEAM_MESSAGES = 500;
+  async function buildHandoff(
+    deliverableId: string,
+    target: "solo" | "plan",
+  ): Promise<{ text: string } | null> {
+    return await send<{ text: string }>({ type: "build_handoff", deliverableId, target });
+  }
 
-  function handleTeamMessageEvent(message: TeamMessage): void {
-    if (!teamMessages.value.some((m) => m.id === message.id)) {
-      teamMessages.value.push(message);
-      if (teamMessages.value.length > MAX_TEAM_MESSAGES) {
-        teamMessages.value.splice(0, teamMessages.value.length - MAX_TEAM_MESSAGES);
-      }
+  /**
+   * Ack one attention item. The main process has no ack event, so the local
+   * flag flips optimistically (the next refresh re-reads the acked flags).
+   */
+  async function ackAttention(id: string): Promise<void> {
+    const item = attentionItems.value.find((candidate) => candidate.id === id);
+    if (item !== undefined) {
+      item.acked = true;
+    }
+    await send({ type: "ack_attention", id });
+    // 崩溃恢复的「确认后继续」（§5.11 / F5-4）：ack 只关闭提示，恢复动作要显式发
+    // resume，否则 lifecycle 永远停在 paused，用户以为恢复失败。
+    if (item?.action === "resume") {
+      await send({ type: "resume" });
     }
   }
 
-  const MAX_TEAM_TASKS = 200;
-
-  function handleTaskCreated(task: TeamTask): void {
-    if (!teamTasks.value.some((t) => t.id === task.id)) {
-      teamTasks.value.push(task);
-      if (teamTasks.value.length > MAX_TEAM_TASKS) {
-        teamTasks.value.splice(0, teamTasks.value.length - MAX_TEAM_TASKS);
-      }
-    }
-  }
-
-  function handleTaskUpdated(task: TeamTask): void {
-    const idx = teamTasks.value.findIndex((t) => t.id === task.id);
-    if (idx >= 0) {
-      teamTasks.value[idx] = task;
-    } else {
-      // Task not yet in store (e.g. created before store was active) — add it
-      teamTasks.value.push(task);
-    }
-  }
-
-  function handleTaskDeleted(taskId: string): void {
-    teamTasks.value = teamTasks.value.filter((t) => t.id !== taskId);
-  }
-
-  // ==========================================================================
-  // Protocol Event Handlers (Phase 4)
-  // ==========================================================================
-
-  function handlePermissionRequest(request: PermissionRequest): void {
-    // Deduplicate by id
-    if (permissionRequests.value.some((r) => r.id === request.id)) return;
-    permissionRequests.value = [...permissionRequests.value, request];
-  }
-
-  function handlePermissionResponse(requestId: string, approved: boolean, reason?: string): void {
-    permissionRequests.value = permissionRequests.value.filter((r) => r.id !== requestId);
-    // If rejected, the request is just removed. The worker gets the response via the promise.
-    void approved;
-    void reason;
-  }
-
-  function handlePlanApprovalEvent(approval: PlanApproval): void {
-    if (planApprovals.value.some((a) => a.id === approval.id)) return;
-    planApprovals.value = [...planApprovals.value, approval];
-  }
-
-  function handlePlanResponse(approvalId: string, approved: boolean, feedback?: string): void {
-    planApprovals.value = planApprovals.value.filter((a) => a.id !== approvalId);
-    void approved;
-    void feedback;
-  }
-
-  // ==========================================================================
-  // Task Actions
-  // ==========================================================================
-
-  /** Create a new task in the team's shared task list. */
-  async function createTask(
-    subject: string,
-    description: string,
-    assignTo?: string,
-    blockedBy?: string[],
-  ): Promise<TeamTask | null> {
-    try {
-      const result = await window.pixApi.sendTeamCommand<TeamTask>({
-        type: "create_task",
-        subject,
-        description,
-        assignTo,
-        blockedBy,
-      });
-      if (result.success && result.data) {
-        return result.data;
-      }
-      lastError.value = result.error ?? "创建任务失败";
-      return null;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return null;
-    }
-  }
-
-  /** Delete a task. */
-  async function deleteTask(taskId: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "delete_task",
-        taskId,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "删除任务失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
-  }
-
-  // ==========================================================================
-  // Protocol Actions (Phase 4)
-  // ==========================================================================
-
-  /** Respond to a permission request (approve or reject). */
+  /**
+   * Approve/deny a pending permission. There is no response event (the answer
+   * travels into the seat inbox), so the queue entry is dropped locally.
+   */
   async function respondPermission(requestId: string, approved: boolean, reason?: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "respond_permission",
-        requestId,
-        approved,
-        reason,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "响应权限请求失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
+    const ok = await send({ type: "respond_permission", requestId, approved, reason });
+    if (ok === null && lastError.value !== null) return false;
+    pendingPermissions.value = pendingPermissions.value.filter((request) => request.id !== requestId);
+    return true;
+  }
+
+  async function respondExit(requestId: string, statement: string, accept?: boolean): Promise<void> {
+    await send({ type: "respond_exit", requestId, statement, accept });
+  }
+
+  async function setSettings(settings: Partial<RoundtableSettings>): Promise<void> {
+    await send({ type: "set_settings", settings });
+  }
+
+  async function downgradeModels(model: string): Promise<void> {
+    await send({ type: "downgrade_models", model });
+  }
+
+  async function listPresets(): Promise<Array<{ name: string; seats: SeatConfig[] }>> {
+    return (await send({ type: "list_presets" })) ?? [];
+  }
+
+  async function savePreset(name: string, presetSeats: SeatConfig[]): Promise<boolean> {
+    await send({ type: "save_preset", name, seats: presetSeats });
+    return lastError.value === null;
+  }
+
+  async function deletePreset(name: string): Promise<void> {
+    await send({ type: "delete_preset", name });
+  }
+
+  /** Dismiss the one-time legacy-snapshot banner (workspace-level ack). */
+  async function dismissLegacyNotice(location?: ProjectLocation): Promise<void> {
+    legacyNotice.value = false;
+    if (location) {
+      await window.pixApi.ackLegacyTeamSnapshot(toPlain(location));
     }
   }
 
-  /** Respond to a plan approval request (approve or reject). */
-  async function respondPlanApproval(approvalId: string, approved: boolean, feedback?: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "respond_plan_approval",
-        approvalId,
-        approved,
-        feedback,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "响应计划审批失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
+  function dismissRecordCorruptNotice(): void {
+    recordCorruptNotice.value = null;
   }
 
-  /** Request graceful shutdown for a specific worker or all workers. */
-  async function requestShutdown(agentId?: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "request_shutdown",
-        agentId,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "请求停止成员失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
+  function focusSeat(seatId: string): void {
+    focusedSeatId.value = seatId;
   }
 
-  /** Restart a failed or shutdown worker. */
-  async function restartWorker(agentId: string): Promise<boolean> {
-    try {
-      const result = await window.pixApi.sendTeamCommand({
-        type: "restart_worker",
-        agentId,
-      });
-      if (!result.success) {
-        lastError.value = result.error ?? "重启团队成员失败";
-        return false;
-      }
-      return true;
-    } catch (err) {
-      lastError.value = err instanceof Error ? err.message : String(err);
-      return false;
-    }
+  function clearFocus(): void {
+    focusedSeatId.value = null;
   }
 
-  // ==========================================================================
-  // Expose
-  // ==========================================================================
+  function clearError(): void {
+    lastError.value = null;
+  }
 
   return {
-    // State
-    teamState,
-    isLoading,
-    lastError,
-    workerMessages,
-    workerEvents,
-    teamMessages,
-    teamTasks,
-    permissionRequests,
-    planApprovals,
-    workerSummaries,
+    // ---- Frozen public surface (S7) ----
     teamMode,
-    focusedAgentId,
-    // Computed
+    isLoading,
     isTeamActive,
+    roundtable,
+    timeline,
+    attention,
+    unackedAttention,
+    metrics,
+    startTeamRuntime,
+    stopTeamRuntime,
+    toggleTeamMode,
+    refresh,
+
+    // ---- Projected state / view state the roundtable surfaces read ----
+    lastError,
     teamName,
-    teammates,
-    readyTasks,
-    activeTasks,
-    waitingTasks,
-    problemTasks,
-    doneTasks,
+    lifecycle,
+    orderedMode,
+    seats,
+    seatList,
+    activeSeats,
+    openItems: openItemList,
+    deliverables: deliverableVersions,
+    pendingPermissions,
+    exitRequests,
     pendingProtocolCount,
     currentActivity,
-    // Actions
+    focusedSeatId,
+    focusedSeat,
+    mutedThreads,
+    seatEvents,
+    legacyNotice,
+    recordCorruptNotice,
+    userSeatId: USER_SEAT_ID,
+
+    // ---- Actions ----
     subscribeToEvents,
-    createTeam,
-    fetchTeamState,
-    fetchTeamHistory,
-    stopTeam,
-    sendMessageToWorker,
-    abortWorker,
-    activateMember,
-    pauseMember,
-    createTask,
-    deleteTask,
+    createRoundtable,
+    postUserMessage,
+    setOrderedMode,
+    pause,
+    resume,
+    stopRoundtable,
+    addSeat,
+    removeSeat,
+    updateSeatAuth,
+    wakeSeat,
+    muteThread,
+    requestWrapUp,
+    reviseDeliverable,
+    stanceOnDeliverable,
+    exportMarkdown,
+    buildHandoff,
+    ackAttention,
     respondPermission,
-    respondPlanApproval,
-    requestShutdown,
-    restartWorker,
-    clearError,
-    toggleTeamMode,
-    focusWorker,
+    respondExit,
+    setSettings,
+    downgradeModels,
+    listPresets,
+    savePreset,
+    deletePreset,
+    refreshOpenItems,
+    refreshDeliverables,
+    refreshInbox,
+    dismissLegacyNotice,
+    dismissRecordCorruptNotice,
+    focusSeat,
     clearFocus,
+    clearError,
   };
 });

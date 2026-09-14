@@ -68,8 +68,9 @@ const view = ref<CenterView>("running");
 const scope = ref<TaskScope>("session");
 
 /**
- * 当前会话 id:team 模式取 leader 会话(子代理由 leader 派生)。会话切换空窗期
- * 为 null,此时作用域过滤回退为显示全部(与 projectStore 状态同源)。
+ * 当前会话 id:team 模式取 host 运行时会话——讨论席位从不进入 agent-task
+ * （席位没有 agent/plan/workflow 工具，H12；席位的 seatId 也不是会话 id）。
+ * 会话切换空窗期为 null,此时作用域过滤回退为显示全部(与 projectStore 状态同源)。
  */
 const currentSessionId = computed(
   () => (teamStore.teamMode ? projectStore.currentTeamSession?.id : projectStore.currentSession?.id) ?? null,

@@ -20,9 +20,11 @@ const teamStore = useTeamStore();
 // ---- Agent tasks ----
 /** WSL 项目隐藏 Shell 后台任务卡片；AgentTask 入口保留（1.4.1 §5.4）。 */
 const isWsl = computed(() => rpc.executionEnvironment.value?.kind === "wsl");
+/** team 模式下 agent-task 挂在 host 运行时会话上，来源名取团队会话列表。 */
 const agentTaskSessionNames = computed(() => {
   const names: Record<string, string> = {};
-  for (const session of projectStore.sessions) {
+  const sessions = teamStore.teamMode ? projectStore.teamSessions : projectStore.sessions;
+  for (const session of sessions) {
     if (session.name) names[session.id] = session.name;
   }
   return names;
@@ -193,12 +195,18 @@ watch(() => teamStore.teamMode, () => {
     <!-- ====================================================================== -->
     <!-- Solo Mode: protocol requests + Git workdir card -->
     <!-- ====================================================================== -->
-    <!-- Protocol requests (worker permission approvals) must be visible in
-         every mode: a request raised while the user is outside team mode
-         would otherwise silently time out and fail the worker's task. In team
-         mode TeamDashboard renders this panel, so here it only needs to cover
-         solo mode. -->
+    <!-- Protocol requests (permission approvals) are visibility-critical: a
+         request raised while the user is outside team mode would otherwise
+         silently time out and fail the seat's task. In team mode the roundtable
+         attention surface owns them (TeamDashboard → AttentionSurface), so here
+         the panel only covers solo mode and points at the roundtable. -->
     <TeamProtocolPanel v-if="!teamStore.teamMode" />
+    <div v-else class="info-card protocol-hint-card" data-test="team-protocol-hint">
+      <div class="card-title">协议与权限</div>
+      <div class="protocol-hint-text">
+        团队模式下权限与退出协商走圆桌的注意力面（当前 {{ teamStore.pendingProtocolCount }} 条待处理）。
+      </div>
+    </div>
 
     <!-- Git workdir card (project-level status; replaces the former session
          info cards in both solo and team modes). -->
@@ -224,11 +232,14 @@ watch(() => teamStore.teamMode, () => {
       </div>
     </div>
 
-    <!-- Token stats card -->
+    <!-- Token stats card. Team mode aggregates the roundtable (H17): per-seat
+         totals from team-store metrics, host runtime usage excluded; the
+         per-seat breakdown lives in the roundtable cost strip. -->
     <div class="info-card">
       <div class="card-title-row">
         <span class="card-title">Token 用量</span>
-        <span v-if="acpEnabled" class="acp-badge" data-test="acp-badge" title="主动压缩已启用">ACP</span>
+        <span v-if="teamStore.teamMode" class="card-scope-note">圆桌合计</span>
+        <span v-else-if="acpEnabled" class="acp-badge" data-test="acp-badge" title="主动压缩已启用">ACP</span>
         <button
           v-else
           class="card-action-btn compact-btn"
@@ -490,6 +501,25 @@ watch(() => teamStore.teamMode, () => {
   border-radius: var(--pix-radius-md);
   padding: 2px 8px;
   line-height: 1.4;
+}
+
+/* 团队模式：这张卡是圆桌合计，不是 host 会话用量。 */
+.card-scope-note,
+.protocol-hint-text {
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-muted);
+}
+
+.card-scope-note {
+  border-radius: var(--pix-radius-md);
+  padding: 2px 8px;
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+  line-height: 1.4;
+}
+
+.protocol-hint-text {
+  line-height: var(--pix-leading-base);
 }
 
 .spin-icon {

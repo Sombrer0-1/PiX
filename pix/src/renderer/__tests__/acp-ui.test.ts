@@ -436,7 +436,7 @@ describe("CenterPanel empty-session ACP toggle", () => {
     expect(w.find('[data-test="acp-session-toggle"]').exists()).toBe(false);
   });
 
-  it("shows the toggle in the team empty composer state", async () => {
+  it("does not render the host composer (or its toggle) in team mode", async () => {
     teamStoreMock.state.teamMode.value = true;
     sessionMock.state.displayBlocks.value = [];
     rpcMock.state.isConnected.value = true;
@@ -444,7 +444,22 @@ describe("CenterPanel empty-session ACP toggle", () => {
     const w = mountCenterPanel();
     await flushPromises();
 
-    expect(w.find(".team-conversation-empty").exists()).toBe(true);
-    expect(w.get('[data-test="acp-session-toggle"]').exists()).toBe(true);
+    // 团队模式的主表面是圆桌(席位条 + TeamDashboard/TeamTimeline + 注意力面),
+    // 没有负责人对话区；host composer（.center-composer，v-if 里 `!teamMode` 是它
+    // 唯一的团队侧开关）与它的 ACP 开关都只属于 solo 会话。把 solo composer 加回
+    // team 分支，这条断言就会红（下面的 solo 用例先钉住这个标记确实存在）。
+    expect(w.find(".center-composer").exists()).toBe(false);
+    expect(w.find(".team-middle").exists()).toBe(true);
+    expect(w.find('[data-test="acp-session-toggle"]').exists()).toBe(false);
+  });
+
+  it("renders the host composer in solo mode (the marker the team case denies)", async () => {
+    sessionMock.state.displayBlocks.value = [];
+    rpcMock.state.isConnected.value = true;
+    rpcMock.state.sessionState.value = { acp: { enabled: false, locked: false } };
+    const w = mountCenterPanel();
+    await flushPromises();
+
+    expect(w.find(".center-composer").exists()).toBe(true);
   });
 });

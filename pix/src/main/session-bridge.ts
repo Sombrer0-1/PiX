@@ -787,9 +787,6 @@ export class SessionBridge {
 	}
 
 	async prompt(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
-		if (this._role === "team-leader") {
-			this._teamManager?.resumeRuntime("leader_prompt");
-		}
 		if (typeof text === "string" && text.trim() !== "") {
 			this._recordValidSoloSessionOnce();
 		}
@@ -802,9 +799,6 @@ export class SessionBridge {
 	}
 
 	async steer(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
-		if (this._role === "team-leader") {
-			this._teamManager?.resumeRuntime("leader_steer");
-		}
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().steer(prepared.text, {
 			images: prepared.images,
@@ -814,9 +808,6 @@ export class SessionBridge {
 	}
 
 	async followUp(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
-		if (this._role === "team-leader") {
-			this._teamManager?.resumeRuntime("leader_follow_up");
-		}
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
 		await this._getSession().followUp(prepared.text, {
 			images: prepared.images,
@@ -828,7 +819,9 @@ export class SessionBridge {
 	async abort(): Promise<void> {
 		const session = this._getSession();
 		if (this._role === "team-leader") {
-			await this._teamManager?.abortActiveTurns();
+			// A user abort in team mode maps to pausing the roundtable: the host
+			// session is not a discussion participant and never drives the seats.
+			await this._teamManager?.pause();
 			// Team abort is a runtime boundary: queued Leader steering/follow-up
 			// messages belong to the invalidated epoch and must not run on resume.
 			session.clearQueue();
@@ -838,9 +831,6 @@ export class SessionBridge {
 
 	/** Manually retry the last failed turn (user-initiated, bypasses auto-retry setting). */
 	async retry(): Promise<void> {
-		if (this._role === "team-leader") {
-			this._teamManager?.resumeRuntime("leader_retry");
-		}
 		await this._getSession().retryLastTurn();
 	}
 
@@ -2404,7 +2394,6 @@ export class SessionBridge {
 					settingsManager,
 					extensionFactories: [
 						(pi) => { mcpAdapter.register(pi); },
-						(pi) => { this._teamManager?.registerLeaderTools(pi); },
 						createActiveCompressionExtension(() => sessionManager),
 					],
 				});
@@ -2642,16 +2631,16 @@ export class SessionBridge {
 				return result;
 			}
 
-			// Team-leader: no subagent ModelRegistry/runner/custom tool; the
-			// existing path stays unchanged (only the user-input closure now
-			// binds the generation for the shared FIFO/dismissal lifecycle).
+			// Team-leader: no subagent ModelRegistry/runner/custom tool and no
+			// leader tool registration - the host bridge only supplies the
+			// ProjectExecutionContext / AuthStorage / WSL backend, discussion is
+			// driven by TeamCommand (plan §3.4 / §4.12).
 			const resourceLoader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
 				settingsManager,
 				extensionFactories: [
 					(pi) => { mcpAdapter.register(pi); },
-					(pi) => { this._teamManager?.registerLeaderTools(pi); },
 					createActiveCompressionExtension(() => sessionManager),
 				],
 			});
@@ -2769,10 +2758,10 @@ export class SessionBridge {
 			await this._disposeCandidateRuntime(session);
 			throw err;
 		}
-		// Wire the Leader session to TeamManager so worker summaries can be injected
-		if (this._teamManager) {
-			this._teamManager.setLeaderSession(session);
-		}
+		// The host session is not a roundtable participant: TeamManager never
+		// receives it, and hostSessionId stays a plain persisted state field of
+		// the roundtable. Discussion is driven by TeamCommand and
+		// `team-leader-sessions` is only the runtime attach identity (§6.3).
 		// The stats reference points at this generation's accumulator so history
 		// rebuild and live usage of the same generation write the same object.
 		this._auxiliaryUsage = this._generation?.auxiliaryUsage ?? createEmptyAuxiliaryUsage();
@@ -3167,7 +3156,6 @@ export class SessionBridge {
 			: undefined;
 		this._unsubscribe?.();
 		this._unsubscribe = null;
-		this._teamManager?.setLeaderSession(null);
 		this._session = null;
 		this._sessionManager = null;
 		this._isCompacting = false;

@@ -1,165 +1,100 @@
 <script setup lang="ts">
 /**
- * WorkerStatusBar - Compact horizontal worker status bar.
+ * WorkerStatusBar - the peer seat strip.
  *
- * Shows each worker as a clickable
- * chip with role icon, name, status dot, and last activity tooltip.
+ * Every seat is a peer: one chip per seat with its colour, display name,
+ * status dot and current activity, plus the roundtable name and the unhandled
+ * attention count. Clicking a chip focuses that seat (the workbench shows its
+ * detail card); clicking it again clears the focus. There is no leader entry -
+ * the user speaks from the composer, not from a chair.
+ *
+ * The file keeps its original name because CenterPanel (S7) imports this path;
+ * only the contents are the roundtable seat strip.
  */
 import { computed } from "vue";
 import { useTeamStore } from "../../stores/team-store";
-import { useWorkbenchTab } from "../../composables/useWorkbenchTab";
-import type { TeammateInfo } from "@shared/types.js";
+import { seatStatusDot, seatStatusLabel } from "./roundtable-display";
 
 const teamStore = useTeamStore();
-const { showActivityFocused, showTasks } = useWorkbenchTab();
 
-function roleIcon(role: string): string {
-  switch (role) {
-    case "planner": return "mdi-clipboard-text-outline";
-    case "coder": return "mdi-code-braces";
-    case "reviewer": return "mdi-magnify";
-    case "tester": return "mdi-test-tube";
-    case "researcher": return "mdi-book-search-outline";
-    default: return "mdi-robot";
-  }
-}
+const seatChips = computed(() =>
+  teamStore.seatList.map((seat) => ({
+    seatId: seat.seatId,
+    name: seat.name,
+    slug: seat.slug,
+    status: seat.status,
+    perspective: seat.perspective,
+    activity: seat.currentActivity ?? "",
+    error: seat.error,
+    isFocused: teamStore.focusedSeatId === seat.seatId,
+    color: seat.color,
+    dotColor: seatStatusDot(seat.status),
+    statusLabel: seatStatusLabel(seat.status),
+  })),
+);
 
-function roleColor(role: string): string {
-  switch (role) {
-    case "planner": return "#6356f3";
-    case "coder": return "#16a34a";
-    case "reviewer": return "#f59e0b";
-    case "tester": return "#0ea5e9";
-    case "researcher": return "#a855f7";
-    default: return "#7d859a";
-  }
-}
+const speakingCount = computed(() => seatChips.value.filter((chip) => chip.status === "speaking" || chip.status === "exploring").length);
+const waitingCount = computed(() => seatChips.value.filter((chip) => chip.status === "waiting_turn").length);
 
-function statusDotColor(status: string): string {
-  switch (status) {
-    case "running": return "var(--pix-success)";
-    case "idle": return "var(--pix-text-muted)";
-    case "standby": return "var(--pix-warning)";
-    case "dormant": return "var(--pix-border)";
-    case "error": return "var(--pix-error)";
-    case "shutdown": return "var(--pix-text-muted)";
-    default: return "var(--pix-text-muted)";
-  }
-}
-
-function statusLabel(status: string): string {
-  switch (status) {
-    case "running": return "工作中";
-    case "idle": return "就绪";
-    case "standby": return "就绪";
-    case "dormant": return "已暂停";
-    case "error": return "有问题";
-    case "shutdown": return "已停止";
-    default: return status;
-  }
-}
-
-function handleWorkerClick(agentId: string): void {
-  if (teamStore.focusedAgentId === agentId) {
+function handleSeatClick(seatId: string): void {
+  if (teamStore.focusedSeatId === seatId) {
     teamStore.clearFocus();
-  } else {
-    teamStore.focusWorker(agentId);
-    // Mirror focusTaskOwner: surface the worker's detail/error in the activity
-    // tab instead of leaving the dashboard on the tasks tab.
-    showActivityFocused();
+    return;
   }
+  teamStore.focusSeat(seatId);
 }
-
-const workerChips = computed(() => {
-  const teammates = teamStore.teammates;
-  return teammates.map((agent: TeammateInfo) => {
-    const activity = teamStore.currentActivity[agent.agentId] ?? "";
-    return {
-      agentId: agent.agentId,
-      name: agent.name,
-      role: agent.role,
-      status: agent.status,
-      activity,
-      error: agent.error,
-      isFocused: teamStore.focusedAgentId === agent.agentId,
-      icon: roleIcon(agent.role),
-      // Per-teammate color keeps same-role teammates distinguishable.
-      color: agent.color ?? roleColor(agent.role),
-      dotColor: statusDotColor(agent.status),
-      statusLabel: statusLabel(agent.status),
-    };
-  });
-});
-
-const workingCount = computed(() => workerChips.value.filter((worker) => worker.status === "running").length);
-const openTaskCount = computed(() => teamStore.teamTasks.filter((task) => task.status !== "completed" && task.status !== "cancelled").length);
-const issueCount = computed(() => teamStore.problemTasks.length + teamStore.pendingProtocolCount);
 </script>
 
 <template>
-  <div class="worker-status-bar">
-    <div class="wsb-summary">
-      <span class="wsb-summary-icon">
+  <div class="seat-status-bar" data-test="seat-status-bar">
+    <div class="ssb-summary">
+      <span class="ssb-summary-icon">
         <v-icon icon="mdi-account-group-outline" size="16" />
       </span>
-      <span class="wsb-summary-copy">
-        <strong>{{ teamStore.teamName || "团队工作区" }}</strong>
-        <span>{{ workingCount }} 人工作中 / {{ openTaskCount }} 项待处理</span>
+      <span class="ssb-summary-copy">
+        <strong>{{ teamStore.teamName || "圆桌" }}</strong>
+        <span>{{ speakingCount }} 席在推进 / {{ seatChips.length }} 席</span>
       </span>
     </div>
 
-    <div class="wsb-workers">
+    <div class="ssb-seats">
       <button
-        class="wsb-chip wsb-chip--leader"
-        :class="{ focused: !teamStore.focusedAgentId }"
+        v-for="chip in seatChips"
+        :key="chip.seatId"
+        class="ssb-chip"
+        :class="{ focused: chip.isFocused, running: chip.status === 'speaking' || chip.status === 'exploring', exited: chip.status === 'exited' }"
         type="button"
-        title="负责人是主对话，点击可取消成员聚焦。"
-        @click="teamStore.clearFocus()"
+        :data-test="`seat-chip-${chip.slug}`"
+        :title="chip.activity || chip.perspective || chip.statusLabel"
+        @click="handleSeatClick(chip.seatId)"
       >
-        <v-icon icon="mdi-star" size="14" color="#8b5cf6" />
-        <span class="wsb-chip-name">负责人</span>
-        <span class="wsb-chip-dot" style="background-color: #8b5cf6"></span>
-        <span class="wsb-chip-status">在线</span>
-      </button>
-
-      <button
-        v-for="chip in workerChips"
-        :key="chip.agentId"
-        class="wsb-chip"
-        :class="{ focused: chip.isFocused, running: chip.status === 'running' }"
-        type="button"
-        :title="chip.activity || chip.statusLabel"
-        @click="handleWorkerClick(chip.agentId)"
-      >
-        <v-icon :icon="chip.icon" size="14" :style="{ color: chip.color }" />
-        <span class="wsb-chip-name">{{ chip.name }}</span>
-        <span
-          class="wsb-chip-dot"
-          :class="chip.status"
-          :style="{ backgroundColor: chip.dotColor }"
-        ></span>
-        <span class="wsb-chip-status">{{ chip.statusLabel }}</span>
+        <span class="ssb-chip-dot" :style="{ backgroundColor: chip.dotColor }"></span>
+        <span class="ssb-chip-name" :style="{ color: chip.color }">{{ chip.name }}</span>
+        <span class="ssb-chip-status">{{ chip.statusLabel }}</span>
       </button>
     </div>
 
-    <button
-      v-if="issueCount > 0"
-      class="wsb-issues"
-      type="button"
-      title="需要处理的项目：点击查看任务（问题任务置顶）"
-      aria-label="需要处理的项目，点击查看任务"
-      @click="showTasks()"
+    <span
+      v-if="waitingCount > 0 || teamStore.unackedAttention.length > 0"
+      class="ssb-attention"
+      :title="`${waitingCount} 席等待发言 · ${teamStore.unackedAttention.length} 条待处理注意力`"
     >
-      <v-icon icon="mdi-alert-circle-outline" size="14" />
-      {{ issueCount }}
-    </button>
+      <template v-if="waitingCount > 0">
+        <v-icon icon="mdi-timer-sand" size="13" />
+        {{ waitingCount }}
+      </template>
+      <template v-if="teamStore.unackedAttention.length > 0">
+        <v-icon icon="mdi-bell-outline" size="13" />
+        {{ teamStore.unackedAttention.length }}
+      </template>
+    </span>
   </div>
 </template>
 
 <style scoped>
-.worker-status-bar {
+.seat-status-bar {
   display: grid;
-  grid-template-columns: minmax(160px, auto) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(150px, auto) minmax(0, 1fr) auto;
   align-items: center;
   min-height: 52px;
   padding: 6px var(--pix-space-md);
@@ -169,14 +104,14 @@ const issueCount = computed(() => teamStore.problemTasks.length + teamStore.pend
   gap: var(--pix-space-sm);
 }
 
-.wsb-summary {
+.ssb-summary {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
 }
 
-.wsb-summary-icon {
+.ssb-summary-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -184,35 +119,35 @@ const issueCount = computed(() => teamStore.problemTasks.length + teamStore.pend
   height: 30px;
   flex-shrink: 0;
   border-radius: var(--pix-radius-md);
-  background: #eef7f2;
-  color: #15805f;
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
 }
 
-.wsb-summary-copy {
+.ssb-summary-copy {
   display: flex;
   flex-direction: column;
   min-width: 0;
 }
 
-.wsb-summary-copy strong,
-.wsb-summary-copy span {
+.ssb-summary-copy strong,
+.ssb-summary-copy span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.wsb-summary-copy strong {
+.ssb-summary-copy strong {
   color: var(--pix-text-primary);
   font-size: var(--pix-text-xs);
   font-weight: var(--pix-weight-semibold);
 }
 
-.wsb-summary-copy span {
+.ssb-summary-copy span {
   color: var(--pix-text-muted);
   font-size: 10px;
 }
 
-.wsb-workers {
+.ssb-seats {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -222,11 +157,11 @@ const issueCount = computed(() => teamStore.problemTasks.length + teamStore.pend
   scrollbar-width: thin;
 }
 
-.wsb-chip {
+.ssb-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  min-height: 32px;
+  min-height: 30px;
   padding: 4px 9px;
   border-radius: var(--pix-radius-md);
   background: var(--pix-bg-card);
@@ -237,96 +172,72 @@ const issueCount = computed(() => teamStore.problemTasks.length + teamStore.pend
   font-size: var(--pix-text-xs);
 }
 
-.wsb-chip:hover {
+.ssb-chip:hover {
   border-color: var(--pix-border);
   background: var(--pix-bg-hover);
 }
 
-.wsb-chip.focused {
+.ssb-chip.focused {
   border-color: var(--pix-accent);
   background: var(--pix-accent-light);
   box-shadow: 0 0 0 1px var(--pix-accent-soft);
 }
 
-.wsb-chip.running {
+.ssb-chip.running {
   border-color: var(--pix-success-light);
 }
 
-.wsb-chip--leader {
-  border-color: #d8d3ff;
-  background: #f5f3ff;
+.ssb-chip.exited {
+  opacity: 0.55;
 }
 
-.wsb-chip--leader:hover {
-  border-color: #7c3aed;
-  background: rgba(139, 92, 246, 0.12);
-}
-
-.wsb-chip--leader.focused {
-  border-color: #7c3aed;
-  background: rgba(139, 92, 246, 0.15);
-  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.3);
-}
-
-.wsb-issues {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  min-width: 34px;
-  min-height: 28px;
-  padding: 3px 7px;
-  border: 1px solid transparent;
-  border-radius: var(--pix-radius-md);
-  background: var(--pix-warning-bg);
-  color: var(--pix-warning);
-  font-family: var(--pix-font-ui);
-  font-size: 10px;
-  font-weight: var(--pix-weight-semibold);
-  cursor: pointer;
-  transition: background var(--pix-transition-fast), border-color var(--pix-transition-fast);
-}
-
-.wsb-issues:hover {
-  background: var(--pix-warning-light);
-  border-color: var(--pix-warning);
-}
-
-.wsb-chip-name {
-  font-weight: var(--pix-weight-medium);
-  color: var(--pix-text-primary);
-  text-transform: capitalize;
-}
-
-.wsb-chip-dot {
+.ssb-chip-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
 }
 
-.wsb-chip-dot.running {
-  animation: wsb-pulse 1.5s ease-in-out infinite;
+.ssb-chip.running .ssb-chip-dot {
+  animation: ssb-pulse 1.5s ease-in-out infinite;
 }
 
-@keyframes wsb-pulse {
+@keyframes ssb-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
 
-.wsb-chip-status {
+.ssb-chip-name {
+  font-weight: var(--pix-weight-medium);
+}
+
+.ssb-chip-status {
   font-size: 10px;
   color: var(--pix-text-muted);
+  white-space: nowrap;
+}
+
+.ssb-attention {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 3px 8px;
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+  font-size: 10px;
+  font-weight: var(--pix-weight-semibold);
+  white-space: nowrap;
 }
 
 @media (max-width: 1100px) {
-  .worker-status-bar {
+  .seat-status-bar {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .wsb-summary {
+  .ssb-summary {
     display: none;
   }
 }
-
 </style>

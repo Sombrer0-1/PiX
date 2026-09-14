@@ -33,6 +33,15 @@ const teamLeaderTransport: RpcTransport = {
 
 const teamLeaderClient = createRpcClient(teamLeaderTransport, "useTeamLeaderRpc");
 
+/**
+ * Host runtime transport — **not** a discussion engine.
+ *
+ * The host SessionBridge only starts/stops the team runtime and reports its
+ * own session state (dev plan §9: the host is not a discussion participant).
+ * The discussion goes through `useTeamStore()` → `TeamCommand`; the composer
+ * must never send `prompt` / `steer` here. `sendPrompt` stays on the shared
+ * client for the solo transport only.
+ */
 export function useTeamLeaderRpc() {
   return {
     ...teamLeaderClient,

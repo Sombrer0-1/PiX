@@ -32,7 +32,6 @@ import type {
   SessionInfo,
   TeamCommand,
   TeamEvent,
-  TeamState,
   WorkflowCommand,
   WorkflowEvent,
   WorkflowViewState,
@@ -56,6 +55,8 @@ export interface PixApi {
   startTeamRuntime: (location: ProjectLocation) => Promise<{ success: boolean; error?: string }>;
   stopTeamRuntime: () => Promise<{ success: boolean }>;
   hasTeamSnapshot: (location: ProjectLocation) => Promise<boolean>;
+  hasLegacyTeamSnapshot: (location: ProjectLocation) => Promise<boolean>;
+  ackLegacyTeamSnapshot: (location: ProjectLocation) => Promise<{ success: boolean; error?: string }>;
   getWorkspaceMode: (location: ProjectLocation) => Promise<"team" | "solo" | null>;
   setWorkspaceMode: (location: ProjectLocation, mode: "team" | "solo") => Promise<void>;
 
@@ -185,6 +186,8 @@ const api: PixApi = {
   startTeamRuntime: (location: ProjectLocation) => ipcRenderer.invoke("start-team-runtime", location),
   stopTeamRuntime: () => ipcRenderer.invoke("stop-team-runtime"),
   hasTeamSnapshot: (location: ProjectLocation) => ipcRenderer.invoke("has-team-snapshot", location),
+  hasLegacyTeamSnapshot: (location: ProjectLocation) => ipcRenderer.invoke("has-legacy-team-snapshot", location),
+  ackLegacyTeamSnapshot: (location: ProjectLocation) => ipcRenderer.invoke("ack-legacy-team-snapshot", location),
   getWorkspaceMode: (location: ProjectLocation) => ipcRenderer.invoke("get-workspace-mode", location),
   setWorkspaceMode: (location: ProjectLocation, mode: "team" | "solo") => ipcRenderer.invoke("set-workspace-mode", location, mode),
   listWslDistros: () => ipcRenderer.invoke("list-wsl-distros"),
