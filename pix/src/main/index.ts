@@ -10,6 +10,7 @@ import { BrowserWindow, Menu, app, shell } from "electron";
 import { dirname, join } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { closeAllMcpConnections } from "pi-mcp-adapter";
 import { registerIpcHandlers, setupEventForwarding, teardownEventForwarding } from "./ipc-handlers.js";
 import { SessionBridge } from "./session-bridge.js";
 import { SettingsStore } from "./settings-store.js";
@@ -164,6 +165,15 @@ async function cleanup(): Promise<void> {
     } catch (err) {
       console.error("[main] Error during single session cleanup:", err);
     }
+  }
+  // MCP connections are process-wide (shared pool); disposing the bridges only
+  // releases their references so the next session can re-acquire a warm
+  // connection. Close the pool here, after every owner has released, so
+  // HTTP/SSE transports are torn down and stdio children are killed.
+  try {
+    await closeAllMcpConnections();
+  } catch (err) {
+    console.error("[main] Error during MCP connection cleanup:", err);
   }
   // Flush the local baseline log last so no product event is lost (PiX 1.4.0).
   if (productEventCollector) {

@@ -93,6 +93,12 @@ const showForkDialog = ref(false);
 const showSwitchToSoloConfirmDialog = ref(false);
 const showExecutionModeMenu = ref(false);
 const contentArea = ref<HTMLElement | null>(null);
+/** SessionView 窗口化 API（仅 windowed 时生效；分支树视图下为 null）。 */
+const sessionViewRef = ref<{
+  hasHiddenPrefix: () => boolean;
+  revealOlderWindow: () => void;
+  pinToTail: () => void;
+} | null>(null);
 /** PlanCard 容器锚点：session-content 内的卡片滚动定位目标。 */
 const planCardRoot = ref<HTMLElement | null>(null);
 const shouldStickToBottom = ref(true);
@@ -149,6 +155,8 @@ const AUTO_SCROLL_THRESHOLD_PX = 48;
  */
 let programmaticScrollTarget: number | null = null;
 let programmaticScrollTimeout: number | null = null;
+/** 展开旧窗口时的重入保护（滚动高度补偿会再次触发 scroll 事件）。 */
+let revealingOlderBlocks = false;
 
 const projectName = computed(() => projectStore.currentProject?.name || "");
 const environmentLabel = computed(() => {
@@ -412,7 +420,7 @@ watch(
       if (shouldStickToBottom.value) {
         scrollContentToBottom();
       } else {
-        el.scrollTop = savedSessionScrollTop;
+        void restoreScrollPosition(savedSessionScrollTop);
       }
     });
   }
@@ -464,15 +472,38 @@ onMounted(async () => {
 });
 
 function scrollContentToBottom(): void {
+  if (!contentArea.value) return;
+  // 窗口化时先把窗口钉回尾部，再在下一帧按新高度跳底（pinToTail 的 DOM
+  // 更新要等一次渲染，直接读 scrollHeight 会拿到旧值）。
+  sessionViewRef.value?.pinToTail?.();
+  void nextTick(() => {
+    const el = contentArea.value;
+    if (!el) return;
+    programmaticScrollTarget = el.scrollHeight - el.clientHeight;
+    el.scrollTop = el.scrollHeight;
+    if (programmaticScrollTimeout !== null) window.clearTimeout(programmaticScrollTimeout);
+    programmaticScrollTimeout = window.setTimeout(() => {
+      programmaticScrollTarget = null;
+      programmaticScrollTimeout = null;
+    }, 200);
+  });
+}
+
+/** 触顶时向前展开一个窗口，并补偿滚动高度（保持视觉位置不变）。 */
+async function revealOlderBlocks(): Promise<void> {
   const el = contentArea.value;
-  if (!el) return;
-  programmaticScrollTarget = el.scrollHeight - el.clientHeight;
-  el.scrollTop = el.scrollHeight;
-  if (programmaticScrollTimeout !== null) window.clearTimeout(programmaticScrollTimeout);
-  programmaticScrollTimeout = window.setTimeout(() => {
-    programmaticScrollTarget = null;
-    programmaticScrollTimeout = null;
-  }, 200);
+  const view = sessionViewRef.value;
+  if (!el || !view || revealingOlderBlocks) return;
+  if (!view.hasHiddenPrefix()) return;
+  revealingOlderBlocks = true;
+  try {
+    const before = el.scrollHeight;
+    view.revealOlderWindow();
+    await nextTick();
+    el.scrollTop = el.scrollHeight - before + el.scrollTop;
+  } finally {
+    revealingOlderBlocks = false;
+  }
 }
 
 function handleContentScroll(): void {
@@ -480,7 +511,9 @@ function handleContentScroll(): void {
   if (!el) return;
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
   isNearBottom.value = distance <= AUTO_SCROLL_THRESHOLD_PX;
-  isNearTop.value = el.scrollTop <= AUTO_SCROLL_THRESHOLD_PX;
+  const hiddenPrefix = sessionViewRef.value?.hasHiddenPrefix?.() === true;
+  // 仍有折叠的更早记录时「回到顶部」按钮必须保持可见，否则用户无法取回历史。
+  isNearTop.value = el.scrollTop <= AUTO_SCROLL_THRESHOLD_PX && !hiddenPrefix;
   if (
     programmaticScrollTarget !== null &&
     Math.abs(programmaticScrollTarget - el.scrollTop) <= AUTO_SCROLL_THRESHOLD_PX
@@ -492,6 +525,9 @@ function handleContentScroll(): void {
     return;
   }
   shouldStickToBottom.value = isNearBottom.value;
+  if (hiddenPrefix && el.scrollTop <= AUTO_SCROLL_THRESHOLD_PX) {
+    void revealOlderBlocks();
+  }
 }
 
 /** 回到底部并恢复自动跟随（浮动按钮入口）。 */
@@ -503,8 +539,42 @@ function jumpToBottom(): void {
 /** 回到顶部并停止自动跟随（浮动按钮入口）。 */
 function jumpToTop(): void {
   shouldStickToBottom.value = false;
+  const view = sessionViewRef.value;
+  if (view) {
+    // 有界循环：每次 revealOlderWindow 至少前进一个 WINDOW_TAIL。
+    // 这里是显式用户动作，允许一次性展开全量历史。
+    let guard = 0;
+    while (view.hasHiddenPrefix() && guard < 512) {
+      view.revealOlderWindow();
+      guard += 1;
+    }
+  }
+  void nextTick(() => {
+    const el = contentArea.value;
+    if (el) el.scrollTop = 0;
+  });
+}
+
+/** 恢复 scrollTop：窗口化时先按需要展开旧窗口，并用高度增量补偿。 */
+async function restoreScrollPosition(saved: number): Promise<void> {
   const el = contentArea.value;
-  if (el) el.scrollTop = 0;
+  if (!el) return;
+  const view = sessionViewRef.value;
+  if (!view) {
+    el.scrollTop = saved;
+    return;
+  }
+  let guard = 0;
+  while (view.hasHiddenPrefix() && el.scrollHeight - el.clientHeight < saved && guard < 512) {
+    const before = el.scrollHeight;
+    view.revealOlderWindow();
+    await nextTick();
+    el.scrollTop = el.scrollHeight - before + el.scrollTop;
+    guard += 1;
+  }
+  // 展开到足够高度后，剩余偏差在最后一个窗口内按绝对位置收口（近似恢复）。
+  const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+  el.scrollTop = Math.min(saved, maxScroll);
 }
 
 /** 把 PlanCard 滚到可见（卡片在 session-content 内，随内容滚动）。 */
@@ -1236,7 +1306,7 @@ function sendQuickStart(prompt: string): void {
             />
           </div>
 
-          <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
+          <SessionView v-if="sessionViewMode === 'session'" ref="sessionViewRef" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" windowed @retry="retryLastTurn" @cancel="cancelRetry" />
           <SessionTreeView v-else />
           <!-- PlanCard 随内容滚动（Stage A）：session-content 内、SessionView 之后，
                不再是消息区与 composer 之间的固定夹层。控制器初始快照的 phase

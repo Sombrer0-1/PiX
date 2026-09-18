@@ -33,6 +33,19 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 20_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const MAX_STDERR_CHARS = 16_384;
 const RECONNECT_COOLDOWN_MS = 5_000;
+/**
+ * How long an unused pooled connection stays alive (and keeps its warm
+ * handshake + tools cache) after the last adapter releases it. Session
+ * switches in PiX close the old McpAdapter before the next one is created, so
+ * this grace window is what makes re-acquisition free.
+ */
+const IDLE_EVICT_MS = 10 * 60_000;
+/** First backoff step of the connect circuit breaker; doubles per failure. */
+const BREAKER_BASE_MS = 30_000;
+/** Backoff ceiling of the connect circuit breaker. */
+const BREAKER_MAX_MS = 300_000;
+/** Default upper bound for blocking session_start on non-required servers. */
+const DEFAULT_STARTUP_BLOCKING_BUDGET_MS = 1_500;
 
 const LOG_PREFIX = "[mcp-adapter]";
 
@@ -76,6 +89,12 @@ export interface McpAdapterOptions {
 	registerResourceTools?: boolean;
 	startupTimeoutMs?: number;
 	requestTimeoutMs?: number;
+	/**
+	 * Upper bound (ms) that a non-required MCP server may block session_start
+	 * while connecting. Servers that exceed the budget keep connecting in the
+	 * background and register their tools once they are ready. Defaults to 1500.
+	 */
+	startupBlockingBudgetMs?: number;
 	/**
 	 * Whether stdio MCP servers may be spawned on the host. Defaults to true.
 	 * WSL-backed sessions pass false: the Windows host cannot launch a Linux
@@ -316,6 +335,23 @@ function getTransportKind(config: McpServerConfig): McpTransportKind {
 	return config.url ? "http" : "stdio";
 }
 
+/** Shared by the GUI query API and the mcp_list_servers tool so they agree. */
+function describeConnectionStatus(connection: McpServerConnection): McpServerStatus {
+	const breakerMs = connection.breakerRemainingMs();
+	return {
+		name: connection.name,
+		status: connection.status,
+		// Breaker wins: the failure path never clears connection.error, so the raw
+		// error would otherwise hide the remaining cool-down.
+		error: breakerMs > 0 ? connection.describeBreaker() : connection.error,
+		toolCount: connection.tools.length,
+		tools: connection.tools.map((tool) => tool.name),
+		transport: getTransportKind(connection.config),
+		required: connection.config.required === true,
+		stderr: connection.lastStderr || undefined,
+	};
+}
+
 function resolveConfigTemplate(value: string): string {
 	return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, braced, bare) => {
 		const envValue = process.env[(braced || bare) as string];
@@ -472,6 +508,17 @@ function describeTool(serverName: string, tool: Tool): string {
 	return pieces.join(" ");
 }
 
+/**
+ * Per-adapter subscription to a connection. Connections live in the module-level
+ * pool and may be shared by several adapters (active session, background
+ * sessions, nested agent-task sessions), so notifications fan out to every
+ * subscriber instead of a single construction-time callback.
+ */
+interface ConnectionListener {
+	onToolsChanged: (serverName: string, tools: Tool[]) => void;
+	onResourcesChanged: (serverName: string) => void;
+}
+
 class McpServerConnection {
 	readonly name: string;
 	readonly config: McpServerConfig;
@@ -482,35 +529,105 @@ class McpServerConnection {
 	private client: Client | undefined;
 	private transport: Transport | undefined;
 	private connecting: Promise<void> | undefined;
-	private onToolsChanged: (serverName: string, tools: Tool[]) => void;
-	private onResourcesChanged: (serverName: string) => void;
+	private readonly listeners = new Set<ConnectionListener>();
 	private startupTimeoutMs: number;
 	private requestTimeoutMs: number;
 	private readonly allowStdio: boolean;
 	private lastReconnectAttempt = 0;
 	private healthCheckTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly HEALTH_CHECK_INTERVAL_MS = 30_000;
+	/** Consecutive startup connect failures; drives the circuit breaker backoff. */
+	private failureCount = 0;
+	/** Epoch ms until which startup connects are refused without touching the network. */
+	private breakerOpenUntil = 0;
+	private lastConnectError: string | undefined;
+	/** Whether the in-flight connect() should arm the breaker on failure. */
+	private armBreaker = false;
 
 	constructor(
 		name: string,
 		config: McpServerConfig,
 		options: { startupTimeoutMs: number; requestTimeoutMs: number; allowStdio: boolean },
-		onToolsChanged: (serverName: string, tools: Tool[]) => void,
-		onResourcesChanged: (serverName: string) => void,
 	) {
 		this.name = name;
 		this.config = config;
 		this.startupTimeoutMs = config.startupTimeoutMs ?? config.timeoutMs ?? options.startupTimeoutMs;
 		this.requestTimeoutMs = config.requestTimeoutMs ?? config.timeoutMs ?? options.requestTimeoutMs;
 		this.allowStdio = options.allowStdio;
-		this.onToolsChanged = onToolsChanged;
-		this.onResourcesChanged = onResourcesChanged;
 	}
 
-	async connect(signal?: AbortSignal): Promise<void> {
+	addListener(listener: ConnectionListener): void {
+		this.listeners.add(listener);
+	}
+
+	removeListener(listener: ConnectionListener): void {
+		this.listeners.delete(listener);
+	}
+
+	get isConnected(): boolean {
+		return this.status === "connected" && this.client !== undefined;
+	}
+
+	breakerRemainingMs(now = Date.now()): number {
+		return Math.max(0, this.breakerOpenUntil - now);
+	}
+
+	describeBreaker(): string {
+		const left = Math.ceil(this.breakerRemainingMs() / 1000);
+		return `连接熔断中（${left}s 后可重试）：${this.lastConnectError ?? "unknown error"}`;
+	}
+
+	/**
+	 * Best-effort synchronous teardown for process exit. Only stdio servers need
+	 * it: HTTP/SSE sockets die with the process, but a spawned child would
+	 * otherwise be orphaned because the pool's idle timers die with us too.
+	 */
+	killSync(): void {
+		const transport = this.transport;
+		if (!(transport instanceof StdioClientTransport)) return;
+		const pid = transport.pid;
+		if (!pid) return;
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+			// already gone
+		}
+	}
+
+	private recordFailure(error: unknown): void {
+		this.failureCount += 1;
+		this.lastConnectError = error instanceof Error ? error.message : String(error);
+		this.breakerOpenUntil = Date.now() + Math.min(BREAKER_BASE_MS * 2 ** (this.failureCount - 1), BREAKER_MAX_MS);
+	}
+
+	private clearFailure(): void {
+		this.failureCount = 0;
+		this.breakerOpenUntil = 0;
+		this.lastConnectError = undefined;
+	}
+
+	private notifyToolsChanged(): void {
+		for (const listener of this.listeners) listener.onToolsChanged(this.name, this.tools);
+	}
+
+	private notifyResourcesChanged(): void {
+		for (const listener of this.listeners) listener.onResourcesChanged(this.name);
+	}
+
+	/**
+	 * @param options.armBreaker Arm the circuit breaker when this connect fails.
+	 * Only the session_start path passes true; request paths (tool calls, GUI
+	 * resource queries) stay able to retry for real, so a user-triggered refresh
+	 * can always recover a server while the breaker window is still open.
+	 */
+	async connect(signal?: AbortSignal, options?: { armBreaker?: boolean }): Promise<void> {
 		if (this.status === "connected" && this.client) return;
 		if (this.connecting) return this.connecting;
+		if (options?.armBreaker === true && this.breakerRemainingMs() > 0) {
+			throw new Error(this.describeBreaker());
+		}
 
+		this.armBreaker = options?.armBreaker === true;
 		this.connecting = this.connectOnce(signal).finally(() => {
 			this.connecting = undefined;
 		});
@@ -592,6 +709,7 @@ class McpServerConnection {
 		} catch (error) {
 			this.status = "failed";
 			this.error = error instanceof Error ? error.message : String(error);
+			if (this.armBreaker) this.recordFailure(error);
 			log("error", `"${this.name}" connection failed: ${this.error}`);
 			throw error;
 		}
@@ -621,7 +739,7 @@ class McpServerConnection {
 								return;
 							}
 							this.tools = tools ?? [];
-							this.onToolsChanged(this.name, this.tools);
+							this.notifyToolsChanged();
 						},
 					},
 					resources: {
@@ -630,7 +748,7 @@ class McpServerConnection {
 								this.error = error.message;
 								return;
 							}
-							this.onResourcesChanged(this.name);
+							this.notifyResourcesChanged();
 						},
 					},
 				},
@@ -663,10 +781,12 @@ class McpServerConnection {
 				return;
 			}
 			this.startHealthCheck();
+			this.clearFailure();
 			log("info", `"${this.name}" has ${this.tools.length} tools`);
 		} catch (error) {
 			this.status = "failed";
 			this.error = error instanceof Error ? error.message : String(error);
+			if (this.armBreaker) this.recordFailure(error);
 			log("error", `"${this.name}" connection failed: ${this.error}`);
 			this.stopHealthCheck();
 			try {
@@ -868,6 +988,117 @@ class McpServerConnection {
 	}
 }
 
+// =========================================================================
+// Process-wide connection pool
+//
+// PiX creates a fresh McpAdapter for every session generation and closes the
+// previous one first (session-bridge _closeCurrentSession runs before
+// _createSession). Reconnecting on every workspace open / session switch costs
+// an initialize + tools/list round trip per server (2-4s on a slow remote, up
+// to DEFAULT_STARTUP_TIMEOUT_MS when unreachable). The pool keeps connections
+// (and their tools cache) alive across that gap so re-acquisition is free.
+//
+// Only the idle timer reclaims entries: the pool is shared by adapters whose
+// loaded configs differ (different cwd, allowStdio, options.servers), so
+// evicting by "not in this adapter's config" would kill connections other
+// adapters still use. A removed server therefore lingers at most IDLE_EVICT_MS
+// and never shows up in getServers() or in any session's tool list.
+// =========================================================================
+
+interface PoolEntry {
+	key: string;
+	connection: McpServerConnection;
+	refCount: number;
+	idleTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+const connectionPool = new Map<string, PoolEntry>();
+
+function computePoolKey(name: string, config: McpServerConfig, allowStdio: boolean): string {
+	const kind = getTransportKind(config);
+	const identity: string[] = [kind, name];
+	if (kind === "stdio") {
+		identity.push(resolveConfigTemplate(config.command ?? ""));
+		identity.push(JSON.stringify(config.args ?? []));
+		identity.push(config.cwd ?? "");
+		identity.push(JSON.stringify(resolveConfigRecord(config.env) ?? {}));
+	} else {
+		identity.push(resolveConfigTemplate(config.url ?? ""));
+	}
+	identity.push(JSON.stringify(Object.entries(resolveConfigRecord(config.headers) ?? {}).sort()));
+	identity.push(allowStdio ? "1" : "0");
+	return identity.join("\u0001");
+}
+
+function acquirePoolEntry(params: {
+	key: string;
+	name: string;
+	config: McpServerConfig;
+	startupTimeoutMs: number;
+	requestTimeoutMs: number;
+	allowStdio: boolean;
+	listener: ConnectionListener;
+}): { entry: PoolEntry; warm: boolean } {
+	let entry = connectionPool.get(params.key);
+	if (!entry) {
+		const connection = new McpServerConnection(params.name, params.config, {
+			startupTimeoutMs: params.startupTimeoutMs,
+			requestTimeoutMs: params.requestTimeoutMs,
+			allowStdio: params.allowStdio,
+		});
+		entry = { key: params.key, connection, refCount: 0, idleTimer: undefined };
+		connectionPool.set(params.key, entry);
+	}
+	if (entry.idleTimer !== undefined) {
+		clearTimeout(entry.idleTimer);
+		entry.idleTimer = undefined;
+	}
+	entry.refCount += 1;
+	entry.connection.addListener(params.listener);
+	return { entry, warm: entry.connection.isConnected };
+}
+
+function releasePoolEntry(entry: PoolEntry, listener: ConnectionListener): void {
+	entry.connection.removeListener(listener);
+	entry.refCount = Math.max(0, entry.refCount - 1);
+	if (entry.refCount > 0) return;
+	if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer);
+	entry.idleTimer = setTimeout(() => {
+		entry.idleTimer = undefined;
+		if (entry.refCount === 0) closePoolEntry(entry);
+	}, IDLE_EVICT_MS);
+	entry.idleTimer.unref?.();
+}
+
+function closePoolEntry(entry: PoolEntry): void {
+	// Defensive: a stale idle timer must never delete a replacement entry that
+	// was acquired under the same key.
+	if (connectionPool.get(entry.key) !== entry) return;
+	connectionPool.delete(entry.key);
+	if (entry.idleTimer !== undefined) {
+		clearTimeout(entry.idleTimer);
+		entry.idleTimer = undefined;
+	}
+	void entry.connection.disconnect().catch(() => {});
+}
+
+/**
+ * Tear down every pooled connection. Call on application shutdown: releasing
+ * adapters only drops their references, so without this the pool's idle timers
+ * would be the only owner of an otherwise unused connection.
+ */
+export async function closeAllMcpConnections(): Promise<void> {
+	const entries = Array.from(connectionPool.values());
+	connectionPool.clear();
+	await Promise.all(entries.map((entry) => entry.connection.disconnect().catch(() => {})));
+}
+
+// Second line of defense: kill stdio children synchronously if the process
+// exits before closeAllMcpConnections() ran (or if it threw).
+process.once("exit", () => {
+	for (const entry of connectionPool.values()) entry.connection.killSync();
+});
+
 export class McpAdapter {
 	private options: McpAdapterOptions;
 	private connections = new Map<string, McpServerConnection>();
@@ -877,6 +1108,7 @@ export class McpAdapter {
 	private exposedByOriginal = new Map<string, ExposedTool>();
 	private activePi: ExtensionAPI | undefined;
 	private resourceToolsRegistered = false;
+	private acquired: Array<{ entry: PoolEntry; listener: ConnectionListener }> = [];
 
 	constructor(options: McpAdapterOptions = {}) {
 		this.options = options;
@@ -902,25 +1134,21 @@ export class McpAdapter {
 	// =========================================================================
 
 	getServers(): McpServerStatus[] {
-		return Array.from(this.connections.values()).map((connection) => ({
-			name: connection.name,
-			status: connection.status,
-			error: connection.error,
-			toolCount: connection.tools.length,
-			tools: connection.tools.map((tool) => tool.name),
-			transport: getTransportKind(connection.config),
-			required: connection.config.required === true,
-			stderr: connection.lastStderr || undefined,
-		}));
+		return Array.from(this.connections.values()).map(describeConnectionStatus);
 	}
 
 	getConfigInfo(): McpConfigInfo {
 		return { configPaths: this.configPaths, errors: this.configErrors };
 	}
 
+	/**
+	 * Release this adapter's pool references. The shared connections stay warm
+	 * for IDLE_EVICT_MS so the next session re-acquires them without a handshake;
+	 * use closeAllMcpConnections() for a real process-wide teardown.
+	 */
 	async dispose(): Promise<void> {
 		this.activePi = undefined;
-		await this.stop();
+		this.releaseAcquiredConnections();
 	}
 
 	async listResources(serverName?: string, signal?: AbortSignal): Promise<McpResourceQueryResult> {
@@ -948,7 +1176,7 @@ export class McpAdapter {
 	}
 
 	private async start(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
-		await this.stop();
+		this.releaseAcquiredConnections();
 		this.activePi = pi;
 		this.resourceToolsRegistered = false;
 		this.toolNameOwners.clear();
@@ -958,53 +1186,117 @@ export class McpAdapter {
 		this.configErrors = loaded.errors;
 		this.configPaths = loaded.paths;
 
-		for (const [name, config] of loaded.servers) {
-			const connection = new McpServerConnection(
-				name,
-				config,
-				{
-					startupTimeoutMs: this.options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
-					requestTimeoutMs: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-					allowStdio: this.options.allowStdio ?? true,
-				},
-				(serverName, tools) => {
-					if (this.activePi) {
-						this.registerServerTools(this.activePi, serverName, tools);
-					}
-				},
-				() => {},
-			);
-			this.connections.set(name, connection);
-		}
+		const allowStdio = this.options.allowStdio ?? true;
+		const startupTimeoutMs = this.options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
+		const requestTimeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+		const budgetMs = this.options.startupBlockingBudgetMs ?? DEFAULT_STARTUP_BLOCKING_BUDGET_MS;
 
-		if (this.connections.size === 0 && this.configErrors.length === 0) {
+		// Preserve the historical behavior: with no usable server but with config
+		// errors, still register the resource tools so the user can read the error.
+		if (loaded.servers.size === 0 && this.configErrors.length === 0) {
 			return;
 		}
 
 		this.registerResourceTools(pi);
 
 		const failures: string[] = [];
-		await Promise.all(
-			Array.from(this.connections.values()).map(async (connection) => {
-				try {
-					await connection.connect(ctx.signal);
-					this.registerServerTools(pi, connection.name, connection.tools);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					failures.push(`${connection.name}: ${message}`);
-					if (connection.config.required) {
-						throw new Error(`Required MCP server "${connection.name}" failed to start: ${message}`);
-					}
+		const pending: Promise<void>[] = [];
+
+		for (const [name, config] of loaded.servers) {
+			const key = computePoolKey(name, config, allowStdio);
+			const listener: ConnectionListener = {
+				onToolsChanged: (serverName, tools) => {
+					// A stale pi must never be handed tools: replacement invalidates
+					// the old extension runtime and registerTool() would throw.
+					if (this.activePi === pi) this.registerServerTools(pi, serverName, tools);
+				},
+				onResourcesChanged: () => {},
+			};
+			const { entry, warm } = acquirePoolEntry({
+				key,
+				name,
+				config,
+				startupTimeoutMs,
+				requestTimeoutMs,
+				allowStdio,
+				listener,
+			});
+			this.acquired.push({ entry, listener });
+			this.connections.set(name, entry.connection);
+
+			if (warm) {
+				// Hot path: warm handshake and cached tools, zero awaits, no network.
+				this.registerServerTools(pi, name, entry.connection.tools);
+				continue;
+			}
+
+			const breakerMs = entry.connection.breakerRemainingMs();
+			if (breakerMs > 0) {
+				const reason = entry.connection.describeBreaker();
+				failures.push(`${name}: ${reason}`);
+				if (config.required === true) {
+					throw new Error(`Required MCP server "${name}" failed to start: ${reason}`);
 				}
-			}),
-		);
+				continue;
+			}
+
+			if (config.required === true) {
+				// required servers keep the fail-fast contract and wait the full
+				// startupTimeoutMs; only their own error may fail the session.
+				let requiredError: unknown;
+				await entry.connection
+					.connect(undefined, { armBreaker: true })
+					.then(() => {
+						if (this.activePi === pi) this.registerServerTools(pi, name, entry.connection.tools);
+					})
+					.catch((error: unknown) => {
+						requiredError = error;
+					});
+				if (requiredError !== undefined) {
+					const message = requiredError instanceof Error ? requiredError.message : String(requiredError);
+					failures.push(`${name}: ${message}`);
+					throw new Error(`Required MCP server "${name}" failed to start: ${message}`);
+				}
+				continue;
+			}
+
+			pending.push(
+				entry.connection
+					.connect(undefined, { armBreaker: true })
+					.then(() => {
+						if (this.activePi === pi) this.registerServerTools(pi, name, entry.connection.tools);
+					})
+					.catch((error: unknown) => {
+						failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+					}),
+			);
+		}
+
+		if (pending.length > 0) {
+			// Bounded blocking: servers that finish within the budget register their
+			// tools in this session_start; slower ones keep connecting in the
+			// background and register when ready (registerTool refreshes the
+			// session's tool registry, so no manual refresh is needed).
+			await Promise.race([
+				Promise.allSettled(pending),
+				new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, budgetMs);
+					timer.unref?.();
+				}),
+			]);
+		}
+
 		this.configErrors.push(...failures);
 	}
 
-	private async stop(): Promise<void> {
-		const connections = Array.from(this.connections.values());
+	private releaseAcquiredConnections(): void {
+		for (const { entry, listener } of this.acquired) releasePoolEntry(entry, listener);
+		this.acquired = [];
 		this.connections.clear();
-		await Promise.all(connections.map((connection) => connection.disconnect()));
+	}
+
+	private async stop(): Promise<void> {
+		this.releaseAcquiredConnections();
 	}
 
 	private registerServerTools(pi: ExtensionAPI, serverName: string, tools: Tool[]): void {
@@ -1110,16 +1402,7 @@ export class McpAdapter {
 				const server = isRecord(params) && typeof params.server === "string" ? params.server : undefined;
 				const servers = Array.from(this.connections.values())
 					.filter((connection) => !server || connection.name === server)
-					.map((connection) => ({
-						name: connection.name,
-						status: connection.status,
-						error: connection.error,
-						toolCount: connection.tools.length,
-						tools: connection.tools.map((tool) => tool.name),
-						transport: getTransportKind(connection.config),
-						required: connection.config.required === true,
-						stderr: connection.lastStderr || undefined,
-					}));
+					.map(describeConnectionStatus);
 				return makeTextResult(jsonText({ configPaths: this.configPaths, errors: this.configErrors, servers }), {
 					configPaths: this.configPaths,
 					errors: this.configErrors,
@@ -1215,9 +1498,10 @@ export class McpAdapter {
 		server: string | undefined,
 		fn: (connection: McpServerConnection) => Promise<T>,
 	): Promise<{ results: T[]; errors: string[] }> {
+		const all = Array.from(this.connections.values());
 		const selected = server
 			? [this.getConnectionOrThrow(server)]
-			: Array.from(this.connections.values()).filter((connection) => connection.status !== "failed");
+			: all.filter((connection) => connection.status !== "failed");
 		const results: T[] = [];
 		const errors: string[] = [];
 		await Promise.all(
@@ -1232,7 +1516,16 @@ export class McpAdapter {
 		if (results.length === 0 && errors.length > 0) {
 			throw new Error(errors.join("\n"));
 		}
-		return { results, errors };
+		// A cooling server is reported instead of silently omitted, but its request
+		// is never attempted here: connecting would block for the full
+		// startupTimeoutMs (20s) and stall the whole listing.
+		const cooling =
+			server === undefined
+				? all
+						.filter((connection) => connection.breakerRemainingMs() > 0)
+						.map((connection) => `${connection.name}: ${connection.describeBreaker()}`)
+				: [];
+		return { results, errors: [...errors, ...cooling] };
 	}
 
 	private getConnectionOrThrow(server: string): McpServerConnection {
