@@ -440,6 +440,9 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   }
 
   function showThinkingBlock(timestamp = Date.now()): void {
+    // 新思考段开启即封口当前 work-status 组：思考与工具在时间线上按到达序
+    // 交错，而非全部聚合进回合首组（Stage C 排序修复）。
+    sealWorkStatus();
     if (openThinkingBlockId) return;
     const block: DisplayBlock = {
       id: nextBlockId(),
@@ -706,9 +709,21 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     }
   }
 
+  /**
+   * 封口当前 work-status 组（Stage C 排序修复）：置空 currentWorkStatusId，
+   * 后续工具进新组。只切断「新工具进入该组」；组内结果的回填按 toolCallId
+   * 经 findWorkStatusForTool 全表匹配，与组是否「当前」无关，封口不影响回填。
+   */
+  function sealWorkStatus(): void {
+    currentWorkStatusId = null;
+  }
+
   function createAgentBlock(text: string, isStreamingBlock: boolean, timestamp = Date.now()): string {
     supersedeOpenThinking();
     closeCurrentWorkStatus();
+    // 正文出现即封口：closeCurrentWorkStatus 的 pending 分支保留
+    // currentWorkStatusId，这里补 seal 让后续工具进新组（时间线按到达序）。
+    sealWorkStatus();
     const block: DisplayBlock = {
       id: nextBlockId(),
       type: "agent-message",
@@ -759,6 +774,14 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         currentAgentBlockId = null;
         supersedeOpenThinking();
         closeCurrentWorkStatus(true);
+        // Sweep：封口后悬置的组（seal 时仍有 result===null 的工具）统一收尾
+        // —— closeCurrentWorkStatus(true) 只覆盖 current 一块。结果仍可晚到
+        // （abort 流补齐），经 findWorkStatusForTool 按 toolCallId 回填不受影响。
+        for (const block of blocks) {
+          if (block.type === "work-status" && block.isStreaming) {
+            block.isStreaming = false;
+          }
+        }
         break;
       }
 
@@ -1137,6 +1160,11 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
               // are skipped — no blank placeholder blocks.
               const thinking = (block as { thinking?: unknown }).thinking;
               if (typeof thinking === "string" && thinking !== "") {
+                // 直播/回放一致（Stage C）：思考段先封口当前组再入块，后续
+                // 工具进新组。已知两个例外（SDD §1.1）：空 thinking（""）回放
+                // 跳过而直播会先 seal，回放少一次分组；同消息内 text→thinking→text
+                // 直播并入同一 agent 块、回放产生两个（既有差异，非本 Stage 引入）。
+                sealWorkStatus();
                 pushBlock({
                   id: nextBlockId(),
                   type: "thinking",
@@ -1162,15 +1190,20 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         };
         const tool = toolsById.get(tr.toolCallId);
         if (tool) {
-          // The `agent` / `workflow` / `ralph` tools keep the full
-          // { content, details } result shape on replay so their rich renderers
-          // (SubagentToolView / WorkflowRunPanel) can draw from the persisted
-          // details; other tools keep the legacy content-only shape to avoid
-          // replay bloat.
-          tool.result =
-            tr.toolName === "agent" || tr.toolName === "workflow" || tr.toolName === "ralph"
-              ? { content: tr.content, details: tr.details }
-              : tr.content;
+          // The `agent` / `workflow` / `ralph` / `edit` / `write` tools keep the
+          // full { content, details } result shape on replay so their rich
+          // renderers (SubagentToolView / WorkflowRunPanel / tool-details
+          // diff rows) can draw from the persisted details (edit/write 的
+          // details.diff / firstChangedLine 留作后续增强，本期渲染不依赖);
+          // other tools keep the legacy content-only shape to avoid replay
+          // bloat.
+          const keepsDetails =
+            tr.toolName === "agent" ||
+            tr.toolName === "workflow" ||
+            tr.toolName === "ralph" ||
+            tr.toolName === "edit" ||
+            tr.toolName === "write";
+          tool.result = keepsDetails ? { content: tr.content, details: tr.details } : tr.content;
           tool.isError = tr.isError;
           if (!tool.toolName && tr.toolName) tool.toolName = tr.toolName;
         }

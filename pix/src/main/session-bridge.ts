@@ -95,9 +95,10 @@ import type {
 	ProjectLocation,
 	RequestUserInputDismissal,
 	RequestUserInputDismissalReason,
-	RpcSessionState,
-	RpcSlashCommand,
-	SessionStats,
+  RpcSessionState,
+  RpcSlashCommand,
+  SessionsStatePayload,
+  SessionStats,
 	ThinkingLevel,
 	AuthStatusMap,
 	TreeEntry,
@@ -155,6 +156,9 @@ export interface SessionBridgeOptions {
 
 const TAKE_HER_EYES_TIMEOUT_MS = 45_000;
 const TAKE_HER_EYES_MAX_TOKENS = 2048;
+
+/** Stage B D2.8: soft cap of backgrounded RUNNING sessions; the oldest is evicted (abort + close). */
+const BACKGROUND_RUNNING_SESSION_CAP = 3;
 const TAKE_HER_EYES_SYSTEM_PROMPT = [
 	"You are takeHerEyes, a precise vision assistant for Pix.",
 	"Describe the attached image(s) so a text-only model can answer the user's request.",
@@ -199,6 +203,52 @@ interface UserInputEntry {
 	resolve: (response: RequestUserInputResponse) => void;
 	reject: (error: Error) => void;
 	removeSignalListener: (() => void) | undefined;
+}
+
+/**
+ * Stage B (§4.3) per-session user-input FIFO state. The host callbacks
+ * (parent session, plan controller, runner context) capture the object created
+ * for their generation, so a session backgrounded while busy keeps receiving
+ * requests into its own suspended FIFO instead of being rejected by a
+ * bridge-level generation guard. The bridge's historical flat fields are
+ * read/write views into the ACTIVE session's object (see the accessors below).
+ */
+interface UserInputSessionState {
+	queue: UserInputEntry[];
+	activeEntry: UserInputEntry | null;
+	queueClosing: boolean;
+	/** genId bound to this state; bumped when the state is marked closing. */
+	generation: number;
+}
+
+/** Stage B: liveness of one backgrounded busy session (H5). */
+type BackgroundSessionState = "running" | "waiting_input";
+
+/**
+ * Stage B (§4.2): a busy session detached on switch/new/fork. Owns the live
+ * runtime (session/generation/MCP) plus the bridge fields migrated off the
+ * active slot at detach (invariant I1: the map never contains the active
+ * session; I2: no per-session mutable state stays on the bridge unkeyed).
+ */
+interface BackgroundLiveSession {
+	/** Resolved session JSONL path; the map key and renderer badge identity. */
+	readonly path: string;
+	readonly session: AgentSession;
+	readonly sessionManager: SessionManager;
+	readonly generation: RuntimeGeneration;
+	readonly mcpAdapter: McpAdapter | null;
+	/** Delivery-sink unsubscribe kept alive across the detach (D2.3). */
+	deliverySinkUnsubscribe: (() => void) | null;
+	/** D5 state-tracking subscription (never forwards to _eventListeners). */
+	unsubscribe: () => void;
+	state: BackgroundSessionState;
+	pendingCount: number;
+	/** Finalize re-entry guard (D5). */
+	finalizeScheduled: boolean;
+	eyeUsage: AuxiliaryUsageTotals;
+	isCompacting: boolean;
+	userInput: UserInputSessionState;
+	validSoloSessionRecorded: boolean;
 }
 
 /**
@@ -568,11 +618,20 @@ export class SessionBridge {
 	private _eventListeners: Array<(event: AgentSessionEvent) => void> = [];
 	private _userInputRequestListeners: UserInputRequestListener[] = [];
 	private _userInputDismissedListeners: Array<(event: RequestUserInputDismissal) => void> = [];
-	private _userInputQueue: UserInputEntry[] = [];
-	private _activeUserInputEntry: UserInputEntry | null = null;
-	private _userInputQueueClosing = false;
-	/** Monotonic, non-reusable user-input generation counter. */
-	private _userInputGeneration = 0;
+	/**
+	 * Stage B (§4.2): user-input FIFO of the ACTIVE session. The historical
+	 * flat fields (_userInputQueue/_activeUserInputEntry/_userInputQueueClosing/
+	 * _userInputGeneration) are views into this object; detach moves it into the
+	 * session's BackgroundLiveSession record and attach moves it back.
+	 */
+	private _userInputState: UserInputSessionState = {
+		queue: [],
+		activeEntry: null,
+		queueClosing: false,
+		generation: 0,
+	};
+	/** Monotonic allocator for per-session user-input generations (never reused). */
+	private _userInputGenerationSeed = 0;
 	/** Solo runtime generation (registry/agentDir/runner/accumulator ownership). */
 	private _generation: RuntimeGeneration | null = null;
 	private _lifecycleListeners: {
@@ -603,6 +662,13 @@ export class SessionBridge {
 	 * "new ask aborts the old"; side questions never emit AgentSessionEvents.
 	 */
 	private _btwCoordinator: SideQuestionCoordinator | null = null;
+	/**
+	 * Stage B: busy sessions detached on switch/new/fork, keyed by resolved
+	 * session JSONL path. Invariant I1: never contains the active session.
+	 */
+	private _backgroundSessions = new Map<string, BackgroundLiveSession>();
+	/** Stage B D7: renderer-side sessions-state broadcast listeners. */
+	private _sessionsStateListeners: Array<(payload: SessionsStatePayload) => void> = [];
 
 	constructor(options: SessionBridgeOptions = {}) {
 		this._role = options.role ?? "single";
@@ -623,6 +689,9 @@ export class SessionBridge {
 
 		// Candidate succeeded: stop the old runtime and take over the new context.
 		const previousContext = this._executionContext;
+		// Stage B D8: a project switch closes every backgrounded live session
+		// (abort included) before the active close.
+		await this._closeAllBackgroundSessions(true);
 		await this._closeCurrentSession("quit");
 		await disposeProjectExecutionContext(previousContext);
 
@@ -668,6 +737,10 @@ export class SessionBridge {
 	}
 
 	async dispose(): Promise<void> {
+		// Stage B D8: dispose closes every backgrounded live session (abort
+		// included) before the active close; markAppShuttingDown semantics are
+		// unchanged for the close matrix itself.
+		await this._closeAllBackgroundSessions(true);
 		const hadSession = await this._closeCurrentSession("quit");
 		const previousContext = this._executionContext;
 		this._executionContext = null;
@@ -861,7 +934,11 @@ export class SessionBridge {
 			}
 		}
 		const parentAcpIfAny = validatedParentSession ? readParentAcp(validatedParentSession) : undefined;
-		await this._closeCurrentSession("new");
+		// Stage B D2: a busy session stays alive in the background instead of
+		// being closed; only idle sessions take the close path.
+		if (!this._detachActiveSessionIfBusy()) {
+			await this._closeCurrentSession("new");
+		}
 
 		this._sessionManager = SessionManager.create(this._physicalCwd, sessionDir, {
 			...(validatedParentSession ? { parentSession: validatedParentSession } : {}),
@@ -883,8 +960,24 @@ export class SessionBridge {
 			throw new Error("No active session.");
 		}
 		this._assertSessionPathInNamespace(sessionPath, currentSessionManager.getSessionDir());
+		const resolvedTarget = resolve(sessionPath);
+		// Stage B D2.9: switching to the current path is a no-op under the
+		// parallel model (the old abort+reopen collapsed the running turn).
+		if (this._role === "single" && this._session?.sessionFile && resolve(this._session.sessionFile) === resolvedTarget) {
+			return { cancelled: false };
+		}
 		const previousSessionFile = this._session?.sessionFile;
-		await this._closeCurrentSession("resume", sessionPath);
+		// Stage B D2/D3: a busy current session detaches to the background
+		// instead of closing; the target is re-attached when it is itself a
+		// backgrounded live session.
+		if (!this._detachActiveSessionIfBusy()) {
+			await this._closeCurrentSession("resume", sessionPath);
+		}
+		const background = this._backgroundSessions.get(resolvedTarget);
+		if (background) {
+			this._attachBackgroundSession(background);
+			return { cancelled: false };
+		}
 
 		this._sessionManager = SessionManager.open(sessionPath, currentSessionManager.getSessionDir(), this._physicalCwd);
 		// switchSession only replaces the session manager; the context (and thus
@@ -936,7 +1029,9 @@ export class SessionBridge {
 				parentSession: currentSessionFile,
 				acp: sessionManager.getAcp(),
 			});
-			await this._closeCurrentSession("fork");
+			if (!this._detachActiveSessionIfBusy()) {
+				await this._closeCurrentSession("fork");
+			}
 			this._sessionManager = newSessionManager;
 
 			const result = await this._createSession(this._physicalCwd, this._sessionManager, {
@@ -954,7 +1049,9 @@ export class SessionBridge {
 			throw new Error("Failed to create forked session");
 		}
 
-		await this._closeCurrentSession("fork", forkedSessionPath);
+		if (!this._detachActiveSessionIfBusy()) {
+			await this._closeCurrentSession("fork", forkedSessionPath);
+		}
 		this._sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
 		if (label) {
 			this._sessionManager.appendLabelChange(targetLeafId, label);
@@ -1815,7 +1912,7 @@ export class SessionBridge {
 		active.removeSignalListener = undefined;
 		this._activeUserInputEntry = null;
 		active.resolve(response);
-		this._pumpUserInputQueue();
+		this._pumpUserInputQueue(this._userInputState);
 		return true;
 	}
 
@@ -1827,25 +1924,21 @@ export class SessionBridge {
 	}
 
 	/**
-	 * Enqueue a user-input request into the bridge FIFO (parent, project trust
-	 * and nested tool approval all share this queue). The generation captured
-	 * at enqueue time guards stale callbacks: a provider calling back after the
-	 * generation was replaced is rejected without any request/dismissal emit.
-	 * The same immediate rejection applies while the queue is closing, when the
-	 * signal is already aborted, or when the id duplicates an active/queued
-	 * item.
+	 * Enqueue a user-input request into a session-scoped FIFO (parent, project
+	 * trust and nested tool approval all share this queue). The host callback
+	 * captures the UserInputSessionState created for its generation: a state
+	 * that was backgrounded keeps accepting requests into its own suspended
+	 * FIFO, while a state marked closing rejects the call outright. The same
+	 * immediate rejection applies when the signal is already aborted or the id
+	 * duplicates an active/queued item of the same session.
 	 */
 	private _requestUserInputForGeneration(
-		generation: number,
+		state: UserInputSessionState,
 		request: RequestUserInputRequest,
 		signal?: AbortSignal,
 	): Promise<RequestUserInputResponse> {
 		return new Promise((resolve, reject) => {
-			if (generation !== this._userInputGeneration) {
-				reject(new Error("request_user_input was aborted."));
-				return;
-			}
-			if (this._userInputQueueClosing) {
+			if (state.queueClosing) {
 				reject(new Error("Session closed before user input was provided."));
 				return;
 			}
@@ -1853,14 +1946,14 @@ export class SessionBridge {
 				reject(new Error("request_user_input was aborted."));
 				return;
 			}
-			if (this._hasUserInputId(request.id)) {
+			if (this._hasUserInputId(state, request.id)) {
 				reject(new Error(`Duplicate user input request id: ${request.id}`));
 				return;
 			}
 
 			const entry: UserInputEntry = {
 				request,
-				generation,
+				generation: state.generation,
 				signal,
 				state: "queued",
 				resolve,
@@ -1873,45 +1966,75 @@ export class SessionBridge {
 			if (signal && !signal.aborted) {
 				const onAbort = () => {
 					if (entry.state === "queued") {
-						this._removeQueuedUserInput(entry);
+						this._removeQueuedUserInput(state, entry);
 						entry.state = "terminal";
 						entry.reject(new Error("request_user_input was aborted."));
 					} else if (entry.state === "active") {
-						this._abortActiveUserInput(this._userInputQueueClosing ? "session_closed" : "aborted");
+						this._abortActiveUserInput(state, state.queueClosing ? "session_closed" : "aborted");
 					}
+					this._syncBackgroundUserInputState(state);
 				};
 				signal.addEventListener("abort", onAbort, { once: true });
 				entry.removeSignalListener = () => signal.removeEventListener("abort", onAbort);
 			}
-			this._userInputQueue.push(entry);
-			this._pumpUserInputQueue();
+			state.queue.push(entry);
+			this._pumpUserInputQueue(state);
+			this._syncBackgroundUserInputState(state);
 		});
 	}
 
-	private _hasUserInputId(id: string): boolean {
-		if (this._activeUserInputEntry?.request.id === id) {
+	/** Active-session views over the shared user-input state object (Stage B §4.2). */
+	private get _userInputQueue(): UserInputEntry[] {
+		return this._userInputState.queue;
+	}
+
+	private get _activeUserInputEntry(): UserInputEntry | null {
+		return this._userInputState.activeEntry;
+	}
+
+	private set _activeUserInputEntry(entry: UserInputEntry | null) {
+		this._userInputState.activeEntry = entry;
+	}
+
+	private get _userInputQueueClosing(): boolean {
+		return this._userInputState.queueClosing;
+	}
+
+	private get _userInputGeneration(): number {
+		return this._userInputState.generation;
+	}
+
+	private _hasUserInputId(state: UserInputSessionState, id: string): boolean {
+		if (state.activeEntry?.request.id === id) {
 			return true;
 		}
-		return this._userInputQueue.some((entry) => entry.request.id === id);
+		return state.queue.some((entry) => entry.request.id === id);
 	}
 
-	private _removeQueuedUserInput(entry: UserInputEntry): void {
-		const index = this._userInputQueue.indexOf(entry);
+	private _removeQueuedUserInput(state: UserInputSessionState, entry: UserInputEntry): void {
+		const index = state.queue.indexOf(entry);
 		if (index !== -1) {
-			this._userInputQueue.splice(index, 1);
+			state.queue.splice(index, 1);
 		}
 	}
 
-	/** Promote the queue head to active and emit its request (never queued items). */
-	private _pumpUserInputQueue(): void {
-		if (this._userInputQueueClosing || this._activeUserInputEntry) {
+	/**
+	 * Promote the queue head to active and emit its request (never queued
+	 * items). Only the ACTIVE session's state is ever pumped: a backgrounded
+	 * session's entries stay queued and are pumped on re-attach (D3.3).
+	 */
+	private _pumpUserInputQueue(state: UserInputSessionState): void {
+		if (state !== this._userInputState) {
 			return;
 		}
-		const entry = this._userInputQueue.shift();
+		if (state.queueClosing || state.activeEntry) {
+			return;
+		}
+		const entry = state.queue.shift();
 		if (!entry) {
 			return;
 		}
-		if (entry.state !== "queued" || entry.generation !== this._userInputGeneration) {
+		if (entry.state !== "queued" || entry.generation !== state.generation) {
 			// Defensive: an entry aborted while queued or belonging to a stale
 			// generation must never reach the renderer; it gets no dismissal.
 			if (entry.state === "queued") {
@@ -1920,11 +2043,11 @@ export class SessionBridge {
 				entry.removeSignalListener = undefined;
 				entry.reject(new Error("request_user_input was aborted."));
 			}
-			this._pumpUserInputQueue();
+			this._pumpUserInputQueue(state);
 			return;
 		}
 		entry.state = "active";
-		this._activeUserInputEntry = entry;
+		state.activeEntry = entry;
 		for (const listener of this._userInputRequestListeners) {
 			try {
 				listener(entry.request);
@@ -1940,17 +2063,24 @@ export class SessionBridge {
 	 * dismissal is "session_closed" so a close-driven abort is never misjudged
 	 * as a user denial.
 	 */
-	private _abortActiveUserInput(reason: RequestUserInputDismissalReason): void {
-		const active = this._activeUserInputEntry;
+	private _abortActiveUserInput(state: UserInputSessionState, reason: RequestUserInputDismissalReason): void {
+		const active = state.activeEntry;
 		if (!active || active.state !== "active") {
 			return;
 		}
-		this._settleUserInputTerminal(active, reason, new Error("request_user_input was aborted."));
-		this._pumpUserInputQueue();
+		this._settleUserInputTerminal(state, active, reason, new Error("request_user_input was aborted."));
+		this._pumpUserInputQueue(state);
 	}
 
-	/** Terminal settle of a displayed request: exactly-once dismissal + reject. */
+	/**
+	 * Terminal settle of a displayed request: exactly-once dismissal + reject.
+	 * The dismissal is a renderer-facing close semantic for the DISPLAYED
+	 * request, so only the active session's state emits; a backgrounded
+	 * session's card was already cleared by the "session_backgrounded"
+	 * dismissal at detach (D2.4).
+	 */
 	private _settleUserInputTerminal(
+		state: UserInputSessionState,
 		entry: UserInputEntry,
 		reason: RequestUserInputDismissalReason,
 		error: Error,
@@ -1961,35 +2091,43 @@ export class SessionBridge {
 		entry.state = "terminal";
 		entry.removeSignalListener?.();
 		entry.removeSignalListener = undefined;
-		if (this._activeUserInputEntry === entry) {
-			this._activeUserInputEntry = null;
+		if (state.activeEntry === entry) {
+			state.activeEntry = null;
 		}
-		this._emitUserInputDismissal(entry.request.id, reason);
+		if (state === this._userInputState) {
+			this._emitUserInputDismissal(entry.request.id, reason);
+		}
 		entry.reject(error);
 	}
 
-	/** Mark the queue closing and invalidate the current generation. */
-	private _markUserInputQueueClosing(): void {
-		this._userInputQueueClosing = true;
-		this._userInputGeneration++;
+	/**
+	 * Mark a session-scoped queue closing and invalidate its generation. The
+	 * generation is reallocated from the monotonic seed so a closing state can
+	 * never alias a live one.
+	 */
+	private _markUserInputStateClosing(state: UserInputSessionState): void {
+		state.queueClosing = true;
+		state.generation = ++this._userInputGenerationSeed;
 	}
 
 	/**
-	 * Settle every pending entry after the queue is marked closing: the
-	 * displayed request gets an exactly-once "session_closed" dismissal, queued
-	 * requests are rejected without a dismissal (they were never displayed).
-	 * Never pumps afterwards; only a new generation reopens the queue.
+	 * Settle every pending entry of a closing state: the displayed request gets
+	 * an exactly-once "session_closed" dismissal (suppressed for a
+	 * backgrounded state whose card is already cleared), queued requests are
+	 * rejected without a dismissal (they were never displayed). Never pumps
+	 * afterwards; only a new generation reopens the queue.
 	 */
-	private _settleClosedUserInputQueue(): void {
-		const active = this._activeUserInputEntry;
+	private _settleClosedUserInputState(state: UserInputSessionState): void {
+		const active = state.activeEntry;
 		if (active && active.state === "active") {
 			this._settleUserInputTerminal(
+				state,
 				active,
 				"session_closed",
 				new Error("Session closed before user input was provided."),
 			);
 		}
-		const queued = this._userInputQueue.splice(0);
+		const queued = state.queue.splice(0);
 		for (const entry of queued) {
 			if (entry.state === "queued") {
 				entry.state = "terminal";
@@ -2369,13 +2507,21 @@ export class SessionBridge {
 		});
 		this._mcpAdapter = mcpAdapter;
 
-		// Each candidate parent session gets a non-reusable generation. Both the
-		// parent createAgentSession requestUserInput closure and the runner's
-		// closure capture this value; a stale provider callback after a
-		// replacement is rejected by the generation guard. The new generation
-		// reopens the queue.
-		const genId = ++this._userInputGeneration;
-		this._userInputQueueClosing = false;
+		// Each candidate parent session gets a non-reusable generation. The
+		// user-input FIFO is session-scoped (Stage B §4.3): the parent
+		// createAgentSession closure, the runner's closure and the Plan
+		// controller's closure all capture THIS state object, so a session
+		// backgrounded while busy keeps its own (suspended) queue and a stale
+		// callback against a closed state is rejected by the closing guard. The
+		// new generation reopens with a fresh state.
+		const genId = ++this._userInputGenerationSeed;
+		const userInputState: UserInputSessionState = {
+			queue: [],
+			activeEntry: null,
+			queueClosing: false,
+			generation: genId,
+		};
+		this._userInputState = userInputState;
 
 		let parentSessionRef: AgentSession | null = null;
 		try {
@@ -2428,7 +2574,7 @@ export class SessionBridge {
 							acp: parent?.sessionManager.getAcp() === true,
 						};
 					},
-					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+					requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
 					recordAuxiliaryUsage: (usage) => {
 						// Generation-bound accumulator: old generations never
 						// write usage into a replacement session through the
@@ -2546,7 +2692,7 @@ export class SessionBridge {
 							attachments: prepared.attachments,
 						});
 					},
-					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+					requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
 					recordProductEvent: (e: ProductEvent) => {
 						this._productEventCollector?.record(e);
 					},
@@ -2623,7 +2769,7 @@ export class SessionBridge {
 					// survives extension reloads (PiX 1.4.0 F1).
 					hostToolPolicyOverride: (input) => planController.decideToolPolicy(input),
 					sessionStartEvent,
-					requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+					requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
 				});
 				parentSessionRef = result.session;
 				generation.session = result.session;
@@ -2658,7 +2804,7 @@ export class SessionBridge {
 				// 1.4.1 WSL Shell tool isolation applies to the leader session too.
 				excludeTools: context?.isWsl === true ? [...SHELL_BACKGROUND_TOOLS] : undefined,
 				sessionStartEvent,
-				requestUserInput: (request, signal) => this._requestUserInputForGeneration(genId, request, signal),
+				requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
 			});
 			// Team-leader keeps no generation record; retain the created session
 			// in the candidate ref so a later bind/activate failure still
@@ -2686,8 +2832,8 @@ export class SessionBridge {
 	private async _disposeCandidateRuntime(candidateSession?: AgentSession | null): Promise<void> {
 		const generation = this._generation;
 		this._generation = null;
-		this._markUserInputQueueClosing();
-		this._settleClosedUserInputQueue();
+		this._markUserInputStateClosing(this._userInputState);
+		this._settleClosedUserInputState(this._userInputState);
 		if (generation) {
 			// 1.4.3 (S8): candidate create/bind/activate failure shares the
 			// close-path prefix - dispose every live workflow run FIRST, then
@@ -2938,18 +3084,24 @@ export class SessionBridge {
 		}
 		this._deliverySinkUnsubscribe?.();
 		this._deliverySinkUnsubscribe = null;
+		// Stage B D2.3: the sink stays registered across a background detach,
+		// so the liveness check is bound to the captured session object (active
+		// OR backgrounded) instead of this._session identity - otherwise every
+		// delivery to a backgrounded session would misreport
+		// target_session_not_open. The sink is unregistered when its session is
+		// really closed (active close / background finalize / bridge dispose).
+		const sinkSession = session;
 		const sessionId = session.sessionId;
 		const workspaceId = workspaceIdOf(this._planExecutionContext().location.physicalPath);
 		this._deliverySinkUnsubscribe = service.registerSessionDeliverySink(
 			sessionId,
 			workspaceId,
 			async (content) => {
-				const current = this._session;
-				if (!current || current.sessionId !== sessionId) {
+				if (!this._isSessionLive(sinkSession)) {
 					throw new Error("target_session_not_open");
 				}
-				const streaming = current.isStreaming;
-				await current.sendCustomMessage(
+				const streaming = sinkSession.isStreaming;
+				await sinkSession.sendCustomMessage(
 					{
 						customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TASK_RESULT,
 						content: this._formatDeliveryContent(content),
@@ -2961,6 +3113,19 @@ export class SessionBridge {
 				);
 			},
 		);
+	}
+
+	/** Stage B D2.3: a session is live while active or backgrounded. */
+	private _isSessionLive(session: AgentSession): boolean {
+		if (this._session === session) {
+			return true;
+		}
+		for (const record of this._backgroundSessions.values()) {
+			if (record.session === session) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Bounded model-facing envelope for one delivered task result. */
@@ -3093,6 +3258,7 @@ export class SessionBridge {
 		const session = this._session;
 		const mcpAdapter = this._mcpAdapter;
 		const generation = this._generation;
+		const userInput = this._userInputState;
 		try {
 			const flush = (
 				session?.sessionManager as { flushIfHasUserMessages?: () => boolean } | undefined
@@ -3107,6 +3273,46 @@ export class SessionBridge {
 		// stays in the panel (design plan §5.4).
 		this._deliverySinkUnsubscribe?.();
 		this._deliverySinkUnsubscribe = null;
+		// Stage B §4.5: the active close delegates to the shared "real close"
+		// sequence; its teardown callback clears the bridge's active fields at
+		// the exact historical point in the order below.
+		return this._closeTarget(
+			{ session, mcpAdapter, generation, userInput },
+			reason,
+			targetSessionFile,
+			() => {
+				this._unsubscribe?.();
+				this._unsubscribe = null;
+				this._session = null;
+				this._sessionManager = null;
+				this._isCompacting = false;
+				this._pendingMessageCount = 0;
+				this._mcpAdapter = null;
+				this._auxiliaryUsage = createEmptyAuxiliaryUsage();
+				this._eyeUsage = createEmptyAuxiliaryUsage();
+			},
+		);
+	}
+
+	/**
+	 * Stage B §4.5: the single "real close" implementation, parameterized by
+	 * target - the active bridge fields (via _closeCurrentSession, whose
+	 * teardown clears them) or one backgrounded record (teardown is a no-op;
+	 * the caller has already removed the record from the map). The step order
+	 * is the pre-existing _closeCurrentSession order and must not drift.
+	 */
+	private async _closeTarget(
+		target: {
+			session: AgentSession | null;
+			mcpAdapter: McpAdapter | null;
+			generation: RuntimeGeneration | null;
+			userInput: UserInputSessionState;
+		},
+		reason: SessionShutdownEvent["reason"],
+		targetSessionFile: string | undefined,
+		teardownActiveFields: () => void,
+	): Promise<boolean> {
+		const { session, mcpAdapter, generation, userInput } = target;
 		// 1.4.3 (S8): workflow children are foreground AgentTask groups of this
 		// session; cancel + bounded-dispose every live workflow run BEFORE the
 		// detach below - a detached group cannot be killed by cancelGroup
@@ -3154,20 +3360,12 @@ export class SessionBridge {
 		const planDisposePromise = generation?.planController
 			? generation.planController.dispose(planDisposeReason)
 			: undefined;
-		this._unsubscribe?.();
-		this._unsubscribe = null;
-		this._session = null;
-		this._sessionManager = null;
-		this._isCompacting = false;
-		this._pendingMessageCount = 0;
-		this._mcpAdapter = null;
-		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
-		this._eyeUsage = createEmptyAuxiliaryUsage();
+		teardownActiveFields();
 
 		// Mark the input queue closing and invalidate the generation FIRST.
 		// Bridge-level request/dismissal listeners must stay so IPC can still
 		// receive the close events (design plan section 4.9).
-		this._markUserInputQueueClosing();
+		this._markUserInputStateClosing(userInput);
 		// Call but do not await runner.dispose(): its synchronous prefix writes
 		// host_disposed and aborts queued/active tasks. Any abort it triggers on
 		// the displayed request now emits "session_closed" exactly once, never
@@ -3177,7 +3375,7 @@ export class SessionBridge {
 		// The bridge then dismisses the displayed request and rejects the
 		// remaining user-input; queued items were never displayed so they get
 		// no dismissal. Never pump afterwards.
-		this._settleClosedUserInputQueue();
+		this._settleClosedUserInputState(userInput);
 
 		const awaitCleanups = async (): Promise<void> => {
 			if (planDisposePromise) {
@@ -3216,6 +3414,382 @@ export class SessionBridge {
 			console.error("[SessionBridge] Error during MCP adapter dispose:", err);
 		}
 		return true;
+	}
+
+	// =========================================================================
+	// Stage B: background live sessions (solo bridge session parallelism)
+	// =========================================================================
+
+	/**
+	 * Stage B D1: busy = the agent loop is streaming, a compaction is in
+	 * flight, or steering/follow-up messages are still queued. A session merely
+	 * waiting for user input is busy through its streaming agent loop; the
+	 * record state tracks the distinction for the badge.
+	 */
+	private _isSessionBusy(): boolean {
+		const session = this._session;
+		if (!session) {
+			return false;
+		}
+		return session.isStreaming || this._isCompacting || this._pendingMessageCount > 0;
+	}
+
+	/**
+	 * Stage B D2 entry point: on switch/new/fork, detach the busy active solo
+	 * session to the background instead of closing it. Returns false (caller
+	 * falls back to the historical close) when idle, team-mode, or the session
+	 * has no persisted file to re-attach by.
+	 */
+	private _detachActiveSessionIfBusy(): boolean {
+		if (this._role !== "single" || !this._isSessionBusy()) {
+			return false;
+		}
+		return this._detachActiveSession();
+	}
+
+	/**
+	 * Stage B D2: detach the busy active session. Steps are normative (SDD
+	 * §4.4 D2.1-D2.8): snapshot the migrated fields and reset the bridge slot
+	 * (I1/I2), unsubscribe the FORWARDING subscription (background events must
+	 * never reach _eventListeners, H6), clear the renderer input card with a
+	 * "session_backgrounded" dismissal WITHOUT settling the bridge queue,
+	 * keep plan/session/MCP/workflow/foreground groups alive, attach the D5
+	 * state-tracking subscription, broadcast, and enforce the running cap.
+	 * Synchronous end to end so no background event can slip between the
+	 * subscription swaps.
+	 */
+	private _detachActiveSession(): boolean {
+		const session = this._session;
+		const sessionManager = this._sessionManager;
+		const generation = this._generation;
+		if (!session || !sessionManager || !generation) {
+			return false;
+		}
+		const sessionFile = session.sessionFile ?? sessionManager.getSessionFile();
+		if (!sessionFile) {
+			// An unpersisted session has no path to re-attach by; close it.
+			return false;
+		}
+		const path = resolve(sessionFile);
+		const userInput = this._userInputState;
+		// D6: side questions are foreground UX; cancel an in-flight one.
+		this._btwCoordinator?.cancel();
+		this._btwCoordinator = null;
+		// D2.2: unsubscribe the forwarding subscription.
+		this._unsubscribe?.();
+		this._unsubscribe = null;
+		// D2.4: clear the renderer card only; the bridge-side entry stays
+		// suspended (a dismissal would be a close semantic). The generation
+		// guard keeps a late renderer response from crossing into the next
+		// session's queue.
+		const suspended = userInput.activeEntry;
+		if (suspended && suspended.state === "active") {
+			this._emitUserInputDismissal(suspended.request.id, "session_backgrounded");
+		}
+		const record: BackgroundLiveSession = {
+			path,
+			session,
+			sessionManager,
+			generation,
+			mcpAdapter: this._mcpAdapter,
+			deliverySinkUnsubscribe: this._deliverySinkUnsubscribe,
+			unsubscribe: () => {},
+			state: suspended ? "waiting_input" : "running",
+			pendingCount: this._pendingMessageCount,
+			finalizeScheduled: false,
+			eyeUsage: this._eyeUsage,
+			isCompacting: this._isCompacting,
+			userInput,
+			validSoloSessionRecorded: this._validSoloSessionRecorded,
+		};
+		// D2.1: reset the bridge slot to neutral values. _auxiliaryUsage is the
+		// I2 exception: it aliases generation.auxiliaryUsage, which keeps
+		// accumulating for the backgrounded generation; the next activation
+		// re-aliases its own generation's accumulator (D3.1).
+		this._session = null;
+		this._sessionManager = null;
+		this._generation = null;
+		this._mcpAdapter = null;
+		this._deliverySinkUnsubscribe = null;
+		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
+		this._eyeUsage = createEmptyAuxiliaryUsage();
+		this._isCompacting = false;
+		this._pendingMessageCount = 0;
+		this._validSoloSessionRecorded = false;
+		this._userInputState = { queue: [], activeEntry: null, queueClosing: true, generation: ++this._userInputGenerationSeed };
+		// D2.6/D5: state-tracking subscription (never forwards events).
+		record.unsubscribe = session.subscribe((event) => {
+			this._onBackgroundSessionEvent(record, event as AgentSessionEvent);
+		});
+		this._backgroundSessions.set(path, record);
+		// D2.7: broadcast the new live set.
+		this._broadcastSessionsState();
+		// D2.8: cap enforcement is fire-and-forget so the switch is not blocked
+		// by the eviction's close sequence.
+		void this._evictOverflowBackgroundSessions();
+		return true;
+	}
+
+	/**
+	 * Stage B D3: re-attach a backgrounded session as the active one. Restores
+	 * the migrated fields and re-aliases the generation accumulator; NEVER
+	 * calls _activateSession - its history rebuild would double-count a
+	 * generation that kept accumulating in the background, and
+	 * planController.restoreFromHistory is untested against a live controller.
+	 * Plan/workflow event forwarding is re-synced by ipc-handlers after the
+	 * switch command returns (existing resync hooks).
+	 */
+	private _attachBackgroundSession(record: BackgroundLiveSession): void {
+		this._backgroundSessions.delete(record.path);
+		// Stop the D5 tracking subscription first so it cannot race the
+		// restored bridge fields.
+		record.unsubscribe();
+		record.unsubscribe = () => {};
+		const session = record.session;
+		this._session = session;
+		this._sessionManager = record.sessionManager;
+		this._generation = record.generation;
+		this._mcpAdapter = record.mcpAdapter;
+		// The delivery sink itself stayed registered across the detach (D2.3);
+		// only the bridge-held unsubscribe moves back so the next real close
+		// unregisters it.
+		this._deliverySinkUnsubscribe = record.deliverySinkUnsubscribe;
+		record.deliverySinkUnsubscribe = null;
+		// D3.2: re-mount the forwarding subscription. _setupEventSubscription
+		// resets the compaction/queue counters, so the record's values are
+		// restored after it (D3.1).
+		this._setupEventSubscription(session);
+		this._isCompacting = record.isCompacting;
+		this._pendingMessageCount = record.pendingCount;
+		this._validSoloSessionRecorded = record.validSoloSessionRecorded;
+		this._auxiliaryUsage = record.generation.auxiliaryUsage;
+		this._eyeUsage = record.eyeUsage;
+		this._userInputState = record.userInput;
+		// D3.3: the suspended active request is re-sent once (the renderer has
+		// no card after the switch); queued items pump through the normal FIFO
+		// now that the state is active again.
+		const suspended = record.userInput.activeEntry;
+		if (suspended && suspended.state === "active") {
+			for (const listener of this._userInputRequestListeners) {
+				try {
+					listener(suspended.request);
+				} catch (err) {
+					console.error("[SessionBridge] User input request listener error:", err);
+				}
+			}
+		} else {
+			this._pumpUserInputQueue(record.userInput);
+		}
+		// D3.6: broadcast the removal.
+		this._broadcastSessionsState();
+	}
+
+	/**
+	 * Stage B D5: state tracking for one backgrounded session. Updates only
+	 * the record - never the bridge's active fields - and auto-finalizes when
+	 * the run drains (waiting_input blocks finalize; H5).
+	 */
+	private _onBackgroundSessionEvent(record: BackgroundLiveSession, event: AgentSessionEvent): void {
+		switch (event.type) {
+			case "agent_start":
+				// Both states are sticky across a new run: "running" stays
+				// "running", and "waiting_input" keeps its suspended request
+				// (a re-triggered delivery turn must not clear the badge), so
+				// agent_start itself never transitions the record.
+				return;
+			case "queue_update":
+				record.pendingCount = (event.steering?.length ?? 0) + (event.followUp?.length ?? 0);
+				return;
+			case "compaction_start":
+				record.isCompacting = true;
+				return;
+			case "compaction_end":
+				record.isCompacting = false;
+				this._scheduleBackgroundFinalize(record);
+				return;
+			case "agent_end":
+				this._scheduleBackgroundFinalize(record);
+				return;
+		}
+	}
+
+	/** D5: schedule the one-macrotask-delayed close-style finalize, re-entry guarded. */
+	private _scheduleBackgroundFinalize(record: BackgroundLiveSession): void {
+		if (record.finalizeScheduled) {
+			return;
+		}
+		if (this._backgroundSessions.get(record.path) !== record) {
+			return;
+		}
+		if (this._isBackgroundSessionDrained(record)) {
+			record.finalizeScheduled = true;
+			setTimeout(() => {
+				void this._finalizeBackgroundSession(record);
+			}, 0);
+		}
+	}
+
+	/**
+	 * Drained = no queued steering/follow-up, no compaction, no streaming run
+	 * and no pending user input. The SDD gate (pendingCount + activeEntry) is
+	 * widened by queue length and isStreaming so a re-triggered run or a
+	 * never-displayed queued request can never be finalized away mid-flight.
+	 */
+	private _isBackgroundSessionDrained(record: BackgroundLiveSession): boolean {
+		return (
+			record.pendingCount === 0 &&
+			!record.isCompacting &&
+			!record.session.isStreaming &&
+			record.userInput.activeEntry === null &&
+			record.userInput.queue.length === 0
+		);
+	}
+
+	private async _finalizeBackgroundSession(record: BackgroundLiveSession): Promise<void> {
+		try {
+			if (this._backgroundSessions.get(record.path) !== record) {
+				return;
+			}
+			if (!this._isBackgroundSessionDrained(record)) {
+				record.finalizeScheduled = false;
+				return;
+			}
+			this._backgroundSessions.delete(record.path);
+			await this._closeBackgroundSession(record, "quit");
+		} catch (err) {
+			console.error("[SessionBridge] Error finalizing background session:", err);
+		} finally {
+			this._broadcastSessionsState();
+		}
+	}
+
+	/**
+	 * Stage B "real close" for one backgrounded record (D5 finalize / D2.8
+	 * eviction / D8 bridge-level close). The caller has already removed the
+	 * record from the map; this runs the _closeCurrentSession order against it.
+	 */
+	private async _closeBackgroundSession(
+		record: BackgroundLiveSession,
+		reason: SessionShutdownEvent["reason"],
+		options: { abort?: boolean } = {},
+	): Promise<void> {
+		// D5: unsubscribe the state-tracking subscription first.
+		record.unsubscribe();
+		record.unsubscribe = () => {};
+		try {
+			const flush = (
+				record.sessionManager as { flushIfHasUserMessages?: () => boolean } | undefined
+			)?.flushIfHasUserMessages;
+			flush?.();
+		} catch (err) {
+			console.warn("[SessionBridge] Failed to flush unpersisted user messages:", err);
+		}
+		// Unregister the delivery sink kept alive across the detach (D2.3).
+		record.deliverySinkUnsubscribe?.();
+		record.deliverySinkUnsubscribe = null;
+		// Eviction/bridge-level close abort the running loop first so the turn
+		// lands on disk with stopReason "aborted" before the dispose.
+		if (options.abort) {
+			try {
+				await record.session.abort();
+			} catch (err) {
+				console.warn("[SessionBridge] Error aborting background session:", err);
+			}
+		}
+		await this._closeTarget(
+			{
+				session: record.session,
+				mcpAdapter: record.mcpAdapter,
+				generation: record.generation,
+				userInput: record.userInput,
+			},
+			reason,
+			undefined,
+			() => {},
+		);
+	}
+
+	/** Stage B D2.8: evict the oldest backgrounded RUNNING sessions past the cap. */
+	private async _evictOverflowBackgroundSessions(): Promise<void> {
+		const running = [...this._backgroundSessions.values()].filter((record) => record.state === "running");
+		if (running.length <= BACKGROUND_RUNNING_SESSION_CAP) {
+			return;
+		}
+		const overflow = running.slice(0, running.length - BACKGROUND_RUNNING_SESSION_CAP);
+		for (const record of overflow) {
+			if (this._backgroundSessions.get(record.path) !== record) {
+				continue;
+			}
+			this._backgroundSessions.delete(record.path);
+			await this._closeBackgroundSession(record, "quit", { abort: true });
+		}
+		this._broadcastSessionsState();
+	}
+
+	/** Stage B D8: close every backgrounded live session (abort included). */
+	private async _closeAllBackgroundSessions(abort: boolean): Promise<void> {
+		if (this._backgroundSessions.size === 0) {
+			return;
+		}
+		const records = [...this._backgroundSessions.values()];
+		this._backgroundSessions.clear();
+		for (const record of records) {
+			await this._closeBackgroundSession(record, "quit", { abort });
+		}
+		this._broadcastSessionsState();
+	}
+
+	/**
+	 * Keep a backgrounded record's waiting_input state in sync with its FIFO:
+	 * any pending entry (active or queued) means the session waits for input;
+	 * draining back to running broadcasts the transition.
+	 */
+	private _syncBackgroundUserInputState(state: UserInputSessionState): void {
+		for (const record of this._backgroundSessions.values()) {
+			if (record.userInput !== state) {
+				continue;
+			}
+			const next: BackgroundSessionState =
+				state.activeEntry !== null || state.queue.length > 0 ? "waiting_input" : "running";
+			if (record.state !== next) {
+				record.state = next;
+				this._broadcastSessionsState();
+			}
+			return;
+		}
+	}
+
+	/** Stage B D7: snapshot of the backgrounded live sessions (the active session is never listed). */
+	getSessionsState(): SessionsStatePayload {
+		return {
+			sessions: [...this._backgroundSessions.values()].map((record) => ({
+				path: record.path,
+				state: record.state,
+				pendingCount: record.pendingCount,
+			})),
+		};
+	}
+
+	/** Stage B D7: subscribe to sessions-state broadcasts (detach/attach/state change/finalize). */
+	onSessionsState(listener: (payload: SessionsStatePayload) => void): () => void {
+		this._sessionsStateListeners.push(listener);
+		return () => {
+			const idx = this._sessionsStateListeners.indexOf(listener);
+			if (idx !== -1) {
+				this._sessionsStateListeners.splice(idx, 1);
+			}
+		};
+	}
+
+	private _broadcastSessionsState(): void {
+		const payload = this.getSessionsState();
+		for (const listener of this._sessionsStateListeners) {
+			try {
+				listener(payload);
+			} catch (err) {
+				console.error("[SessionBridge] Sessions-state listener error:", err);
+			}
+		}
 	}
 
 	private _createSettingsManager(cwd: string): SettingsManager {

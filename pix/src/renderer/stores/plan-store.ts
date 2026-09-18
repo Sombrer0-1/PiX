@@ -71,6 +71,11 @@ export const usePlanStore = defineStore("plan", () => {
   /** The approve command is in flight. */
   const approvalPending = ref(false);
 
+  /** PlanCard expansion; null = follow the phase automatically (awaiting_
+   * approval / planning_failed / a recorded generation failure expand, the
+   * generating planning/revising states stay a collapsed row + spinner). */
+  const cardExpanded = ref<boolean | null>(null);
+
   // ==========================================================================
   // Computed
   // ==========================================================================
@@ -83,6 +88,21 @@ export const usePlanStore = defineStore("plan", () => {
   );
 
   const isApproving = computed(() => approvalPending.value);
+
+  /**
+   * PlanCard expansion state: a manual value (user click / status pill) wins;
+   * otherwise follow the phase. Auto-expand covers awaiting_approval and
+   * planning_failed, plus any recorded generation failure: a revision failure
+   * keeps phase=revising, so phase alone would hide the retry actions behind
+   * the collapsed row (the row only spins while generating without failure).
+   * Snapshot pushes never overwrite a manual value (applySnapshot must not
+   * touch cardExpanded); session switch resets it via setCardExpanded(null).
+   */
+  const isCardExpanded = computed(() => {
+    if (cardExpanded.value !== null) return cardExpanded.value;
+    if (failure.value !== null) return true;
+    return planPhase.value === "awaiting_approval" || planPhase.value === "planning_failed";
+  });
 
   // ==========================================================================
   // Snapshot / event handling
@@ -278,6 +298,13 @@ export const usePlanStore = defineStore("plan", () => {
     lastError.value = null;
   }
 
+  /** Set the PlanCard expansion (manual toggle / status pill). null resumes
+   * phase-following; called with null on session switch so one session's
+   * manual collapse cannot suppress another session's auto-expansion. */
+  function setCardExpanded(value: boolean | null): void {
+    cardExpanded.value = value;
+  }
+
   // ==========================================================================
   // Expose
   // ==========================================================================
@@ -294,6 +321,10 @@ export const usePlanStore = defineStore("plan", () => {
     // Computed
     isGenerating,
     isApproving,
+    isCardExpanded,
+    // Card expansion UI state
+    cardExpanded,
+    setCardExpanded,
     // Subscription
     subscribeToEvents,
     refreshSnapshot,

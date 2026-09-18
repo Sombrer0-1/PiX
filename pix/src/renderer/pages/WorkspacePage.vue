@@ -13,6 +13,7 @@ import { useRouter } from "vue-router";
 import { useSessionStore, useTeamLeaderSessionStore } from "../stores/session-store";
 import { useRpc } from "../composables/useRpc";
 import { useTeamLeaderRpc } from "../composables/useTeamLeaderRpc";
+import { subscribeLiveSessions, unsubscribeLiveSessions } from "../composables/useLiveSessions";
 import { useProjectStore } from "../stores/project-store";
 import { useAuthStore } from "../stores/auth-store";
 import { useTeamStore } from "../stores/team-store";
@@ -396,6 +397,9 @@ onMounted(async () => {
   await authRefreshed;
 
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
+  // Background live-session badges (Stage B D7): mode-independent push channel;
+  // subscribe once per workspace mount.
+  subscribeLiveSessions();
   subscribeToModeEvents();
   if (teamStore.teamMode) {
     // 恢复/挂载路径：圆桌 state+timeline+metrics+attention 走一次 refresh。
@@ -407,6 +411,7 @@ onMounted(async () => {
 onUnmounted(() => {
   subscriptionsReady.value = false;
   clearSessionSubscriptions();
+  unsubscribeLiveSessions();
   if (pendingUserInput.value) void respondUserInput(true);
 });
 </script>

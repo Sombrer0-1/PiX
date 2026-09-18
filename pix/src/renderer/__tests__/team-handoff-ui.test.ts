@@ -326,6 +326,9 @@ function installPixApiMock(): void {
     onUserInputRequest: vi.fn(() => () => {}),
     onUserInputDismissed: vi.fn(() => () => {}),
     getPendingUserInputRequest: vi.fn().mockResolvedValue(null),
+    // Stage B：后台存活会话徽章通道（WorkspacePage 挂载时订阅一次）。
+    onSessionsState: vi.fn(() => () => {}),
+    getSessionsState: vi.fn().mockResolvedValue({ sessions: [] }),
     sendAgentTaskCommand: vi.fn().mockResolvedValue({ success: true }),
     onAgentTaskEvent: vi.fn(() => () => {}),
     onAgentTaskInputRequest: vi.fn(() => () => {}),

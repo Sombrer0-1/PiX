@@ -1,9 +1,15 @@
 <script setup lang="ts">
 /**
- * PlanPanel - 计划面板（PiX 1.4.0）
+ * PlanCard - 计划卡片（PiX 交互升级 Stage A，由 PlanPanel 重构）
  *
- * 计划面板：标题/版本/状态/模型/时间、摘要、当前步骤/总步骤进度、步骤列表
- * （折叠、文件可点击、风险图标+文字）、底部操作（批准并执行/修订/放弃）。
+ * 计划卡片挂在 session-content 内（随内容滚动，不占固定视口高度）：折叠态
+ * 一行摘要（图标 + 标题 + 版本 + 状态徽章 + 进度 + chevron），点击切换展开；
+ * 展开体为原 PlanPanel 面板内容原样迁移（标题/模型/时间/摘要、失败区、命令
+ * 错误、步骤列表、底部操作、修订输入、放弃确认），卡片自身 max-height 60vh
+ * 内滚动。展开策略在 plan-store（isCardExpanded）：手动值优先，否则按 phase
+ * 自动（awaiting_approval/planning_failed/生成失败展开；planning/revising 为
+ * 折叠行 + spinner，不展开）。
+ *
  * 错误紧邻 Plan/step 且携下一步操作：planning_failed 提供重试生成、改用会话
  * 模型重试、精简重新生成（truncated）与放弃；修订失败提供重试修订、返回上一
  * 版本与放弃；步骤失败提供重试步骤。批准后显式启动：awaiting_approval 时
@@ -105,6 +111,13 @@ const hasFooterActions = computed(() => {
   return p === "awaiting_approval" || p === "approved" || p === "paused" || p === "executing";
 });
 const commandError = computed(() => store.lastError);
+
+/** 展开态来自 store（手动值优先，否则按 phase 自动），点击折叠行切换。 */
+const isExpanded = computed(() => store.isCardExpanded);
+
+function toggleExpanded(): void {
+  store.setCardExpanded(!store.isCardExpanded);
+}
 
 function formatTime(ts: number): string {
   if (!ts || !Number.isFinite(ts)) return "";
@@ -247,258 +260,396 @@ function confirmAbandon(): void {
 </script>
 
 <template>
-  <section class="plan-panel" data-test="plan-panel" :aria-label="`计划面板：${statusLabel}`">
-    <header class="plan-panel-header">
-      <div class="plan-panel-title-row">
-        <v-icon icon="mdi-map-outline" size="16" aria-hidden="true" />
-        <h2 class="plan-panel-title" data-test="plan-title">{{ plan?.title || "规划" }}</h2>
-        <span v-if="plan" class="plan-panel-version" data-test="plan-version">v{{ plan.version }}</span>
-        <span class="plan-panel-status" :class="`phase-${phase}`" data-test="plan-status">{{ statusLabel }}</span>
-      </div>
-      <div class="plan-panel-meta">
-        <span v-if="plan" class="plan-panel-model" data-test="plan-model">
-          {{ plan.planningModel.provider }}/{{ plan.planningModel.modelId }}
-        </span>
-        <span v-if="plan" class="plan-panel-time" data-test="plan-time">更新于 {{ formatTime(plan.updatedAt) }}</span>
-        <span v-if="progressText" class="plan-panel-progress" data-test="plan-progress">{{ progressText }}</span>
-      </div>
-      <p v-if="plan?.summary" class="plan-panel-summary" data-test="plan-summary">{{ plan.summary }}</p>
-    </header>
-
-    <!-- 生成/修订进度 -->
-    <div v-if="showGenerating" class="plan-generating" data-test="plan-generating" role="status">
-      <v-icon icon="mdi-loading" class="spin" size="16" aria-hidden="true" />
-      <span>{{ generatingText }}</span>
-    </div>
-
-    <!-- 错误紧邻 Plan/step 且携下一步操作 -->
-    <div v-if="failure" class="plan-failure" data-test="plan-failure" role="alert">
-      <div class="plan-failure-header">
-        <v-icon icon="mdi-alert-outline" size="15" aria-hidden="true" />
-        <span>{{ failure.message || "规划生成失败" }}</span>
-      </div>
-      <div v-if="failure.fieldErrors.length > 0" class="plan-failure-fields">
-        <p v-for="error in failure.fieldErrors" :key="error.path">{{ error.path }}：{{ error.message }}</p>
-      </div>
-      <div class="plan-failure-actions">
-        <button
-          v-if="failure.phase === 'initial'"
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-retry-generation"
-          :disabled="busy"
-          @click="retryGeneration"
-        >重试生成</button>
-        <button
-          v-if="failure.phase === 'initial'"
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-use-session-model"
-          :disabled="busy"
-          @click="useSessionModelAndRetry"
-        >改用会话模型重试</button>
-        <button
-          v-if="failure.code === 'truncated'"
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-regenerate-concise"
-          :disabled="busy"
-          @click="regenerateConcise"
-        >精简重新生成</button>
-        <button
-          v-if="failure.phase === 'revision'"
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-retry-revision"
-          :disabled="busy"
-          @click="retryRevision"
-        >重试修订</button>
-        <button
-          v-if="failure.phase === 'revision'"
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-return-previous"
-          :disabled="busy"
-          @click="returnPreviousVersion"
-        >返回上一版本</button>
-        <button
-          type="button"
-          class="plan-action-btn plan-action-danger"
-          data-test="plan-abandon-failure"
-          :disabled="busy"
-          @click="openAbandonConfirm"
-        >放弃</button>
-      </div>
-    </div>
-
-    <!-- 命令错误（stale_version/read_only 等） -->
-    <div v-if="commandError" class="plan-command-error" data-test="plan-command-error" role="alert">
-      <v-icon icon="mdi-alert-outline" size="14" aria-hidden="true" />
-      <span>{{ commandError }}</span>
-      <button type="button" class="plan-error-dismiss" data-test="plan-error-dismiss" @click="store.clearError()">
-        知道了
-      </button>
-    </div>
-
-    <!-- 步骤列表（折叠、文件可点击、风险图标+文字、偏离标识） -->
-    <ol v-if="plan" class="plan-steps" data-test="plan-steps">
-      <li v-for="(step, idx) in plan.steps" :key="step.stepId" class="plan-step-item">
-        <PlanStepCard
-          :step="step"
-          :index="idx + 1"
-          :deviations="stepDeviations.get(step.stepId) ?? []"
-          :revision-allowed="revisionAllowed"
-          @revise="(feedback: string) => requestStepRevision(step, feedback)"
-          @retry="() => retryFailedStep(step)"
-        />
-      </li>
-    </ol>
-
-    <!-- 底部操作 -->
-    <footer v-if="hasFooterActions" class="plan-panel-actions" data-test="plan-actions">
-      <template v-if="phase === 'awaiting_approval'">
-        <button
-          type="button"
-          class="plan-action-btn plan-action-primary"
-          data-test="plan-approve-btn"
-          :disabled="busy || store.isApproving"
-          @click="approveAndStart"
-        >
-          <v-icon v-if="busy" icon="mdi-loading" class="spin" size="14" aria-hidden="true" />
-          <span>{{ busy ? "处理中..." : "批准并执行" }}</span>
-        </button>
-        <button
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-revise-btn"
-          :disabled="busy"
-          @click="revisionOpen = true"
-        >修订</button>
-        <button
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-abandon-btn"
-          :disabled="busy"
-          @click="openAbandonConfirm"
-        >放弃</button>
-      </template>
-      <template v-else-if="phase === 'approved'">
-        <button
-          type="button"
-          class="plan-action-btn plan-action-primary"
-          data-test="plan-start-btn"
-          :disabled="busy"
-          @click="startExecution"
-        >
-          <v-icon v-if="busy" icon="mdi-loading" class="spin" size="14" aria-hidden="true" />
-          <span>{{ busy ? "处理中..." : "开始执行" }}</span>
-        </button>
-        <button
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-abandon-btn"
-          :disabled="busy"
-          @click="openAbandonConfirm"
-        >放弃</button>
-      </template>
-      <template v-else-if="phase === 'paused'">
-        <button
-          v-if="canContinueExecution"
-          type="button"
-          class="plan-action-btn plan-action-primary"
-          data-test="plan-continue-btn"
-          :disabled="busy"
-          @click="continuePlan"
-        >继续执行</button>
-        <button
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-abandon-btn"
-          :disabled="busy"
-          @click="openAbandonConfirm"
-        >放弃</button>
-      </template>
-      <template v-else-if="phase === 'executing'">
-        <button
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-abandon-btn"
-          :disabled="busy"
-          @click="openAbandonConfirm"
-        >放弃</button>
-      </template>
-    </footer>
-
-    <!-- 面板级修订输入 -->
-    <div v-if="revisionOpen" class="plan-revision-panel" data-test="plan-revision-panel">
-      <textarea
-        v-model="revisionFeedback"
-        rows="2"
-        class="plan-revision-textarea"
-        placeholder="输入整体修订意见..."
-        aria-label="修订意见"
-        data-test="plan-revision-feedback"
-      ></textarea>
-      <div class="plan-revision-actions">
-        <button
-          type="button"
-          class="plan-action-btn plan-action-primary"
-          data-test="plan-revision-submit"
-          :disabled="!canSubmitRevision || busy"
-          @click="submitPanelRevision"
-        >提交修订</button>
-        <button
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-revision-cancel"
-          @click="revisionOpen = false; revisionFeedback = ''"
-        >取消</button>
-      </div>
-    </div>
-
-    <!-- 放弃二次确认 -->
-    <div
-      v-if="showAbandonConfirm"
-      class="plan-abandon-confirm"
-      data-test="plan-abandon-confirm"
-      role="alertdialog"
-      aria-label="放弃计划确认"
+  <section class="plan-card" data-test="plan-panel" :aria-label="`计划面板：${statusLabel}`">
+    <!-- 折叠行：一行摘要，点击切换展开/折叠；planning/revising 徽章带 spinner 文案 -->
+    <button
+      type="button"
+      class="plan-card-toggle"
+      data-test="plan-card-toggle"
+      :aria-expanded="isExpanded"
+      @click="toggleExpanded"
     >
-      <v-icon icon="mdi-help-circle-outline" size="15" aria-hidden="true" />
-      <span v-if="phase === 'revising'">确定放弃本次修订？将回退到上一版本，可在待批准后放弃整个计划。</span>
-      <span v-else>确定放弃当前计划？放弃后计划将标记为已取消。</span>
-      <div class="plan-abandon-actions">
-        <button
-          type="button"
-          class="plan-action-btn"
-          data-test="plan-abandon-cancel"
-          @click="showAbandonConfirm = false"
-        >取消</button>
-        <button
-          type="button"
-          class="plan-action-btn plan-action-danger"
-          data-test="plan-abandon-confirm-btn"
-          @click="confirmAbandon"
-        >确认放弃</button>
+      <v-icon icon="mdi-map-outline" size="16" aria-hidden="true" />
+      <span class="plan-card-title" data-test="plan-title">{{ plan?.title || "规划" }}</span>
+      <span v-if="plan" class="plan-card-version" data-test="plan-version">v{{ plan.version }}</span>
+      <span
+        v-if="showGenerating"
+        class="plan-card-status phase-generating"
+        data-test="plan-generating"
+        role="status"
+      >
+        <v-icon icon="mdi-loading" class="spin" size="13" aria-hidden="true" />
+        <span>{{ generatingText }}</span>
+      </span>
+      <span v-else class="plan-card-status" :class="`phase-${phase}`" data-test="plan-status">{{ statusLabel }}</span>
+      <span v-if="progressText" class="plan-card-progress" data-test="plan-progress">{{ progressText }}</span>
+      <v-icon
+        class="plan-card-chevron"
+        :class="{ open: isExpanded }"
+        icon="mdi-chevron-down"
+        size="16"
+        aria-hidden="true"
+      />
+    </button>
+
+    <!-- 展开体：原 PlanPanel 内容原样迁移（卡片自身 60vh 内滚动） -->
+    <div v-if="isExpanded" class="plan-card-body" data-test="plan-card-body">
+      <header class="plan-panel-header">
+        <div class="plan-panel-title-row">
+          <h2 class="plan-panel-title">{{ plan?.title || "规划" }}</h2>
+        </div>
+        <div class="plan-panel-meta">
+          <span v-if="plan" class="plan-panel-model" data-test="plan-model">
+            {{ plan.planningModel.provider }}/{{ plan.planningModel.modelId }}
+          </span>
+          <span v-if="plan" class="plan-panel-time" data-test="plan-time">更新于 {{ formatTime(plan.updatedAt) }}</span>
+        </div>
+        <p v-if="plan?.summary" class="plan-panel-summary" data-test="plan-summary">{{ plan.summary }}</p>
+      </header>
+
+      <!-- 生成/修订进度（手动展开时可见；折叠行徽章是常驻指示） -->
+      <div v-if="showGenerating" class="plan-generating" role="status">
+        <v-icon icon="mdi-loading" class="spin" size="16" aria-hidden="true" />
+        <span>{{ generatingText }}</span>
+      </div>
+
+      <!-- 错误紧邻 Plan/step 且携下一步操作 -->
+      <div v-if="failure" class="plan-failure" data-test="plan-failure" role="alert">
+        <div class="plan-failure-header">
+          <v-icon icon="mdi-alert-outline" size="15" aria-hidden="true" />
+          <span>{{ failure.message || "规划生成失败" }}</span>
+        </div>
+        <div v-if="failure.fieldErrors.length > 0" class="plan-failure-fields">
+          <p v-for="error in failure.fieldErrors" :key="error.path">{{ error.path }}：{{ error.message }}</p>
+        </div>
+        <div class="plan-failure-actions">
+          <button
+            v-if="failure.phase === 'initial'"
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-retry-generation"
+            :disabled="busy"
+            @click="retryGeneration"
+          >重试生成</button>
+          <button
+            v-if="failure.phase === 'initial'"
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-use-session-model"
+            :disabled="busy"
+            @click="useSessionModelAndRetry"
+          >改用会话模型重试</button>
+          <button
+            v-if="failure.code === 'truncated'"
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-regenerate-concise"
+            :disabled="busy"
+            @click="regenerateConcise"
+          >精简重新生成</button>
+          <button
+            v-if="failure.phase === 'revision'"
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-retry-revision"
+            :disabled="busy"
+            @click="retryRevision"
+          >重试修订</button>
+          <button
+            v-if="failure.phase === 'revision'"
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-return-previous"
+            :disabled="busy"
+            @click="returnPreviousVersion"
+          >返回上一版本</button>
+          <button
+            type="button"
+            class="plan-action-btn plan-action-danger"
+            data-test="plan-abandon-failure"
+            :disabled="busy"
+            @click="openAbandonConfirm"
+          >放弃</button>
+        </div>
+      </div>
+
+      <!-- 命令错误（stale_version/read_only 等） -->
+      <div v-if="commandError" class="plan-command-error" data-test="plan-command-error" role="alert">
+        <v-icon icon="mdi-alert-outline" size="14" aria-hidden="true" />
+        <span>{{ commandError }}</span>
+        <button type="button" class="plan-error-dismiss" data-test="plan-error-dismiss" @click="store.clearError()">
+          知道了
+        </button>
+      </div>
+
+      <!-- 步骤列表（折叠、文件可点击、风险图标+文字、偏离标识） -->
+      <ol v-if="plan" class="plan-steps" data-test="plan-steps">
+        <li v-for="(step, idx) in plan.steps" :key="step.stepId" class="plan-step-item">
+          <PlanStepCard
+            :step="step"
+            :index="idx + 1"
+            :deviations="stepDeviations.get(step.stepId) ?? []"
+            :revision-allowed="revisionAllowed"
+            @revise="(feedback: string) => requestStepRevision(step, feedback)"
+            @retry="() => retryFailedStep(step)"
+          />
+        </li>
+      </ol>
+
+      <!-- 底部操作 -->
+      <footer v-if="hasFooterActions" class="plan-panel-actions" data-test="plan-actions">
+        <template v-if="phase === 'awaiting_approval'">
+          <button
+            type="button"
+            class="plan-action-btn plan-action-primary"
+            data-test="plan-approve-btn"
+            :disabled="busy || store.isApproving"
+            @click="approveAndStart"
+          >
+            <v-icon v-if="busy" icon="mdi-loading" class="spin" size="14" aria-hidden="true" />
+            <span>{{ busy ? "处理中..." : "批准并执行" }}</span>
+          </button>
+          <button
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-revise-btn"
+            :disabled="busy"
+            @click="revisionOpen = true"
+          >修订</button>
+          <button
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-abandon-btn"
+            :disabled="busy"
+            @click="openAbandonConfirm"
+          >放弃</button>
+        </template>
+        <template v-else-if="phase === 'approved'">
+          <button
+            type="button"
+            class="plan-action-btn plan-action-primary"
+            data-test="plan-start-btn"
+            :disabled="busy"
+            @click="startExecution"
+          >
+            <v-icon v-if="busy" icon="mdi-loading" class="spin" size="14" aria-hidden="true" />
+            <span>{{ busy ? "处理中..." : "开始执行" }}</span>
+          </button>
+          <button
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-abandon-btn"
+            :disabled="busy"
+            @click="openAbandonConfirm"
+          >放弃</button>
+        </template>
+        <template v-else-if="phase === 'paused'">
+          <button
+            v-if="canContinueExecution"
+            type="button"
+            class="plan-action-btn plan-action-primary"
+            data-test="plan-continue-btn"
+            :disabled="busy"
+            @click="continuePlan"
+          >继续执行</button>
+          <button
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-abandon-btn"
+            :disabled="busy"
+            @click="openAbandonConfirm"
+          >放弃</button>
+        </template>
+        <template v-else-if="phase === 'executing'">
+          <button
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-abandon-btn"
+            :disabled="busy"
+            @click="openAbandonConfirm"
+          >放弃</button>
+        </template>
+      </footer>
+
+      <!-- 面板级修订输入 -->
+      <div v-if="revisionOpen" class="plan-revision-panel" data-test="plan-revision-panel">
+        <textarea
+          v-model="revisionFeedback"
+          rows="2"
+          class="plan-revision-textarea"
+          placeholder="输入整体修订意见..."
+          aria-label="修订意见"
+          data-test="plan-revision-feedback"
+        ></textarea>
+        <div class="plan-revision-actions">
+          <button
+            type="button"
+            class="plan-action-btn plan-action-primary"
+            data-test="plan-revision-submit"
+            :disabled="!canSubmitRevision || busy"
+            @click="submitPanelRevision"
+          >提交修订</button>
+          <button
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-revision-cancel"
+            @click="revisionOpen = false; revisionFeedback = ''"
+          >取消</button>
+        </div>
+      </div>
+
+      <!-- 放弃二次确认 -->
+      <div
+        v-if="showAbandonConfirm"
+        class="plan-abandon-confirm"
+        data-test="plan-abandon-confirm"
+        role="alertdialog"
+        aria-label="放弃计划确认"
+      >
+        <v-icon icon="mdi-help-circle-outline" size="15" aria-hidden="true" />
+        <span v-if="phase === 'revising'">确定放弃本次修订？将回退到上一版本，可在待批准后放弃整个计划。</span>
+        <span v-else>确定放弃当前计划？放弃后计划将标记为已取消。</span>
+        <div class="plan-abandon-actions">
+          <button
+            type="button"
+            class="plan-action-btn"
+            data-test="plan-abandon-cancel"
+            @click="showAbandonConfirm = false"
+          >取消</button>
+          <button
+            type="button"
+            class="plan-action-btn plan-action-danger"
+            data-test="plan-abandon-confirm-btn"
+            @click="confirmAbandon"
+          >确认放弃</button>
+        </div>
       </div>
     </div>
   </section>
 </template>
 
 <style scoped>
-.plan-panel {
+.plan-card {
   display: flex;
   flex-direction: column;
-  gap: var(--pix-space-sm);
-  flex-shrink: 0;
-  max-height: 46vh;
-  overflow-y: auto;
-  padding: var(--pix-space-md);
-  margin: 0 var(--pix-space-xl) var(--pix-space-sm);
   border: 1px solid var(--pix-border-light);
   border-radius: var(--pix-radius-xl);
   background: rgba(255, 255, 255, 0.96);
   box-shadow: var(--pix-shadow-lg);
+  overflow: hidden;
+}
+
+/* 折叠行：一行摘要（约 38px），点击切换展开 */
+.plan-card-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 12px;
+  border: none;
+  background: transparent;
+  color: var(--pix-accent);
+  font-family: var(--pix-font-ui);
+  font-size: var(--pix-text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.plan-card-toggle:hover {
+  background: var(--pix-bg-hover);
+}
+
+.plan-card-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-sm);
+  font-weight: var(--pix-weight-semibold);
+}
+
+.plan-card-version {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-code);
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-xs);
+}
+
+.plan-card-status {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: 10px;
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-semibold);
+  white-space: nowrap;
+}
+
+.plan-card-status.phase-planning,
+.plan-card-status.phase-revising,
+.plan-card-status.phase-generating,
+.plan-card-status.phase-executing,
+.plan-card-status.phase-approved {
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+}
+
+.plan-card-status.phase-awaiting_approval {
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+}
+
+.plan-card-status.phase-planning_failed,
+.plan-card-status.phase-failed {
+  background: var(--pix-error-bg);
+  color: var(--pix-error);
+}
+
+.plan-card-status.phase-completed {
+  background: var(--pix-success-bg);
+  color: var(--pix-success);
+}
+
+.plan-card-progress {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--pix-bg-code);
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-xs);
+  font-weight: var(--pix-weight-medium);
+}
+
+.plan-card-chevron {
+  flex-shrink: 0;
+  color: var(--pix-text-secondary);
+  transition: transform var(--pix-transition-fast);
+}
+
+.plan-card-chevron.open {
+  transform: rotate(180deg);
+}
+
+/* 展开体：原 PlanPanel 内容；极端大计划也不吞屏 */
+.plan-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pix-space-sm);
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: var(--pix-space-md);
+  border-top: 1px solid var(--pix-border-subtle);
 }
 
 .plan-panel-header {
@@ -512,7 +663,6 @@ function confirmAbandon(): void {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  color: var(--pix-accent);
 }
 
 .plan-panel-title {
@@ -526,50 +676,6 @@ function confirmAbandon(): void {
   font-weight: var(--pix-weight-semibold);
 }
 
-.plan-panel-version {
-  flex-shrink: 0;
-  padding: 2px 7px;
-  border-radius: var(--pix-radius-sm);
-  background: var(--pix-bg-code);
-  color: var(--pix-text-secondary);
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
-}
-
-.plan-panel-status {
-  flex-shrink: 0;
-  padding: 2px 9px;
-  border-radius: 10px;
-  background: var(--pix-bg-hover);
-  color: var(--pix-text-secondary);
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-semibold);
-}
-
-.plan-panel-status.phase-planning,
-.plan-panel-status.phase-revising,
-.plan-panel-status.phase-executing,
-.plan-panel-status.phase-approved {
-  background: var(--pix-accent-light);
-  color: var(--pix-accent);
-}
-
-.plan-panel-status.phase-awaiting_approval {
-  background: var(--pix-warning-bg);
-  color: var(--pix-warning);
-}
-
-.plan-panel-status.phase-planning_failed,
-.plan-panel-status.phase-failed {
-  background: var(--pix-error-bg);
-  color: var(--pix-error);
-}
-
-.plan-panel-status.phase-completed {
-  background: var(--pix-success-bg);
-  color: var(--pix-success);
-}
-
 .plan-panel-meta {
   display: flex;
   flex-wrap: wrap;
@@ -581,17 +687,6 @@ function confirmAbandon(): void {
 
 .plan-panel-model {
   font-family: var(--pix-font-mono);
-}
-
-.plan-panel-progress {
-  margin-left: auto;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: var(--pix-bg-code);
-  color: var(--pix-text-secondary);
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-medium);
 }
 
 .plan-panel-summary {

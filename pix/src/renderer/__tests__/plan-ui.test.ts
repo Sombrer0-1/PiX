@@ -1,21 +1,24 @@
 /**
- * Plan UI tests (PiX 1.4.0, stage P4).
+ * Plan UI tests (PiX 1.4.0, stage P4; 交互升级 Stage A 改写).
  *
  * Acceptance: the real CenterPanel mounts PlanModeToggle in the inline composer
- * and PlanPanel between the message area and the composer. Covered here:
- * toggle only arms / never fires IPC, non-empty armed submit sends ONE
- * enter_planning carrying text + attachments, failure restores the composer,
- * real mount, only-idle toggle with disable reason, three plan indicators,
- * abandon confirmation, 300ms busy progress, double-submit protection,
- * keyboard/aria, file locating, long-text expand, non-color status/risk,
- * deviations, error recovery (retry/use-session-model/concise-regenerate/
- * revision fallback) and explicit start after approval. No screenshot
- * assertions - behavior only.
+ * and the PlanCard inside the session scroll container (.session-content, after
+ * SessionView - never a fixed panel between the message area and the composer).
+ * Covered here: toggle only arms / never fires IPC, non-empty armed submit
+ * sends ONE enter_planning carrying text + attachments, failure restores the
+ * composer, real mount, only-idle toggle with disable reason, three plan
+ * indicators, card collapse semantics (auto-expand for awaiting_approval /
+ * planning_failed / failures, collapsed row while executing, manual collapse
+ * surviving snapshots, status pill expand), abandon confirmation, 300ms busy
+ * progress, double-submit protection, keyboard/aria, file locating, long-text
+ * expand, non-color status/risk, deviations, error recovery (retry/
+ * use-session-model/concise-regenerate/revision fallback) and explicit start
+ * after approval. No screenshot assertions - behavior only.
  *
  * The component tree talks to main only through window.pixApi
  * (sendPlanCommand / onPlanEvent) and the mocked composables/stores, so no
  * Electron runtime is loaded; the plan store itself is real (Pinia) so the
- * PlanPanel renders real store-driven state.
+ * PlanCard renders real store-driven state.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,7 +39,7 @@ import type {
 } from "@shared/types.js";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import PlanModeToggle from "../components/plan/PlanModeToggle.vue";
-import PlanPanel from "../components/plan/PlanPanel.vue";
+import PlanCard from "../components/plan/PlanCard.vue";
 import PlanStepCard from "../components/plan/PlanStepCard.vue";
 
 // ============================================================================
@@ -342,7 +345,7 @@ afterEach(() => {
 // ============================================================================
 
 describe("real mount", () => {
-  it("mounts CenterPanel with the real PlanModeToggle and PlanPanel", async () => {
+  it("mounts CenterPanel with the real PlanModeToggle and PlanCard inside the session content", async () => {
     const w = await mountAndFlush();
 
     // PlanModeToggle is the real component inside the composer.
@@ -350,8 +353,8 @@ describe("real mount", () => {
     expect(toggle.exists()).toBe(true);
     expect(toggle.find(".plan-mode-toggle").exists()).toBe(true);
 
-    // PlanPanel is v-if'ed on the plan phase: hidden before the first snapshot.
-    expect(w.findComponent(PlanPanel).exists()).toBe(false);
+    // PlanCard is v-if'ed on the plan phase: hidden before the first snapshot.
+    expect(w.findComponent(PlanCard).exists()).toBe(false);
 
     emitPlanEvent({
       type: "plan_state",
@@ -359,10 +362,17 @@ describe("real mount", () => {
     });
     await flushPromises();
 
-    const panel = w.findComponent(PlanPanel);
-    expect(panel.exists()).toBe(true);
-    expect(w.find('[data-test="plan-panel"]').exists()).toBe(true);
-    // The step list renders the real PlanStepCard, not a stub.
+    const card = w.findComponent(PlanCard);
+    expect(card.exists()).toBe(true);
+    const cardEl = w.get('[data-test="plan-panel"]').element;
+    // The card lives inside the session scroll container (it scrolls away with
+    // the transcript; the message area is never squeezed by a fixed panel), as
+    // the last element after SessionView.
+    const content = w.get(".session-content").element;
+    expect(cardEl.closest(".session-content")).toBe(content);
+    expect(content.lastElementChild).toBe(cardEl.parentElement);
+    // awaiting_approval auto-expands: the step list renders the real
+    // PlanStepCard, not a stub.
     expect(w.findAllComponents(PlanStepCard).length).toBe(1);
     expect(w.get('[data-test="plan-title"]').text()).toContain("实现登录");
     expect(w.get('[data-test="plan-status"]').text()).toBe("待批准");
@@ -371,22 +381,22 @@ describe("real mount", () => {
     expect(w.get('[data-test="plan-summary"]').text()).toContain("实现登录流程");
   });
 
-  it("does not render an empty PlanPanel for a new session whose snapshot has no plan", async () => {
+  it("does not render an empty PlanCard for a new session whose snapshot has no plan", async () => {
     const w = await mountAndFlush();
 
     // The controller's initial snapshot is a sentinel: phase "cancelled" with
     // planId/plan null. A new session must not show a meaningless
-    // "已取消" empty panel.
+    // "已取消" empty card.
     emitPlanEvent({
       type: "plan_state",
       snapshot: makeSnapshot({ phase: "cancelled" }),
     });
     await flushPromises();
 
-    expect(w.findComponent(PlanPanel).exists()).toBe(false);
+    expect(w.findComponent(PlanCard).exists()).toBe(false);
   });
 
-  it("still renders the PlanPanel for a genuinely cancelled plan", async () => {
+  it("still renders the PlanCard for a genuinely cancelled plan", async () => {
     const w = await mountAndFlush();
     emitPlanEvent({
       type: "plan_state",
@@ -394,8 +404,9 @@ describe("real mount", () => {
     });
     await flushPromises();
 
-    expect(w.findComponent(PlanPanel).exists()).toBe(true);
+    expect(w.findComponent(PlanCard).exists()).toBe(true);
     expect(w.find('[data-test="plan-panel"]').exists()).toBe(true);
+    // Collapsed to the summary row, whose status badge stays readable.
     expect(w.get('[data-test="plan-status"]').text()).toBe("已取消");
   });
 });
@@ -650,7 +661,7 @@ describe("armed submit", () => {
 // ============================================================================
 
 describe("three plan indicators", () => {
-  it("shows planning via the toggle, the PlanPanel and the status pill", async () => {
+  it("shows planning via the toggle, the PlanCard and the status pill", async () => {
     const w = await mountAndFlush();
     await w.get(".plan-mode-toggle").trigger("click");
 
@@ -662,7 +673,7 @@ describe("three plan indicators", () => {
 
     // 1. Input-area toggle.
     expect(w.get(".plan-toggle-text").text()).toBe("规划已开启");
-    // 2. PlanPanel header (title + status).
+    // 2. PlanCard summary row (title + status).
     expect(w.find('[data-test="plan-panel"]').exists()).toBe(true);
     expect(w.get('[data-test="plan-status"]').text()).toBe("待批准");
     // 3. CenterPanel session status text.
@@ -689,6 +700,142 @@ describe("three plan indicators", () => {
     expect(w.get('[data-test="plan-status"]').text()).toBe("执行中");
     // Current running step / total steps.
     expect(w.get('[data-test="plan-progress"]').text()).toBe("2/3");
+  });
+});
+
+// ============================================================================
+// PlanCard collapse semantics (Stage A)
+// ============================================================================
+
+describe("plan card collapse", () => {
+  it("keeps the card collapsed to a single summary row while executing", async () => {
+    const w = await mountAndFlush();
+    const steps = [
+      makeStep({ stepId: "s1", status: "completed" }),
+      makeStep({ stepId: "s2", stepKey: "k2", title: "Step 2", status: "running" }),
+      makeStep({ stepId: "s3", stepKey: "k3", title: "Step 3", status: "pending" }),
+    ];
+    emitPlanEvent({
+      type: "plan_state",
+      snapshot: makeSnapshot({
+        phase: "executing",
+        plan: makePlan({ status: "executing", steps }),
+      }),
+    });
+    await flushPromises();
+
+    const row = w.get('[data-test="plan-card-toggle"]');
+    expect(row.attributes("aria-expanded")).toBe("false");
+    // No expanded body: the message area is not squeezed by a fixed panel.
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(false);
+    // The row itself still carries the status badge and progress.
+    expect(w.get('[data-test="plan-status"]').text()).toBe("执行中");
+    expect(w.get('[data-test="plan-progress"]').text()).toBe("2/3");
+  });
+
+  it("auto-expands for awaiting_approval so approve is immediately reachable", async () => {
+    const w = await mountAndFlush();
+    emitPlanEvent({
+      type: "plan_state",
+      snapshot: makeSnapshot({ phase: "awaiting_approval", plan: makePlan() }),
+    });
+    await flushPromises();
+
+    expect(w.get('[data-test="plan-card-toggle"]').attributes("aria-expanded")).toBe("true");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(true);
+    expect(w.get('[data-test="plan-approve-btn"]').text()).toContain("批准并执行");
+  });
+
+  it("toggles the card body via the collapsed row click", async () => {
+    const w = await mountAndFlush();
+    emitPlanEvent({
+      type: "plan_state",
+      snapshot: makeSnapshot({ phase: "awaiting_approval", plan: makePlan() }),
+    });
+    await flushPromises();
+
+    const row = w.get('[data-test="plan-card-toggle"]');
+    await row.trigger("click");
+    expect(row.attributes("aria-expanded")).toBe("false");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(false);
+    // The summary row survives the collapse with its badge.
+    expect(w.get('[data-test="plan-status"]').text()).toBe("待批准");
+
+    await row.trigger("click");
+    expect(row.attributes("aria-expanded")).toBe("true");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(true);
+  });
+
+  it("keeps a manual collapse across a newer snapshot push", async () => {
+    const w = await mountAndFlush();
+    emitPlanEvent({
+      type: "plan_state",
+      snapshot: makeSnapshot({ phase: "awaiting_approval", plan: makePlan() }),
+    });
+    await flushPromises();
+
+    await w.get('[data-test="plan-card-toggle"]').trigger("click");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(false);
+
+    // A newer snapshot (step statuses moved on) must not re-open the card the
+    // user manually collapsed.
+    emitPlanEvent({
+      type: "plan_state",
+      snapshot: makeSnapshot({
+        phase: "awaiting_approval",
+        plan: makePlan({ updatedAt: 9999 }),
+      }),
+    });
+    await flushPromises();
+
+    expect(w.get('[data-test="plan-card-toggle"]').attributes("aria-expanded")).toBe("false");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(false);
+  });
+
+  it("auto-expands planning_failed showing the retry actions", async () => {
+    const w = await mountAndFlush();
+    emitPlanEvent({
+      type: "plan_state",
+      snapshot: makeSnapshot({
+        phase: "planning_failed",
+        planId: "plan-1",
+        failure: {
+          generationId: "g-1",
+          phase: "initial",
+          code: "invalid_plan",
+          message: "计划校验失败",
+          fieldErrors: [],
+          retryable: true,
+          occurredAt: 5,
+        },
+      }),
+    });
+    await flushPromises();
+
+    expect(w.get('[data-test="plan-card-toggle"]').attributes("aria-expanded")).toBe("true");
+    expect(w.get('[data-test="plan-failure"]').text()).toContain("计划校验失败");
+    expect(w.get('[data-test="plan-retry-generation"]').exists()).toBe(true);
+    expect(w.get('[data-test="plan-use-session-model"]').exists()).toBe(true);
+    expect(w.get('[data-test="plan-abandon-failure"]').exists()).toBe(true);
+  });
+
+  it("expands the card when the status pill is clicked", async () => {
+    const w = await mountAndFlush();
+    emitPlanEvent({
+      type: "plan_state",
+      snapshot: makeSnapshot({
+        phase: "executing",
+        plan: makePlan({ status: "executing" }),
+      }),
+    });
+    await flushPromises();
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(false);
+
+    await w.get(".status-pill").trigger("click");
+    await flushPromises();
+
+    expect(w.get('[data-test="plan-card-toggle"]').attributes("aria-expanded")).toBe("true");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(true);
   });
 });
 
@@ -806,10 +953,12 @@ describe("approval flow", () => {
       sendPlanCommand.mock.calls.findIndex(([c]) => c.type === "start_execution"),
     );
 
-    // Phase moved to approved: the explicit start button is idle again.
-    const startBtn = w.get('[data-test="plan-start-btn"]');
-    expect(startBtn.text()).toBe("开始执行");
-    expect((startBtn.element as HTMLButtonElement).disabled).toBe(false);
+    // Phase moved to approved: the card collapsed back to its summary row
+    // (approved is not an auto-expand phase); the explicit start path is
+    // covered by the read-only test below.
+    expect(w.get('[data-test="plan-card-toggle"]').attributes("aria-expanded")).toBe("false");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(false);
+    expect(w.get('[data-test="plan-status"]').text()).toBe("已批准");
   });
 
   it("stops at approved (read-only) and starts execution only on explicit click", async () => {
@@ -820,7 +969,11 @@ describe("approval flow", () => {
     });
     await flushPromises();
 
+    // approved does not auto-expand: open the card from the summary row first.
+    await w.get('[data-test="plan-card-toggle"]').trigger("click");
     const startBtn = w.get('[data-test="plan-start-btn"]');
+    expect(startBtn.text()).toBe("开始执行");
+    expect((startBtn.element as HTMLButtonElement).disabled).toBe(false);
     await startBtn.trigger("click");
     await flushPromises();
 
@@ -837,6 +990,7 @@ describe("approval flow", () => {
     });
     await flushPromises();
 
+    await w.get('[data-test="plan-card-toggle"]').trigger("click");
     await w.get('[data-test="plan-continue-btn"]').trigger("click");
     await flushPromises();
     expect(planCalls("continue_plan")).toHaveLength(1);
@@ -856,6 +1010,8 @@ describe("approval flow", () => {
       }),
     });
     await flushPromises();
+    // Expand first: absence inside the expanded body is the meaningful check.
+    await w.get('[data-test="plan-card-toggle"]').trigger("click");
     expect(w.find('[data-test="plan-continue-btn"]').exists()).toBe(false);
   });
 
@@ -867,12 +1023,15 @@ describe("approval flow", () => {
     });
     await flushPromises();
 
+    // planning stays a collapsed row: the row badge IS the spinner indicator.
     const generating = w.find('[data-test="plan-generating"]');
     expect(generating.exists()).toBe(true);
     expect(generating.text()).toContain("正在生成计划");
+    expect(w.get('[data-test="plan-card-toggle"]').attributes("aria-expanded")).toBe("false");
+    expect(w.find('[data-test="plan-card-body"]').exists()).toBe(false);
   });
 
-  it("surfaces command errors next to the panel with a dismiss action", async () => {
+  it("surfaces command errors next to the card with a dismiss action", async () => {
     const w = await mountAndFlush();
     emitPlanEvent({
       type: "plan_state",
@@ -880,6 +1039,8 @@ describe("approval flow", () => {
     });
     await flushPromises();
 
+    // approved does not auto-expand: open the card before acting in it.
+    await w.get('[data-test="plan-card-toggle"]').trigger("click");
     sendPlanCommand.mockResolvedValue({ success: false, error: "read_only", code: "read_only" });
     await w.get('[data-test="plan-start-btn"]').trigger("click");
     await flushPromises();

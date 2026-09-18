@@ -6,9 +6,11 @@ import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { useTeamLeaderRpc } from "../../composables/useTeamLeaderRpc";
+import { useLiveSessions } from "../../composables/useLiveSessions";
 import { useProjectStore } from "../../stores/project-store";
 import { useSessionStore, useTeamLeaderSessionStore } from "../../stores/session-store";
 import { useTeamStore } from "../../stores/team-store";
+import { usePlanStore } from "../../stores/plan-store";
 import RosterSetupDialog from "../team/RosterSetupDialog.vue";
 import { deriveSessionTitle, formatSessionTime } from "@/utils/session-title";
 import type { AgentMessage } from "@/types/rpc";
@@ -17,10 +19,12 @@ import type { SessionInfo } from "@/types/session";
 const router = useRouter();
 const rpc = useRpc();
 const teamLeaderRpc = useTeamLeaderRpc();
+const liveSessions = useLiveSessions();
 const projectStore = useProjectStore();
 const sessionStore = useSessionStore();
 const teamLeaderSessionStore = useTeamLeaderSessionStore();
 const teamStore = useTeamStore();
+const planStore = usePlanStore();
 
 const searchQuery = ref("");
 const pinnedIds = ref<Set<string>>(new Set());
@@ -71,6 +75,11 @@ const filteredSessions = computed(() => {
 
 function isCurrentTeamSession(session: SessionInfo): boolean {
   return teamStore.teamMode && currentSessionId.value === session.id;
+}
+
+/** 后台存活徽章（Stage B）：会话 path 命中 liveSessions 才有值；当前激活会话永不出现在 map 中。 */
+function sessionLiveState(session: SessionInfo): "running" | "waiting_input" | undefined {
+  return liveSessions.liveStateFor(session.path);
 }
 
 async function refreshCurrentSession(): Promise<void> {
@@ -181,6 +190,9 @@ async function handleSelectSession(session: SessionInfo): Promise<void> {
 
   const result = await rpc.switchSession(session.path);
   if (!result || result.cancelled) return;
+
+  // 会话无关的 UI 态随切换重置：A 会话的手动折叠不能抑制 B 会话待批计划的自动展开。
+  planStore.setCardExpanded(null);
 
   projectStore.setCurrentSession(session);
   const messages = await rpc.getMessages();
@@ -355,6 +367,15 @@ function goSettings(): void { void router.push("/settings"); }
             {{ deriveSessionTitle(session) }}
           </span>
           <span v-if="isCurrentTeamSession(session)" class="session-kind">团队</span>
+          <span
+            v-if="sessionLiveState(session)"
+            class="live-badge"
+            :class="`live-${sessionLiveState(session)}`"
+            :title="sessionLiveState(session) === 'running' ? '后台运行中' : '后台等待输入'"
+          >
+            <span v-if="sessionLiveState(session) === 'running'" class="live-spinner" aria-hidden="true"></span>
+            <span class="live-badge-text">{{ sessionLiveState(session) === 'running' ? '运行中' : '等待输入' }}</span>
+          </span>
         </div>
         <span class="session-time">{{ formatSessionTime(session.modified) }}</span>
         <span class="hover-actions">
@@ -729,6 +750,42 @@ function goSettings(): void { void router.push("/settings"); }
   font-size: 10px;
   font-weight: var(--pix-weight-semibold);
   flex-shrink: 0;
+}
+
+/* 后台存活徽章（Stage B D7）：纯 CSS、无交互；running 带旋转小点，等待输入为静态文案。 */
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--pix-bg-code);
+  color: var(--pix-text-secondary);
+  font-size: 10px;
+  font-weight: var(--pix-weight-semibold);
+  flex-shrink: 0;
+  line-height: 1.5;
+}
+
+.live-badge.live-waiting_input {
+  background: rgba(217, 119, 6, 0.1);
+  color: #b45309;
+}
+
+.live-spinner {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  animation: live-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes live-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .session-time {

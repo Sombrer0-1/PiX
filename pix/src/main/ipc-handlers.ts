@@ -785,6 +785,13 @@ export function registerIpcHandlers(
     return teamLeaderSessionBridge.getActiveUserInputRequest();
   });
 
+  // Stage B D7: initial pull of the background live-session state so a remount
+  // (or a renderer that missed earlier broadcasts) converges without waiting
+  // for the next state change.
+  ipcMain.handle("get-sessions-state", () => {
+    return singleSessionBridge.getSessionsState();
+  });
+
   // =========================================================================
   // Session listing
   // =========================================================================
@@ -1312,6 +1319,16 @@ export function setupEventForwarding(
     const win = getWin();
     if (win && !win.isDestroyed()) {
       win.webContents.send("user-input-dismissed", event);
+    }
+  }));
+
+  // Stage B D7: background live-session state (liveness badges). Pushed on the
+  // dedicated pi-sessions-state channel at detach/attach/state-change/finalize;
+  // small payloads, never coalesced.
+  eventForwardingUnsubscribes.push(singleSessionBridge.onSessionsState((payload) => {
+    const win = getWin();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("pi-sessions-state", payload);
     }
   }));
 

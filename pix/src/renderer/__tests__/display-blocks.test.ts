@@ -467,6 +467,73 @@ describe("loadEntries", () => {
       expect(ws.tools[0].result).toEqual({ content: [{ type: "text", text: "done" }], details: { status: "completed" } });
     }
   });
+
+  it("keeps the edit/write result shape with details on replay (Stage D)", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message", timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [
+            toolCallBlock("e-1", "edit", { path: "a.ts", edits: [{ oldText: "x", newText: "y" }] }),
+            toolCallBlock("w-1", "write", { path: "b.ts", content: "new" }),
+            toolCallBlock("r-1", "read", { path: "c.ts" }),
+          ],
+          timestamp: 100,
+        }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:01.000Z",
+        message: makeMessage({
+          role: "toolResult",
+          toolCallId: "e-1",
+          toolName: "edit",
+          content: [{ type: "text", text: "edited" }],
+          details: { diff: "@@ -1 +1 @@\n-x\n+y", firstChangedLine: 1 },
+          isError: false,
+          timestamp: 200,
+        }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:02.000Z",
+        message: makeMessage({
+          role: "toolResult",
+          toolCallId: "w-1",
+          toolName: "write",
+          content: [{ type: "text", text: "wrote" }],
+          details: { added: 1, removed: 0 },
+          isError: false,
+          timestamp: 300,
+        }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:03.000Z",
+        message: makeMessage({
+          role: "toolResult",
+          toolCallId: "r-1",
+          toolName: "read",
+          content: [{ type: "text", text: "line1\nline2" }],
+          isError: false,
+          timestamp: 400,
+        }),
+      },
+    ]);
+    const ws = a.blocks.find((b) => b.type === "work-status");
+    expect(ws?.type).toBe("work-status");
+    if (ws && ws.type === "work-status") {
+      // edit / write keep the { content, details } shape; other tools (read) stay content-only.
+      expect(ws.tools[0].result).toEqual({
+        content: [{ type: "text", text: "edited" }],
+        details: { diff: "@@ -1 +1 @@\n-x\n+y", firstChangedLine: 1 },
+      });
+      expect(ws.tools[1].result).toEqual({
+        content: [{ type: "text", text: "wrote" }],
+        details: { added: 1, removed: 0 },
+      });
+      expect(ws.tools[2].result).toEqual([{ type: "text", text: "line1\nline2" }]);
+    }
+  });
 });
 
 describe("internal notification protocol", () => {
@@ -1062,6 +1129,148 @@ describe("thinking blocks (PiX 1.5)", () => {
       expect(agent.content).toBe("回答一");
       expect(agent.content).not.toContain("一段");
     }
+  });
+});
+
+// ============================================================================
+// Timeline ordering (Stage C — tool groups and thinking interleave)
+// ============================================================================
+
+describe("timeline ordering (Stage C)", () => {
+  type WorkStatusBlock = Extract<DisplayBlock, { type: "work-status" }>;
+  type ThinkingBlock = Extract<DisplayBlock, { type: "thinking" }>;
+
+  function isThinking(block: DisplayBlock): block is ThinkingBlock {
+    return block.type === "thinking";
+  }
+
+  /** message_update carrying an assistantMessageEvent (pi-ai stream event). */
+  function updateWithAme(message: AgentMessage, ame: unknown): AgentSessionEvent {
+    return { type: "message_update", message, assistantMessageEvent: ame };
+  }
+
+  /** Pure thinking-stream updates: the partial message carries no text block. */
+  function thinkingUpdates(...ame: unknown[]): AgentSessionEvent[] {
+    return ame.map((e) => updateWithAme(makeMessage({ role: "assistant", content: [], timestamp: 2 }), e));
+  }
+
+  function workStatusBlocks(a: DisplayBlockAssembler): WorkStatusBlock[] {
+    return a.blocks.filter((b): b is WorkStatusBlock => b.type === "work-status");
+  }
+
+  it("live: interleaved tool/thinking events fold into chronological groups (直播交错分组)", () => {
+    const a = createDisplayBlockAssembler();
+    const empty = makeMessage({ role: "assistant", content: [], timestamp: 2 });
+
+    a.applyEvent({ type: "agent_start" });
+    a.applyEvent(msgStart(empty));
+
+    // Group 1: t1 t2, both settle before the first thinking segment.
+    a.applyEvents([
+      toolStart("t1"),
+      toolStart("t2"),
+      toolEnd("t1", "bash", "r1"),
+      toolEnd("t2", "bash", "r2"),
+    ]);
+
+    // Thinking segment 1 opens AFTER the tools — it must seal group 1.
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 0 },
+      { type: "thinking_delta", contentIndex: 0, delta: "第一段" },
+      { type: "thinking_end", contentIndex: 0, content: "第一段" },
+    ));
+
+    // Group 2: t3 t4 — t4's result arrives late, after segment 2 seals the group.
+    a.applyEvents([
+      toolStart("t3"),
+      toolStart("t4"),
+      toolEnd("t3", "bash", "r3"),
+    ]);
+
+    a.applyEvents(thinkingUpdates(
+      { type: "thinking_start", contentIndex: 1 },
+      { type: "thinking_delta", contentIndex: 1, delta: "第二段" },
+      { type: "thinking_end", contentIndex: 1, content: "第二段" },
+    ));
+
+    // Group 3: t5 — its result arrives just before agent_end.
+    a.applyEvent(toolStart("t5"));
+    // Late backfill into the already-sealed group 2 (toolCallId full scan,
+    // independent of which group is current).
+    a.applyEvent(toolEnd("t4", "bash", "r4"));
+    a.applyEvent(toolEnd("t5", "bash", "r5"));
+    a.applyEvent({ type: "agent_end", messages: [] });
+
+    expect(a.blocks.map((b) => b.type)).toEqual([
+      "work-status", "thinking", "work-status", "thinking", "work-status",
+    ]);
+
+    const groups = workStatusBlocks(a);
+    expect(groups.map((ws) => ws.tools.map((t) => t.toolCallId))).toEqual([
+      ["t1", "t2"],
+      ["t3", "t4"],
+      ["t5"],
+    ]);
+    // Sealing splits groups but never blocks result backfill.
+    expect(groups.map((ws) => ws.tools.map((t) => t.result))).toEqual([
+      ["r1", "r2"],
+      ["r3", "r4"],
+      ["r5"],
+    ]);
+    expect(groups.every((ws) => !ws.isStreaming)).toBe(true);
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking.map((b) => b.content)).toEqual(["第一段", "第二段"]);
+  });
+
+  it("replay: [toolCall,toolCall,thinking,toolCall] folds [ws,thinking,ws] (回放交错分组)", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message", timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [
+            toolCallBlock("c1", "bash", { command: "ls" }),
+            toolCallBlock("c2", "bash", { command: "pwd" }),
+            { type: "thinking", thinking: "回放思考段" } as { type: string; text?: string },
+            toolCallBlock("c3", "bash", { command: "date" }),
+          ],
+          timestamp: 200,
+        }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:01.000Z",
+        message: makeMessage({ role: "toolResult", toolCallId: "c1", toolName: "bash", content: [{ type: "text", text: "f1" }], isError: false, timestamp: 300 }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:02.000Z",
+        message: makeMessage({ role: "toolResult", toolCallId: "c2", toolName: "bash", content: [{ type: "text", text: "f2" }], isError: false, timestamp: 301 }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:03.000Z",
+        message: makeMessage({ role: "toolResult", toolCallId: "c3", toolName: "bash", content: [{ type: "text", text: "f3" }], isError: false, timestamp: 302 }),
+      },
+    ]);
+
+    expect(a.blocks.map((b) => b.type)).toEqual(["work-status", "thinking", "work-status"]);
+
+    const groups = workStatusBlocks(a);
+    expect(groups).toHaveLength(2);
+    expect(groups[0].tools.map((t) => t.toolCallId)).toEqual(["c1", "c2"]);
+    expect(groups[1].tools.map((t) => t.toolCallId)).toEqual(["c3"]);
+    // The thinking block sits between the two groups in content order.
+    const thinking = a.blocks.find((b) => b.type === "thinking");
+    expect(thinking?.type).toBe("thinking");
+    if (thinking && thinking.type === "thinking") {
+      expect(thinking.content).toBe("回放思考段");
+    }
+    // Tool results still match by toolCallId across the sealed split.
+    expect(groups[0].tools.map((t) => t.result)).toEqual([
+      [{ type: "text", text: "f1" }],
+      [{ type: "text", text: "f2" }],
+    ]);
+    expect(groups[1].tools[0].result).toEqual([{ type: "text", text: "f3" }]);
+    expect(groups.every((ws) => !ws.isStreaming)).toBe(true);
   });
 });
 

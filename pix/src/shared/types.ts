@@ -380,8 +380,13 @@ export interface RequestUserInputResponse {
   cancelled?: boolean;
 }
 
-/** Why the main process revoked an already-displayed user input request. */
-export type RequestUserInputDismissalReason = "aborted" | "session_closed";
+/**
+ * Why the main process revoked an already-displayed user input request.
+ * "session_backgrounded" (Stage B) only clears the renderer card when a busy
+ * session is detached into the background; the bridge-side entry stays
+ * suspended and is re-sent on re-attach.
+ */
+export type RequestUserInputDismissalReason = "aborted" | "session_closed" | "session_backgrounded";
 
 /**
  * Main-initiated revocation of a displayed user input request (design plan
@@ -392,6 +397,24 @@ export interface RequestUserInputDismissal {
   id: string;
   reason: RequestUserInputDismissalReason;
 }
+
+// ============================================================================
+// Background Live Sessions (Stage B: solo bridge session parallelism)
+// ============================================================================
+
+/** Liveness badge of one backgrounded busy session (the active session is never listed). */
+export interface LiveSessionInfo {
+  /** Session JSONL physical path (matches SessionInfo.path). */
+  path: string;
+  state: "running" | "waiting_input";
+  pendingCount: number;
+}
+
+/**
+ * Full snapshot of the backgrounded live sessions, pushed on the dedicated
+ * pi-sessions-state channel at detach/attach/state-change/finalize (Stage B D7).
+ */
+export type SessionsStatePayload = { sessions: LiveSessionInfo[] };
 
 // ============================================================================
 // Auth Types

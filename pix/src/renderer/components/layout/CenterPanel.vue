@@ -27,7 +27,7 @@ import { useTeamStore } from "../../stores/team-store";
 import TeamDashboard from "../team/TeamDashboard.vue";
 import WorkerStatusBar from "../team/WorkerStatusBar.vue";
 import PlanModeToggle from "../plan/PlanModeToggle.vue";
-import PlanPanel from "../plan/PlanPanel.vue";
+import PlanCard from "../plan/PlanCard.vue";
 import { usePlanStore } from "../../stores/plan-store";
 import { useWorkflowStore } from "../../stores/workflow-store";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
@@ -93,6 +93,8 @@ const showForkDialog = ref(false);
 const showSwitchToSoloConfirmDialog = ref(false);
 const showExecutionModeMenu = ref(false);
 const contentArea = ref<HTMLElement | null>(null);
+/** PlanCard 容器锚点：session-content 内的卡片滚动定位目标。 */
+const planCardRoot = ref<HTMLElement | null>(null);
 const shouldStickToBottom = ref(true);
 /** 浮动回顶/回底按钮的可见性；由 handleContentScroll 持续维护。 */
 const isNearBottom = ref(true);
@@ -221,7 +223,7 @@ const composerPlaceholder = computed(() => {
 
 // Plan mode (PiX 1.4.0): the toggle only arms the current Solo composer; no
 // IPC fires on toggle, and enter_planning is sent once on the next non-empty
-// submit (§5.1). The status pill + toggle + PlanPanel form the three explicit
+// submit (§5.1). The status pill + toggle + PlanCard form the three explicit
 // plan indicators.
 const PLAN_PHASE_PILL_TEXT: Partial<Record<PlanStatus, string>> = {
   planning: "规划中",
@@ -416,6 +418,20 @@ watch(
   }
 );
 
+// PlanCard 自动展开跃迁（phase 变为 awaiting_approval/planning_failed 或生成
+// 失败，且未被手动折叠）时把卡片滚进视野。卡片是 session-content 的最后一个
+// 元素，block:"nearest" 只在卡片不可见时最小滚动：落点贴近底部时与底部跟随
+// 闩锁兼容；落点离开底部则由既有 handleContentScroll 语义停止跟随（用户注意
+// 力已移到卡片），不与跳底机件抢滚动。
+watch(
+  () => planStore.isCardExpanded,
+  async (expanded, wasExpanded) => {
+    if (!expanded || wasExpanded) return;
+    await nextTick();
+    scrollPlanCardIntoView();
+  },
+);
+
 // 子代理与 workflow 子进程以独立的 AgentTask 计费，主会话在整段工具调用期间
 // 不产生任何会刷新 token 面板的会话事件（useRpc 只监听主会话流事件）。任务
 // 转为终态正是其 usage 落账的时刻，对终态计数做 watcher 补上这条刷新链路。
@@ -434,8 +450,8 @@ watch(terminalAuxTaskCount, () => {
 
 // Scroll to bottom on mount when there are existing blocks (e.g. navigating back from settings)
 onMounted(async () => {
-  // Plan event mirror: subscribe once here so PlanPanel (v-if'ed on the plan
-  // phase) never misses pushes; a remount replaces the subscription (§5.1).
+  // Plan event mirror: subscribe once here so the PlanCard (v-if'ed on the
+  // plan phase) never misses pushes; a remount replaces the subscription (§5.1).
   planStore.subscribeToEvents();
   // Workflow run mirror: same subscription-point reasoning - the panel is
   // v-if'ed on tool results, so subscribe next to the plan mirror; a remount
@@ -489,6 +505,20 @@ function jumpToTop(): void {
   shouldStickToBottom.value = false;
   const el = contentArea.value;
   if (el) el.scrollTop = 0;
+}
+
+/** 把 PlanCard 滚到可见（卡片在 session-content 内，随内容滚动）。 */
+function scrollPlanCardIntoView(): void {
+  const el = planCardRoot.value;
+  if (!el || typeof el.scrollIntoView !== "function") return;
+  el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+/** 状态 pill 点击（plan 活跃时可点）：展开计划卡并滚到可见。 */
+function onStatusPillClick(): void {
+  if (soloPlanPhase.value == null) return;
+  planStore.setCardExpanded(true);
+  void nextTick(() => scrollPlanCardIntoView());
 }
 
 // Session ops
@@ -1031,7 +1061,12 @@ function sendQuickStart(prompt: string): void {
           <span class="topbar-sep">&rsaquo;</span>
           <span class="topbar-path">{{ sessionName }}</span>
         </template>
-        <span class="status-pill" :class="statusClass">
+        <span
+          class="status-pill"
+          :class="[statusClass, { 'status-pill-plan': soloPlanPhase != null }]"
+          :title="soloPlanPhase != null ? '查看计划' : undefined"
+          @click="onStatusPillClick"
+        >
           <span class="status-dot"></span>
           {{ statusText }}
         </span>
@@ -1153,7 +1188,8 @@ function sendQuickStart(prompt: string): void {
     </div>
 
     <!-- 任务中心:顶层渲染于 team/solo 两分支之上(假设 6:team 模式同样生效);
-         打开前记住会话视图模式,关闭后回打开前视图(假设 5 期间隐藏 composer 与 PlanPanel)。 -->
+         打开前记住会话视图模式,关闭后回打开前视图(假设 5 期间隐藏 composer 与
+         会话区,计划卡随 session-pane 一并隐藏)。 -->
     <TaskCenterView v-if="agentTaskStore.centerOpen" :session-names="agentTaskSessionNames" />
 
     <!-- Team mode: the roundtable itself is the main surface (seat strip +
@@ -1202,6 +1238,17 @@ function sendQuickStart(prompt: string): void {
 
           <SessionView v-if="sessionViewMode === 'session'" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" @retry="retryLastTurn" @cancel="cancelRetry" />
           <SessionTreeView v-else />
+          <!-- PlanCard 随内容滚动（Stage A）：session-content 内、SessionView 之后，
+               不再是消息区与 composer 之间的固定夹层。控制器初始快照的 phase
+               "cancelled" 且无 plan 是未进入过规划的哨兵，仅该情况隐藏；真正
+               取消过的计划仍渲染。任务中心打开时整个 session-pane 不渲染（假设 5）。 -->
+          <div
+            v-if="!agentTaskStore.centerOpen && soloPlanPhase != null && !(soloPlanPhase === 'cancelled' && soloPlan == null)"
+            ref="planCardRoot"
+            class="session-plan-card"
+          >
+            <PlanCard />
+          </div>
         </div>
         <!-- 浮动导航（TeamTimeline 同款 absolute 定位）：距顶/距底超过阈值时出现。 -->
         <button
@@ -1226,15 +1273,6 @@ function sendQuickStart(prompt: string): void {
         </button>
       </div>
     </template>
-
-    <!-- PlanPanel sits between the message area and the composer (solo only).
-         The controller's initial snapshot uses phase "cancelled" with no plan
-         as the never-entered sentinel; only hide the panel in that case, a
-         genuinely cancelled plan still renders. 任务中心打开时隐藏(假设 5)。 -->
-    <PlanPanel
-      v-if="!agentTaskStore.centerOpen && soloPlanPhase != null && !(soloPlanPhase === 'cancelled' && soloPlan == null)"
-      class="center-plan-panel"
-    />
 
     <!-- Composer 只在 solo 渲染：团队模式的输入是圆桌的 RoundtableComposer，
          它走 TeamCommand，绝不经过 host 会话的 prompt。
@@ -1573,6 +1611,15 @@ function sendQuickStart(prompt: string): void {
   background: var(--pix-warning);
 }
 
+/* plan 活跃时状态 pill 可点：展开并定位计划卡 */
+.status-pill.status-pill-plan {
+  cursor: pointer;
+}
+
+.status-pill.status-pill-plan:hover {
+  box-shadow: var(--pix-shadow-xs);
+}
+
 @keyframes status-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
@@ -1884,6 +1931,11 @@ function sendQuickStart(prompt: string): void {
   flex: 1;
   overflow-y: auto;
   padding: var(--pix-space-3xl) var(--pix-space-xl) var(--pix-space-xl);
+}
+
+/* PlanCard 容器：随内容滚动，与 transcript 保持一段间距 */
+.session-plan-card {
+  margin-top: var(--pix-space-lg);
 }
 
 .scroll-float-btn {

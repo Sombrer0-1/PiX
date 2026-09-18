@@ -29,6 +29,7 @@ import type {
   RequestUserInputRequest,
   ResolveProjectLocationResult,
   RpcCommand,
+  SessionsStatePayload,
   SessionInfo,
   TeamCommand,
   TeamEvent,
@@ -89,6 +90,10 @@ export interface PixApi {
   onUserInputDismissed: (callback: (event: RequestUserInputDismissal) => void) => () => void;
   getPendingUserInputRequest: () => Promise<RequestUserInputRequest | null>;
   getTeamLeaderPendingUserInputRequest: () => Promise<RequestUserInputRequest | null>;
+
+  // Background live sessions (Stage B)
+  onSessionsState: (callback: (payload: SessionsStatePayload) => void) => () => void;
+  getSessionsState: () => Promise<SessionsStatePayload>;
   onTeamLeaderEvent: (callback: (event: AgentSessionEvent) => void) => () => void;
   onTeamLeaderExit: (callback: (data: { code: number | null; signal: string | null; stderr: string }) => void) => () => void;
   onTeamLeaderError: (callback: (err: { message: string }) => void) => () => void;
@@ -243,6 +248,14 @@ const api: PixApi = {
   },
   getPendingUserInputRequest: () => ipcRenderer.invoke("get-pending-user-input-request"),
   getTeamLeaderPendingUserInputRequest: () => ipcRenderer.invoke("get-team-leader-pending-user-input-request"),
+
+  // Background live sessions (Stage B), pattern-aligned with onPiEvent.
+  onSessionsState: (callback: (payload: SessionsStatePayload) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: SessionsStatePayload) => callback(data);
+    ipcRenderer.on("pi-sessions-state", handler);
+    return () => ipcRenderer.removeListener("pi-sessions-state", handler);
+  },
+  getSessionsState: () => ipcRenderer.invoke("get-sessions-state"),
   onTeamLeaderEvent: (callback: (event: AgentSessionEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: AgentSessionEvent) => callback(data);
     ipcRenderer.on("team-leader-event", handler);

@@ -15,6 +15,8 @@ import SubagentToolView from "./SubagentToolView.vue";
 import WorkflowRunPanel from "./WorkflowRunPanel.vue";
 import ThinkingBlock from "./ThinkingBlock.vue";
 import AgentMessageView from "./AgentMessageView.vue";
+import ToolCallDetails from "./tool-details/ToolCallDetails.vue";
+import { extractToolResultText } from "./tool-details/result";
 import { codeCheckIcon, codeCopyIcon } from "@/utils/markdown";
 
 function formatTime(ts: number): string {
@@ -25,18 +27,6 @@ function toolSummary(tools: ToolWorkItem[]): string {
   if (tools.length === 0) return "";
   const names = [...new Set(tools.map((t) => t.toolName || "task"))];
   return names.join(", ");
-}
-
-function resultText(result: unknown): string {
-  if (result === null || result === undefined) return "";
-  if (typeof result === "string") return result;
-  if (Array.isArray(result)) {
-    return result
-      .filter((b) => b.type === "text" && typeof b.text === "string")
-      .map((b) => b.text)
-      .join("");
-  }
-  return JSON.stringify(result, null, 2);
 }
 
 function compactWhitespace(text: string): string {
@@ -183,7 +173,7 @@ function workDiff(tools: ToolWorkItem[]): DiffSummary {
 }
 
 function resultPreview(result: unknown): string {
-  return truncate(compactWhitespace(resultText(result)), 120);
+  return truncate(compactWhitespace(extractToolResultText(result)), 120);
 }
 
 const WINDOW_THRESHOLD = 120;
@@ -500,14 +490,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
                 <span class="ws-tool-toggle">{{ isToolExpanded(block.id, tool.toolCallId) ? '收起' : '展开' }}</span>
               </button>
               <div v-if="isToolExpanded(block.id, tool.toolCallId)" class="ws-tool-details">
-                <details v-if="tool.args" class="ws-tool-section">
-                  <summary class="ws-tool-label">参数</summary>
-                  <pre class="ws-tool-code">{{ argsText(tool.args) }}</pre>
-                </details>
-                <details v-if="tool.result !== null" class="ws-tool-section">
-                  <summary class="ws-tool-label">结果</summary>
-                  <pre class="ws-tool-code">{{ resultText(tool.result) }}</pre>
-                </details>
+                <ToolCallDetails :tool="tool" />
               </div>
             </div>
           </template>
@@ -670,6 +653,13 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 
 .work-status-block + .agent-block {
   margin-top: 0;
+}
+
+/* Adjacent work-status groups (the same tool chain split by a sealed
+   thinking/text segment) pull together: still distinguishable groups, but
+   visibly one chain. Blocks next to a thinking block keep the normal gap. */
+.work-status-block + .work-status-block {
+  margin-top: calc(-1 * var(--pix-space-md) + 2px);
 }
 
 .work-status-block.streaming {
@@ -844,37 +834,6 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
   padding: 0 10px 10px;
   border-top: 1px solid var(--pix-border-light);
   background: rgba(255, 255, 255, 0.86);
-}
-
-.ws-tool-section {
-  margin-top: var(--pix-space-sm);
-}
-
-.ws-tool-label {
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0;
-  margin-bottom: var(--pix-space-xs);
-  cursor: pointer;
-  user-select: none;
-}
-
-.ws-tool-code {
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
-  line-height: var(--pix-leading-tight);
-  background: var(--pix-bg-code);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  overflow-x: auto;
-  max-height: 200px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--pix-text-primary);
 }
 
 .session-window-placeholder {
