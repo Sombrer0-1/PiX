@@ -98,17 +98,32 @@ function assertFailure(
 // ============================================================================
 
 class FakeEngine extends WorkflowEngine {
+  cancels: Array<{ runId: string; reason?: string }> = [];
+  private readonly liveRuns = new Set<string>();
+
   start(): never {
     throw new Error("workflow-ipc.test: engine.start is not exercised");
+  }
+
+  cancel(runId: string, reason?: string): boolean {
+    this.cancels.push({ runId, reason });
+    if (!this.liveRuns.has(runId)) return false;
+    this.liveRuns.delete(runId);
+    return true;
+  }
+
+  /** Test helper: mark a run id as live so the next cancel hits. */
+  markLive(runId: string): void {
+    this.liveRuns.add(runId);
   }
 
   async disposeAll(): Promise<void> {}
 }
 
-function makeRecorder(): WorkflowRecorder {
+function makeRecorder(engine: FakeEngine = new FakeEngine()): WorkflowRecorder {
   return createWorkflowRecorder({
     append: () => {},
-    engine: new FakeEngine(),
+    engine,
   });
 }
 
@@ -203,7 +218,7 @@ function snapshotEvents(wc: FakeWebContents): Array<{ type: string; runs?: Workf
 
 await run("registration: illegal command rejected; no recorder -> get_snapshot returns []", async () => {
   const ipc = new FakeIpcMain();
-  registerWorkflowIpcHandlers(ipc, () => null);
+  registerWorkflowIpcHandlers(ipc, () => null, () => null);
 
   const bogus = (await ipc.invoke("workflow-command", { type: "bogus" })) as PixCommandResult;
   const bogusFailure = assertFailure(bogus, "unknown type rejected");
@@ -228,7 +243,7 @@ await run("get_snapshot: live recorder fold returned in the envelope", async () 
   recorder.finish(runId, "completed");
 
   const ipc = new FakeIpcMain();
-  registerWorkflowIpcHandlers(ipc, () => recorder);
+  registerWorkflowIpcHandlers(ipc, () => recorder, () => new FakeEngine());
   const result = (await ipc.invoke("workflow-command", { type: "get_snapshot" })) as PixCommandResult<WorkflowViewState[]>;
   assertEqual(result.success, true, "get_snapshot succeeds");
   if (result.success === true) {
@@ -241,6 +256,38 @@ await run("get_snapshot: live recorder fold returned in the envelope", async () 
     assertEqual(view.stopReason, "completed", "view stopReason");
     assertEqual(view.members.length, 0, "no members");
   }
+});
+
+await run("cancel_run: engine hit returns the folded snapshot; miss or no engine is run_not_found", async () => {
+  const engine = new FakeEngine();
+  const recorder = makeRecorder(engine);
+  const runId = WorkflowRunId("wf-run-9");
+  recorder.start({ id: runId, meta: { name: "audit", description: "Audit packages" } }, "call_9", "workflow");
+  engine.markLive(runId);
+
+  const ipc = new FakeIpcMain();
+  registerWorkflowIpcHandlers(ipc, () => recorder, () => engine);
+  const hit = (await ipc.invoke("workflow-command", { type: "cancel_run", runId })) as PixCommandResult<WorkflowViewState[]>;
+  assertEqual(hit.success, true, "cancel_run on a live run succeeds");
+  assertEqual(engine.cancels.length, 1, "cancel reaches the engine exactly once");
+  assertEqual(engine.cancels[0]!.runId, runId, "cancel targets the requested run");
+  assertEqual(engine.cancels[0]!.reason, "cancelled_by_user", "cancel carries the user reason");
+  if (hit.success === true) {
+    assertEqual(hit.data.length, 1, "the folded snapshot rides the success envelope");
+    assertEqual(hit.data[0]!.runId, runId, "snapshot carries the cancelled run");
+  }
+
+  // Terminal runs leave the engine registry on settle: a repeat cancel misses.
+  const miss = (await ipc.invoke("workflow-command", { type: "cancel_run", runId })) as PixCommandResult;
+  const missFailure = assertFailure(miss, "cancel after terminal fails");
+  assertEqual(missFailure.code, "run_not_found", "run_not_found code on a registry miss");
+
+  // No engine (no solo generation) has no live run either.
+  const ipcNoEngine = new FakeIpcMain();
+  registerWorkflowIpcHandlers(ipcNoEngine, () => null, () => null);
+  const noEngine = (await ipcNoEngine.invoke("workflow-command", { type: "cancel_run", runId: "wf-run-x" })) as PixCommandResult;
+  const noEngineFailure = assertFailure(noEngine, "no engine -> run_not_found");
+  assertEqual(noEngineFailure.code, "run_not_found", "no engine fails with run_not_found");
 });
 
 await run("event forwarding: baseline snapshot, live upserts, unsubscribe stops", async () => {
@@ -289,7 +336,7 @@ await run("command-time re-sync pushes a snapshot before get_snapshot", async ()
   );
 
   const ipc = new FakeIpcMain();
-  registerWorkflowIpcHandlers(ipc, () => recorder);
+  registerWorkflowIpcHandlers(ipc, () => recorder, () => new FakeEngine());
   await ipc.invoke("workflow-command", { type: "get_snapshot" });
 
   // Baseline subscribe sync + command-time re-sync.

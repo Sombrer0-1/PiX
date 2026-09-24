@@ -941,8 +941,44 @@ describe("transcript channel", () => {
 
     expect(store.transcripts["task-1"]?.liveEvents.map((entry) => entry.seq)).toEqual([0, 2]);
     expect(store.transcripts["task-2"]?.liveEvents.map((entry) => entry.seq)).toEqual([1]);
-    // 初始 consumedSeq 为 0(未消费)。
-    expect(store.transcripts["task-1"]?.consumedSeq).toBe(0);
+    // 初始 per-item 游标为空(未消费)。
+    expect(store.transcripts["task-1"]?.consumedSeqByItem).toEqual({});
+  });
+
+  it("chain 双 item 交错事件:per-item 游标互不吞没(切换 item 后另一 item 仍可消费)", () => {
+    const store = useAgentTaskStore();
+    store.subscribeToEvents();
+
+    // 同一 chain 任务两个 item 的直播事件按 seq 交错到达。
+    emit({ type: "task_transcript", taskId: "task-1", itemIndex: 0, event: { type: "turn_start" } });
+    emit({ type: "task_transcript", taskId: "task-1", itemIndex: 1, event: { type: "turn_start" } });
+    emit({ type: "task_transcript", taskId: "task-1", itemIndex: 0, event: { type: "turn_end", message: { role: "assistant", content: "a" }, toolResults: [] } });
+    emit({ type: "task_transcript", taskId: "task-1", itemIndex: 1, event: { type: "turn_end", message: { role: "assistant", content: "b" }, toolResults: [] } });
+
+    const state = store.transcripts["task-1"];
+    expect(state?.liveEvents.map((entry) => [entry.itemIndex, entry.seq])).toEqual([
+      [0, 0],
+      [1, 1],
+      [0, 2],
+      [1, 3],
+    ]);
+    if (!state) throw new Error("missing transcript state");
+
+    // 模拟 item 0 视图的消费(TaskTranscriptView.consumeLiveEvents 语义):
+    // 只应用 itemIndex 匹配的事件,只推进该 item 自己的游标。
+    const cursor = state.consumedSeqByItem[0] ?? 0;
+    for (const entry of state.liveEvents) {
+      if (entry.itemIndex !== 0) continue;
+      if (entry.seq <= cursor) continue;
+      state.consumedSeqByItem[0] = entry.seq;
+    }
+    expect(state.consumedSeqByItem[0]).toBe(2);
+
+    // item 1 的事件仍可消费:其游标仍低于它们的 seq(旧的单游标语义会被 item 0
+    // 推到 2,永久跳过 seq 1)。
+    const cursor1 = state.consumedSeqByItem[1] ?? 0;
+    const consumable = state.liveEvents.filter((entry) => entry.itemIndex === 1 && entry.seq > cursor1);
+    expect(consumable.map((entry) => entry.seq)).toEqual([1, 3]);
   });
 
   it("caps the live ring at 4000 (drop oldest, liveDropped=true)", () => {

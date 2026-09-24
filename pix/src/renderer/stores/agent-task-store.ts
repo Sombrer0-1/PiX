@@ -36,7 +36,7 @@
  * TaskDetailPanel owns the write side (watchTask/unwatchTask); TaskTranscriptView
  * owns the read side: it loads transcript pages through loadTranscriptPage,
  * refolds the full entries array and consumes unconsumed live events by
- * advancing consumedSeq. A terminal task_state while watched clears the local
+ * advancing the per-item cursor consumedSeqByItem. A terminal task_state while watched clears the local
  * flag (the panel still sends unwatch_task on unmount - idempotent double
  * insurance; main already stopped forwarding at terminal).
  *
@@ -90,9 +90,10 @@ const TRANSCRIPT_LIVE_EVENTS_LIMIT = 4000;
  * Per-task transcript buffer (Plan 4.8, S5). byItem accumulates the full
  * disk-replay entries page by page (never incrementally appended - the view
  * refolds the whole array through assembler.loadEntries); liveEvents is the
- * per-task ring of task_transcript pushes with a monotonic seq. consumedSeq is
- * the view-side consumption cursor: the view advances it (filtered by
- * itemIndex) and the store only appends.
+ * per-task ring of task_transcript pushes with a monotonic seq. consumedSeqByItem
+ * is the per-item consumption cursor: the view advances the entry of the item it
+ * renders (chain 多 item 的 seq 相互交错，单游标会永久跳过其它 item 的事件) and
+ * the store only appends.
  */
 export interface TaskTranscriptState {
   byItem: Record<
@@ -110,8 +111,8 @@ export interface TaskTranscriptState {
   liveEvents: Array<{ seq: number; itemIndex: number; event: AgentSessionEvent }>;
   liveDropped: boolean;
   watched: boolean;
-  /** 消费游标:已被视图确认消费的最大 seq(视图按 itemIndex 过滤后推进)。 */
-  consumedSeq: number;
+  /** per-item 消费游标:已被视图确认消费的最大 seq(视图只推进当前 item 的条目)。 */
+  consumedSeqByItem: Record<number, number>;
 }
 
 export const useAgentTaskStore = defineStore("agent-task", () => {
@@ -642,7 +643,7 @@ export const useAgentTaskStore = defineStore("agent-task", () => {
         liveEvents: [],
         liveDropped: false,
         watched: false,
-        consumedSeq: 0,
+        consumedSeqByItem: {},
       };
       transcripts.value = { ...transcripts.value, [taskId]: state };
     }

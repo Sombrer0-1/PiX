@@ -863,6 +863,51 @@ describe("thinking blocks (PiX 1.5)", () => {
     expect(thinking[0].superseded).toBe(false);
   });
 
+  it("backfills the full thinking segment from the snapshot on a mid-join delta (中途加入快照回填)", () => {
+    const a = createDisplayBlockAssembler();
+    // Mid-join mount: "12345" streamed before the view attached, so the first
+    // event it sees carries only delta "67890" while the message_update
+    // snapshot holds the cumulative segment "1234567890".
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: [thinkingBlock("1234567890")], timestamp: 2 }),
+      { type: "thinking_delta", contentIndex: 0, delta: "67890" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe("1234567890");
+  });
+
+  it("is a clean no-op when the snapshot carries no thinking segment (快照无 thinking 段)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));
+    // contentIndex 0 命中的是 text 段:不采用、不回落兜底,纯追加 delta。
+    a.applyEvent(updateWithAme(
+      makeMessage({ role: "assistant", content: textBlocks("正文"), timestamp: 2 }),
+      { type: "thinking_delta", contentIndex: 0, delta: "纯追加" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe("纯追加");
+  });
+
+  it("does not adopt a multi-segment snapshot when the delta has no contentIndex (多段不兜底)", () => {
+    const a = createDisplayBlockAssembler();
+    a.applyEvent(updateWithAme(
+      makeMessage({
+        role: "assistant",
+        content: [thinkingBlock("第一段"), thinkingBlock("第二段")],
+        timestamp: 2,
+      }),
+      { type: "thinking_delta", delta: "追加" },
+    ));
+
+    const thinking = a.blocks.filter(isThinking);
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe("追加");
+  });
+
   it("marks the block ended on thinking_end and supersedes it on the first text (thinking_end 后 supersede)", () => {
     const a = createDisplayBlockAssembler();
     a.applyEvent(msgStart(makeMessage({ role: "user", content: "hi", timestamp: 1 })));

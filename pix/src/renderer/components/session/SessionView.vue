@@ -60,6 +60,26 @@ function argsSummary(args: unknown): string {
   return truncate(compactWhitespace(JSON.stringify(value)), 110);
 }
 
+/** todo_write 的折叠行摘要：清单进度一行（args.todos 是全量替换载荷）。 */
+function todoWritePreview(args: unknown): string {
+  if (typeof args !== "object" || args === null || !Array.isArray((args as { todos?: unknown }).todos)) {
+    return "";
+  }
+  const todos = (args as { todos: unknown[] }).todos.filter(
+    (item): item is { status: string } =>
+      typeof item === "object" && item !== null && typeof (item as { status?: unknown }).status === "string",
+  );
+  if (todos.length === 0) return "清单已清空";
+  const completed = todos.filter((item) => item.status === "completed").length;
+  return completed === todos.length ? `全部完成 (${completed}/${todos.length})` : `清单 ${completed}/${todos.length} 完成`;
+}
+
+/** 工具行折叠摘要入口：todo_write 走清单进度，其余走通用参数摘要。 */
+function previewSummary(tool: ToolWorkItem): string {
+  if (tool.toolName === "todo_write") return todoWritePreview(tool.args);
+  return argsSummary(tool.args);
+}
+
 interface DiffSummary {
   added: number;
   removed: number;
@@ -481,7 +501,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
               <button class="ws-tool-header" @click="toggleTool(block.id, tool.toolCallId)">
                 <span class="ws-tool-dot" :class="tool.isError ? 'err' : 'ok'"></span>
                 <span class="ws-tool-name">{{ tool.toolName || 'task' }}</span>
-                <span v-if="tool.args" class="ws-tool-preview">{{ argsSummary(tool.args) }}</span>
+                <span v-if="tool.args" class="ws-tool-preview">{{ previewSummary(tool) }}</span>
                 <span v-else-if="tool.result !== null" class="ws-tool-preview">{{ resultPreview(tool.result) }}</span>
                 <span v-if="hasDiff(toolDiff(tool))" class="ws-tool-diff">
                   <span class="diff-added">+{{ toolDiff(tool).added }}</span>

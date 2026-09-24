@@ -49,6 +49,11 @@ import {
   subscribePlanEventForwarding,
 } from "./ipc-plan-adapters.js";
 import {
+  registerTodoIpcHandlers,
+  resyncTodoEventForwarding,
+  subscribeTodoEventForwarding,
+} from "./ipc-todo-adapters.js";
+import {
   registerWorkflowIpcHandlers,
   resyncWorkflowEventForwarding,
   subscribeWorkflowEventForwarding,
@@ -490,6 +495,7 @@ export function registerIpcHandlers(
       // plan command.
       resyncPlanEventForwarding();
       resyncWorkflowEventForwarding();
+      resyncTodoEventForwarding();
       return { success: true };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -504,6 +510,7 @@ export function registerIpcHandlers(
     }
     resyncPlanEventForwarding();
     resyncWorkflowEventForwarding();
+    resyncTodoEventForwarding();
     return { success: true };
   });
 
@@ -518,6 +525,7 @@ export function registerIpcHandlers(
       await singleSessionBridge.dispose();
       resyncPlanEventForwarding();
       resyncWorkflowEventForwarding();
+      resyncTodoEventForwarding();
       await teamLeaderSessionBridge.start(location, settingsStore.getAll());
       // TeamManager.initialize takes the borrowed leader context (S8); the
       // leader SessionBridge owns the backend and TeamManager never disposes it
@@ -691,11 +699,22 @@ export function registerIpcHandlers(
   registerPlanIpcHandlers(ipcMain, () => singleSessionBridge.getPlanController());
 
   // =========================================================================
+  // Todo Commands (R3; always routed through the singleSessionBridge
+  // TodoController of the current solo generation)
+  // =========================================================================
+
+  registerTodoIpcHandlers(ipcMain, () => singleSessionBridge.getTodoController());
+
+  // =========================================================================
   // Workflow Commands (PiX 1.4.3; recorder of the current solo generation,
   // design plan §3)
   // =========================================================================
 
-  registerWorkflowIpcHandlers(ipcMain, () => singleSessionBridge.getWorkflowRecorder());
+  registerWorkflowIpcHandlers(
+    ipcMain,
+    () => singleSessionBridge.getWorkflowRecorder(),
+    () => singleSessionBridge.getWorkflowEngine(),
+  );
 
   // =========================================================================
   // Agent Task Commands (PiX 1.4.1; app-level AgentTaskService, design plan §3)
@@ -1109,12 +1128,14 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       // session's plan (the re-sync pushes a fresh snapshot on change).
       resyncPlanEventForwarding();
       resyncWorkflowEventForwarding();
+      resyncTodoEventForwarding();
       return result;
     }
     case "fork": {
       const result = await bridge.fork(cmd.entryId, cmd.position ?? "before", cmd.label);
       resyncPlanEventForwarding();
       resyncWorkflowEventForwarding();
+      resyncTodoEventForwarding();
       return result;
     }
     case "navigate_tree": {
@@ -1126,12 +1147,14 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       });
       resyncPlanEventForwarding();
       resyncWorkflowEventForwarding();
+      resyncTodoEventForwarding();
       return result;
     }
     case "clone": {
       const result = await bridge.clone();
       resyncPlanEventForwarding();
       resyncWorkflowEventForwarding();
+      resyncTodoEventForwarding();
       return result;
     }
     case "get_last_assistant_text":
@@ -1165,6 +1188,7 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       // PlanController, so re-sync plan-event forwarding to it.
       resyncPlanEventForwarding();
       resyncWorkflowEventForwarding();
+      resyncTodoEventForwarding();
       return result;
     }
 
@@ -1366,6 +1390,21 @@ export function setupEventForwarding(
         return win && !win.isDestroyed() ? win.webContents : null;
       },
       () => singleSessionBridge.getPlanController(),
+    ),
+  );
+
+  // Forward TodoController events (R3) on the dedicated todo-event channel.
+  // Like the PlanController, each solo runtime generation owns its own
+  // TodoController, so the subscription is re-synced to the current instance
+  // (command-time hook + the session-switching and runtime start-stop paths
+  // via resyncTodoEventForwarding).
+  eventForwardingUnsubscribes.push(
+    subscribeTodoEventForwarding(
+      () => {
+        const win = getWin();
+        return win && !win.isDestroyed() ? win.webContents : null;
+      },
+      () => singleSessionBridge.getTodoController(),
     ),
   );
 
@@ -1724,3 +1763,11 @@ export {
   resyncWorkflowEventForwarding,
   subscribeWorkflowEventForwarding,
 } from "./ipc-workflow-adapters.js";
+
+export {
+  executeTodoCommand,
+  isTodoCommand,
+  registerTodoIpcHandlers,
+  resyncTodoEventForwarding,
+  subscribeTodoEventForwarding,
+} from "./ipc-todo-adapters.js";

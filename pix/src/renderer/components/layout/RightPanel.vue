@@ -7,15 +7,18 @@ import { useRouter } from "vue-router";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useProjectStore } from "../../stores/project-store";
 import { useTeamStore } from "../../stores/team-store";
+import { useTodoStore } from "../../stores/todo-store";
 import AgentTaskLauncher from "../agent-task/AgentTaskLauncher.vue";
 import TokenStats from "../status/TokenStats.vue";
 import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
 import GitWorkdirCard from "../git/GitWorkdirCard.vue";
+import TodoCard from "../todo/TodoCard.vue";
 import type { McpServerInfo } from "../../../shared/types";
 
 const rpc = useWorkspaceRpc();
 const projectStore = useProjectStore();
 const teamStore = useTeamStore();
+const todoStore = useTodoStore();
 
 // ---- Agent tasks ----
 /** WSL 项目隐藏 Shell 后台任务卡片；AgentTask 入口保留（1.4.1 §5.4）。 */
@@ -211,6 +214,10 @@ watch(() => teamStore.teamMode, () => {
     <!-- Git workdir card (project-level status; replaces the former session
          info cards in both solo and team modes). -->
     <GitWorkdirCard />
+
+    <!-- 任务清单卡（R3）：模型经 todo_write 写入、只读展示；空清单隐藏，
+         完成收尾后保留"全部完成"摘要行直到下一次写入。卡片自订阅。 -->
+    <TodoCard v-if="todoStore.hasVisibleContent && !teamStore.teamMode" />
 
     <!-- Goal card (normal mode only) -->
     <div v-if="goal && !teamStore.teamMode" class="info-card">

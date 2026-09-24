@@ -8,9 +8,9 @@
  * watch/unwatch 由父组件 TaskDetailPanel 持有,本组件不发送。
  *
  * 挂载:读 store.transcripts[taskId](无则 loadTranscriptPage)→ 组装器 loadEntries
- * (先 clear 再全量重折叠)→ 消费 liveEvents 中 seq > consumedSeq 且 itemIndex
- * 匹配的事件(推进 consumedSeq)→ applyEvent。直播接缝不重复由组装器两条去重规则
- * 保证(同一消息经磁盘+直播两路到达只折叠一次)。
+ * (先 clear 再全量重折叠)→ 消费 liveEvents 中当前 item 的事件(per-item 游标
+ * consumedSeqByItem,只推进该 item 的条目)→ applyEvent。直播接缝不重复由组装器
+ * 两条去重规则保证(同一消息经磁盘+直播两路到达只折叠一次)。
  *
  * 全量重放重建(以磁盘为真相):终态(task.status 转终态)或 liveDropped 或未消费
  * 事件被环形淘汰(seq <= 最旧保留 seq)时 loadTranscriptPage 后整体重折叠。
@@ -70,26 +70,33 @@ function refold(): void {
 }
 
 /**
- * 消费 liveEvents 中 seq > consumedSeq 且 itemIndex 匹配的事件(推进
- * consumedSeq)→ applyEvent。非匹配 item 的事件保留,待该 item 视图消费。
- * 消费后检查环形淘汰(seq <= 最旧保留 seq)→ 全量重放重建。
+ * 消费 liveEvents 中当前 item 的事件:读取该 item 自己的游标
+ * consumedSeqByItem[activeItemIndex](缺省 0),只对 itemIndex 匹配且
+ * seq > 游标的事件 applyEvent 并写回该 item 的游标。非匹配 item 的事件保留,
+ * 待该 item 的视图消费(chain 多 item 的 seq 相互交错,单游标会永久跳过其它
+ * item 的事件)。消费后检查环形淘汰 → 全量重放重建。
  */
 function consumeLiveEvents(): void {
   const state = transcriptState.value;
   if (!state) return;
+  const item = activeItemIndex.value;
+  const cursor = state.consumedSeqByItem[item] ?? 0;
   for (const entry of state.liveEvents) {
-    if (entry.seq <= state.consumedSeq) continue;
-    if (entry.itemIndex !== activeItemIndex.value) continue;
+    if (entry.itemIndex !== item) continue;
+    if (entry.seq <= cursor) continue;
     assembler.applyEvent(entry.event);
-    state.consumedSeq = entry.seq;
+    state.consumedSeqByItem[item] = entry.seq;
   }
 }
 
-/** 未消费事件被环形淘汰:liveEvents[0].seq 与 consumedSeq 间出现空洞。 */
+/** 未消费事件被环形淘汰:该 item 保留的最老 seq 与其游标间出现空洞。只看当前
+ * item 的保留事件(全局 liveEvents[0] 会因其它 item 的交错 seq 持续误报)。 */
 function hasEvictionGap(): boolean {
   const state = transcriptState.value;
   if (!state || state.liveEvents.length === 0) return false;
-  return state.liveEvents[0].seq > state.consumedSeq + 1;
+  const cursor = state.consumedSeqByItem[activeItemIndex.value] ?? 0;
+  const first = state.liveEvents.find((entry) => entry.itemIndex === activeItemIndex.value);
+  return first !== undefined && first.seq > cursor + 1;
 }
 
 let rebuilding = false;

@@ -37,10 +37,12 @@ import type {
   PlanStep,
   PixCommandResult,
 } from "@shared/types.js";
+import type { TodoEvent } from "@shared/todo-types.js";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import PlanModeToggle from "../components/plan/PlanModeToggle.vue";
 import PlanCard from "../components/plan/PlanCard.vue";
 import PlanStepCard from "../components/plan/PlanStepCard.vue";
+import { useTodoStore } from "../stores/todo-store";
 
 // ============================================================================
 // Mocks (module-level, hoisted)
@@ -51,6 +53,7 @@ const rpcMock = vi.hoisted(() => ({
     sessionState: { value: null },
     isConnected: { value: true },
     isStreaming: { value: false },
+    stopRequested: { value: false },
     executionEnvironment: { value: null },
     commands: { value: [] as Array<{ name: string }> },
     availableModels: { value: [] as Array<{ provider: string; id: string }> },
@@ -113,6 +116,7 @@ vi.mock("../composables/useWorkspaceRpc", () => ({
     sessionState: rpcMock.state.sessionState,
     isConnected: rpcMock.state.isConnected,
     isStreaming: rpcMock.state.isStreaming,
+    stopRequested: rpcMock.state.stopRequested,
     executionEnvironment: rpcMock.state.executionEnvironment,
     commands: rpcMock.state.commands,
     availableModels: rpcMock.state.availableModels,
@@ -246,12 +250,15 @@ let sendPlanCommand: ReturnType<typeof vi.fn>;
 let onPlanEvent: ReturnType<typeof vi.fn>;
 let sendWorkflowCommand: ReturnType<typeof vi.fn>;
 let onWorkflowEvent: ReturnType<typeof vi.fn>;
+let onTodoEvent: ReturnType<typeof vi.fn>;
 let selectChatFiles: ReturnType<typeof vi.fn>;
 let planEventCallback: ((event: PlanEvent) => void) | null;
+let todoEventCallback: ((event: TodoEvent) => void) | null;
 let wrapper: ReturnType<typeof mount> | undefined;
 
 function installPixApiMock(): void {
   planEventCallback = null;
+  todoEventCallback = null;
   sendPlanCommand = vi.fn().mockResolvedValue({ success: true });
   onPlanEvent = vi.fn((callback: (event: PlanEvent) => void) => {
     planEventCallback = callback;
@@ -259,12 +266,18 @@ function installPixApiMock(): void {
   });
   sendWorkflowCommand = vi.fn().mockResolvedValue({ success: true, data: [] });
   onWorkflowEvent = vi.fn(() => () => {});
+  onTodoEvent = vi.fn((callback: (event: TodoEvent) => void) => {
+    todoEventCallback = callback;
+    return () => {};
+  });
   selectChatFiles = vi.fn().mockResolvedValue([]);
   window.pixApi = {
     sendPlanCommand,
     onPlanEvent,
     sendWorkflowCommand,
     onWorkflowEvent,
+    sendTodoCommand: vi.fn().mockResolvedValue({ success: true }),
+    onTodoEvent,
     selectChatFiles,
   } as unknown as PixApi;
 }
@@ -408,6 +421,36 @@ describe("real mount", () => {
     expect(w.find('[data-test="plan-panel"]').exists()).toBe(true);
     // Collapsed to the summary row, whose status badge stays readable.
     expect(w.get('[data-test="plan-status"]').text()).toBe("已取消");
+  });
+
+  it("subscribes the todo mirror at mount so todo_state reaches the store while the card is not mounted", async () => {
+    // Regression (R3): the TodoCard is v-if'ed on hasVisibleContent (initially
+    // false) and must not own the todo subscription - a card-owned subscription
+    // never attaches, the first todo_state is lost and the card never appears.
+    // CenterPanel owns the subscription (plan/workflow mirror pattern).
+    const w = await mountAndFlush();
+    const todoStore = useTodoStore();
+
+    expect(onTodoEvent).toHaveBeenCalledTimes(1);
+    expect(todoStore.hasVisibleContent).toBe(false);
+
+    todoEventCallback?.({
+      type: "todo_state",
+      snapshot: {
+        sessionId: "s1",
+        items: [
+          { content: "Inspect the module", status: "completed" },
+          { content: "Run tests", status: "in_progress", activeForm: "Running tests" },
+          { content: "Update docs", status: "pending" },
+        ],
+        updatedAt: 1,
+      },
+    });
+    await flushPromises();
+
+    expect(todoStore.items).toHaveLength(3);
+    expect(todoStore.completedCount).toBe(1);
+    expect(todoStore.hasVisibleContent).toBe(true);
   });
 });
 

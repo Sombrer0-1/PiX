@@ -76,6 +76,23 @@ const status = computed<WorkflowRunStatus>(() => {
   return view.value?.status ?? (props.isError ? "failed" : "running");
 });
 
+/** Backgrounded running run (R4): the handle result carries no frozen view,
+ *  so the store's live view drives the panel; only those runs offer a stop
+ *  entry in the first version (foreground runs keep the main stop button).
+ *  engine.cancel is idempotent, so the gating here is purely about not
+ *  changing the foreground interaction. */
+const backgroundedRunId = computed<string | null>(() => {
+  if (status.value !== "running") return null;
+  if (details.value !== null && details.value.view !== undefined) return null;
+  return view.value?.runId ?? null;
+});
+
+function stopRun(): void {
+  const runId = backgroundedRunId.value;
+  if (runId === null) return;
+  void workflowStore.cancelRun(runId);
+}
+
 // ── Labels and formatting ──
 
 const STATUS_LABELS: Record<WorkflowRunStatus, string> = {
@@ -213,22 +230,35 @@ function jumpToTask(childId: string): void {
 
     <!-- Folded view: status-driven disclosure -->
     <template v-else>
-      <button
-        type="button"
-        class="wfp-header"
-        :aria-expanded="bodyOpen"
-        @click="expanded = !expanded"
-      >
-        <span class="wfp-icon" aria-hidden="true">
-          <span v-if="status === 'running'" class="spinner"></span>
-          <span v-else class="wfp-dot" :class="statusClass(status)"></span>
-        </span>
-        <span class="wfp-title">{{ displayName }}</span>
-        <span class="wfp-status" :class="status" data-test="wfp-status">{{ statusLabel(status) }}</span>
-        <span v-if="currentPhase && status === 'running'" class="wfp-count">{{ currentPhase }}</span>
-        <span v-if="memberCount > 0" class="wfp-count">{{ memberCount }} 个子任务</span>
-        <span class="wfp-toggle" data-test="wfp-toggle">{{ bodyOpen ? "收起" : "展开" }}</span>
-      </button>
+      <div class="wfp-header-row">
+        <button
+          type="button"
+          class="wfp-header"
+          :aria-expanded="bodyOpen"
+          @click="expanded = !expanded"
+        >
+          <span class="wfp-icon" aria-hidden="true">
+            <span v-if="status === 'running'" class="spinner"></span>
+            <span v-else class="wfp-dot" :class="statusClass(status)"></span>
+          </span>
+          <span class="wfp-title">{{ displayName }}</span>
+          <span class="wfp-status" :class="status" data-test="wfp-status">{{ statusLabel(status) }}</span>
+          <span v-if="currentPhase && status === 'running'" class="wfp-count">{{ currentPhase }}</span>
+          <span v-if="memberCount > 0" class="wfp-count">{{ memberCount }} 个子任务</span>
+          <span class="wfp-toggle" data-test="wfp-toggle">{{ bodyOpen ? "收起" : "展开" }}</span>
+        </button>
+        <button
+          v-if="backgroundedRunId !== null"
+          type="button"
+          class="wfp-stop-btn"
+          data-test="wfp-stop-run"
+          title="停止运行"
+          aria-label="停止运行"
+          @click="stopRun"
+        >
+          <v-icon icon="mdi-stop-circle-outline" size="16" aria-hidden="true" />
+        </button>
+      </div>
 
       <div v-if="bodyOpen" class="wfp-body">
         <div v-if="currentPhase" class="wfp-current-phase">当前阶段：{{ currentPhase }}</div>
@@ -339,6 +369,18 @@ function jumpToTask(childId: string): void {
 }
 
 /* ── Header / fallback row ── */
+.wfp-header-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.wfp-header-row .wfp-header {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
 .wfp-header {
   display: flex;
   align-items: center;
@@ -427,6 +469,29 @@ button.wfp-header:hover {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-secondary);
   font-weight: var(--pix-weight-medium);
+}
+
+/* Stop entry for a backgrounded running run (R4); the disclosure button
+ * stays the row's primary action, this sits beside it. */
+.wfp-stop-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  margin-right: 6px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-sm);
+  background: var(--pix-bg-content);
+  color: var(--pix-text-secondary);
+  cursor: pointer;
+}
+
+.wfp-stop-btn:hover {
+  background: var(--pix-error-light);
+  border-color: var(--pix-error-light);
+  color: var(--pix-error);
 }
 
 /* ── Body ── */

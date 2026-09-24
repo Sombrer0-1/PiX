@@ -131,6 +131,10 @@ class FakeEngine extends WorkflowEngine {
     throw new Error("unused in recorder tests");
   }
 
+  cancel(): boolean {
+    return false;
+  }
+
   disposeAll(): Promise<void> {
     return Promise.resolve();
   }

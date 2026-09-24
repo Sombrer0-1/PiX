@@ -24,27 +24,37 @@ import {
   type WorkflowEvent,
   type WorkflowViewState,
 } from "../shared/workflow-types.js";
+import type { WorkflowEngine } from "./workflow/engine/engine.js";
 import type { WorkflowRecorder } from "./workflow/recorder.js";
 import type { IpcMainLike, WebContentsLike } from "./ipc-plan-adapters.js";
 
 /**
- * Dispatch one WorkflowCommand against the current generation's recorder.
- * The only valid command is get_snapshot. With no recorder (no active solo
- * generation) an empty snapshot is a legitimate state, not an error
- * (design plan §4.9: get_snapshot -> recorder.getSnapshot(); no generation
- * -> []).
+ * Dispatch one WorkflowCommand against the current generation's recorder and
+ * engine (both read from one generation snapshot by the caller). get_snapshot
+ * with no recorder (no active solo generation) returns an empty snapshot — a
+ * legitimate state, not an error (design plan §4.9). cancel_run (R4) cancels
+ * through the engine's live-run registry: a miss (terminal or unknown run, or
+ * no engine) fails with run_not_found.
  */
 export async function executeWorkflowCommand(
   recorder: WorkflowRecorder | null,
+  engine: WorkflowEngine | null,
   cmd: WorkflowCommand,
 ): Promise<PixCommandResult<WorkflowViewState[]>> {
-  if (!recorder) {
-    return { success: true, data: [] };
-  }
   try {
     switch (cmd.type) {
       case "get_snapshot":
-        return { success: true, data: recorder.getSnapshot() };
+        return { success: true, data: recorder ? recorder.getSnapshot() : [] };
+      case "cancel_run": {
+        if (!engine || !engine.cancel(cmd.runId, "cancelled_by_user")) {
+          return {
+            success: false,
+            code: "run_not_found",
+            error: `No live workflow run to cancel: ${cmd.runId}`,
+          };
+        }
+        return { success: true, data: recorder ? recorder.getSnapshot() : [] };
+      }
       default:
         return {
           success: false,
@@ -60,11 +70,15 @@ export async function executeWorkflowCommand(
 /**
  * Register the workflow-command handler on an injectable ipcMain adapter.
  * Production passes the real ipcMain; workflow-ipc.test.ts passes a fake
- * adapter.
+ * adapter. The recorder and engine getters are read back to back (one
+ * synchronous generation snapshot: a session switch cannot interleave between
+ * the two reads), so cancel_run always dispatches against the generation whose
+ * recorder supplies the returned snapshot.
  */
 export function registerWorkflowIpcHandlers(
   ipc: IpcMainLike,
   getRecorder: () => WorkflowRecorder | null,
+  getEngine: () => WorkflowEngine | null,
 ): void {
   ipc.handle("workflow-command", async (_event: unknown, command: unknown) => {
     // Re-sync the workflow-event forwarding subscription before every
@@ -78,7 +92,7 @@ export function registerWorkflowIpcHandlers(
         error: `Invalid workflow command: ${JSON.stringify(command)}`,
       };
     }
-    return await executeWorkflowCommand(getRecorder(), command);
+    return await executeWorkflowCommand(getRecorder(), getEngine(), command);
   });
 }
 

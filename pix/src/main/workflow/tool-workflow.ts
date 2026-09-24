@@ -18,6 +18,12 @@
  *   as the CustomEntry path) so live and restored views agree; the terminal
  *   stopReason is overlaid because the fold only learns it when finish()
  *   appends the run-end record, after this tool's result is computed.
+ * - run_in_background (R4): the foreground path is unchanged; a background
+ *   run starts without the parent signal or abort bridge, the call returns a
+ *   backgrounded handle immediately (details carry NO frozen view so the
+ *   panel follows the recorder's live store view), and a detached closure
+ *   disposes + finishes the record and delivers an internal workflow-result
+ *   notification - a delivery failure on a dead session is swallowed.
  */
 
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
@@ -37,6 +43,8 @@ import type {
   WorkflowToolDetails,
   WorkflowViewState,
 } from "../../shared/workflow-types.js";
+import { formatInternalNotification } from "../../shared/internal-notification.js";
+import type { InternalNotification } from "../../shared/internal-notification.js";
 // The seam vocabulary this tool depends on (S1): the engine abstraction.
 // Start-time failures propagate untouched - classification is the worker
 // combinators' job, not the tool's.
@@ -50,6 +58,10 @@ export interface WorkflowToolHost {
   recorder: WorkflowRecorder;
   /** Parent session for the tool call; throws when no session is active. */
   getParentRef(toolCallId: string): WorkflowParentRef;
+  /** Deliver a completed background run's internal notification to the parent
+   * session (R4); rejects when the target session is no longer live (the
+   * detached caller swallows the rejection). */
+  deliverNotification(notification: InternalNotification): Promise<void>;
 }
 
 /** Rendered-result ceiling: a longer output is truncated with a notice. */
@@ -113,6 +125,13 @@ const WorkflowParams = Type.Object({
       },
     ),
   ),
+  run_in_background: Type.Optional(
+    Type.Boolean({
+      default: false,
+      description:
+        "Set true to run the workflow in the background and return immediately; you will be notified automatically when it completes. Choose background when you have independent work to do in parallel (or when the user asks for background execution); choose foreground when you need the results before you can continue. Do not guess from expected duration alone, and never sleep or poll while waiting.",
+    }),
+  ),
 });
 
 type WorkflowParamsStatic = Static<typeof WorkflowParams>;
@@ -148,7 +167,7 @@ const DESCRIPTION = [
   "",
   "Misused hooks (bad arguments, unknown options, unsupported schemas, tripped caps) throw errors that ALWAYS kill the script - they never dissolve into a per-item `null`.",
   "",
-  "Constraints: concurrency and total-agent caps apply; no filesystem, network, timers, or Node.js APIs are provided - the agents do the work, the script only coordinates them. The run executes in the foreground: this call returns when the whole script finishes. A parent abort or a tripped total-agent cap cancels in-flight children and this tool throws; there is no separate per-child wall-clock timeout (bound a child with maxTurns).",
+  "Constraints: concurrency and total-agent caps apply; no filesystem, network, timers, or Node.js APIs are provided - the agents do the work, the script only coordinates them. The run executes in the foreground by default: this call returns when the whole script finishes, and a parent abort or a tripped total-agent cap cancels in-flight children and this tool throws. With run_in_background: true the run detaches - this call returns a backgrounded handle immediately, the completion arrives later as an internal workflow-result notification (do not sleep, poll, or relaunch it), and a background run lives only for the current session: any session switch or close cancels it. There is no separate per-child wall-clock timeout (bound a child with maxTurns).",
 ].join("\n");
 
 function textContent(text: string): TextContent {
@@ -529,13 +548,37 @@ function completedDetails(
   };
 }
 
+/** Fixed handle message for a backgrounded run (R4). */
+const BACKGROUND_HANDLE_MESSAGE =
+  "The workflow is running in the background. You will be notified automatically when it completes — do not sleep, poll, or relaunch it.";
+
+/**
+ * Internal workflow-result notification for one settled background run (R4):
+ * the rendered envelope bounded by MAX_RESULT_CHARS plus the terminal status
+ * and error; completed / failed / cancelled all take this same path.
+ */
+function buildWorkflowNotification(run: WorkflowRun, result: WorkflowResult): InternalNotification {
+  return {
+    notificationId: `workflow-result:${run.id}`,
+    source: "workflow",
+    kind: "workflow-result",
+    taskId: run.id,
+    groupId: run.id,
+    status: result.stopReason,
+    result: renderResult(run.id, run.meta.name, result, MAX_RESULT_CHARS),
+    ...(result.error !== undefined ? { error: result.error } : {}),
+  };
+}
+
 /**
  * Create the `workflow` ToolDefinition bound to the host seam (design plan
  * section 4.7). The execute lifecycle is shared with the ralph tool: parent
  * ref, start (synchronous failures throw), recorder.start, abort bridge,
  * observe-only event updates, await result, dispose + finish with abandon as
  * the fallback, and a salvage-envelope throw for every non-"completed" stop
- * reason after that teardown.
+ * reason after that teardown. run_in_background (R4) short-circuits after
+ * recorder.start into a backgrounded handle plus a detached teardown and
+ * notification closure.
  */
 export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefinition<typeof WorkflowParams, WorkflowToolDetails> {
   return {
@@ -547,6 +590,7 @@ export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefini
       "Use the workflow tool ONLY when the user explicitly asks for multi-subagent orchestration: you write a JavaScript script that fans work out across many subagents with phases and structured results.",
       "For one or two delegations, prefer the agent tool.",
       "Ralph is a separate tool; use it only when the user explicitly asks for fresh-agent iteration.",
+      "run_in_background defaults to false (foreground: you need the results before you can continue). Choose background when you have genuinely independent work to do in parallel or the user asks for background execution; the completion arrives as an internal workflow-result notification - do not sleep, poll, or relaunch it, and remember any session switch or close cancels a background run.",
       "Keep each child prompt and schema small; split heavy reports across stages or extra agent() calls. Filter nulls and compare counts before treating the return value as complete.",
       "opts.schema must be object-rooted: every node including the root needs an explicit type; enum/const/oneOf cannot stand alone.",
       "opts.provider is an agent definition name (general-purpose, ...), not an LLM vendor. opts.model is the model id. Omit provider to use the run default.",
@@ -563,12 +607,16 @@ export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefini
       // Missing parent session: the host throws and the failure surfaces as
       // an isError result.
       const parent = host.getParentRef(toolCallId);
+      const runInBackground = params.run_in_background === true;
       const request: WorkflowStartRequest = {
         script: params.script,
         meta: params.meta,
         ...(params.args !== undefined ? { args: params.args } : {}),
         parent,
-        signal,
+        // A background run must survive this tool call: the parent signal
+        // enters the engine directly, so it is dropped for background runs
+        // (the abort bridge below is skipped for the same reason).
+        signal: runInBackground ? undefined : signal,
       };
       // Bridge the tool's abort signal onto the run with the plan-locked
       // reason. The listener registers BEFORE engine.start so it fires ahead
@@ -576,12 +624,14 @@ export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefini
       // and this ordering is what makes "parent step aborted" the effective
       // reason instead of the engine's generic one. The signal also enters
       // the engine directly as a safety net for implementations that would
-      // ignore a bridged cancel.
+      // ignore a bridged cancel. Foreground only (R4).
       let startedRun: WorkflowRun | undefined;
       const onAbort = (): void => {
         startedRun?.cancel("parent step aborted");
       };
-      signal?.addEventListener("abort", onAbort, { once: true });
+      if (!runInBackground) {
+        signal?.addEventListener("abort", onAbort, { once: true });
+      }
       // Meta/body validation failures (META_INVALID / SCRIPT_PARSE /
       // INVALID_ARGUMENT) throw synchronously before any run is published;
       // the agent loop turns the throw into an isError result and the model
@@ -590,13 +640,57 @@ export function createWorkflowToolDefinition(host: WorkflowToolHost): ToolDefini
       try {
         run = host.engine.start(request);
       } catch (error) {
-        signal?.removeEventListener("abort", onAbort);
+        if (!runInBackground) {
+          signal?.removeEventListener("abort", onAbort);
+        }
         throw error;
       }
       startedRun = run;
 
       // Publish the durable run record and subscribe the live fold.
       host.recorder.start(run, toolCallId, WORKFLOW_TOOL_NAME);
+
+      if (runInBackground) {
+        // Background handle (R4): the call returns immediately. No abort
+        // listener and no live onUpdate subscription (the tool result is
+        // final here; recorder -> workflow-event -> workflow-store keeps the
+        // panel live), and the details carry NO frozen view so the panel
+        // follows the store's live fold instead of a snapshot frozen at the
+        // backgrounding moment.
+        const handleText = [
+          `<workflow-result workflow-id="${escapeXml(run.id)}" workflow="${escapeXml(run.meta.name)}" status="backgrounded" requires-action="false">`,
+          `<result>${escapeXml(BACKGROUND_HANDLE_MESSAGE)}</result>`,
+          "</workflow-result>",
+        ].join("");
+        const handleDetails: WorkflowToolDetails = {
+          kind: "pix-workflow-run",
+          schemaVersion: WORKFLOW_RECORD_SCHEMA_VERSION,
+          view: undefined,
+          value: null,
+          agentsStarted: 0,
+        };
+        // Detached teardown + delivery (fire-and-forget), mirroring the
+        // foreground finally ordering: dispose, then finish (abandon as the
+        // pre-finish fallback). run.result never rejects by contract; a
+        // contract-violating engine still ends in abandon. A delivery
+        // rejection (target session no longer live) is swallowed: a
+        // background run may outlive its session.
+        void (async () => {
+          try {
+            const settled = await run.result;
+            try {
+              await run.dispose();
+            } catch {
+              // Bounded teardown: disposeAll joins the same memoized cancel.
+            }
+            host.recorder.finish(run.id, settled.stopReason);
+            await host.deliverNotification(buildWorkflowNotification(run, settled)).catch(() => {});
+          } catch {
+            host.recorder.abandon(run.id);
+          }
+        })();
+        return { content: [textContent(handleText)], details: handleDetails };
+      }
 
       let unsubscribes: Array<() => void> = [];
       let result: WorkflowResult | undefined;

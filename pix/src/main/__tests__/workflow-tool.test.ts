@@ -44,6 +44,8 @@ import type {
   WorkflowToolDetails,
   WorkflowViewState,
 } from "../../shared/workflow-types.js";
+import { formatInternalNotification } from "../../shared/internal-notification.js";
+import type { InternalNotification } from "../../shared/internal-notification.js";
 
 /** Mirrors the unexported truncation notice in tool-workflow.ts / tool-ralph.ts. */
 const TRUNCATION_NOTICE = "\n… [truncated]";
@@ -225,6 +227,10 @@ class FakeEngine extends WorkflowEngine {
     this.emit(name, ...args);
   }
 
+  cancel(): boolean {
+    return false;
+  }
+
   disposeAll(): Promise<void> {
     return Promise.resolve();
   }
@@ -317,11 +323,13 @@ interface Harness {
   engine: FakeEngine;
   recorder: FakeRecorder;
   parentRef: WorkflowParentRef;
+  delivered: InternalNotification[];
 }
 
 function makeHarness(options?: { getParentRef?: (toolCallId: string) => WorkflowParentRef }): Harness {
   const engine = new FakeEngine();
   const recorder = new FakeRecorder(engine);
+  const delivered: InternalNotification[] = [];
   const parentRef: WorkflowParentRef = {
     sessionId: "session-1",
     toolCallId: "call-1",
@@ -329,8 +337,15 @@ function makeHarness(options?: { getParentRef?: (toolCallId: string) => Workflow
     getSubmissionContext: () => ({}) as AgentTaskSubmissionContext,
   };
   const getParentRef = options?.getParentRef ?? (() => parentRef);
-  const tool = createWorkflowToolDefinition({ engine, recorder, getParentRef });
-  return { tool, engine, recorder, parentRef };
+  const tool = createWorkflowToolDefinition({
+    engine,
+    recorder,
+    getParentRef,
+    deliverNotification: async (notification) => {
+      delivered.push(notification);
+    },
+  });
+  return { tool, engine, recorder, parentRef, delivered };
 }
 
 function executeTool(
@@ -361,7 +376,15 @@ function makeRalphHarness(config?: RalphToolConfig): RalphHarness {
     workspaceId: "ws-test",
     getSubmissionContext: () => ({}) as AgentTaskSubmissionContext,
   };
-  const tool = createRalphToolDefinition({ engine, recorder, getParentRef: () => parentRef }, config);
+  const tool = createRalphToolDefinition(
+    {
+      engine,
+      recorder,
+      getParentRef: () => parentRef,
+      deliverNotification: async () => {},
+    },
+    config,
+  );
   return { tool, engine, recorder, parentRef };
 }
 
@@ -622,6 +645,91 @@ await run("abort signal cancels the run once with parent step aborted", async ()
   assert(text.includes('status="cancelled"'), "aborted envelope status");
   assert(text.includes("workflow run was cancelled (parent step aborted)"), "the run reports the parent-step-aborted reason");
   assertJson(h.recorder.finishes, [{ runId: run.id, stopReason: "cancelled" }], "finish records cancelled");
+});
+
+await run("run_in_background returns a backgrounded handle detached from the abort signal", async () => {
+  const h = makeHarness();
+  const controller = new AbortController();
+  const updates: AgentToolResult<WorkflowToolDetails>[] = [];
+  const result = await executeTool(
+    h.tool,
+    { script: SCRIPT, meta: META, run_in_background: true },
+    controller.signal,
+    (update) => {
+      updates.push(update);
+    },
+  );
+
+  // The handle returns without waiting for the run.
+  const run = h.engine.runs[0]!;
+  assertEqual(h.engine.requests.length, 1, "start called exactly once");
+  assert(h.engine.requests[0]!.signal === undefined, "the parent abort signal never enters the engine");
+  assertEqual(h.recorder.starts.length, 1, "the durable run record is published");
+  assertEqual(updates.length, 0, "background runs push no live onUpdate");
+
+  // The parent abort must not cancel a background run.
+  controller.abort();
+  assertEqual(h.engine.cancels.length, 0, "the abort bridge is not registered for background runs");
+
+  const text = (result.content[0] as TextContent).text;
+  assert(text.startsWith(`<workflow-result workflow-id="${run.id}" workflow="audit-all" status="backgrounded" requires-action="false">`), "handle content carries the backgrounded envelope");
+  assert(text.includes("You will be notified automatically when it completes"), "handle content tells the model to wait for the notification");
+  assert(text.endsWith("</workflow-result>"), "handle content closes the envelope");
+  assert(isWorkflowToolDetails(result.details), "handle details pass the shared guard");
+  assertEqual(result.details.view, undefined, "handle details carry NO frozen view (the panel follows the store)");
+  assertEqual(result.details.value, null, "handle details carry no value");
+  assertEqual(result.details.agentsStarted, 0, "handle details carry zero agents");
+
+  // Settling later: dispose + finish + deliverNotification, never a throw.
+  h.engine.settle(run.id, { value: { ok: true }, stopReason: "completed", agentsStarted: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assertEqual(h.engine.disposed, 1, "the detached closure disposes the run");
+  assertJson(h.recorder.finishes, [{ runId: run.id, stopReason: "completed" }], "the detached closure finishes the record");
+  assertEqual(h.recorder.abandons.length, 0, "no abandon on the clean background path");
+  assertEqual(h.delivered.length, 1, "exactly one completion notification is delivered");
+  const notification = h.delivered[0]!;
+  assertEqual(notification.notificationId, `workflow-result:${run.id}`, "notification id embeds the run id");
+  assertEqual(notification.source, "workflow", "notification source is workflow");
+  assertEqual(notification.kind, "workflow-result", "notification kind is workflow-result");
+  assertEqual(notification.status, "completed", "notification status is the stop reason");
+  assert((notification.result ?? "").includes(`<workflow-result workflow-id="${run.id}"`), "notification result carries the rendered envelope");
+  const rendered = formatInternalNotification(notification);
+  assert(rendered.startsWith("<workflow-result "), "the serialized notification uses the workflow-result root tag");
+  assert(rendered.includes("</workflow-result>"), "the serialized notification closes the root tag");
+});
+
+await run("background cancel settle finishes cancelled and delivers the notification; delivery rejection is swallowed", async () => {
+  const h = makeHarness();
+  let rejectDelivery = false;
+  const tool = createWorkflowToolDefinition({
+    engine: h.engine,
+    recorder: h.recorder,
+    getParentRef: () => h.parentRef,
+    deliverNotification: async () => {
+      if (rejectDelivery) throw new Error("target_session_not_open");
+    },
+  });
+  await executeTool(tool, { script: SCRIPT, meta: META, run_in_background: true });
+  const run = h.engine.runs[0]!;
+
+  rejectDelivery = true;
+  h.engine.settle(run.id, { value: null, stopReason: "cancelled", error: "session closing", agentsStarted: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assertJson(h.recorder.finishes, [{ runId: run.id, stopReason: "cancelled" }], "a cancelled settle still finishes the record");
+  assertEqual(h.recorder.abandons.length, 0, "a delivery rejection does not abandon the finished record");
+});
+
+await run("background dispose failure is bounded: finish still records the terminal state", async () => {
+  const h = makeHarness();
+  h.engine.disposeError = new Error("dispose boom");
+  await executeTool(h.tool, { script: SCRIPT, meta: META, run_in_background: true });
+  const run = h.engine.runs[0]!;
+  h.engine.settle(run.id, { value: null, stopReason: "completed", agentsStarted: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assertEqual(h.engine.disposed, 1, "the detached closure still attempts dispose");
+  assertJson(h.recorder.finishes, [{ runId: run.id, stopReason: "completed" }], "a dispose failure does not block the terminal record");
+  assertEqual(h.recorder.abandons.length, 0, "no abandon on the swallowed-dispose path");
+  assertEqual(h.delivered.length, 1, "the completion notification is still delivered");
 });
 
 await run("values beyond 50_000 characters are truncated with a notice", async () => {

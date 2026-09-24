@@ -25,6 +25,7 @@ import WriteToolDetails from "../components/session/tool-details/WriteToolDetail
 import BashToolDetails from "../components/session/tool-details/BashToolDetails.vue";
 import ReadFileToolDetails from "../components/session/tool-details/ReadFileToolDetails.vue";
 import JsonToolDetails from "../components/session/tool-details/JsonToolDetails.vue";
+import TodoToolDetails from "../components/session/tool-details/TodoToolDetails.vue";
 import {
   countDiffRows,
   extractToolResultDetails,
@@ -124,6 +125,15 @@ describe("ToolCallDetails dispatcher", () => {
       label: "substring search",
       tool: makeTool({ toolName: "workspace_search", args: { query: "pi" }, result: "hit" }),
       viewClass: ".td-search",
+    },
+    {
+      label: "exact todo_write (exact name beats the write substring)",
+      tool: makeTool({
+        toolName: "todo_write",
+        args: { todos: [{ content: "Run tests", status: "in_progress" }] },
+        result: "updated",
+      }),
+      viewClass: ".td-todo",
     },
     {
       label: "unknown tool falls back to json",
@@ -536,5 +546,83 @@ describe("JsonToolDetails", () => {
     expect(pre.exists()).toBe(true);
     expect(pre.find("code").exists()).toBe(false);
     expect(pre.text()).toBe("joined output");
+  });
+});
+
+// ============================================================================
+// TodoToolDetails (R3, CC-style checklist presentation)
+// ============================================================================
+
+describe("TodoToolDetails", () => {
+  it("renders the full list from args.todos with per-status styling and the activeForm copy", () => {
+    wrapper = mount(TodoToolDetails, {
+      props: {
+        tool: makeTool({
+          toolName: "todo_write",
+          args: {
+            todos: [
+              { content: "Inspect the module", status: "completed" },
+              { content: "Run tests", status: "in_progress", activeForm: "Running tests" },
+              { content: "Update docs", status: "pending" },
+            ],
+          },
+          result: "updated",
+        }),
+      },
+    });
+
+    expect(wrapper.find(".td-todo-stat").text()).toContain("1/3 完成");
+    const rows = wrapper.findAll(".td-todo-row");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].classes()).toContain("completed");
+    expect(rows[1].classes()).toContain("in_progress");
+    expect(rows[2].classes()).toContain("pending");
+    // in_progress rows show the progressive copy, others the imperative one.
+    expect(rows[1].find(".td-todo-text").text()).toBe("Running tests");
+    expect(rows[2].find(".td-todo-text").text()).toBe("Update docs");
+    // Partially done list has no wrap-up hint.
+    expect(wrapper.find(".td-todo-done-hint").exists()).toBe(false);
+  });
+
+  it("shows the wrap-up hint for an all-completed payload (controller auto-clear)", () => {
+    wrapper = mount(TodoToolDetails, {
+      props: {
+        tool: makeTool({
+          toolName: "todo_write",
+          args: { todos: [{ content: "Run tests", status: "completed" }] },
+          result: "updated",
+        }),
+      },
+    });
+
+    expect(wrapper.find(".td-todo-stat").text()).toContain("1/1 完成");
+    expect(wrapper.find(".td-todo-done-hint").exists()).toBe(true);
+  });
+
+  it("renders the empty state for an explicit clear and for malformed args", () => {
+    wrapper = mount(TodoToolDetails, {
+      props: { tool: makeTool({ toolName: "todo_write", args: { todos: [] }, result: "updated" }) },
+    });
+    expect(wrapper.find(".td-todo-empty").text()).toBe("清单已清空");
+
+    wrapper = mount(TodoToolDetails, {
+      props: { tool: makeTool({ toolName: "todo_write", args: { todos: "junk" }, result: "updated" }) },
+    });
+    expect(wrapper.find(".td-todo-empty").text()).toBe("清单已清空");
+    expect(wrapper.find(".td-todo-row").exists()).toBe(false);
+  });
+
+  it("drops structurally invalid items instead of rendering them", () => {
+    wrapper = mount(TodoToolDetails, {
+      props: {
+        tool: makeTool({
+          toolName: "todo_write",
+          args: { todos: [{ content: "Run tests", status: "in_progress" }, { content: "", status: "pending" }] },
+          result: "updated",
+        }),
+      },
+    });
+
+    expect(wrapper.findAll(".td-todo-row")).toHaveLength(1);
   });
 });

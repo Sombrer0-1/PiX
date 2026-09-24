@@ -30,10 +30,11 @@ import PlanModeToggle from "../plan/PlanModeToggle.vue";
 import PlanCard from "../plan/PlanCard.vue";
 import { usePlanStore } from "../../stores/plan-store";
 import { useWorkflowStore } from "../../stores/workflow-store";
+import { useTodoStore } from "../../stores/todo-store";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
 import TaskCenterView from "../agent-task/TaskCenterView.vue";
 import { btwValidateQuestion } from "@shared/types.js";
-import type { PlanStatus } from "@shared/types.js";
+import type { AgentTaskInfo, PlanStatus } from "@shared/types.js";
 import type { DeliverableVersion } from "@shared/team-types.js";
 import type { RequestUserInputRequest, RequestUserInputQuestion, RpcSlashCommand } from "@/types/rpc";
 import { thinkingLevelLabel } from "../../utils/thinking-labels";
@@ -47,6 +48,7 @@ const settingsStore = useSettingsStore();
 const teamStore = useTeamStore();
 const planStore = usePlanStore();
 const workflowStore = useWorkflowStore();
+const todoStore = useTodoStore();
 const agentTaskStore = useAgentTaskStore();
 
 /** sessionId -> 会话名（任务中心行/详情来源展示）。team 模式下任务挂在 host
@@ -182,6 +184,22 @@ const canSend = computed(() =>
 const isStreaming = computed(() => rpc.isStreaming.value);
 const isCompacting = computed(() => rpc.sessionState.value?.isCompacting === true);
 const isBusy = computed(() => isStreaming.value || isCompacting.value);
+/** 停止已发出但尚未落地（abort 乐观标志 + 仍在运行/压缩）：按钮转圈、状态条显示"停止中"。 */
+const stopPending = computed(() => rpc.stopRequested.value && (isStreaming.value || isCompacting.value));
+
+// ── 后台任务提示条（R4c）：solo 空闲 + 当前会话仍有活跃后台任务 ──
+const currentSessionId = computed(() => rpc.sessionState.value?.sessionId ?? null);
+/** 会话范围过滤（activeTasks/waitingTasks 是全工作区镜像，须按会话裁剪，
+ *  与 AgentTaskLauncher 的 parentSessionId 过滤同口径；会话未定时回退全局）。 */
+function sessionTaskFilter(task: AgentTaskInfo): boolean {
+  return currentSessionId.value === null || task.parentSessionId === currentSessionId.value;
+}
+const backgroundTaskCount = computed(() =>
+  !teamStore.teamMode && !isBusy.value
+    ? agentTaskStore.activeTasks.filter(sessionTaskFilter).length +
+      agentTaskStore.waitingTasks.filter(sessionTaskFilter).length
+    : 0,
+);
 const isEmptySession = computed(() => sessionStore.displayBlocks.value.length === 0);
 const acpEnabled = computed(() => rpc.sessionState.value?.acp?.enabled === true);
 const acpLocked = computed(() => rpc.sessionState.value?.acp?.locked === true);
@@ -314,6 +332,7 @@ const statusText = computed(() => {
   if (teamStore.teamMode) return teamLifecycleText.value;
   const planStatus = planPillText.value;
   if (planStatus) return planStatus;
+  if (stopPending.value) return "停止中";
   if (rpc.isStreaming.value) return streamingEffortLabel.value ? `运行中 · ${streamingEffortLabel.value}` : "运行中";
   if (rpc.sessionState.value?.isCompacting) return "压缩中";
   return "空闲";
@@ -323,6 +342,7 @@ const statusClass = computed(() => {
   if (teamStore.teamMode) return teamLifecycleClass.value;
   const planClass = planPillClass.value;
   if (planClass) return planClass;
+  if (stopPending.value) return "status-compacting";
   if (rpc.isStreaming.value) return "status-running";
   if (rpc.sessionState.value?.isCompacting) return "status-compacting";
   return "status-idle";
@@ -465,6 +485,11 @@ onMounted(async () => {
   // v-if'ed on tool results, so subscribe next to the plan mirror; a remount
   // replaces the subscription and get_snapshot re-syncs after session switch.
   workflowStore.subscribeToEvents();
+  // Todo mirror: same reasoning, and load-bearing for the TodoCard - the card
+  // is v-if'ed on hasVisibleContent (initially false), so a card-owned
+  // subscription would never attach and the first todo_state would be missed
+  // (the card would then never appear). CenterPanel subscribes instead.
+  todoStore.subscribeToEvents();
   if (sessionStore.displayBlocks.value.length > 0) {
     await nextTick();
     scrollContentToBottom();
@@ -1356,6 +1381,17 @@ function sendQuickStart(prompt: string): void {
         @dragleave="handleDragLeave"
         @drop="handleDrop"
       >
+        <!-- 后台任务提示条（R4c）：solo 空闲 + 当前会话有活跃后台任务时显示，点击打开任务中心 -->
+        <button
+          v-if="backgroundTaskCount > 0"
+          type="button"
+          class="bg-task-strip"
+          data-test="bg-task-strip"
+          @click="agentTaskStore.openTaskCenter()"
+        >
+          {{ backgroundTaskCount }} 个后台任务运行中 · 查看
+        </button>
+
         <CommandPalette
           v-if="showCommandPalette"
           :search="searchQuery"
@@ -1509,12 +1545,14 @@ function sendQuickStart(prompt: string): void {
             <button
               v-if="isBusy"
               class="composer-action-btn stop-action"
+              :class="{ stopping: stopPending }"
               type="button"
-              :title="isCompacting ? '取消压缩' : '停止'"
-              :aria-label="isCompacting ? '取消压缩' : '停止'"
+              :title="stopPending ? '正在停止...' : isCompacting ? '取消压缩' : '停止'"
+              :aria-label="stopPending ? '正在停止...' : isCompacting ? '取消压缩' : '停止'"
               @click="stopAgent"
             >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <span v-if="stopPending" class="stop-spinner" aria-hidden="true"></span>
+              <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                 <rect x="6" y="6" width="12" height="12" rx="2" />
               </svg>
             </button>
@@ -2162,6 +2200,28 @@ function sendQuickStart(prompt: string): void {
   box-shadow: var(--pix-shadow-lg), 0 0 0 3px rgba(98, 84, 243, 0.12);
 }
 
+/* 后台任务提示条（R4c）：composer 顶部全宽细条，hover 提亮 */
+.bg-task-strip {
+  display: block;
+  width: 100%;
+  padding: 4px 10px;
+  border: none;
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-accent-light);
+  color: var(--pix-accent);
+  font-size: var(--pix-text-xs);
+  font-family: var(--pix-font-ui);
+  font-weight: var(--pix-weight-medium);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--pix-transition-base), color var(--pix-transition-base);
+}
+
+.bg-task-strip:hover {
+  background: var(--pix-accent-light-hover);
+  color: var(--pix-accent);
+}
+
 .composer-inner.dragging-files {
   border-color: var(--pix-accent);
   background: var(--pix-accent-light);
@@ -2483,6 +2543,25 @@ function sendQuickStart(prompt: string): void {
 .composer-action-btn.stop-action:hover {
   background: var(--pix-error-light);
   transform: translateY(-1px);
+}
+
+/* 停止已发出、等待 agent_end 落地：可点击（abort 幂等），光标转忙碌态 */
+.composer-action-btn.stop-action.stopping {
+  cursor: progress;
+}
+
+.stop-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: stop-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes stop-spin {
+  to { transform: rotate(360deg); }
 }
 
 .confirm-dialog-card {

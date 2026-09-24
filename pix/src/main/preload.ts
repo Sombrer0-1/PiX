@@ -38,6 +38,7 @@ import type {
   WorkflowViewState,
   WslDistroListResult,
 } from "../shared/types.js";
+import type { TodoCommand, TodoEvent, TodoSnapshot } from "../shared/todo-types.js";
 
 export interface PixApi {
   // File dialogs
@@ -145,6 +146,10 @@ export interface PixApi {
   // Plan commands (PiX 1.4.0)
   sendPlanCommand: (command: PlanCommand) => Promise<PixCommandResult<PlanRuntimeSnapshot | undefined>>;
   onPlanEvent: (callback: (event: PlanEvent) => void) => () => void;
+
+  // Todo commands (R3)
+  sendTodoCommand: (command: TodoCommand) => Promise<PixCommandResult<TodoSnapshot>>;
+  onTodoEvent: (callback: (event: TodoEvent) => void) => () => void;
 
   // Workflow commands (PiX 1.4.3)
   sendWorkflowCommand: (command: WorkflowCommand) => Promise<PixCommandResult<WorkflowViewState[]>>;
@@ -341,6 +346,15 @@ const api: PixApi = {
     const handler = (_event: Electron.IpcRendererEvent, data: PlanEvent) => callback(data);
     ipcRenderer.on("plan-event", handler);
     return () => ipcRenderer.removeListener("plan-event", handler);
+  },
+
+  // Todo commands
+  sendTodoCommand: (command: TodoCommand) =>
+    ipcRenderer.invoke("todo-command", command) as Promise<PixCommandResult<TodoSnapshot>>,
+  onTodoEvent: (callback: (event: TodoEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: TodoEvent) => callback(data);
+    ipcRenderer.on("todo-event", handler);
+    return () => ipcRenderer.removeListener("todo-event", handler);
   },
 
   // Workflow commands

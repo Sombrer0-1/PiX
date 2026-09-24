@@ -130,6 +130,26 @@ export const useWorkflowStore = defineStore("workflow", () => {
     }
   }
 
+  /**
+   * Cancel one live workflow run (R4, background stop button). A success
+   * carries the post-cancel folded snapshot, which replaces the mirror so the
+   * panel converges without waiting for the run-end upsert; a miss (terminal
+   * or unknown run) surfaces as lastError and never throws.
+   */
+  async function cancelRun(runId: string): Promise<void> {
+    try {
+      const result = await workflowRpc.sendWorkflowCommand({ type: "cancel_run", runId });
+      if (result.success && result.data) {
+        applySnapshot(result.data);
+      } else if (!result.success) {
+        lastError.value = result.error ?? "workflow cancel failed";
+      }
+    } catch (err) {
+      lastError.value = err instanceof Error ? err.message : String(err);
+      console.error("[workflow-store] Failed to cancel workflow run:", err);
+    }
+  }
+
   // ==========================================================================
   // Expose
   // ==========================================================================
@@ -144,5 +164,6 @@ export const useWorkflowStore = defineStore("workflow", () => {
     // Subscription
     subscribeToEvents,
     refreshSnapshot,
+    cancelRun,
   };
 });

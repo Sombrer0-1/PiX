@@ -91,6 +91,7 @@ const mocks = vi.hoisted(() => {
       isConnected: fakeRef(true),
       piStatus: fakeRef("running" as string),
       isStreaming: fakeRef(false),
+      stopRequested: fakeRef(false),
       sessionState: fakeRef(null as unknown),
       sessionStats: fakeRef(null as unknown),
       executionEnvironment: fakeRef(null as unknown),
@@ -336,6 +337,8 @@ function installPixApiMock(): void {
     onPlanEvent: vi.fn(() => () => {}),
     sendWorkflowCommand: vi.fn().mockResolvedValue({ success: true, data: [] }),
     onWorkflowEvent: vi.fn(() => () => {}),
+    sendTodoCommand: vi.fn().mockResolvedValue({ success: true }),
+    onTodoEvent: vi.fn(() => () => {}),
     btwAsk: vi.fn().mockResolvedValue({ status: "error", errorMessage: "unused" }),
   } as unknown as PixApi;
 }

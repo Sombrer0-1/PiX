@@ -76,6 +76,20 @@ function resultWithDetails(view: WorkflowViewState): unknown {
   };
 }
 
+/** A backgrounded run's handle result (R4): the details pass the guard but
+ *  carry NO frozen view, so the panel must follow the store's live view. */
+function resultWithHandleDetails(): unknown {
+  return {
+    content: [{ type: "text", text: 'workflow "audit-all" backgrounded' }],
+    details: {
+      kind: "pix-workflow-run",
+      schemaVersion: WORKFLOW_RECORD_SCHEMA_VERSION,
+      value: null,
+      agentsStarted: 0,
+    },
+  };
+}
+
 // ============================================================================
 // Harness: stub window.pixApi so the real workflow store transport works
 // ============================================================================
@@ -424,6 +438,50 @@ describe("member jump", () => {
     await button.trigger("click");
     expect(taskStore.centerOpen).toBe(false);
     expect(taskStore.selectedTaskId).toBeNull();
+  });
+});
+
+// ============================================================================
+// Background stop button (R4)
+// ============================================================================
+
+describe("background stop button", () => {
+  it("handle details without a view fall back to the store view and show the stop button while running", async () => {
+    const view = makeView({ runId: WorkflowRunId("run-9"), members: [makeMember()] });
+    const { wrapper, store } = mountPanel({ result: resultWithHandleDetails() });
+    const cancelRun = vi.spyOn(store, "cancelRun").mockResolvedValue();
+
+    // Before the store catches up there is no view at all: no run, no button.
+    expect(wrapper.find('[data-test="wfp-stop-run"]').exists()).toBe(false);
+
+    emitUpsert(view);
+    await flushPromises();
+
+    expect(statusText(wrapper)).toBe("运行中");
+    const stop = wrapper.get('[data-test="wfp-stop-run"]');
+    expect(stop.attributes("title")).toBe("停止运行");
+    await stop.trigger("click");
+    expect(cancelRun).toHaveBeenCalledTimes(1);
+    expect(cancelRun).toHaveBeenCalledWith("run-9");
+  });
+
+  it("foreground details (frozen view) never show the stop button", () => {
+    const view = makeView({ members: [makeMember()] });
+    const { wrapper } = mountPanel({ result: resultWithDetails(view) });
+
+    expect(statusText(wrapper)).toBe("运行中");
+    expect(wrapper.find('[data-test="wfp-stop-run"]').exists()).toBe(false);
+  });
+
+  it("hides the stop button once the backgrounded run settles", async () => {
+    const { wrapper } = mountPanel({ result: resultWithHandleDetails() });
+    emitUpsert(makeView({ runId: WorkflowRunId("run-1") }));
+    await flushPromises();
+    expect(wrapper.find('[data-test="wfp-stop-run"]').exists()).toBe(true);
+
+    emitUpsert(makeView({ status: "cancelled", stopReason: "cancelled" }));
+    await flushPromises();
+    expect(wrapper.find('[data-test="wfp-stop-run"]').exists()).toBe(false);
   });
 });
 

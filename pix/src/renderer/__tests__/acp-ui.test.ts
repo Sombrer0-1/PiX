@@ -33,6 +33,7 @@ const rpcMock = vi.hoisted(() => ({
     },
     isConnected: { value: true },
     isStreaming: { value: false },
+    stopRequested: { value: false },
     executionEnvironment: { value: null as null | { kind: "windows" | "wsl"; distro?: string; logicalCwd?: string } },
     lastError: { value: null as string | null },
     commands: { value: [] as Array<{ name: string }> },
@@ -111,6 +112,7 @@ vi.mock("../composables/useWorkspaceRpc", () => ({
     sessionState: rpcMock.state.sessionState,
     isConnected: rpcMock.state.isConnected,
     isStreaming: rpcMock.state.isStreaming,
+    stopRequested: rpcMock.state.stopRequested,
     executionEnvironment: rpcMock.state.executionEnvironment,
     lastError: rpcMock.state.lastError,
     commands: rpcMock.state.commands,
@@ -221,6 +223,8 @@ function installPixApiMock(settings: Partial<GuiSettings> = {}): void {
     onPlanEvent: vi.fn(() => () => {}),
     sendWorkflowCommand: vi.fn().mockResolvedValue({ success: true, data: [] }),
     onWorkflowEvent: vi.fn(() => () => {}),
+    sendTodoCommand: vi.fn().mockResolvedValue({ success: true }),
+    onTodoEvent: vi.fn(() => () => {}),
     selectChatFiles: vi.fn().mockResolvedValue([]),
   } as unknown as PixApi;
 }

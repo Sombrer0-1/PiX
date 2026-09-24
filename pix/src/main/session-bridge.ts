@@ -54,6 +54,8 @@ import type {
 } from "./plan/plan-controller.js";
 import { detectFileDeviation, type PlanPathContext } from "./plan/plan-deviation.js";
 import { createSubmitUserPlanTool, createUpdatePlanStepTool } from "./plan/plan-tools.js";
+import { TodoController } from "./todo/todo-controller.js";
+import { createTodoWriteTool } from "./todo/todo-tool.js";
 import { WorkflowChildCache } from "./workflow/child-cache.js";
 import { createAgentTaskChildSpawner } from "./workflow/child-spawner.js";
 import { WorkerThreadWorkflowEngine } from "./workflow/engine/index.js";
@@ -272,6 +274,8 @@ interface RuntimeGeneration {
 	readonly mcpAdapter: McpAdapter;
 	/** Solo Plan state machine of this generation (PiX 1.4.0). */
 	readonly planController: PlanController;
+	/** Session todo list of this generation (R3); in-memory, model-written via todo_write. */
+	readonly todoController: TodoController;
 	/** Workflow engine of this generation (PiX 1.4.3): children spawn through the generation's AgentTaskService via the injected spawner (host/engine never import AgentTaskService). */
 	readonly workflowEngine: WorkerThreadWorkflowEngine;
 	/** Durable projection + V143 lifecycle binding of this generation's workflow runs. */
@@ -777,6 +781,16 @@ export class SessionBridge {
 	/** Solo workflow recorder of the current generation (null for team-leader); ipc-handlers resync against this instance. */
 	getWorkflowRecorder(): WorkflowRecorder | null {
 		return this._generation?.workflowRecorder ?? null;
+	}
+
+	/** Solo workflow engine of the current generation (null for team-leader); the cancel_run command path cancels through this instance. */
+	getWorkflowEngine(): WorkerThreadWorkflowEngine | null {
+		return this._generation?.workflowEngine ?? null;
+	}
+
+	/** Solo todo controller of the current generation (null for team-leader); ipc-handlers resync against this instance. */
+	getTodoController(): TodoController | null {
+		return this._generation?.todoController ?? null;
 	}
 
 	/**
@@ -2621,8 +2635,13 @@ export class SessionBridge {
 					},
 				);
 				const workflowRecorder = createWorkflowRecorder({
+					// Generation-bound append sink (R4 review fix): capture the
+					// _createSession sessionManager parameter, NOT the mutable
+					// this._sessionManager — a backgrounded run of an old
+					// generation finishing late must never write its run-end
+					// record into the replacement session's JSONL.
 					append: (data) => {
-						this._sessionManager?.appendCustomEntry(WORKFLOW_RECORD_CUSTOM_TYPE, data);
+						sessionManager.appendCustomEntry(WORKFLOW_RECORD_CUSTOM_TYPE, data);
 					},
 					engine: workflowEngine,
 					onLifecycle: (event, payload) => this._recordWorkflowLifecycle(event, payload),
@@ -2646,6 +2665,30 @@ export class SessionBridge {
 							workspaceId: workspaceIdOf(cwd),
 							getSubmissionContext: () => runner.assembleSubmissionContext(toolCallId),
 						};
+					},
+					// R4: deliver a background run's completion notification to
+					// the parent session. The liveness check is bridge-level
+					// (_isSessionLive, Stage B D2.3 semantics: active OR
+					// backgrounded): AgentSession.sendCustomMessage has no
+					// disposed guard, so a plain parentSessionRef null check is
+					// not enough — delivering on a zombie session would start a
+					// real LLM turn instead of throwing.
+					deliverNotification: async (notification) => {
+						const session = parentSessionRef;
+						if (session === null || !this._isSessionLive(session)) {
+							throw new Error("target_session_not_open");
+						}
+						const streaming = session.isStreaming;
+						await session.sendCustomMessage(
+							{
+								customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TASK_RESULT,
+								content: formatInternalNotification(notification),
+								display: false,
+								details: notification,
+								context: "internal",
+							},
+							streaming ? { deliverAs: "followUp" } : { triggerTurn: true },
+						);
 					},
 				};
 
@@ -2721,6 +2764,13 @@ export class SessionBridge {
 						await service.releasePlanTaskGroup(groupId, link, reason);
 					},
 				});
+				// Session todo list (R3). Created next to the PlanController so the
+				// todo_write tool can be mounted on the same session; the session
+				// id is resolved lazily via parentSessionRef (set right after
+				// createAgentSession), same deferred pattern as the controller
+				// context getters above. In-memory only: a generation switch
+				// starts from an empty list.
+				const todoController = new TodoController(() => parentSessionRef?.sessionId ?? "");
 				const generation: RuntimeGeneration = {
 					genId,
 					agentDir,
@@ -2731,6 +2781,7 @@ export class SessionBridge {
 					runner,
 					mcpAdapter,
 					planController,
+					todoController,
 					workflowEngine,
 					workflowRecorder,
 				};
@@ -2764,6 +2815,7 @@ export class SessionBridge {
 						createUpdatePlanStepTool({ controller: planController }) as ToolDefinition,
 						createWorkflowToolDefinition(workflowHost) as ToolDefinition,
 						createRalphToolDefinition(workflowHost) as ToolDefinition,
+						createTodoWriteTool(todoController) as ToolDefinition,
 					],
 					// Authoritative host tool policy during planning/revising;
 					// survives extension reloads (PiX 1.4.0 F1).
@@ -2856,6 +2908,8 @@ export class SessionBridge {
 			} catch (err) {
 				console.error("[SessionBridge] Error during plan controller dispose:", err);
 			}
+			// R3: generation-bound todo listeners (in-memory items die with the instance).
+			generation.todoController.dispose();
 			try {
 				await generation.runner.dispose();
 			} catch (err) {
@@ -3360,6 +3414,10 @@ export class SessionBridge {
 		const planDisposePromise = generation?.planController
 			? generation.planController.dispose(planDisposeReason)
 			: undefined;
+		// R3: dispose the generation's todo listeners alongside the plan dispose
+		// (the background-session close path routes through this same teardown,
+		// so all three conceptual close sites are covered by the two blocks).
+		generation?.todoController.dispose();
 		teardownActiveFields();
 
 		// Mark the input queue closing and invalidate the generation FIRST.

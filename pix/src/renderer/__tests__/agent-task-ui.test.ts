@@ -93,6 +93,7 @@ const rpcMock = vi.hoisted(() => ({
     sessionState: { value: null as null | { sessionId?: string; model?: { provider: string; id: string }; thinkingLevel?: string; sessionName?: string; messageCount?: number; goal?: unknown; isCompacting?: boolean } },
     isConnected: { value: true },
     isStreaming: { value: false },
+    stopRequested: { value: false },
     executionEnvironment: { value: null as null | { kind: "windows" | "wsl"; distro?: string; logicalCwd?: string } },
     lastError: { value: null as string | null },
     commands: { value: [] as Array<{ name: string }> },
@@ -178,6 +179,7 @@ vi.mock("../composables/useWorkspaceRpc", () => ({
     sessionState: rpcMock.state.sessionState,
     isConnected: rpcMock.state.isConnected,
     isStreaming: rpcMock.state.isStreaming,
+    stopRequested: rpcMock.state.stopRequested,
     executionEnvironment: rpcMock.state.executionEnvironment,
     lastError: rpcMock.state.lastError,
     commands: rpcMock.state.commands,
@@ -496,7 +498,7 @@ function installPixApiMock(): void {
     inputUnsubscribers.push(unsubscribe);
     return unsubscribe;
   });
-  window.pixApi = { sendAgentTaskCommand, onAgentTaskEvent, onAgentTaskInputRequest } as unknown as PixApi;
+  window.pixApi = { sendAgentTaskCommand, onAgentTaskEvent, onAgentTaskInputRequest, sendTodoCommand: vi.fn().mockResolvedValue({ success: true }), onTodoEvent: vi.fn(() => () => {}) } as unknown as PixApi;
 }
 
 /** Deliver an AgentTaskEvent through the currently registered onAgentTaskEvent callback. */

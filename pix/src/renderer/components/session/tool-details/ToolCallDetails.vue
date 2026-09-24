@@ -19,6 +19,7 @@ import BashToolDetails from "./BashToolDetails.vue";
 import ReadFileToolDetails from "./ReadFileToolDetails.vue";
 import SearchToolDetails from "./SearchToolDetails.vue";
 import JsonToolDetails from "./JsonToolDetails.vue";
+import TodoToolDetails from "./TodoToolDetails.vue";
 import { isRecord } from "./result";
 
 const props = defineProps<{
@@ -50,6 +51,8 @@ const viewComponent = computed<Component>(() => {
     case "find":
     case "ls":
       return SearchToolDetails;
+    case "todo_write":
+      return TodoToolDetails;
   }
   if (lower.includes("edit")) return EditToolDetails;
   if (lower.includes("write")) return WriteToolDetails;

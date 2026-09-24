@@ -74,6 +74,14 @@ export abstract class WorkflowEngine {
 
   abstract start(request: WorkflowStartRequest): WorkflowRun;
 
+  /**
+   * Cancel one live run by id (R4). Returns whether a live run was found:
+   * terminal runs have left the engine's live registry, so cancelling after
+   * settlement is a safe no-op reported as false (the caller maps it to a
+   * run_not_found failure).
+   */
+  abstract cancel(runId: string, reason?: string): boolean;
+
   /** Cancel + bounded-dispose all unsettled runs; idempotent. */
   abstract disposeAll(): Promise<void>;
 

@@ -213,11 +213,14 @@ export interface WorkflowViewState {
   status: WorkflowRunStatus;      // derived, see projectWorkflowStatus
 }
 
-/** Written into AgentToolResult.details / onUpdate.partialResult.details. */
+/** Written into AgentToolResult.details / onUpdate.partialResult.details.
+ * `view` is optional: a backgrounded run's handle result (R4) carries no
+ * frozen view on purpose, so the panel follows the recorder's live store
+ * view instead of a snapshot frozen at the backgrounding moment. */
 export interface WorkflowToolDetails {
   kind: "pix-workflow-run";
   schemaVersion: typeof WORKFLOW_RECORD_SCHEMA_VERSION;
-  view: WorkflowViewState;
+  view?: WorkflowViewState;
   /** Only a terminal "completed" carries it; updates and non-completed runs are null. */
   value: unknown | null;
   agentsStarted: number;
@@ -228,7 +231,9 @@ export interface WorkflowToolDetails {
 // IPC
 // ============================================================================
 
-export type WorkflowCommand = { type: "get_snapshot" };
+export type WorkflowCommand =
+  | { type: "get_snapshot" }
+  | { type: "cancel_run"; runId: string };
 
 export type WorkflowEvent =
   | { type: "snapshot"; runs: WorkflowViewState[] }
@@ -271,7 +276,8 @@ function isWorkflowLogLine(value: unknown): value is WorkflowLogLine {
 
 /**
  * Non-throwing structural narrowing of an unknown value into WorkflowToolDetails.
- * Checks the kind/schemaVersion markers, the folded view state, the required
+ * Checks the kind/schemaVersion markers, the folded view state (optional: a
+ * background handle result carries none, R4), the required
  * value field (any JSON-shaped payload) and the agent count bounds. Does not
  * judge status/stopReason consistency - the details are produced by the
  * recorder fold and consumed display-only here.
@@ -280,7 +286,7 @@ export function isWorkflowToolDetails(value: unknown): value is WorkflowToolDeta
   if (!isRecord(value)) return false;
   if (value.kind !== "pix-workflow-run") return false;
   if (value.schemaVersion !== WORKFLOW_RECORD_SCHEMA_VERSION) return false;
-  if (!isWorkflowViewState(value.view)) return false;
+  if (value.view !== undefined && !isWorkflowViewState(value.view)) return false;
   if (!("value" in value)) return false;
   if (typeof value.agentsStarted !== "number" || !Number.isSafeInteger(value.agentsStarted) || value.agentsStarted < 0) {
     return false;
@@ -545,7 +551,9 @@ function projectRun(run: FoldRun): WorkflowViewState {
  * Non-throwing structural narrowing of an unknown value into WorkflowCommand.
  */
 export function isWorkflowCommand(value: unknown): value is WorkflowCommand {
-  return isRecord(value) && value.type === "get_snapshot";
+  if (!isRecord(value)) return false;
+  if (value.type === "get_snapshot") return true;
+  return value.type === "cancel_run" && typeof value.runId === "string" && value.runId.length > 0;
 }
 
 /**

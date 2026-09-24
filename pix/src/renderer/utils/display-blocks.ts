@@ -95,6 +95,8 @@ interface AssistantMessageEventLike {
   type: string;
   delta?: unknown;
   content?: unknown;
+  /** thinking 段在 message.content 中的下标（pi-ai 各 provider 的 thinking_* 事件均携带）。 */
+  contentIndex?: unknown;
 }
 
 function isAssistantMessageEvent(value: unknown): value is AssistantMessageEventLike {
@@ -457,14 +459,49 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   }
 
   /**
+   * 从累计快照回填当前 thinking 段（中途加入的组装器自愈）。
+   *
+   * message_update 的 message.content 是累计快照：任务详情/团队等中途挂载的
+   * 组装器错过了加入前已流出的 thinking 前缀，这里按 ame.contentIndex 从快照
+   * 取该段完整文本，净化后比本地块长才采用（正常流等长 no-op）。无
+   * contentIndex（防御路径）时仅当快照恰有一个 thinking 段才采用，多段不兜底
+   * （盲目取某段全文会污染另一段）。
+   */
+  function reconcileThinkingFromSnapshot(ame: AssistantMessageEventLike, message: AgentMessage | undefined): void {
+    if (!message || !Array.isArray(message.content) || !openThinkingBlockId) return;
+    const block = blockById.get(openThinkingBlockId);
+    if (!block || block.type !== "thinking") return;
+    let segment: string | undefined;
+    if (typeof ame.contentIndex === "number") {
+      // contentIndex 是 message.content 的下标（跨 provider 已验证：anthropic/openai/google/faux）。
+      // 下标漂移/非法负载：整段跳过，绝不回落单段兜底（防段错位污染）。
+      const raw = message.content[ame.contentIndex];
+      if (raw && raw.type === "thinking" && typeof (raw as { thinking?: unknown }).thinking === "string") {
+        segment = (raw as { type: string; thinking: string }).thinking;
+      }
+    } else {
+      // 无 contentIndex（防御路径）：仅当快照恰有一个 thinking 段时采用。
+      const segments = message.content.filter(
+        (c): c is { type: string; thinking: string } =>
+          c.type === "thinking" && typeof (c as { thinking?: unknown }).thinking === "string",
+      );
+      if (segments.length === 1) segment = segments[0].thinking;
+    }
+    if (segment === undefined) return;
+    const full = stripAcpDisplayTags(segment);
+    if (full.length > block.content.length) block.content = full; // 净化后比较，只在更长时采用
+  }
+
+  /**
    * Consume the assistantMessageEvent streamed inside message_update (PiX 1.5).
    * thinking_start reuses the placeholder block from the user turn; deltas
    * append to the open block; thinking_end marks it ended but keeps it open so
    * the next move (text / tool call) supersedes it; toolcall_start supersedes
    * immediately (it arrives before tool_execution_start — first one wins).
    * text_start / text_delta are folded by the text branch in message_update.
+   * message 是 message_update 携带的累计快照，用于 thinking 段的快照回填。
    */
-  function applyAssistantMessageEvent(ame: AssistantMessageEventLike, timestamp: number): void {
+  function applyAssistantMessageEvent(ame: AssistantMessageEventLike, timestamp: number, message: AgentMessage | undefined): void {
     switch (ame.type) {
       case "thinking_start": {
         // Adjacent thinking segment (两段思考之间无正文/工具事件): thinking_end
@@ -484,9 +521,14 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         if (block && block.type === "thinking" && typeof ame.delta === "string") {
           block.content = stripAcpDisplayTags(block.content + ame.delta);
         }
+        // 追加 delta 后按累计快照对齐（中途加入的组装器自愈；正常流等长 no-op）。
+        reconcileThinkingFromSnapshot(ame, message);
         break;
       }
       case "thinking_end": {
+        // 快照回填先于 redacted 回填执行：快照采用后块非空，redacted 分支的
+        // "仅空块回填"守卫自然跳过；redacted 段快照为空串，"更长才采用"不覆盖。
+        reconcileThinkingFromSnapshot(ame, message);
         const block = openThinkingBlockId ? blockById.get(openThinkingBlockId) : null;
         if (block && block.type === "thinking") {
           // Redacted thinking (Anthropic safety filter) and any provider that
@@ -816,7 +858,7 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
           // content, and the early return below would skip toolcall_start's
           // supersede.
           if (isAssistantMessageEvent(event.assistantMessageEvent)) {
-            applyAssistantMessageEvent(event.assistantMessageEvent, messageTimestamp(msg));
+            applyAssistantMessageEvent(event.assistantMessageEvent, messageTimestamp(msg), msg);
           }
           const text = extractContentText(msg);
           if (!text) return;

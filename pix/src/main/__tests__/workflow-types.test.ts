@@ -523,8 +523,12 @@ await run("foldWorkflowRecords: never throws on arbitrary input", async () => {
   assert(!threw, "fold does not throw on a cyclic records array");
 });
 
-await run("isWorkflowCommand: accepts get_snapshot only", async () => {
+await run("isWorkflowCommand: accepts get_snapshot and cancel_run", async () => {
   assert(isWorkflowCommand({ type: "get_snapshot" }), "get_snapshot accepted");
+  assert(isWorkflowCommand({ type: "cancel_run", runId: "run-1" }), "cancel_run with a runId accepted");
+  assert(!isWorkflowCommand({ type: "cancel_run" }), "cancel_run without runId rejected");
+  assert(!isWorkflowCommand({ type: "cancel_run", runId: 5 }), "cancel_run with a non-string runId rejected");
+  assert(!isWorkflowCommand({ type: "cancel_run", runId: "" }), "cancel_run with an empty runId rejected");
   assert(!isWorkflowCommand({ type: "other" }), "other command type rejected");
   assert(!isWorkflowCommand({}), "missing type rejected");
   assert(!isWorkflowCommand("get_snapshot"), "non-object rejected");
@@ -653,7 +657,9 @@ await run("S1: WorkflowChildStats.replayed is optional; salvage types exist; det
 await run("isWorkflowToolDetails: rejects malformed details", async () => {
   assert(!isWorkflowToolDetails(makeDetailsInput({ kind: "other" })), "wrong kind rejected");
   assert(!isWorkflowToolDetails(makeDetailsInput({ schemaVersion: 2 })), "wrong schemaVersion rejected");
-  assert(!isWorkflowToolDetails(makeDetailsInput({ view: undefined })), "missing view rejected");
+  // R4: a backgrounded run's handle details carry no frozen view (the panel
+  // then follows the recorder's live store view) - missing view is legal.
+  assert(isWorkflowToolDetails(makeDetailsInput({ view: undefined })), "missing view accepted");
   assert(!isWorkflowToolDetails(makeDetailsInput({ view: { status: "done" } })), "invalid view rejected");
   const noValue = makeDetailsInput() as Record<string, unknown>;
   delete noValue.value;

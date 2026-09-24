@@ -1197,7 +1197,7 @@ await run("WSL runtime isolation: all-tools activation excludes shell background
   assertNoUnhandledRejections();
 });
 
-await run("tool: schema defaults run_in_background to false and the description forbids self-selection", async () => {
+await run("tool: schema defaults run_in_background to false and the description teaches the decision model", async () => {
   clearAgents();
   const h = makeHarness();
   const tool = createSubagentToolDefinition(makeHost(h));
@@ -1209,12 +1209,20 @@ await run("tool: schema defaults run_in_background to false and the description 
   assertEqual(backgroundParam!.default, false, "run_in_background defaults to false");
   assert(tool.description.includes("run_in_background"), "description documents the parameter");
   assert(
-    tool.description.includes("explicitly requested") && tool.description.includes("never infer"),
-    "description forbids self-selecting the background by duration",
+    tool.description.includes("notified automatically") && tool.description.includes("independent work"),
+    "description teaches background-for-parallel-work with automatic notification",
   );
   assert(
-    tool.promptGuidelines?.some((g) => g.includes("run_in_background") && g.includes("explicitly asked")) === true,
-    "prompt guidelines carry the same gate",
+    tool.description.includes("Do not guess background from expected duration alone"),
+    "description keeps the duration warning",
+  );
+  assert(
+    tool.promptGuidelines?.some((g) => g.includes("run_in_background") && g.includes("notified automatically")) === true,
+    "prompt guidelines carry the same decision model",
+  );
+  assert(
+    tool.promptGuidelines?.some((g) => g.includes("run_in_background") && g.includes("independent work")) === true,
+    "prompt guidelines anchor background on independent parallel work",
   );
 });
 

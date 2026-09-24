@@ -93,6 +93,9 @@ export function createRpcClient(transport: RpcTransport, label: string) {
   const sessionStats = ref<SessionStats | null>(null);
   const stderr = ref("");
   const lastError = ref<string | null>(null);
+  /** Optimistic stop flag: set the moment abort/abort_retry is sent, cleared
+   *  by the same lifecycle events that flip isStreaming back off. */
+  const stopRequested = ref(false);
   /** Execution environment of the active runtime (null while stopped). */
   const executionEnvironment = ref<ExecutionEnvironmentInfo | null>(null);
   let eventUnsubscribers: Array<() => void> = [];
@@ -211,20 +214,25 @@ export function createRpcClient(transport: RpcTransport, label: string) {
         stderr.value = data.stderr;
         sessionState.value = null;
         executionEnvironment.value = null;
+        stopRequested.value = false;
       }),
       transport.onError((err) => {
         piStatus.value = "error";
         lastError.value = err.message;
+        stopRequested.value = false;
         console.error(`[${label}] Error:`, err.message);
       }),
       transport.onEvent((event) => {
         if (event.type === "agent_start") {
           if (sessionState.value) sessionState.value = { ...sessionState.value, isStreaming: true };
+          // Fallback clear: a new turn started, any earlier stop resolved.
+          stopRequested.value = false;
           flushPendingStatsRefresh();
           return;
         }
         if (event.type === "agent_end") {
           if (sessionState.value) sessionState.value = { ...sessionState.value, isStreaming: false };
+          stopRequested.value = false;
           void refreshState();
           flushPendingStatsRefresh();
           return;
@@ -258,6 +266,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
         }
         if (event.type === "compaction_end" && sessionState.value) {
           sessionState.value = { ...sessionState.value, isCompacting: false };
+          stopRequested.value = false;
           void refreshSessionStats();
           void refreshState();
         }
@@ -344,6 +353,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
       sessionStats.value = null;
       // onExit is detached above before stopRuntime fires, so clear here too.
       executionEnvironment.value = null;
+      stopRequested.value = false;
     }
   }
 
@@ -352,22 +362,34 @@ export function createRpcClient(transport: RpcTransport, label: string) {
   }
 
   async function abort(): Promise<void> {
+    // Set before sending: even if the command fails, the pending state is
+    // cleared by lifecycle events (agent_end/exit/error), never stuck.
+    stopRequested.value = true;
     await sendCommand({ type: "abort" });
   }
 
   async function abortRetry(): Promise<void> {
+    stopRequested.value = true;
     await sendCommand({ type: "abort_retry" });
   }
 
   async function newSession(): Promise<{ cancelled: boolean } | null> {
     const result = await sendCommand<{ cancelled: boolean }>({ type: "new_session" });
-    if (result && !result.cancelled) await refreshSessionData();
+    if (result && !result.cancelled) {
+      // Backgrounded old sessions no longer forward agent_end here, so the
+      // session boundary must clear the stop flag itself.
+      stopRequested.value = false;
+      await refreshSessionData();
+    }
     return result;
   }
 
   async function switchSession(sessionPath: string): Promise<{ cancelled: boolean } | null> {
     const result = await sendCommand<{ cancelled: boolean }>({ type: "switch_session", sessionPath });
-    if (result && !result.cancelled) await refreshSessionData();
+    if (result && !result.cancelled) {
+      stopRequested.value = false;
+      await refreshSessionData();
+    }
     return result;
   }
 
@@ -537,6 +559,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     lastError: computed(() => lastError.value),
     isRunning: computed(() => piStatus.value === "running"),
     isStreaming: computed(() => sessionState.value?.isStreaming ?? false),
+    stopRequested: computed(() => stopRequested.value),
     executionEnvironment: computed(() => executionEnvironment.value),
     // Connection state consumes the execution environment: a WSL backend only
     // reports ready after warm-up completes, so a running session whose

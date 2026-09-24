@@ -237,6 +237,18 @@ export class WorkerThreadWorkflowEngine extends WorkflowEngine {
   }
 
   /**
+   * Cancel one live run by id (R4). The live registry entry leaves when the
+   * run settles (see start), so a terminal or unknown run is a safe no-op
+   * reported as false.
+   */
+  cancel(runId: string, reason?: string): boolean {
+    const run = this.live.get(runId as WorkflowRunId);
+    if (run === undefined) return false;
+    run.cancel(reason ?? "cancelled_by_user");
+    return true;
+  }
+
+  /**
    * Cancel + bounded-dispose every live run. Each run's dispose is itself
    * bounded by disposeGraceMs and guarantees the worker's terminate() is
    * issued, so this resolves after every registered child's cancellation has
