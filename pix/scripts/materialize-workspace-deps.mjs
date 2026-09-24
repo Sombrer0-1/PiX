@@ -58,7 +58,19 @@ function copyPackage(name, src) {
   }
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dirname(dest), { recursive: true });
-  cpSync(src, dest, { recursive: true });
+  cpSync(src, dest, {
+    recursive: true,
+    // Never carry the copied package's OWN nested @earendil-works copies
+    // into the app: npm/sync leftovers inside packages/*/node_modules would
+    // shadow the fresh top-level copies materialized in this pass and freeze
+    // the runtime at stale content (e.g. an old @earendil-works/pi-ai model
+    // catalog). All @earendil-works/* workspace packages are copied from the
+    // workspace source in this same pass, so any nested copy is redundant.
+    filter: (filePath) => {
+      const rel = filePath.slice(src.length).replace(/^[\\/]+/, "").replace(/\\/g, "/");
+      return !rel.startsWith("node_modules/@earendil-works/");
+    },
+  });
   console.log(`[materialize-workspace-deps] ${name} -> ${dest}${wasLink ? " (replaced symlink)" : ""}`);
   return true;
 }

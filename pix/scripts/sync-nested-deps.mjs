@@ -20,7 +20,7 @@
 //
 // Runs as part of `npm run build` (and therefore `npm run package`).
 
-import { readFileSync, existsSync, rmSync, mkdirSync, cpSync, readdirSync } from "fs";
+import { readFileSync, existsSync, lstatSync, rmSync, mkdirSync, cpSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -161,6 +161,24 @@ let total = 0;
 for (const { name, buildDir } of fileDeps) {
   const installedDir = join(PIX_MODULES, ...name.split("/"));
   if (!existsSync(installedDir) || !existsSync(buildDir)) continue;
+
+  // npm installs `file:` deps as symlinks/junctions in the dev layout. In that
+  // layout node_modules/<name> is the workspace source itself, so nesting
+  // through it would write real copies into packages/*/node_modules and
+  // pollute the source tree (stale @earendil-works copies that later packaging
+  // steps would carry into the app). Resolution already matches the build
+  // context there, so there is nothing to sync.
+  let installedIsLink = false;
+  try {
+    installedIsLink = lstatSync(installedDir).isSymbolicLink();
+  } catch {
+    // destination vanished between the checks — let syncPackage's guard handle it
+  }
+  if (installedIsLink) {
+    console.warn(`[sync-nested-deps] skip ${name}: installed as an npm link (dev layout)`);
+    continue;
+  }
+
   const nested = syncPackage(name, buildDir, installedDir, localPackages);
   if (nested.length) {
     total += nested.length;
