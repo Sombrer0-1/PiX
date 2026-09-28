@@ -15,7 +15,8 @@ import { ref, computed, watch, onMounted } from "vue";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useAuthStore } from "../../stores/auth-store";
 import { SENTINEL } from "../../../shared/custom-providers";
-import type { CustomProviderConfig, CustomModelConfig, CustomApi } from "../../../shared/custom-providers";
+import type { CustomProviderConfig, CustomModelConfig, CustomApi, FetchProviderModelsResult } from "../../../shared/custom-providers";
+import { toCandidateRows, mergeFetchedModels, type ModelCandidateRow } from "../../utils/provider-models";
 
 interface GetCustomProvidersResult {
   providers: Record<string, CustomProviderConfig>;
@@ -80,11 +81,21 @@ interface ProviderDraft {
 	compatOverrideWarning: string;
 	showAdvanced: boolean;
 	expanded: boolean;
+	/** 「从 API 获取模型」进行中（每张 provider 卡片独立）。 */
+	fetchingModels: boolean;
+	/** 「从 API 获取模型」的行内错误（空串 = 无错误）。 */
+	fetchModelsError: string;
 }
 
 const rpc = useWorkspaceRpc() as ReturnType<typeof useWorkspaceRpc> & {
 	getCustomProviders(): Promise<GetCustomProvidersResult>;
 	setCustomProviders(providers: Record<string, CustomProviderConfig>): Promise<SetCustomProvidersResult>;
+	fetchProviderModels(params: {
+		baseUrl: string;
+		api: CustomApi;
+		apiKey?: string;
+		providerName?: string;
+	}): Promise<FetchProviderModelsResult | null>;
 };
 const authStore = useAuthStore();
 
@@ -316,6 +327,8 @@ function toDraft(key: string, cfg: CustomProviderConfig): ProviderDraft {
 		compatOverrideWarning: "",
 		showAdvanced: false,
 		expanded: false,
+		fetchingModels: false,
+		fetchModelsError: "",
 	};
 	// Surface override warnings (unknown / structured keys) immediately on load.
 	validateOverride(draft);
@@ -360,6 +373,8 @@ function addDraft(): void {
 		compatOverrideWarning: "",
 		showAdvanced: false,
 		expanded: true,
+		fetchingModels: false,
+		fetchModelsError: "",
 	});
 }
 
@@ -664,6 +679,122 @@ async function deleteProvider(idx: number): Promise<void> {
 	}
 }
 
+// ============================================================================
+// 从 API 获取模型（OpenAI 兼容 GET {baseUrl}/models，dsh discovery 对齐）
+// ============================================================================
+
+// 仅 openai 兼容协议有可读的 /models 列表（与主进程 LISTABLE_APIS 保持一致）。
+const FETCHABLE_APIS = new Set<CustomApi>(["openai-completions", "openai-responses"]);
+
+/** 按钮禁用原因（空串 = 可点击）。 */
+function fetchModelsBlockedReason(draft: ProviderDraft): string {
+	if (!(draft.config.baseUrl ?? "").trim()) return "先填写 baseUrl 才能从 API 获取模型";
+	if (draft.config.api === undefined || !FETCHABLE_APIS.has(draft.config.api)) {
+		return "仅 openai-completions / openai-responses 支持获取模型列表";
+	}
+	return "";
+}
+
+/** 候选对话框：目标 provider 草稿的对象引用（null = 关闭）。存引用而非下标：重连触发的 load() 会重建 drafts 数组，下标可能指向另一张卡片或越界，引用则天然失效（确认时按同一性校验）。 */
+const fetchTargetDraft = ref<ProviderDraft | null>(null);
+const fetchCandidates = ref<ModelCandidateRow[]>([]);
+const fetchDialogOpen = computed({
+	get: () => fetchTargetDraft.value !== null,
+	set: (open: boolean) => { if (!open) closeFetchDialog(); },
+});
+const fetchPickedCount = computed(() => fetchCandidates.value.filter((c) => c.picked && !c.exists).length);
+
+function closeFetchDialog(): void {
+	fetchTargetDraft.value = null;
+	fetchCandidates.value = [];
+}
+
+async function fetchModelsFromApi(draft: ProviderDraft): Promise<void> {
+	const api = draft.config.api;
+	const baseUrl = (draft.config.baseUrl ?? "").trim();
+	if (!api || !FETCHABLE_APIS.has(api) || !baseUrl || draft.fetchingModels) return;
+	draft.fetchModelsError = "";
+	draft.fetchingModels = true;
+	try {
+		// 表单里已输入的密钥优先（用户在测试的正是它）；已配置未改动时把 provider 名
+		// 交给主进程回读真实密钥（渲染层只见 SENTINEL 掩码，读不到明文）。
+		const apiKeyInput = draft.apiKeyInput.trim();
+		const result = await rpc.fetchProviderModels({
+			baseUrl,
+			api,
+			apiKey: apiKeyInput || undefined,
+			providerName: draft.keyConfigured && !draft.apiKeyCleared && !apiKeyInput ? draft.key.trim() || undefined : undefined,
+		});
+		if (result === null) {
+			draft.fetchModelsError = "获取模型列表失败：RPC 通道错误";
+			return;
+		}
+		if (!result.success) {
+			draft.fetchModelsError = result.error;
+			return;
+		}
+		if (result.models.length === 0) {
+			draft.fetchModelsError = "API 未返回任何模型";
+			return;
+		}
+		// 保存/删除会经 load() 重建 drafts；此时旧 draft 对象已脱离列表，丢弃本次
+		// 结果（其引用不再指向任何卡片，确认时无目标可合并）。
+		if (drafts.value.indexOf(draft) === -1) return;
+		// 另一张卡片的拉取先到且对话框已打开（模态中无法再点按钮，故这只发生在
+		// 对话框打开前连点了两张卡片）：丢弃迟到的结果，避免换掉正在查看的候选。
+		if (fetchTargetDraft.value !== null) {
+			draft.fetchModelsError = "已有候选列表待确认，请先处理后再获取";
+			return;
+		}
+		fetchCandidates.value = toCandidateRows(
+			result.models,
+			draft.config.models.map((m) => (m.id ?? "").trim()).filter((id) => id !== ""),
+		);
+		fetchTargetDraft.value = draft;
+	} catch (err) {
+		draft.fetchModelsError = err instanceof Error ? err.message : String(err);
+	} finally {
+		draft.fetchingModels = false;
+	}
+}
+
+/** 确认导入：勾选且未配置的候选追加进草稿（默认值与「添加模型」一致）；已存在行不动。目标草稿已因重连重建而失效时丢弃候选（合并进错误卡片比丢失一次拉取结果更糟）。 */
+function confirmImportModels(): void {
+	const draft = fetchTargetDraft.value;
+	if (draft === null) return;
+	if (drafts.value.indexOf(draft) !== -1) {
+		mergeFetchedModels(
+			draft.config.models,
+			fetchCandidates.value,
+			(candidate) => ({
+				id: candidate.id,
+				name: candidate.name,
+				reasoning: false,
+				input: ["text" as const],
+				contextWindow: candidate.contextWindow,
+				maxTokens: candidate.maxTokens,
+				thinkingLevelMapJson: "",
+				thinkingLevelMapError: "",
+				showThinking: false,
+			}),
+		);
+	}
+	closeFetchDialog();
+}
+
+/** 候选行副标题：显示名（若有且不同于 id）+ 上下文窗口 / 最大输出（K 缩写）。 */
+function candidateSubtitle(c: ModelCandidateRow): string {
+	const parts: string[] = [];
+	if (c.name && c.name !== c.id) parts.push(c.name);
+	if (c.contextWindow !== undefined) parts.push(`上下文 ${formatTokenCount(c.contextWindow)}`);
+	if (c.maxTokens !== undefined) parts.push(`最大输出 ${formatTokenCount(c.maxTokens)}`);
+	return parts.join(" · ");
+}
+
+function formatTokenCount(n: number): string {
+	return n >= 1000 ? `${Math.round(n / 1000)}K` : String(n);
+}
+
 onMounted(load);
 
 // #15: only onMounted loads; a session-less invalid write's deferred schemaError
@@ -956,7 +1087,31 @@ watch(
                 </div>
               </div>
             </div>
-            <v-btn size="small" variant="text" prepend-icon="mdi-plus" @click="addModel(draft)">添加模型</v-btn>
+            <div class="model-list-actions">
+              <v-btn size="small" variant="text" prepend-icon="mdi-plus" @click="addModel(draft)">添加模型</v-btn>
+              <!-- disabled 的 v-btn 不参与命中测试（.v-btn--disabled{pointer-events:none}），tooltip 必须挂在包裹元素上才能在禁用态显示原因 -->
+              <v-tooltip location="top" :disabled="!fetchModelsBlockedReason(draft)">
+                <template #activator="{ props: tooltipProps }">
+                  <span v-bind="tooltipProps">
+                    <v-btn
+                      size="small"
+                      variant="text"
+                      prepend-icon="mdi-cloud-download-outline"
+                      :loading="draft.fetchingModels"
+                      :disabled="!!fetchModelsBlockedReason(draft) || saving"
+                      @click="fetchModelsFromApi(draft)"
+                    >
+                      从 API 获取模型
+                    </v-btn>
+                  </span>
+                </template>
+                {{ fetchModelsBlockedReason(draft) }}
+              </v-tooltip>
+            </div>
+            <div v-if="draft.fetchModelsError" class="fetch-error-hint">
+              <v-icon size="small" icon="mdi-alert-circle-outline" />
+              <span>{{ draft.fetchModelsError }}</span>
+            </div>
           </div>
 
           <div class="provider-actions">
@@ -977,6 +1132,36 @@ watch(
           <v-spacer />
           <v-btn variant="text" :disabled="saving" @click="deleteDialogOpen = false">取消</v-btn>
           <v-btn color="error" variant="tonal" :loading="saving" @click="confirmDelete">确认删除</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="fetchDialogOpen" max-width="600" persistent>
+      <v-card>
+        <v-card-title class="text-h6">从 API 获取模型{{ fetchTargetDraft ? ` - ${fetchTargetDraft.key}` : "" }}</v-card-title>
+        <v-card-text>
+          <div class="inline-hint mb-2">
+            勾选要导入的模型（新模型默认全选）；标注「已存在」的模型不参与导入，已有配置不会被覆盖。导入后需点击「保存」才会写入磁盘。
+          </div>
+          <v-list density="compact" lines="two" class="candidate-list">
+            <v-list-item v-for="c in fetchCandidates" :key="c.id">
+              <template #prepend>
+                <v-checkbox-btn v-model="c.picked" :disabled="c.exists" class="mr-2" />
+              </template>
+              <template #append>
+                <v-chip v-if="c.exists" size="x-small" variant="tonal" label>已存在</v-chip>
+              </template>
+              <v-list-item-title class="candidate-id">{{ c.id }}</v-list-item-title>
+              <v-list-item-subtitle v-if="candidateSubtitle(c)">{{ candidateSubtitle(c) }}</v-list-item-subtitle>
+            </v-list-item>
+          </v-list>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="closeFetchDialog">取消</v-btn>
+          <v-btn color="primary" variant="tonal" :disabled="fetchPickedCount === 0" @click="confirmImportModels">
+            导入所选{{ fetchPickedCount > 0 ? `（${fetchPickedCount}）` : "" }}
+          </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1143,5 +1328,40 @@ watch(
   gap: var(--pix-space-sm);
   justify-content: flex-end;
   margin-top: var(--pix-space-sm);
+}
+
+.model-list-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-xs);
+  flex-wrap: wrap;
+}
+
+.fetch-error-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--pix-space-xs);
+  margin-top: var(--pix-space-xs);
+  font-size: var(--pix-text-xs);
+  color: rgb(var(--v-theme-error));
+}
+
+/* 错误文案内嵌完整 URL（长不可断 token），防止撑破卡片 */
+.fetch-error-hint span {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.candidate-list {
+  border: 1px solid var(--pix-border-light);
+  border-radius: 8px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.candidate-id {
+  font-weight: 500;
+  font-size: var(--pix-text-sm);
+  word-break: break-all;
 }
 </style>

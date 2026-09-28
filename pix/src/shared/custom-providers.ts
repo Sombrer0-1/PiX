@@ -55,5 +55,21 @@ export interface ModelsJson {
   providers: Record<string, CustomProviderConfig>;
 }
 
+/** One model entry reported by an OpenAI-compatible `GET {baseUrl}/models` listing. */
+export interface FetchedProviderModel {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
+/**
+ * Result of the fetch_provider_models RPC command. Failure carries a
+ * user-facing (Chinese) error; the apiKey never appears in it.
+ */
+export type FetchProviderModelsResult =
+  | { success: true; models: FetchedProviderModel[] }
+  | { success: false; error: string };
+
 /** apiKey mask returned to the renderer; signals "do not modify" on write. */
 export const SENTINEL = "__PIX_KEY_MASKED__";

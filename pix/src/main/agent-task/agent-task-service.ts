@@ -13,8 +13,12 @@
  * resolution + project agent approval) while the parent generation is still
  * valid and returns only after every spec is frozen to plain data. Nothing in
  * `AgentTaskSubmissionContext` - objects or closures - is retained past that
- * boundary. `parallel` splits into one mode=single spec per item (each child
- * occupies its own global slot); `single` and `chain` are one spec each.
+ * boundary, with one exception: `parentAnswer` (the parent-agent answering
+ * seam for the nested request_user_input tool) is retained on the in-memory
+ * TaskEntry only - it is never frozen into the spec, never persisted, and
+ * generation-bound to the submitting parent session. `parallel` splits into
+ * one mode=single spec per item (each child occupies its own global slot);
+ * `single` and `chain` are one spec each.
  *
  * Foreground contract: the caller (facade) awaits `awaitGroup`, which resolves
  * once every child is terminal (rebuilding the legacy SubagentDetails in the
@@ -53,6 +57,7 @@ import type { SettingsStore } from "../settings-store.js";
 import type { SubagentParentRuntimeSnapshot, SubagentTaskItem } from "../subagent/types.js";
 import { workspaceIdOf } from "./agent-task-identity.js";
 import { AgentTaskInputRouter, type AgentTaskInputSettleReason } from "./agent-task-input.js";
+import type { ParentAnswerHandler } from "./parent-answer.js";
 import { AgentTaskScheduler } from "./agent-task-scheduler.js";
 import {
   AgentTaskRuntime,
@@ -191,7 +196,9 @@ function indexEntryFromMetadata(metadata: TaskMetadata, lastWriterRunId: string)
 
 /**
  * Borrowed only during the await of createTaskGroup; the service retains none
- * of these objects or closures past the freeze boundary.
+ * of these objects or closures past the freeze boundary except `parentAnswer`,
+ * which lives on the in-memory TaskEntry (runtime reference only, never
+ * serialized into the spec/checkpoint; resumed tasks hydrate without it).
  */
 export interface AgentTaskSubmissionContext {
   parentSessionId: string;
@@ -203,6 +210,11 @@ export interface AgentTaskSubmissionContext {
   parentRuntime: SubagentParentRuntimeSnapshot; // 值快照，不是 getter
   requestUserInput: RequestUserInputHandler; // 仅 preflight 项目 agent 授权期间借用，返回前释放
   hostDisposed: Promise<"host_disposed">; // 与 requestUserInput/父 signal 竞速，保留关闭分类
+  /**
+   * 父代理作答缝隙（PiX）：嵌套 request_user_input 的回答者。缺省/返回
+   * undefined 时降级人类路由（AgentTaskInputRouter）。不进 spec/checkpoint。
+   */
+  parentAnswer?: ParentAnswerHandler;
 }
 
 /**
@@ -312,7 +324,18 @@ export interface AgentTaskServiceTestHooks {
   /** Injectable timer factory (fake timers for short-timeout tests). */
   setTimer?: (callback: () => void, ms: number) => AgentTaskServiceTimerHandle;
   /** Injectable runtime factory (tests replace the real nested-session runtime). */
-  runtimeFactory?: (spec: AgentTaskSpec, input: AgentTaskInputRouter, taskSessionDir?: string) => AgentTaskRuntime;
+  runtimeFactory?: (
+    spec: AgentTaskSpec,
+    input: AgentTaskInputRouter,
+    taskSessionDir?: string,
+    parentAnswer?: ParentAnswerHandler,
+  ) => AgentTaskRuntime;
+  /**
+   * Transforms the parent-answer handler before each runtime is built. The
+   * e2e legs that assert the human-routing contract pass () => undefined to
+   * force the degradation path while everything else stays live.
+   */
+  parentAnswerFilter?: (parentAnswer: ParentAnswerHandler | undefined, spec: AgentTaskSpec) => ParentAnswerHandler | undefined;
   /** Overrides the settings-derived auto-background delay (0 = off). */
   autoBackgroundMsOverride?: number;
   /** Overrides the per-task creation budget reservation (tests use tiny stores). */
@@ -397,6 +420,12 @@ interface TaskEntry {
   slotHeld: boolean;
   /** True after cancel() until the run settles; input settle must not restore running. */
   cancelRequested: boolean;
+  /**
+   * Parent-agent answering seam captured at submission (PiX). In-memory only -
+   * never frozen into the spec nor persisted; hydrated (resumed) tasks keep
+   * undefined and degrade request_user_input to human routing.
+   */
+  parentAnswer: ParentAnswerHandler | undefined;
   /** 1.4.2 (R3): a resumed run is waiting for its first finalized assistant message (resume_succeeded). */
   resumedRun: boolean;
   stopReason: AgentTaskStopReason | undefined;
@@ -645,7 +674,7 @@ export class AgentTaskService {
     //    enqueue/timer logic runs.
     for (const spec of specs) {
       group.taskIds.push(spec.taskId);
-      this._createTaskEntry(spec, effectivePresentation);
+      this._createTaskEntry(spec, effectivePresentation, parent.parentAnswer);
     }
 
     // 1b. 1.4.2: reserve budget and durably initialize each task (metadata +
@@ -1984,7 +2013,7 @@ export class AgentTaskService {
   // Task lifecycle
   // =========================================================================
 
-  private _createTaskEntry(spec: AgentTaskSpec, presentation: AgentTaskPresentation): TaskEntry {
+  private _createTaskEntry(spec: AgentTaskSpec, presentation: AgentTaskPresentation, parentAnswer?: ParentAnswerHandler): TaskEntry {
     const now = this._now();
     // 1.5 (S1): the workflow-owned flag is known at group creation; mirror it
     // into the initial AgentTaskInfo (later hydrated from the index entry).
@@ -2027,6 +2056,7 @@ export class AgentTaskService {
       controller: undefined,
       slotHeld: false,
       cancelRequested: false,
+      parentAnswer,
       resumedRun: false,
       stopReason: undefined,
       workflowOwned,
@@ -2096,8 +2126,9 @@ export class AgentTaskService {
     entry.controller = controller;
     // 1.4.2 (R3): a resumed task already carries its prepared runtime (the
     // idle session was built by prepareResume before the queued state landed);
-    // only fresh tasks create a runtime here.
-    entry.runtime = entry.runtime ?? this._createRuntime(entry.spec);
+    // only fresh tasks create a runtime here. Fresh tasks pass the submission
+    // context's parent-answer seam; a prepared resume runtime never has one.
+    entry.runtime = entry.runtime ?? this._createRuntime(entry.spec, undefined, entry.parentAnswer);
     // 1.5 (P3): a watcher subscribed while the task was queued must see the
     // stream from the first emitted event - initialize the (possibly fresh)
     // runtime's forwarding state from the current watcher count (idempotent
@@ -2120,12 +2151,13 @@ export class AgentTaskService {
     this._emitTaskState(taskId);
   }
 
-  private _createRuntime(spec: AgentTaskSpec, taskSessionDir?: string): AgentTaskRuntime {
+  private _createRuntime(spec: AgentTaskSpec, taskSessionDir?: string, parentAnswer?: ParentAnswerHandler): AgentTaskRuntime {
     const dir = taskSessionDir ?? this._store.getTaskSessionDir(spec.workspaceId, spec.taskId);
+    const handler = testHooks?.parentAnswerFilter?.(parentAnswer, spec) ?? parentAnswer;
     if (testHooks?.runtimeFactory) {
-      return testHooks.runtimeFactory(spec, this._input, dir);
+      return testHooks.runtimeFactory(spec, this._input, dir, handler);
     }
-    return new AgentTaskRuntime({ spec, input: this._input, taskSessionDir: dir });
+    return new AgentTaskRuntime({ spec, input: this._input, taskSessionDir: dir, parentAnswer: handler });
   }
 
   private _onRuntimeEvent(taskId: string, event: AgentTaskRuntimeEvent): void {
@@ -3251,6 +3283,9 @@ export class AgentTaskService {
       controller: undefined,
       slotHeld: false,
       cancelRequested: false,
+      // Hydrated tasks have no live parent context; request_user_input keeps
+      // the human routing path.
+      parentAnswer: undefined,
       resumedRun: false,
       stopReason: info.stopReason,
       workflowOwned: indexEntry.workflowOwned === true,

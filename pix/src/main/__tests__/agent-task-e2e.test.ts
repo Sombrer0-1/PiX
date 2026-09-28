@@ -56,7 +56,7 @@ import type { AgentTaskGroupHandle, AgentTaskInfo, AgentTaskInputRequest } from 
 import type { ProjectLocation } from "../../shared/project-location.js";
 import { isSubagentDetails, type SubagentDetails } from "../../shared/subagent-types.js";
 import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { AgentTaskService, type AgentTaskServiceEvent } from "../agent-task/agent-task-service.js";
+import { AgentTaskService, __setAgentTaskServiceHooksForTests, type AgentTaskServiceEvent } from "../agent-task/agent-task-service.js";
 import type { ProjectExecutionContext } from "../execution-context.js";
 import { createProjectExecutionContext, disposeProjectExecutionContext, resolveProjectLocation } from "../execution-context.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
@@ -439,6 +439,10 @@ if (RUN_WINDOWS) {
   });
 
   await run("windows: nested requestUserInput routes to the panel and respondInput continues the task", async () => {
+    // This leg asserts the human-routing contract, so the parent-agent seam is
+    // forced off; with it live the parent model would answer out of band and
+    // the request would never reach the router.
+    const restoreParentAnswerHook = __setAgentTaskServiceHooksForTests({ parentAnswerFilter: () => undefined });
     const service = makeService();
     const bridge = new SessionBridge({ agentTaskService: service });
     await bridge.start(WIN_LOCATION);
@@ -481,11 +485,15 @@ if (RUN_WINDOWS) {
     } finally {
       await bridge.dispose();
       await service.dispose("app_shutdown");
+      restoreParentAnswerHook();
     }
     assertNoUnhandledRejections();
   });
 
   await run("windows: bounded app shutdown cancels tasks and settles pending input", async () => {
+    // Waiting-input shutdown settle is a human-routing property; force the
+    // parent-agent seam off so the input task actually parks on the router.
+    const restoreParentAnswerHook = __setAgentTaskServiceHooksForTests({ parentAnswerFilter: () => undefined });
     const service = makeService();
     const bridge = new SessionBridge({ agentTaskService: service });
     await bridge.start(WIN_LOCATION);
@@ -538,6 +546,7 @@ if (RUN_WINDOWS) {
       assertIncludes(dismissedReasons.join(","), "shutdown", "the pending request is dismissed with reason shutdown");
     } finally {
       await bridge.dispose();
+      restoreParentAnswerHook();
     }
     assertNoUnhandledRejections();
   });
@@ -684,6 +693,9 @@ if (RUN_WSL2) {
     });
 
     await run("wsl2: nested requestUserInput routes through the input router and respondInput continues", async () => {
+      // Human-routing contract leg: force the parent-agent seam off (see the
+      // matching windows leg for the rationale).
+      const restoreParentAnswerHook = __setAgentTaskServiceHooksForTests({ parentAnswerFilter: () => undefined });
       const service = makeService();
       const bridge = new SessionBridge({ agentTaskService: service });
       await bridge.start(wslLocation!);
@@ -716,6 +728,7 @@ if (RUN_WSL2) {
       } finally {
         await bridge.dispose();
         await service.dispose("app_shutdown");
+        restoreParentAnswerHook();
       }
       assertNoUnhandledRejections();
     });

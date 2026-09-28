@@ -1211,6 +1211,13 @@ async function executeCommand(bridge: SessionBridge, cmd: RpcCommand): Promise<u
       return bridge.getCustomProviders();
     case "set_custom_providers":
       return bridge.setCustomProviders(cmd.providers);
+    case "fetch_provider_models":
+      return bridge.fetchProviderModels({
+        baseUrl: cmd.baseUrl,
+        api: cmd.api,
+        apiKey: cmd.apiKey,
+        providerName: cmd.providerName,
+      });
 
     // Settings (full pi settings)
     case "get_pi_settings":

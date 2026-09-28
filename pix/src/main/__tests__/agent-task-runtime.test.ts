@@ -30,6 +30,7 @@ import { WslDistroResolver, type WslAutomountConfig, type WslDistroInfo } from "
 import { WslPathConverter } from "../wsl/wsl-paths.js";
 import { createWslExecutionBackend } from "../wsl/wsl-execution-backend.js";
 import type { AgentTaskInputRouter } from "../agent-task/agent-task-input.js";
+import type { ParentAnswerInfo } from "../agent-task/parent-answer.js";
 import {
   AgentTaskRuntime,
   MAX_DELEGATED_PROMPT_BYTES,
@@ -993,6 +994,161 @@ await run("input routing: enqueue shape, resolveInput continues the turn, cancel
   await runtime.dispose();
 });
 
+await run("parent answer: handler answers, no enqueue, turn continues", async () => {
+  provider.scripts.length = 0;
+  provider.calls.length = 0;
+  provider.scripts.push(
+    {
+      kind: "message",
+      text: "",
+      stopReason: "stop",
+      toolCall: {
+        name: "request_user_input",
+        id: "pa-tc-1",
+        args: {
+          questions: [{ id: "q1", header: "Header", question: "Question?", options: [{ label: "A" }, { label: "B" }] }],
+        },
+      },
+    },
+    { kind: "message", text: "parent answered", stopReason: "stop" },
+  );
+
+  const spec = makeSpec({ items: [makeReadyItem({ description: "PA test item", prompt: "do the pa work" })] });
+  const input = makeInputMock();
+  const seen: Array<{ info: ParentAnswerInfo; request: RequestUserInputRequest }> = [];
+  const runtime = new AgentTaskRuntime({
+    spec,
+    input: input.router,
+    parentAnswer: async (info, request) => {
+      seen.push({ info, request });
+      return { id: request.id, answers: { q1: "A" } };
+    },
+  });
+
+  const result = await runtime.run(new AbortController().signal, () => {});
+
+  assertEqual(result.status, "completed", "task completed via the parent answer");
+  assertEqual(result.finalOutput, "parent answered", "turn continued after the parent answered");
+  // No router enqueue also means the service never sees waiting_input /
+  // task_input for this request (it reacts solely to the router's onRequest).
+  assertEqual(input.state.enqueued.length, 0, "no enqueue when the parent answers");
+  assertEqual(seen.length, 1, "handler called exactly once");
+  if (seen.length === 1) {
+    assertEqual(seen[0].info.agentName, "general-purpose", "info agentName from the frozen spec");
+    assert(seen[0].info.taskSummary.includes("PA test item"), "taskSummary contains the item description");
+    assert(seen[0].info.taskSummary.includes("do the pa work"), "taskSummary contains the item prompt");
+    assertEqual(seen[0].request.questions.length, 1, "request carries the nested tool's questions");
+    assertEqual(seen[0].request.questions[0].id, "q1", "question id normalized by the tool");
+  }
+
+  await runtime.dispose();
+});
+
+await run("parent answer: handler undefined / rejection / sync throw degrade to the human enqueue path", async () => {
+  // undefined -> human routing (the no-handler behavior stays covered by the
+  // "input routing" test above; an asynchronously rejected AND a synchronously
+  // throwing handler must degrade identically - a sync throw must never
+  // reject the tool call itself).
+  for (const mode of ["undefined", "throw", "sync-throw"] as const) {
+    provider.scripts.length = 0;
+    provider.calls.length = 0;
+    provider.scripts.push(
+      {
+        kind: "message",
+        text: "",
+        stopReason: "stop",
+        toolCall: {
+          name: "request_user_input",
+          id: `pa-tc-${mode === "undefined" ? "2" : mode === "throw" ? "3" : "4"}`,
+          args: {
+            questions: [{ id: "q1", header: "Header", question: "Question?", options: [{ label: "A" }, { label: "B" }] }],
+          },
+        },
+      },
+      { kind: "message", text: `human answered (${mode})`, stopReason: "stop" },
+    );
+
+    const spec = makeSpec({ items: [makeReadyItem()] });
+    const input = makeInputMock();
+    const handlerCalls: number[] = [];
+    const runtime = new AgentTaskRuntime({
+      spec,
+      input: input.router,
+      // Deliberately NOT async in the sync-throw mode so the throw happens
+      // before a promise exists.
+      parentAnswer:
+        mode === "sync-throw"
+          ? () => {
+              handlerCalls.push(1);
+              throw new Error("parent seam exploded synchronously");
+            }
+          : async () => {
+              handlerCalls.push(1);
+              if (mode === "throw") {
+                throw new Error("parent seam exploded");
+              }
+              return undefined;
+            },
+    });
+
+    const runPromise = runtime.run(new AbortController().signal, () => {});
+    await waitFor(() => input.state.enqueued.length === 1, 20000, `${mode}: degraded to enqueue`);
+    assertEqual(handlerCalls.length, 1, `${mode}: handler attempted first`);
+
+    const enqueuedRequest = input.state.enqueued[0];
+    const delivered = await runtime.resolveInput(enqueuedRequest.request.id, {
+      id: enqueuedRequest.request.id,
+      answers: { q1: "A" },
+    });
+    assertEqual(delivered, true, `${mode}: resolveInput delivered`);
+    const result = await runPromise;
+    assertEqual(result.status, "completed", `${mode}: turn continued after the human answer`);
+    assertEqual(result.finalOutput, `human answered (${mode})`, `${mode}: final output`);
+
+    await runtime.dispose();
+  }
+  assertNoUnhandledRejections();
+});
+
+await run("parent answer: nested abort while the handler is pending resolves cancelled", async () => {
+  const spec = makeSpec({ items: [makeReadyItem()] });
+  const input = makeInputMock();
+  let releaseHandler: (() => void) | undefined;
+  const runtime = new AgentTaskRuntime({
+    spec,
+    input: input.router,
+    parentAnswer: () =>
+      new Promise((resolve) => {
+        releaseHandler = () => resolve(undefined);
+      }),
+  });
+
+  const request: RequestUserInputRequest = {
+    id: "pa-abort-1",
+    questions: [{ id: "q1", header: "Header", question: "Question?" }],
+  };
+  const signal = new AbortController();
+  const pending = (
+    runtime as unknown as {
+      _requestUserInput: (request: RequestUserInputRequest, signal?: AbortSignal) => Promise<RequestUserInputResponse>;
+    }
+  )._requestUserInput(request, signal.signal);
+
+  await drain();
+  signal.abort();
+  const response = await pending;
+  assertEqual(response.cancelled, true, "abort wins the race with the pending handler");
+  assertEqual(response.id, "pa-abort-1", "cancelled response mirrors the request id");
+  assertEqual(input.state.enqueued.length, 0, "aborted parent answer never enqueues");
+
+  // A late handler settlement must not surface as an unhandled rejection.
+  releaseHandler?.();
+  await drain();
+  assertNoUnhandledRejections();
+
+  await runtime.dispose();
+});
+
 await run("memory mode: no checkpoint events emitted without a taskSessionDir", async () => {
   provider.scripts.length = 0;
   provider.calls.length = 0;
@@ -1276,6 +1432,33 @@ await run("nestedSystemPromptOverride: extraAppend then schema completion contra
   assert(extraIdx > agentIdx, "extraAppend follows the agent systemPrompt");
   assert(schemaIdx > extraIdx, "schema completion contract is last");
   await runtime.dispose();
+});
+
+await run("nestedSystemPromptOverride: parent-input note only when request_user_input is reachable", async () => {
+  const runOne = async (agentOverride: { tools?: string[]; disallowedTools?: string[] }): Promise<string> => {
+    provider.scripts.length = 0;
+    provider.calls.length = 0;
+    provider.scripts.push({ kind: "message", text: "ok", stopReason: "stop" });
+    const item = makeReadyItem({
+      agent: {
+        name: "general-purpose",
+        description: "General purpose agent",
+        systemPrompt: "You are a test agent.",
+        source: "built-in",
+        ...agentOverride,
+      },
+    });
+    const runtime = new AgentTaskRuntime({ spec: makeSpec({ items: [item] }), input: makeInputMock().router });
+    await runtime.run(new AbortController().signal, () => {});
+    await runtime.dispose();
+    return provider.calls[0]?.context.systemPrompt ?? "";
+  };
+
+  const noteMarker = "When you call request_user_input";
+  assert((await runOne({})).includes(noteMarker), "no tools allowlist: the note is appended");
+  assert((await runOne({ tools: ["read", "bash"] })).includes(noteMarker) === false, "allowlist without request_user_input: the note is omitted");
+  assert((await runOne({ tools: ["read", "request_user_input"] })).includes(noteMarker), "allowlist containing request_user_input: the note is appended");
+  assert((await runOne({ disallowedTools: ["request_user_input"] })).includes(noteMarker) === false, "disallowedTools entry hides the tool: the note is omitted");
 });
 
 await run("appendSystemPrompt does not count against the 64KB delegated prompt cap", async () => {

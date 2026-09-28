@@ -34,6 +34,7 @@ import type {
 import type { AgentTaskGroupHandle } from "../../shared/agent-task-types.js";
 import type { ProjectLocation } from "../../shared/project-location.js";
 import type { SubagentDetails, SubagentAgentScope, SubagentMode, SubagentUsage } from "../../shared/subagent-types.js";
+import type { ParentAnswerHandler } from "../agent-task/parent-answer.js";
 import type { AgentTaskService, AgentTaskSubmissionContext } from "../agent-task/agent-task-service.js";
 import type { SubagentRunner } from "./subagent-runner.js";
 
@@ -71,6 +72,11 @@ export interface SubagentExecutionContext {
   getLoadedAgents: () => LoadAgentsResult | undefined;
   getParentRuntime: () => SubagentParentRuntimeSnapshot;
   requestUserInput: RequestUserInputHandler;
+  /**
+   * 父代理作答缝隙（PiX）：嵌套 request_user_input 由父 AgentSession 带外
+   * 单次补全作答。缺省时保持人类路由。与 requestUserInput 同为 generation-bound。
+   */
+  parentAnswer?: ParentAnswerHandler;
   recordAuxiliaryUsage: (usage: SubagentUsage) => void;
   /** App-level agent task service (1.4.1); owned by index.ts, borrowed. */
   getTaskService: () => AgentTaskService | undefined;

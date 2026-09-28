@@ -68,6 +68,7 @@ import {
 import { createRalphToolDefinition } from "./workflow/tool-ralph.js";
 import { createWorkflowToolDefinition, type WorkflowToolHost } from "./workflow/tool-workflow.js";
 import type { AgentTaskDeliveryContent, AgentTaskService, AgentTaskSubmissionContext } from "./agent-task/agent-task-service.js";
+import { runParentAnswer } from "./agent-task/parent-answer.js";
 import { workspaceIdOf } from "./agent-task/agent-task-identity.js";
 import type { AgentTaskPlanLink } from "../shared/agent-task-types.js";
 import {
@@ -110,7 +111,8 @@ import type {
 	ChatMessageAttachment,
 	SessionInfo,
 } from "../shared/types.js";
-import { type CustomProviderConfig, SENTINEL } from "../shared/custom-providers.js";
+import { type CustomApi, type CustomProviderConfig, SENTINEL, type FetchProviderModelsResult } from "../shared/custom-providers.js";
+import { fetchProviderModels, resolveApiKeyForProbe } from "./providers/fetch-models.js";
 import { processChatFiles } from "./chat-files.js";
 
 interface ExitPayload {
@@ -1439,6 +1441,91 @@ export class SessionBridge {
 	}
 
 	/**
+	 * Probe one custom provider's OpenAI-compatible `GET {baseUrl}/models`
+	 * listing for import candidates (settings UI "fetch models from API").
+	 * Read-only apart from one edge: an OAuth credential may refresh its
+	 * token (and persist it) exactly as a real request would. The reply is
+	 * candidate metadata the UI offers for adoption.
+	 *
+	 * Credential resolution mirrors the kernel's precedence: the form's
+	 * current apiKey input wins (it is the key the user is testing), then
+	 * auth.json (it outranks models.json for real requests too), then the
+	 * models.json apiKey. The renderer only ever sees the SENTINEL mask, so
+	 * it sends providerName when the stored key should be used. `$ENV`
+	 * references are resolved, `!cmd` values are refused by the fetch module
+	 * rather than executed. Failures return a user-facing, key-free error.
+	 */
+	async fetchProviderModels(params: {
+		baseUrl: string;
+		api: CustomApi;
+		apiKey?: string;
+		providerName?: string;
+	}): Promise<FetchProviderModelsResult> {
+		try {
+			const apiKey = await this._resolveProbeApiKey(params);
+			const { models } = await fetchProviderModels({
+				baseUrl: params.baseUrl,
+				api: params.api,
+				apiKey,
+			});
+			return { success: true, models };
+		} catch (err) {
+			return { success: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	/**
+	 * Resolve the probe credential: a non-empty form apiKey wins; otherwise,
+	 * when the renderer named the provider (key configured, untouched), read
+	 * the stored key -- auth.json first (same precedence as real requests),
+	 * then the models.json apiKey (raw form; $ENV/!cmd handling lives in the
+	 * fetch module).
+	 */
+	private async _resolveProbeApiKey(params: {
+		apiKey?: string;
+		providerName?: string;
+	}): Promise<string | undefined> {
+		// The renderer's input field is user-typed only, but treat the SENTINEL
+		// mask as "no form key" anyway so a contract slip can never send the
+		// mask literal to the endpoint (it falls through to the stored key).
+		const formKey = params.apiKey === SENTINEL ? undefined : params.apiKey?.trim();
+		if (formKey) return formKey;
+		if (!params.providerName) return undefined;
+		// The bridge storage exists only after a session activated; settings
+		// can open before that, so read through a fresh AuthStorage then.
+		const authStorage = this._authStorage ?? AuthStorage.create(join(getAgentDir(), "auth.json"));
+		// A stored api_key credential must NOT go through getApiKey(): it runs
+		// the kernel resolver, which EXECUTES `!cmd` values. The settings probe
+		// never runs shell commands, so the raw stored value is routed through
+		// the probe resolver instead (same $ENV semantics, !cmd refused).
+		const stored = authStorage.get(params.providerName);
+		if (stored?.type === "api_key") {
+			return resolveApiKeyForProbe(stored.key);
+		}
+		// No api_key credential: getApiKey covers an OAuth credential (a token
+		// refresh may run and persist a new token, mirroring a real request)
+		// and the env-var fallback; neither path executes shell commands.
+		const authKey = await authStorage.getApiKey(params.providerName, { includeFallback: false });
+		if (authKey !== undefined && authKey !== "") return authKey;
+		return this._readModelsProviderApiKey(params.providerName);
+	}
+
+	/** Read one provider's raw models.json apiKey under the models.json lock. */
+	private _readModelsProviderApiKey(providerName: string): string | undefined {
+		// A lock timeout must not silently degrade the probe to anonymous: the
+		// endpoint would answer 401 and the error would blame the key. Surface
+		// the contention instead.
+		return this.withModelsLock(() => {
+			const modelsPath = join(getAgentDir(), "models.json");
+			if (!existsSync(modelsPath)) return undefined;
+			const raw = readFileSync(modelsPath, "utf-8");
+			const parsed: unknown = JSON.parse(raw);
+			const key = readModelsProviders(parsed)[providerName]?.apiKey;
+			return typeof key === "string" && key !== "" ? key : undefined;
+		});
+	}
+
+	/**
 	 * Read the set of provider names defined in models.json. Used to block
 	 * setApiKey/removeAuth from touching providers whose credentials must be
 	 * managed in the custom-providers partition (prevents auth.json from
@@ -2589,6 +2676,24 @@ export class SessionBridge {
 						};
 					},
 					requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
+					// Parent-agent answering for nested request_user_input (PiX):
+					// the subagent's questions are answered out of band by the
+					// generation's own parent session (the agent blocked in the
+					// agent tool call). Generation-bound like getParentRuntime -
+					// a stale runner's late questions never reach a replacement
+					// parent session. After the session is disposed the closure
+					// keeps its last reference and answers from the frozen
+					// read-only context (better than bouncing a backgrounded
+					// task's question to the human panel). undefined (session
+					// not yet created / no model / no auth) degrades to the
+					// human task_input route.
+					parentAnswer: (info, request, signal) => {
+						const parent = parentSessionRef;
+						if (parent === null) {
+							return Promise.resolve(undefined);
+						}
+						return runParentAnswer(parent, info, request, signal);
+					},
 					recordAuxiliaryUsage: (usage) => {
 						// Generation-bound accumulator: old generations never
 						// write usage into a replacement session through the

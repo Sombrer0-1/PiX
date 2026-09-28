@@ -20,7 +20,7 @@ import type {
   TreeEntry,
   UserMessageForForking,
 } from "@/types/rpc";
-import type { CustomProviderConfig } from "@shared/custom-providers";
+import type { CustomApi, CustomProviderConfig, FetchProviderModelsResult } from "@shared/custom-providers";
 import type { RoundtableMetricsSnapshot, RoundtableState } from "@shared/team-types.js";
 
 /**
@@ -119,6 +119,12 @@ export function useWorkspaceRpc() {
     setApiKey: (provider: string, key: string): Promise<void> => activeRpc.value.setApiKey(provider, key),
     getCustomProviders: () => activeRpc.value.getCustomProviders(),
     setCustomProviders: (providers: Record<string, CustomProviderConfig>) => activeRpc.value.setCustomProviders(providers),
+    fetchProviderModels: (params: {
+      baseUrl: string;
+      api: CustomApi;
+      apiKey?: string;
+      providerName?: string;
+    }): Promise<FetchProviderModelsResult | null> => activeRpc.value.fetchProviderModels(params),
     removeAuth: (provider: string): Promise<void> => activeRpc.value.removeAuth(provider),
     getPiSettings: (): Promise<Record<string, unknown> | null> => activeRpc.value.getPiSettings(),
     setPiSetting: (key: string, value: unknown): Promise<void> => activeRpc.value.setPiSetting(key, value),

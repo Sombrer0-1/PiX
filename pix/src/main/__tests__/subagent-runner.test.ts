@@ -51,6 +51,7 @@ import { isProductEvent, type ProductEvent } from "../../shared/product-events.j
 import type { ProductEventCollector } from "../product-event-collector.js";
 import type { AgentTaskInputRouter } from "../agent-task/agent-task-input.js";
 import type { AgentTaskRuntime, AgentTaskRuntimeResult } from "../agent-task/agent-task-runtime.js";
+import type { ParentAnswerInfo } from "../agent-task/parent-answer.js";
 import {
   AgentTaskService,
   __setAgentTaskServiceHooksForTests,
@@ -506,6 +507,7 @@ interface FacadeHarness {
   usageSink: SubagentUsage[];
   inputRequests: Array<{ request: RequestUserInputRequest; signal: AbortSignal | undefined }>;
   approvals: ApprovalControls;
+  parentAnswerCalls: Array<{ info: ParentAnswerInfo; request: RequestUserInputRequest; signal: AbortSignal | undefined }>;
   resolveHostDisposed: () => void;
   hostDisposed: Promise<"host_disposed">;
   loadedAgents: LoadAgentsResult;
@@ -596,6 +598,7 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): FacadeHar
 
   const usageSink: SubagentUsage[] = [];
   const inputRequests: Array<{ request: RequestUserInputRequest; signal: AbortSignal | undefined }> = [];
+  const parentAnswerCalls: Array<{ info: ParentAnswerInfo; request: RequestUserInputRequest; signal: AbortSignal | undefined }> = [];
   const parentRuntime = {
     model: parentModel,
     thinkingLevel: "high" as ThinkingLevel,
@@ -620,6 +623,10 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): FacadeHar
       inputRequests.push({ request, signal });
       return approvals.requestUserInput(request, signal);
     },
+    parentAnswer: (info, request, signal) => {
+      parentAnswerCalls.push({ info, request, signal });
+      return Promise.resolve({ id: request.id, answers: { [request.questions[0]?.id ?? "q"]: "A" } });
+    },
     recordAuxiliaryUsage: (usage) => {
       usageSink.push(usage);
     },
@@ -634,6 +641,7 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): FacadeHar
     usageSink,
     inputRequests,
     approvals,
+    parentAnswerCalls,
     resolveHostDisposed,
     hostDisposed,
     loadedAgents,
@@ -743,6 +751,33 @@ await run("preflight failures via the service: unknown agent / prompt bounds / m
   // proj-a is a project agent: the approval is requested and denied below.
   assertEqual(h.inputRequests.length, 0, "user-scope runs never request project approval");
   assertEqual(FakeRuntime.instances.length, 0, "no session created for invalid prompts");
+});
+
+await run("assembleSubmissionContext forwards the parentAnswer seam (both submission paths share it)", async () => {
+  clearAgents();
+  const h = makeHarness();
+
+  const context = h.runner.assembleSubmissionContext("pa-tool-call");
+  assert(context.parentAnswer !== undefined, "submission context carries the parentAnswer closure");
+  const request: RequestUserInputRequest = {
+    id: "pa-1",
+    questions: [{ id: "q1", header: "Header", question: "Question?", options: [{ label: "A" }, { label: "B" }] }],
+  };
+  const response = await context.parentAnswer!({ agentName: "probe-agent", taskSummary: "probe summary" }, request);
+  assertEqual(h.parentAnswerCalls.length, 1, "the ctx handler was invoked exactly once");
+  if (h.parentAnswerCalls.length === 1) {
+    assertEqual(h.parentAnswerCalls[0].info.agentName, "probe-agent", "info forwarded verbatim");
+    assertEqual(h.parentAnswerCalls[0].request.id, "pa-1", "request forwarded verbatim");
+  }
+  assert(response !== undefined && response.cancelled !== true, "handler answered instead of cancelling");
+  if (response !== undefined) {
+    assertEqual(response.answers.q1, "A", "answer flows back through the context seam");
+  }
+
+  // The workflow child spawner and the plan adapter submit through the same
+  // assembleSubmissionContext path, so one seam covers every submission path.
+  const viaHost = makeHost(h).getSubmissionContext("wf-tool-call");
+  assert(viaHost.parentAnswer !== undefined, "the tool-host submission context carries the seam too");
 });
 
 await run("foreground single: completes with details and records aggregated usage exactly once", async () => {

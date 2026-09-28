@@ -23,7 +23,7 @@ import type {
 } from "@/types/rpc";
 import type { PixApi } from "../../main/preload";
 import type { ProjectLocation } from "@/types/session";
-import type { CustomProviderConfig } from "@shared/custom-providers";
+import type { CustomApi, CustomProviderConfig, FetchProviderModelsResult } from "@shared/custom-providers";
 
 type CommandResponse<T = unknown> = { success: boolean; data?: T; error?: string };
 type LifecycleExit = { code: number | null; signal: string | null; stderr: string };
@@ -467,6 +467,16 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     return result;
   }
 
+  /** 获取 provider 的 /models 候选列表；失败以 success:false + 中文错误返回（不抛出）。 */
+  function fetchProviderModels(params: {
+    baseUrl: string;
+    api: CustomApi;
+    apiKey?: string;
+    providerName?: string;
+  }): Promise<FetchProviderModelsResult | null> {
+    return sendCommand<FetchProviderModelsResult>({ type: "fetch_provider_models", ...params });
+  }
+
   async function removeAuth(provider: string): Promise<void> {
     await sendCommand({ type: "remove_auth", provider });
     await Promise.all([refreshModels(), refreshState()]);
@@ -604,6 +614,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
     setApiKey,
     getCustomProviders,
     setCustomProviders,
+    fetchProviderModels,
     removeAuth,
     getPiSettings,
     setPiSetting,

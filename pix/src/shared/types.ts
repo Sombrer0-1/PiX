@@ -12,7 +12,7 @@ import type {
   ExecutionEnvironmentInfo,
   ThinkingLevel,
 } from "./project-location.js";
-import type { CustomProviderConfig } from "./custom-providers.js";
+import type { CustomApi, CustomProviderConfig } from "./custom-providers.js";
 import type {
   PlanCancelRef,
   PlanDeviation,
@@ -103,6 +103,18 @@ export type RpcCommand =
   // Custom providers (models.json management; reuses the RPC channel)
   | { id?: string; type: "get_custom_providers" }
   | { id?: string; type: "set_custom_providers"; providers: Record<string, CustomProviderConfig> }
+  // Probe an OpenAI-compatible {baseUrl}/models listing for import candidates.
+  // apiKey is the form's current input (plaintext); providerName asks main to
+  // fall back to the stored key (auth.json first, then models.json) when the
+  // form carries none -- the renderer only ever sees the SENTINEL mask.
+  | {
+      id?: string;
+      type: "fetch_provider_models";
+      baseUrl: string;
+      api: CustomApi;
+      apiKey?: string;
+      providerName?: string;
+    }
   // Settings (full pi settings from SettingsManager)
   | { id?: string; type: "get_pi_settings" }
   | { id?: string; type: "set_pi_setting"; key: string; value: unknown }

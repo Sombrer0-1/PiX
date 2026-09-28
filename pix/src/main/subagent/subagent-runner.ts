@@ -152,6 +152,7 @@ export class SubagentRunner {
       modelRegistry: this._ctx.modelRegistry,
       parentRuntime: this._ctx.getParentRuntime(),
       requestUserInput: this._ctx.requestUserInput,
+      parentAnswer: this._ctx.parentAnswer,
       hostDisposed: this._hostDisposed(),
     };
   }

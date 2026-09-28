@@ -31,12 +31,16 @@
  * changes verbatim (the legacy SubagentRunner default:break dropped them; here
  * they reach AgentTaskService / Plan deviation detection).
  *
- * User input: the requestUserInput closure points at the AgentTaskInputRouter
- * (enqueue per §4.5; the router is created by AgentTaskService in B3). The
- * runtime owns the pending response promises; the service delivers answers
- * through resolveInput()/cancelInput() so the nested request_user_input tool
- * can await them. This module only type-imports ./agent-task-input.js
- * (missing until B3; type-only imports are erased at transform time).
+ * User input: the requestUserInput closure first tries the parent-agent
+ * answering seam (opts.parentAnswer, see ./parent-answer.ts): when the parent
+ * agent answers out of band, the response resolves directly and nothing is
+ * routed to the human. Otherwise (no handler, handler unavailable or a
+ * handler error) the request falls back to the AgentTaskInputRouter enqueue
+ * path (§4.5; the router is created by AgentTaskService in B3). The runtime
+ * owns the pending response promises; the service delivers answers through
+ * resolveInput()/cancelInput() so the nested request_user_input tool can await
+ * them. This module only type-imports ./agent-task-input.js (missing until B3;
+ * type-only imports are erased at transform time).
  *
  * 1.4.1 version gates: in-memory SessionManager only; no checkpoint /
  * persistSessionFile / prepareResume / AgentTaskRuntimeResumeSeed; no import of
@@ -97,6 +101,7 @@ import {
   STRUCTURED_OUTPUT_TOOL_NAME,
 } from "../workflow/structured-output-tool.js";
 import type { AgentTaskInputRouter } from "./agent-task-input.js";
+import type { ParentAnswerHandler, ParentAnswerInfo } from "./parent-answer.js";
 import {
   DEFAULT_MAX_TURNS,
   type AgentTaskActivity,
@@ -252,10 +257,42 @@ function emptyUsage(): SubagentUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
 }
 
+/**
+ * Nested-session note for request_user_input (see ./parent-answer.ts). The
+ * wording must hold on every routing path: the coordinating parent agent
+ * normally answers out of band, but after a resume (or when the parent has no
+ * model/auth) the human panel answers instead, so the note describes both. A
+ * "cancelled" reply means the coordinator was momentarily unavailable - the
+ * SDK tool text renders it as a user cancellation, which the note corrects.
+ * Appended only when the item's tool set can actually expose the tool (the SDK
+ * registers request_user_input as a custom tool subject to the same
+ * tools/disallowedTools gating as every other tool - an explicit allowlist
+ * without it hides the tool, and a note describing an unreachable tool would
+ * be misleading).
+ */
+const PARENT_INPUT_SYSTEM_NOTE = [
+  "When you call request_user_input, the coordinating agent that started you answers on the user's behalf;",
+  "if it is unavailable, the end user answers directly.",
+  "Use it whenever you genuinely need a decision or clarification to proceed.",
+  "If a request is reported as cancelled, treat that as the coordinator being momentarily unavailable, not as a refusal:",
+  "pick a sensible default and continue (you may ask again later).",
+].join(" ");
+
+/** Whether the nested session's tool set exposes request_user_input for this item. */
+function requestUserInputReachable(agent: { tools?: string[]; disallowedTools?: string[] }): boolean {
+  if ((agent.disallowedTools ?? []).includes("request_user_input")) {
+    return false;
+  }
+  return agent.tools === undefined || agent.tools.includes("request_user_input");
+}
+
 /** Nested-session system prompt: base, agent.systemPrompt, extraAppend?, schemaPrompt last. */
 function nestedSystemPromptOverride(item: AgentTaskItemSpec & { resolution: "ready" }): (base: string[]) => string[] {
   return (base) => {
     const parts = [...base, item.agent.systemPrompt];
+    if (requestUserInputReachable(item.agent)) {
+      parts.push(PARENT_INPUT_SYSTEM_NOTE);
+    }
     if (item.appendSystemPrompt !== undefined) {
       parts.push(item.appendSystemPrompt);
     }
@@ -492,6 +529,8 @@ export class AgentTaskRuntime {
   private readonly _spec: AgentTaskSpec;
   private readonly _input: AgentTaskInputRouter;
   private readonly _taskSessionDir: string | undefined;
+  /** Parent-agent answering seam for request_user_input; absent on resumed tasks (human routing). */
+  private readonly _parentAnswer: ParentAnswerHandler | undefined;
 
   private _disposed = false;
   private _abortRequested = false;
@@ -533,10 +572,11 @@ export class AgentTaskRuntime {
   /** Checkpoint/input generation: RUNTIME_TASK_GENERATION normally, seed + 1 after prepareResume. */
   private _taskGeneration = RUNTIME_TASK_GENERATION;
 
-  constructor(opts: { spec: AgentTaskSpec; input: AgentTaskInputRouter; taskSessionDir?: string }) {
+  constructor(opts: { spec: AgentTaskSpec; input: AgentTaskInputRouter; taskSessionDir?: string; parentAnswer?: ParentAnswerHandler }) {
     this._spec = opts.spec;
     this._input = opts.input;
     this._taskSessionDir = opts.taskSessionDir;
+    this._parentAnswer = opts.parentAnswer;
   }
 
   async run(signal: AbortSignal, onEvent: (e: AgentTaskRuntimeEvent) => void): Promise<AgentTaskRuntimeResult> {
@@ -1422,11 +1462,78 @@ export class AgentTaskRuntime {
   // =========================================================================
 
   /**
-   * The nested session's requestUserInput closure: routes the request into the
-   * AgentTaskInputRouter and returns a promise that resolves when the service
-   * delivers the answer (resolveInput/cancelInput) or the nested signal aborts.
+   * The nested session's requestUserInput closure. The parent-agent seam runs
+   * first (see ./parent-answer.ts): a non-undefined result resolves directly -
+   * no router enqueue, no waiting_input status, no task_input event. undefined
+   * (or a thrown handler) degrades to the human-routed enqueue path below.
    */
-  private _requestUserInput(request: RequestUserInputRequest, signal?: AbortSignal): Promise<RequestUserInputResponse> {
+  private async _requestUserInput(request: RequestUserInputRequest, signal?: AbortSignal): Promise<RequestUserInputResponse> {
+    const parentAnswer = this._parentAnswer;
+    if (parentAnswer !== undefined) {
+      let pending: Promise<RequestUserInputResponse | undefined>;
+      try {
+        // Promise.resolve also covers a contract-breaking non-thenable return,
+        // which would otherwise throw inside _awaitParentAnswer's .then call.
+        pending = Promise.resolve(parentAnswer(this._parentAnswerInfo(), request, signal));
+      } catch {
+        // A synchronously throwing handler is the same degradation class as a
+        // rejected one - the human route must stay reachable either way.
+        return this._enqueueUserInput(request, signal);
+      }
+      const parent = await this._awaitParentAnswer(pending, request, signal);
+      if (parent !== undefined) {
+        return parent;
+      }
+    }
+    return this._enqueueUserInput(request, signal);
+  }
+
+  /**
+   * Race the parent-answer promise against the nested signal: undefined (or a
+   * rejection - the parent seam must never break the tool call) degrades to
+   * the human route; an abort resolves cancelled without waiting for the model
+   * call to unwind. The original promise keeps its rejection observer, so a
+   * late failure can never become an unhandled rejection.
+   */
+  private async _awaitParentAnswer(
+    pending: Promise<RequestUserInputResponse | undefined>,
+    request: RequestUserInputRequest,
+    signal: AbortSignal | undefined,
+  ): Promise<RequestUserInputResponse | undefined> {
+    const guarded = pending.then(
+      (value) => value,
+      () => undefined,
+    );
+    if (signal === undefined) {
+      return guarded;
+    }
+    const abort = new Promise<RequestUserInputResponse>((resolve) => {
+      const onAbort = (): void => resolve({ id: request.id, answers: {}, cancelled: true });
+      if (signal.aborted) {
+        onAbort();
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    });
+    return Promise.race([guarded, abort]);
+  }
+
+  /** Subagent identity for the parent-answer prompt, from the frozen spec + active item. */
+  private _parentAnswerInfo(): ParentAnswerInfo {
+    const item = this._spec.items[this._activeItemIndex];
+    const agentName =
+      item !== undefined && item.resolution === "ready" ? item.agent.name : item?.requestedAgentName ?? "general-purpose";
+    const taskSummary = item !== undefined && item.description !== "" ? `${item.description}\n${item.prompt}` : (item?.prompt ?? "");
+    return { agentName, taskSummary };
+  }
+
+  /**
+   * Human-routed path (the pre-parent-answer behavior): routes the request
+   * into the AgentTaskInputRouter and returns a promise that resolves when the
+   * service delivers the answer (resolveInput/cancelInput) or the nested
+   * signal aborts.
+   */
+  private _enqueueUserInput(request: RequestUserInputRequest, signal?: AbortSignal): Promise<RequestUserInputResponse> {
     return new Promise<RequestUserInputResponse>((resolve) => {
       this._pendingInputs.set(request.id, { resolve });
       // The routed generation follows the task's current generation (0 for
