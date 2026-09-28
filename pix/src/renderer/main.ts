@@ -10,6 +10,7 @@ import * as vuetifyComponents from "vuetify/components";
 import * as vuetifyDirectives from "vuetify/directives";
 import "vuetify/styles";
 import "@mdi/font/css/materialdesignicons.css";
+import "katex/dist/katex.min.css";
 import App from "./App.vue";
 import router from "./router";
 import "./assets/styles/main.css";

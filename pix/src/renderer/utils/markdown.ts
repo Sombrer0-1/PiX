@@ -7,7 +7,8 @@
  * Main-answer HTML must stay equivalent to the pre-extraction build; the
  * protocol whitelist is never relaxed.
  */
-import { marked } from "marked";
+import katex from "katex";
+import { marked, type Tokens, type TokenizerAndRendererExtension } from "marked";
 
 marked.setOptions({ breaks: true, gfm: true });
 const markdownRenderer = new marked.Renderer();
@@ -42,6 +43,100 @@ function sanitizeHref(href: string): string | null {
     return null;
   }
 }
+
+/**
+ * LaTeX 数学公式渲染（KaTeX 预渲染为 HTML 字符串）。
+ *
+ * 安全要点：数学 HTML 通过 marked 扩展 renderer 的返回值注入——Parser
+ * 对扩展 token 直接拼入输出、不经过 renderer.html 的转义，这是唯一注入
+ * 通道，原始 HTML 的 XSS 防线不受影响。KaTeX 侧保持 trust: false（默认，
+ * \href 等危险命令按错误文本渲染）与 throwOnError: false（坏公式显示
+ * 红色错误文本而不是让整条消息渲染失败）。
+ *
+ * 代码保护：block 层扩展 tokenizer 先于 fence、inline 层先于 codespan
+ * 尝试，但正则锚定行首/串首，因此 fenced code 与 code span 由内建
+ * tokenizer 在自身起点整体消费，内部的 $、$$、\[ 不会进入数学匹配。
+ */
+function renderMathHtml(tex: string, displayMode: boolean): string {
+  try {
+    return katex.renderToString(tex, {
+      displayMode,
+      throwOnError: false,
+      strict: false,
+      trust: false,
+    });
+  } catch {
+    // KaTeX 极端异常时退回字面文本，避免整条消息渲染失败
+    return `<code class="katex-error">${escapeHtml(tex)}</code>`;
+  }
+}
+
+// 货币防误伤：开 $ 后不能紧跟空白、闭 $ 前不能是空白、闭 $ 后不能紧跟数字；
+// 行内 $ 公式限制单行，内容不含 $。支持 \$ 转义（marked escape tokenizer 处理）。
+const inlineDollarMath = /^\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)/;
+// display 与 \(...\) 内容允许换行但不跨空行，避免误吞后续段落正文
+const inlineDoubledDollarMath = /^\$\$((?:(?!\n\n)[\s\S])*?)\$\$/;
+const inlineParenMath = /^\\\(((?:(?!\n\n)[\s\S])*?)\\\)/;
+const inlineBracketMath = /^\\\[((?:(?!\n\n)[\s\S])*?)\\\]/;
+const blockDollarMath = /^\$\$((?:(?!\n\n)[\s\S])*?)\$\$/;
+const blockBracketMath = /^\\\[((?:(?!\n\n)[\s\S])*?)\\\]/;
+
+/**
+ * 行内数学扩展：处理段落文本中的 $...$、\(...\)，以及 block 层不剪切的
+ * 位置（标题、表格单元格）里的 $$...$$、\[...\]。
+ */
+const inlineMathExtension: TokenizerAndRendererExtension = {
+  name: "inlineMath",
+  level: "inline",
+  // $ 不是 inlineText 的停止字符，必须提供 start 让 marked 在公式
+  // 起点截断普通文本 token，否则 $ 前的文本会把公式整段吞掉。
+  start(src: string): number {
+    return src.search(/\$|\\\(/);
+  },
+  tokenizer(src: string): Tokens.Generic | undefined {
+    const paren = inlineParenMath.exec(src);
+    if (paren) return mathToken("inlineMath", paren[0], paren[1], false);
+    const dollar = inlineDollarMath.exec(src);
+    if (dollar) return mathToken("inlineMath", dollar[0], dollar[1], false);
+    const doubled = inlineDoubledDollarMath.exec(src);
+    if (doubled) return mathToken("inlineMath", doubled[0], doubled[1], true);
+    const bracket = inlineBracketMath.exec(src);
+    if (bracket) return mathToken("inlineMath", bracket[0], bracket[1], true);
+    return undefined;
+  },
+  renderer(token: Tokens.Generic): string {
+    return renderMathHtml(readTex(token), token.displayMode === true);
+  },
+};
+
+/** 块级数学扩展：独立成块的 $$...$$ 与 \[...\]（display 模式）。 */
+const blockMathExtension: TokenizerAndRendererExtension = {
+  name: "blockMath",
+  level: "block",
+  // 不提供 start：start 会把 paragraph 剪切到 code span 内部的 $$ 起点上，
+  // 使块级扩展从 span 内部匹配（破坏代码保护）。独立成块的公式本来就在
+  // block 词法起点被直接命中；段中 $$ 与 \[ 由 inline 扩展兜底渲染。
+  tokenizer(src: string): Tokens.Generic | undefined {
+    const dollar = blockDollarMath.exec(src);
+    if (dollar) return mathToken("blockMath", dollar[0], dollar[1], true);
+    const bracket = blockBracketMath.exec(src);
+    if (bracket) return mathToken("blockMath", bracket[0], bracket[1], true);
+    return undefined;
+  },
+  renderer(token: Tokens.Generic): string {
+    return renderMathHtml(readTex(token), token.displayMode === true);
+  },
+};
+
+function mathToken(type: string, raw: string, tex: string, displayMode: boolean): Tokens.Generic {
+  return { type, raw, text: tex.trim(), displayMode };
+}
+
+function readTex(token: Tokens.Generic): string {
+  return typeof token.text === "string" ? token.text : "";
+}
+
+marked.use({ extensions: [blockMathExtension, inlineMathExtension] });
 
 /**
  * renderMarkdown 结果 LRU 缓存（perf SDD §3.18/§4.9）。

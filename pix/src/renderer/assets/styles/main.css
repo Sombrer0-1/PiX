@@ -151,6 +151,22 @@ pre code {
   background: none;
 }
 
+/* ── KaTeX math ── */
+/* 数学 HTML 经 v-html 注入，全局规则才能覆盖三处消费组件（主聊天 / BtwCard /
+   子代理输出）。display 公式横向滚动，长公式不撑破聊天气泡。 */
+.katex-display {
+  margin: var(--pix-space-md) 0;
+  padding: var(--pix-space-xs) 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* KaTeX 自身的错误 span 带内联 color:#cc0000；这条规则兜底
+   renderMathHtml catch 分支的 <code class="katex-error">，保证坏公式可见 */
+.katex-error {
+  color: var(--pix-error);
+}
+
 /* ── Focus ── */
 :focus-visible {
   outline: 2px solid var(--pix-accent);
