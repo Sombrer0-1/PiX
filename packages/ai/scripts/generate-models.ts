@@ -2,14 +2,22 @@
 
 import { writeFileSync } from "fs";
 import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import {
 	CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL,
 	CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL,
 	CLOUDFLARE_AI_GATEWAY_OPENAI_BASE_URL,
 	CLOUDFLARE_WORKERS_AI_BASE_URL,
 } from "../src/providers/cloudflare.ts";
-import type { AnthropicMessagesCompat, Api, KnownProvider, Model, OpenAICompletionsCompat } from "../src/types.ts";
+import type {
+	AnthropicMessagesCompat,
+	Api,
+	KnownProvider,
+	Model,
+	OpenAICompletionsCompat,
+	ThinkingLevel,
+	ThinkingLevelMap,
+} from "../src/types.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -20,11 +28,18 @@ function formatCostValue(value: number): string {
 	return String(Object.is(rounded, -0) ? 0 : rounded);
 }
 
+/** Reasoning control shapes exposed by models.dev, mirroring opencode's models-dev schema. */
+export type ReasoningOption =
+	| { type: "effort"; values: (string | null)[] }
+	| { type: "toggle" }
+	| { type: "budget_tokens"; min?: number; max?: number };
+
 interface ModelsDevModel {
 	id: string;
 	name: string;
 	tool_call?: boolean;
 	reasoning?: boolean;
+	reasoning_options?: ReasoningOption[];
 	limit?: {
 		context?: number;
 		output?: number;
@@ -41,6 +56,101 @@ interface ModelsDevModel {
 	provider?: {
 		npm?: string;
 	};
+}
+
+/**
+ * Internal generator-only extension that carries models.dev reasoning_options
+ * through the pipeline so the final metadata pass can apply catalog-derived
+ * thinkingLevelMaps. Not emitted into models.generated.ts.
+ */
+type CatalogModel = Model<any> & { reasoningOptions?: ReasoningOption[] };
+
+/**
+ * Convert models.dev reasoning_options effort values into a pi thinkingLevelMap.
+ *
+ * Wire values are normalized to lowercase. Tiers without a matching wire value
+ * are hidden (null) so the picker only offers efforts the model actually
+ * accepts; unrecognized wire values are ignored.
+ *
+ * xhigh slot conflict (values contain both "xhigh" and "max"): "max" wins, it
+ * is the stronger effort and pi has a single xhigh slot, so the wire "xhigh" is
+ * dropped.
+ *
+ * off tier: when values contain an off wire value ("none"/"off"/"disabled", or
+ * a null entry, which opencode maps to "none"), off maps to it. Responses-API
+ * models without an off wire value hide off (null) because the openai-responses
+ * send side injects effort "none" for a missing off entry, which those models
+ * reject (see openai-responses.ts reasoning param handling and the existing
+ * gpt-5.5-pro off: null rule). All other APIs leave off unset (undefined):
+ * their providers translate off into a genuine disable mechanism (anthropic
+ * thinking disabled, google disabled thinking config, completions toggle
+ * formats or an omitted reasoning_effort). An off-only vocabulary (no
+ * recognized effort tier, e.g. ["none","default"]) still yields a map with
+ * every tier hidden, so the picker only offers off.
+ *
+ * toggle and budget_tokens options produce no map: pi's thinkingLevelMap has no
+ * token-budget tiers and no wire vocabulary for plain on/off toggles, so those
+ * models keep the provider-specific hardcoded metadata.
+ */
+export function reasoningOptionsToThinkingLevelMap(
+	options: ReasoningOption[] | undefined,
+	api: Api,
+): ThinkingLevelMap | undefined {
+	// Defensive against dirty catalog data: this is the one place the generator
+	// parses models.dev structures that may drift from the opencode schema, and
+	// an exception would abort the whole regeneration silently (the entry point
+	// logs and exits 0), shipping a stale catalog.
+	if (!Array.isArray(options) || options.length === 0) return undefined;
+	const effort = options.find((option) => option?.type === "effort");
+	if (!effort || !Array.isArray(effort.values)) return undefined;
+
+	const tiers: Partial<Record<ThinkingLevel, string>> = {};
+	let offWire: string | undefined;
+	for (const value of effort.values) {
+		// opencode maps a null effort value to "none" (transform.ts effortVariants).
+		const raw = value === null || value === undefined ? "none" : value;
+		if (typeof raw !== "string") continue;
+		const wire = raw.toLowerCase();
+		switch (wire) {
+			case "none":
+			case "off":
+			case "disabled":
+				offWire = wire;
+				break;
+			case "minimal":
+			case "low":
+			case "medium":
+			case "high":
+				tiers[wire] = wire;
+				break;
+			case "xhigh":
+			case "extra_high":
+				// A preceding "max" wins the xhigh slot on conflict.
+				if (tiers.xhigh !== "max") tiers.xhigh = "xhigh";
+				break;
+			case "max":
+			case "maximum":
+				tiers.xhigh = "max";
+				break;
+			default:
+				// Unrecognized wire value (e.g. a custom tier name): ignore.
+				break;
+		}
+	}
+
+	const tierLevels = Object.keys(tiers) as ThinkingLevel[];
+	if (tierLevels.length === 0 && offWire === undefined) return undefined;
+
+	const map: ThinkingLevelMap = {};
+	if (offWire !== undefined) {
+		map.off = offWire;
+	} else if (api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses") {
+		map.off = null;
+	}
+	for (const level of ["minimal", "low", "medium", "high", "xhigh"] as const) {
+		map[level] = tiers[level] ?? null;
+	}
+	return map;
 }
 
 interface AiGatewayModel {
@@ -96,7 +206,12 @@ const TOGETHER_REASONING_ONLY_MODELS = new Set([
 	"MiniMaxAI/MiniMax-M2.7",
 ]);
 const TOGETHER_REASONING_EFFORT_MODELS = new Set(["openai/gpt-oss-20b", "openai/gpt-oss-120b"]);
-const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set(["deepseek-ai/DeepSeek-V4-Pro"]);
+// Catalog shape is toggle + effort values for these; without the effort compat
+// the offered tiers would all send the identical toggle wire.
+const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set([
+	"deepseek-ai/DeepSeek-V4-Pro",
+	"deepseek-ai/DeepSeek-V4-Flash-0731",
+]);
 const TOGETHER_FIXED_REASONING_LEVEL_MAP = {
 	off: null,
 	minimal: null,
@@ -217,34 +332,80 @@ function isGemma4Model(modelId: string): boolean {
 	return /gemma-?4/.test(modelId.toLowerCase());
 }
 
-function applyThinkingLevelMetadata(model: Model<any>): void {
-	if (
-		(model.api === "openai-responses" || model.api === "azure-openai-responses") &&
-		model.id.startsWith("gpt-5")
-	) {
-		mergeThinkingLevelMap(model, { off: null });
-	}
-	if (model.provider === "github-copilot" && model.id.startsWith("gpt-5")) {
-		mergeThinkingLevelMap(model, { minimal: "low" });
-	}
-	if (
-		model.api === "openai-responses" &&
-		model.provider === "openai" &&
-		OPENAI_RESPONSES_NONE_REASONING_MODELS.has(model.id)
-	) {
-		mergeThinkingLevelMap(model, { off: "none" });
-	}
-	if (supportsOpenAiXhigh(model.id)) {
-		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
-	}
-	if (model.provider === "openai" && model.id === "gpt-5.5") {
-		mergeThinkingLevelMap(model, { minimal: null });
-	}
-	if (model.id.endsWith("gpt-5.5-pro")) {
-		mergeThinkingLevelMap(model, { off: null, minimal: null, low: null });
-	}
-	if (model.id.includes("opus-4-6") || model.id.includes("opus-4.6")) {
-		mergeThinkingLevelMap(model, { xhigh: "max" });
+/**
+ * Apply client-side thinking metadata heuristics. Map entries are only merged
+ * when the model has no catalog-derived thinkingLevelMap (models.dev
+ * reasoning_options take priority; hardcoded rules are the fallback, mirroring
+ * opencode). Compat rules always apply.
+ */
+export function applyThinkingLevelMetadata(model: Model<any>, hasCatalogThinkingLevelMap: boolean): void {
+	if (!hasCatalogThinkingLevelMap) {
+		if (
+			(model.api === "openai-responses" || model.api === "azure-openai-responses") &&
+			model.id.startsWith("gpt-5")
+		) {
+			mergeThinkingLevelMap(model, { off: null });
+		}
+		if (model.provider === "github-copilot" && model.id.startsWith("gpt-5")) {
+			mergeThinkingLevelMap(model, { minimal: "low" });
+		}
+		if (
+			model.api === "openai-responses" &&
+			model.provider === "openai" &&
+			OPENAI_RESPONSES_NONE_REASONING_MODELS.has(model.id)
+		) {
+			mergeThinkingLevelMap(model, { off: "none" });
+		}
+		if (supportsOpenAiXhigh(model.id)) {
+			mergeThinkingLevelMap(model, { xhigh: "xhigh" });
+		}
+		if (model.provider === "openai" && model.id === "gpt-5.5") {
+			mergeThinkingLevelMap(model, { minimal: null });
+		}
+		if (model.id.endsWith("gpt-5.5-pro")) {
+			mergeThinkingLevelMap(model, { off: null, minimal: null, low: null });
+		}
+		if (model.id.includes("opus-4-6") || model.id.includes("opus-4.6")) {
+			mergeThinkingLevelMap(model, { xhigh: "max" });
+		}
+		if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
+			mergeThinkingLevelMap(
+				model,
+				model.provider === "openrouter"
+					? { ...DEEPSEEK_V4_THINKING_LEVEL_MAP, xhigh: "xhigh" }
+					: DEEPSEEK_V4_THINKING_LEVEL_MAP,
+			);
+		}
+		if (isGoogleThinkingApi(model) && isGemini3ProModel(model.id)) {
+			mergeThinkingLevelMap(model, { off: null, minimal: null, low: "LOW", medium: null, high: "HIGH" });
+		}
+		if (isGoogleThinkingApi(model) && isGemini3FlashModel(model.id)) {
+			mergeThinkingLevelMap(model, { off: null });
+		}
+		if (isGoogleThinkingApi(model) && isGemma4Model(model.id)) {
+			mergeThinkingLevelMap(model, { off: null, minimal: "MINIMAL", low: null, medium: null, high: "HIGH" });
+		}
+		if (model.provider === "groq" && model.id === "qwen/qwen3-32b") {
+			mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null, high: "default" });
+		}
+		if (model.provider === "openai-codex" && supportsOpenAiXhigh(model.id)) {
+			mergeThinkingLevelMap(model, { minimal: "low" });
+		}
+		if (model.provider === "openrouter" && model.id.startsWith("inception/mercury-2")) {
+			// Mercury 2 in instant mode (reasoning_effort: "none") disables tool calling.
+			// Mark "off" unsupported so the openai-completions provider omits the reasoning param
+			// instead of defaulting to {reasoning:{effort:"none"}} (see openai-completions.ts:575).
+			// Pi's low/medium/high pass through verbatim; OpenRouter normalizes to Mercury's vocabulary.
+			mergeThinkingLevelMap(model, { off: null });
+		}
+		if (model.provider === "opencode-go" && model.id === "kimi-k2.6") {
+			// OpenCode Go exposes Kimi K2.6 thinking as on/off, not distinct effort tiers.
+			mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null });
+		}
+		if (model.provider === "opencode" && model.id === "grok-build-0.1") {
+			// OpenCode Zen Grok Build reasons by default but rejects explicit reasoningEffort.
+			mergeThinkingLevelMap(model, { off: null, minimal: null, low: null, medium: null });
+		}
 	}
 	if (
 		model.id.includes("opus-4-7") ||
@@ -252,51 +413,42 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.includes("opus-4-8") ||
 		model.id.includes("opus-4.8")
 	) {
+		// models.dev lists both "xhigh" and "max" for Opus 4.7/4.8, but the
+		// Anthropic API only accepts "xhigh" there ("max" is Opus 4.6-only).
+		// This tested override wins over the catalog-derived map.
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
+	}
+	// Reasoning cannot be disabled on these models: the Google send side falls
+	// back to the lowest thinkingLevel (see getDisabledThinkingConfig) and
+	// Together's gpt-oss endpoints accept no "none" effort, so an offered "off"
+	// would silently behave as default reasoning. Keep off hidden even when a
+	// catalog map leaves the off slot unset.
+	if (
+		isGoogleThinkingApi(model) &&
+		(isGemini3ProModel(model.id) || isGemini3FlashModel(model.id) || isGemma4Model(model.id))
+	) {
+		mergeThinkingLevelMap(model, { off: null });
+	}
+	// Gemini 3 Pro exposes only LOW/HIGH thinking levels on the Google send
+	// side (medium folds to HIGH); hide the folded tier so google and
+	// google-vertex twins offer the same set.
+	if (isGoogleThinkingApi(model) && isGemini3ProModel(model.id)) {
+		mergeThinkingLevelMap(model, { medium: null });
+	}
+	if (model.provider === "together" && TOGETHER_REASONING_EFFORT_MODELS.has(model.id)) {
+		mergeThinkingLevelMap(model, { off: null });
+	}
+	// gpt-oss reasons by default and its vocabularies carry no "none" effort on
+	// any host: an offered off would just omit reasoning_effort and silently
+	// keep default reasoning. Only applies when no off wire value exists.
+	if (model.id.includes("gpt-oss") && model.thinkingLevelMap?.off === undefined) {
+		mergeThinkingLevelMap(model, { off: null });
 	}
 	if (model.api === "anthropic-messages" && isAnthropicAdaptiveThinkingModel(model.id)) {
 		mergeAnthropicMessagesCompat(model, { forceAdaptiveThinking: true });
 	}
 	if (model.api === "anthropic-messages" && isAnthropicTemperatureUnsupportedModel(model.id)) {
 		mergeAnthropicMessagesCompat(model, { supportsTemperature: false });
-	}
-	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
-		mergeThinkingLevelMap(
-			model,
-			model.provider === "openrouter"
-				? { ...DEEPSEEK_V4_THINKING_LEVEL_MAP, xhigh: "xhigh" }
-				: DEEPSEEK_V4_THINKING_LEVEL_MAP,
-		);
-	}
-	if (isGoogleThinkingApi(model) && isGemini3ProModel(model.id)) {
-		mergeThinkingLevelMap(model, { off: null, minimal: null, low: "LOW", medium: null, high: "HIGH" });
-	}
-	if (isGoogleThinkingApi(model) && isGemini3FlashModel(model.id)) {
-		mergeThinkingLevelMap(model, { off: null });
-	}
-	if (isGoogleThinkingApi(model) && isGemma4Model(model.id)) {
-		mergeThinkingLevelMap(model, { off: null, minimal: "MINIMAL", low: null, medium: null, high: "HIGH" });
-	}
-	if (model.provider === "groq" && model.id === "qwen/qwen3-32b") {
-		mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null, high: "default" });
-	}
-	if (model.provider === "openai-codex" && supportsOpenAiXhigh(model.id)) {
-		mergeThinkingLevelMap(model, { minimal: "low" });
-	}
-	if (model.provider === "openrouter" && model.id.startsWith("inception/mercury-2")) {
-		// Mercury 2 in instant mode (reasoning_effort: "none") disables tool calling.
-		// Mark "off" unsupported so the openai-completions provider omits the reasoning param
-		// instead of defaulting to {reasoning:{effort:"none"}} (see openai-completions.ts:575).
-		// Pi's low/medium/high pass through verbatim; OpenRouter normalizes to Mercury's vocabulary.
-		mergeThinkingLevelMap(model, { off: null });
-	}
-	if (model.provider === "opencode-go" && model.id === "kimi-k2.6") {
-		// OpenCode Go exposes Kimi K2.6 thinking as on/off, not distinct effort tiers.
-		mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null });
-	}
-	if (model.provider === "opencode" && model.id === "grok-build-0.1") {
-		// OpenCode Zen Grok Build reasons by default but rejects explicit reasoningEffort.
-		mergeThinkingLevelMap(model, { off: null, minimal: null, low: null, medium: null });
 	}
 }
 
@@ -433,13 +585,13 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	}
 }
 
-async function loadModelsDevData(): Promise<Model<any>[]> {
+async function loadModelsDevData(): Promise<CatalogModel[]> {
 	try {
 		console.log("Fetching models from models.dev API...");
 		const response = await fetch("https://models.dev/api.json");
 		const data = await response.json();
 
-		const models: Model<any>[] = [];
+		const models: CatalogModel[] = [];
 
 		// Process Amazon Bedrock models
 		if (data["amazon-bedrock"]?.models) {
@@ -466,6 +618,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "amazon-bedrock" as const,
 					baseUrl: getBedrockBaseUrl(id),
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: (m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
 					cost: {
 						input: m.cost?.input || 0,
@@ -492,6 +645,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "anthropic",
 					baseUrl: "https://api.anthropic.com",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -518,6 +672,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "google",
 					baseUrl: "https://generativelanguage.googleapis.com/v1beta",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -544,6 +699,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "openai",
 					baseUrl: "https://api.openai.com/v1",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -570,6 +726,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "groq",
 					baseUrl: "https://api.groq.com/openai/v1",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -596,6 +753,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "cerebras",
 					baseUrl: "https://api.cerebras.ai/v1",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -622,6 +780,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "cloudflare-workers-ai",
 					baseUrl: CLOUDFLARE_WORKERS_AI_BASE_URL,
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -677,6 +836,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "cloudflare-ai-gateway",
 					baseUrl,
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -704,6 +864,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "xai",
 					baseUrl: "https://api.x.ai/v1",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -731,6 +892,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "zai",
 					baseUrl: "https://api.z.ai/api/coding/paas/v4",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: supportsImage ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -762,6 +924,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "mistral",
 					baseUrl: "https://api.mistral.ai",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -788,6 +951,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "huggingface",
 					baseUrl: "https://router.huggingface.co/v1",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -818,6 +982,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					// Fireworks Anthropic-compatible API - SDK appends /v1/messages
 					baseUrl: "https://api.fireworks.ai/inference",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -858,6 +1023,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "together",
 					baseUrl: TOGETHER_BASE_URL,
 					reasoning,
+					reasoningOptions: m.reasoning_options,
 					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
@@ -954,6 +1120,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: variant.provider,
 					baseUrl,
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -989,13 +1156,14 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				const anthropicCompat =
 					api === "anthropic-messages" ? getAnthropicMessagesCompat("github-copilot", modelId) : undefined;
 
-				const copilotModel: Model<any> = {
+				const copilotModel: CatalogModel = {
 					id: modelId,
 					name: m.name || modelId,
 					api,
 					provider: "github-copilot",
 					baseUrl: "https://api.individual.githubcopilot.com",
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -1041,6 +1209,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						// MiniMax's Anthropic-compatible API - SDK appends /v1/messages
 						baseUrl,
 						reasoning: m.reasoning === true,
+						reasoningOptions: m.reasoning_options,
 						input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 						cost: {
 							input: m.cost?.input || 0,
@@ -1081,6 +1250,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.kimi.com/coding",
 					headers: { ...KIMI_STATIC_HEADERS },
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -1121,6 +1291,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider,
 					baseUrl,
 					reasoning: m.reasoning === true,
+					reasoningOptions: m.reasoning_options,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -1165,6 +1336,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						baseUrl,
 						compat: xiaomiCompat,
 						reasoning: m.reasoning === true,
+						reasoningOptions: m.reasoning_options,
 						input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 						cost: {
 							input: m.cost?.input || 0,
@@ -1197,7 +1369,7 @@ async function generateModels() {
 	const aiGatewayModels = await fetchAiGatewayModels();
 
 	// Combine models (models.dev has priority)
-	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
+	const allModels: CatalogModel[] = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);
@@ -1933,7 +2105,12 @@ async function generateModels() {
 	allModels.push(...azureOpenAiModels);
 
 	for (const model of allModels) {
-		applyThinkingLevelMetadata(model);
+		// models.dev reasoning_options take priority over the hardcoded heuristics
+		// below (mirroring opencode: catalog data first, client-side hardcoded as
+		// fallback). A catalog-derived map replaces any load-time map wholesale.
+		const catalogMap = reasoningOptionsToThinkingLevelMap(model.reasoningOptions, model.api);
+		if (catalogMap) model.thinkingLevelMap = catalogMap;
+		applyThinkingLevelMetadata(model, catalogMap !== undefined);
 	}
 
 	// Group by provider and deduplicate by model ID
@@ -2021,5 +2198,14 @@ export const MODELS = {
 	}
 }
 
-// Run the generator
-generateModels().catch(console.error);
+// Run the generator only when executed directly (imports from tests must not
+// trigger network fetches); compare case-insensitively on Windows where the
+// argv drive-letter casing can differ from the module URL.
+const invokedDirectly =
+	process.argv[1] !== undefined &&
+	(process.platform === "win32"
+		? pathToFileURL(process.argv[1]).href.toLowerCase() === import.meta.url.toLowerCase()
+		: pathToFileURL(process.argv[1]).href === import.meta.url);
+if (invokedDirectly) {
+	generateModels().catch(console.error);
+}

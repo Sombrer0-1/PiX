@@ -43,8 +43,10 @@ describe("Together models", () => {
 	});
 
 	it("models Together reasoning controls from the Together API surface", () => {
+		// thinkingLevelMaps come from models.dev reasoning_options (catalog-first).
 		const gptOss = getModel("together", "openai/gpt-oss-120b");
-		expect(gptOss.thinkingLevelMap).toEqual({ off: null, minimal: null });
+		// off stays hidden: Together's gpt-oss endpoints accept no "none" effort.
+		expect(gptOss.thinkingLevelMap).toEqual({ off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null });
 		expect(gptOss.compat).toMatchObject({
 			supportsReasoningEffort: true,
 			thinkingFormat: "openai",
@@ -56,7 +58,7 @@ describe("Together models", () => {
 			low: null,
 			medium: null,
 			high: "high",
-			xhigh: null,
+			xhigh: "max",
 		});
 		expect(deepSeekV4.compat).toMatchObject({
 			supportsReasoningEffort: true,
