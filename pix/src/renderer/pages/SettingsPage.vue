@@ -5,7 +5,7 @@
  * Sidebar + content layout. Left nav selects the section,
  * right panel shows the form fields for that section.
  */
-import { computed, ref, onMounted, watch } from "vue";
+import { computed, ref, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useSettingsStore } from "../stores/settings-store";
 import { useAuthStore } from "../stores/auth-store";
@@ -13,6 +13,9 @@ import { useWorkspaceRpc } from "../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 import { thinkingLevelItems } from "../utils/thinking-labels";
 import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, AGENT_TASK_MAX_RUNNING_SLOTS } from "@shared/agent-task-types.js";
+import SettingsGroup from "../components/settings/SettingsGroup.vue";
+import SettingsRow from "../components/settings/SettingsRow.vue";
+import WindowTitlebar from "../components/layout/WindowTitlebar.vue";
 import McpSettings from "../components/settings/McpSettings.vue";
 import CustomProviders from "../components/settings/CustomProviders.vue";
 
@@ -23,21 +26,174 @@ const authStore = useAuthStore();
 const rpc = useWorkspaceRpc();
 
 // ---- Navigation ----
-type SettingsSection = "general" | "model" | "plan" | "shell" | "wsl" | "resources" | "mcp" | "custom" | "auth" | "advanced";
+type SettingsSection =
+  | "general"
+  | "plan"
+  | "images"
+  | "environment"
+  | "resources"
+  | "model"
+  | "custom"
+  | "auth"
+  | "mcp"
+  | "advanced";
 const activeSection = ref<SettingsSection>("general");
-const sections: { key: SettingsSection; label: string; icon: string }[] = [
-  { key: "general", label: "常规", icon: "mdi-cog-outline" },
-  { key: "model", label: "模型", icon: "mdi-cube-outline" },
-  { key: "plan", label: "规划", icon: "mdi-clipboard-list-outline" },
-  { key: "shell", label: "Shell", icon: "mdi-bash" },
-  { key: "wsl", label: "WSL", icon: "mdi-linux" },
-  { key: "resources", label: "资源", icon: "mdi-package-variant" },
-  { key: "mcp", label: "MCP", icon: "mdi-puzzle-outline" },
-  { key: "custom", label: "自定义模型", icon: "mdi-transit-connection-variant" },
-  { key: "auth", label: "认证", icon: "mdi-shield-key" },
-  { key: "advanced", label: "高级", icon: "mdi-tune" },
+const searchQuery = ref("");
+const navigationOpen = ref(false);
+const navigation = ref<HTMLElement | null>(null);
+const menuButton = ref<HTMLButtonElement | null>(null);
+const settingsScroll = ref<HTMLElement | null>(null);
+const sections: {
+  key: SettingsSection;
+  label: string;
+  icon: string;
+  group: string;
+  description: string;
+  keywords: string;
+}[] = [
+  {
+    key: "general",
+    label: "常规",
+    icon: "mdi-cog-outline",
+    group: "使用偏好",
+    description: "设置 Agent 的执行权限与日常对话行为。",
+    keywords: "执行模式 审批 只读 无监管 完成前验证 默认思考 引导 后续 自动压缩 主动压缩 ACP 安静启动",
+  },
+  {
+    key: "plan",
+    label: "规划与任务",
+    icon: "mdi-clipboard-list-outline",
+    group: "使用偏好",
+    description: "配置规划模型与后台 Agent 任务。",
+    keywords: "规划模型 思考强度 自动后台 阈值 子 Agent 并发 排队",
+  },
+  {
+    key: "images",
+    label: "图片理解",
+    icon: "mdi-eye-outline",
+    group: "使用偏好",
+    description: "管理图片输入与眼睛模型。",
+    keywords: "自动缩放 禁图 阻止图片 视觉 takeHerEyes 提供商",
+  },
+  {
+    key: "environment",
+    label: "执行环境",
+    icon: "mdi-console",
+    group: "工作区",
+    description: "配置 Shell、网络及新项目的 WSL 默认值。",
+    keywords: "Shell 路径 Bash 命令前缀 npm HTTP 空闲超时 WSL2 发行版 Linux 目录",
+  },
+  {
+    key: "resources",
+    label: "扩展与资源",
+    icon: "mdi-layers-outline",
+    group: "工作区",
+    description: "配置扩展、技能、提示模板与主题路径。",
+    keywords: "扩展路径 技能命令 skill prompt 提示模板 主题 重新加载",
+  },
+  {
+    key: "model",
+    label: "模型与连接",
+    icon: "mdi-chip",
+    group: "模型与集成",
+    description: "管理可用模型与 API 连接方式。",
+    keywords: "enabledModels glob 规则 传输 transport SSE WebSocket 自动重试",
+  },
+  {
+    key: "custom",
+    label: "自定义提供商",
+    icon: "mdi-connection",
+    group: "模型与集成",
+    description: "",
+    keywords:
+      "Provider 模型目录 baseUrl API Key Headers Bearer compat 协议 兼容 JSON thinkingLevelMap 从 API 获取 导入",
+  },
+  {
+    key: "auth",
+    label: "认证",
+    icon: "mdi-key-outline",
+    group: "模型与集成",
+    description: "配置内置提供商的 API 密钥。",
+    keywords: "API Key auth.json 来源 密钥 保存 替换 删除",
+  },
+  {
+    key: "mcp",
+    label: "MCP 服务器",
+    icon: "mdi-power-plug-outline",
+    group: "模型与集成",
+    description: "",
+    keywords: "连接 工具 配置文件 刷新 stderr 错误 required",
+  },
+  {
+    key: "advanced",
+    label: "高级",
+    icon: "mdi-tune",
+    group: "应用",
+    description: "管理应用更新与诊断信息。",
+    keywords: "自动补全 数量 匿名使用数据 分析 遥测 更新 下载 安装 诊断 路径 数据目录 会话存储 设置文件",
+  },
 ];
 const sectionKeys = new Set<SettingsSection>(sections.map((section) => section.key));
+const currentSection = computed(() => sections.find((section) => section.key === activeSection.value)!);
+const filteredGroups = computed(() => {
+  const query = searchQuery.value.trim().toLowerCase();
+  return ["使用偏好", "工作区", "模型与集成", "应用"]
+    .map((label) => ({
+      label,
+      sections: sections.filter(
+        (section) =>
+          section.group === label &&
+          (!query || `${section.label} ${section.description} ${section.keywords}`.toLowerCase().includes(query)),
+      ),
+    }))
+    .filter((group) => group.sections.length > 0);
+});
+function selectSection(section: SettingsSection): void {
+  activeSection.value = section;
+  if (typeof router.replace === "function") void router.replace({ path: "/settings", query: { section } });
+  closeNavigation();
+}
+function closeNavigation(): void {
+  const wasOpen = navigationOpen.value;
+  navigationOpen.value = false;
+  if (wasOpen) void nextTick(() => menuButton.value?.focus());
+}
+watch(navigationOpen, async (open) => {
+  if (open) {
+    await nextTick();
+    navigation.value?.querySelector<HTMLInputElement>("input")?.focus();
+  }
+});
+function handleNavigationKey(event: KeyboardEvent): void {
+  if (!navigationOpen.value) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeNavigation();
+  }
+  if (event.key === "Tab") {
+    const controls = Array.from(navigation.value?.querySelectorAll<HTMLElement>("button, input, a") ?? []);
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last?.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first?.focus();
+    }
+  }
+}
+function handleResize(): void {
+  if (window.innerWidth > 560) closeNavigation();
+}
+onMounted(() => {
+  window.addEventListener("keydown", handleNavigationKey);
+  window.addEventListener("resize", handleResize);
+});
+onUnmounted(() => {
+  window.removeEventListener("keydown", handleNavigationKey);
+  window.removeEventListener("resize", handleResize);
+});
 
 // ---- Form state ----
 const defaultProvider = ref("");
@@ -71,7 +227,14 @@ const enableProductAnalytics = ref(false);
 const autoBackgroundMs = ref(0);
 const agentTaskMaxConcurrent = ref(AGENT_TASK_DEFAULT_RUNNING_SLOTS);
 const agentTaskConcurrentTicks: Record<number, string> = {
-  1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8",
+  1: "1",
+  2: "2",
+  3: "3",
+  4: "4",
+  5: "5",
+  6: "6",
+  7: "7",
+  8: "8",
 };
 
 const shellPath = ref("");
@@ -95,6 +258,105 @@ const autocompleteMaxVisible = ref(5);
 
 const saving = ref(false);
 const saved = ref(false);
+const loading = ref(true);
+const loadError = ref("");
+const saveError = ref("");
+const piReady = ref(false);
+const guiReady = ref(false);
+const authError = ref("");
+const authBusy = ref<string | null>(null);
+const pendingAuthDelete = ref<string | null>(null);
+const showAuthDeleteDialog = computed({
+  get: () => pendingAuthDelete.value !== null,
+  set: (open: boolean) => { if (!open) pendingAuthDelete.value = null; },
+});
+const showDiscardDialog = ref(false);
+const providersDirty = ref(false);
+const baseline = ref("");
+const piBaseline = ref("");
+const piSnapshot = computed(() =>
+  JSON.stringify([
+    steeringMode.value,
+    followUpMode.value,
+    executionMode.value,
+    verificationGate.value,
+    autoCompact.value,
+    quietStartup.value,
+    enabledModels.value,
+    transport.value,
+    retryEnabled.value,
+    imageAutoResize.value,
+    blockImages.value,
+    shellPath.value,
+    shellCommandPrefix.value,
+    npmCommand.value,
+    httpIdleTimeoutMs.value,
+    extensionPaths.value,
+    skillPaths.value,
+    promptTemplatePaths.value,
+    themePaths.value,
+    enableSkillCommands.value,
+    autocompleteMaxVisible.value,
+  ]),
+);
+const formSnapshot = computed(() =>
+  JSON.stringify([
+    defaultThinkingLevel.value,
+    steeringMode.value,
+    followUpMode.value,
+    executionMode.value,
+    verificationGate.value,
+    autoCompact.value,
+    defaultAcp.value,
+    quietStartup.value,
+    enabledModels.value,
+    transport.value,
+    retryEnabled.value,
+    imageAutoResize.value,
+    blockImages.value,
+    takeHerEyesEnabled.value,
+    takeHerEyesModel.value,
+    planModelKey.value,
+    planThinkingLevel.value,
+    enableProductAnalytics.value,
+    autoBackgroundMs.value,
+    agentTaskMaxConcurrent.value,
+    shellPath.value,
+    shellCommandPrefix.value,
+    npmCommand.value,
+    httpIdleTimeoutMs.value,
+    wslEnabled.value,
+    wslDistro.value,
+    wslDefaultCwd.value,
+    extensionPaths.value,
+    skillPaths.value,
+    promptTemplatePaths.value,
+    themePaths.value,
+    enableSkillCommands.value,
+    autocompleteMaxVisible.value,
+  ]),
+);
+const dirty = computed(() => baseline.value !== "" && formSnapshot.value !== baseline.value);
+const reloadingResources = ref(false);
+const resourceFeedback = ref("");
+const resourceError = ref(false);
+async function reloadResources(): Promise<void> {
+  reloadingResources.value = true;
+  resourceFeedback.value = "";
+  resourceError.value = false;
+  try {
+    await rpc.reloadResources();
+    resourceFeedback.value = "资源已重新加载";
+  } catch (error) {
+    resourceError.value = true;
+    resourceFeedback.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    reloadingResources.value = false;
+  }
+}
+watch(formSnapshot, () => {
+  saved.value = false;
+});
 
 // ---- Update state ----
 const checkingUpdate = ref(false);
@@ -129,26 +391,41 @@ function toggleEditProvider(provider: string): void {
 
 async function saveKey(provider: string): Promise<void> {
   const key = editingKeys.value[provider]?.trim();
-  if (!key) return;
+  if (!key || authBusy.value) return;
+  authBusy.value = provider;
+  authError.value = "";
   try {
     await rpc.setApiKey(provider, key);
     editingKeys.value[provider] = "";
     editingProvider.value = null;
     await authStore.refreshStatus();
   } catch (err) {
-    console.error("[SettingsPage] Failed to save API key:", err);
+    authError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    authBusy.value = null;
   }
 }
 
 async function deleteKey(provider: string): Promise<void> {
+  if (authBusy.value || customProviderNames.value.has(provider)) return;
+  authBusy.value = provider;
+  authError.value = "";
   try {
     await rpc.removeAuth(provider);
     editingKeys.value[provider] = "";
     editingProvider.value = null;
     await authStore.refreshStatus();
   } catch (err) {
-    console.error("[SettingsPage] Failed to remove API key:", err);
+    authError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    authBusy.value = null;
   }
+}
+
+async function confirmDeleteKey(): Promise<void> {
+  const provider = pendingAuthDelete.value;
+  pendingAuthDelete.value = null;
+  if (provider !== null) await deleteKey(provider);
 }
 
 // ---- Option lists ----
@@ -177,7 +454,7 @@ const visionModelItems = computed(() =>
       props: {
         subtitle: model.contextWindow ? `${formatContextWindow(model.contextWindow)} 上下文` : undefined,
       },
-    }))
+    })),
 );
 
 // Plan-mode model choices; the first entry (empty value) means "inherit the
@@ -249,9 +526,24 @@ function syncSectionFromRoute(): void {
 }
 
 // ---- Load ----
-onMounted(async () => {
+async function loadSettings(): Promise<void> {
+  if (settingsStore.isLoaded && baseline.value) {
+    loadError.value = "";
+    const wasDirty = dirty.value;
+    await loadPiSettings();
+    if (!wasDirty) baseline.value = formSnapshot.value;
+    return;
+  }
+  loading.value = true;
+  loadError.value = "";
   syncSectionFromRoute();
   await settingsStore.load();
+  if (!settingsStore.isLoaded || settingsStore.loadError) {
+    loadError.value = settingsStore.loadError || "读取应用设置失败，请重试。";
+    loading.value = false;
+    return;
+  }
+  guiReady.value = true;
   defaultProvider.value = settingsStore.settings.defaultProvider || "";
   defaultModel.value = settingsStore.settings.defaultModel || "";
   defaultThinkingLevel.value = settingsStore.settings.defaultThinkingLevel || "xhigh";
@@ -277,19 +569,39 @@ onMounted(async () => {
   // tracks wslDistrosLoaded internally; the page only reads the results.
   void settingsStore.loadWslDistros();
 
-  if (rpc.isConnected.value) {
-    try {
-      const s = await rpc.getPiSettings();
-      if (s) applyPiSettings(s);
-    } catch { /* use defaults */ }
-    try { await rpc.refreshModels(); } catch { /* unavailable */ }
-    try { await authStore.refreshStatus(); } catch { /* unavailable */ }
-    try {
-      const result = await rpc.getCustomProviders();
-      if (result) customProviderNames.value = new Set(Object.keys(result.providers));
-    } catch { /* unavailable */ }
+  await loadPiSettings();
+  baseline.value = formSnapshot.value;
+  loading.value = false;
+}
+async function loadPiSettings(): Promise<void> {
+  if (!rpc.isConnected.value) return;
+  try {
+    const s = await rpc.getPiSettings();
+    if (!s) throw new Error("读取 Agent 配置失败，请重试。");
+    applyPiSettings(s);
+    piReady.value = true;
+    piBaseline.value = piSnapshot.value;
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : String(error);
   }
-});
+  await Promise.allSettled([rpc.refreshModels(), authStore.refreshStatus()]);
+  try {
+    const result = await rpc.getCustomProviders();
+    if (result) customProviderNames.value = new Set(Object.keys(result.providers));
+  } catch (error) {
+    authError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+onMounted(loadSettings);
+watch(
+  () => rpc.isConnected.value,
+  async (connected) => {
+    if (!connected || loading.value || piReady.value) return;
+    const wasDirty = dirty.value;
+    await loadPiSettings();
+    if (!wasDirty) baseline.value = formSnapshot.value;
+  },
+);
 
 watch(() => route.query.section, syncSectionFromRoute);
 
@@ -297,11 +609,15 @@ watch(() => route.query.section, syncSectionFromRoute);
 // double-source guard reflects any providers added/removed in "自定义模型"
 // since mount (CustomProviders.vue refreshes auth status on save but not this set).
 watch(activeSection, async (section) => {
+  await nextTick();
+  if (settingsScroll.value) settingsScroll.value.scrollTop = 0;
   if (section !== "auth" || !rpc.isConnected.value) return;
   try {
     const result = await rpc.getCustomProviders();
     if (result) customProviderNames.value = new Set(Object.keys(result.providers));
-  } catch { /* unavailable */ }
+  } catch {
+    /* unavailable */
+  }
 });
 
 function applyPiSettings(s: Record<string, unknown>): void {
@@ -310,27 +626,34 @@ function applyPiSettings(s: Record<string, unknown>): void {
   const execution = (s.execution && typeof s.execution === "object" ? s.execution : {}) as Record<string, unknown>;
   executionMode.value = execution.mode === "read-only" || execution.mode === "unattended" ? execution.mode : "approval";
   verificationGate.value = (execution.verificationGate ?? true) as boolean;
-  autoCompact.value = (s.compactionEnabled ?? s.compaction?.enabled ?? true) as boolean;
+  const compaction = s.compaction as { enabled?: boolean } | undefined;
+  const images = s.images as { autoResize?: boolean; blockImages?: boolean } | undefined;
+  const retry = s.retry as { enabled?: boolean } | undefined;
+  autoCompact.value = (s.compactionEnabled ?? compaction?.enabled ?? true) as boolean;
   quietStartup.value = (s.quietStartup ?? false) as boolean;
   if (s.enabledModels && Array.isArray(s.enabledModels)) enabledModels.value = s.enabledModels.join(", ");
   transport.value = (s.transport ?? "auto") as string;
-  retryEnabled.value = (s.retry?.enabled ?? true) as boolean;
-  imageAutoResize.value = (s.images?.autoResize ?? true) as boolean;
-  blockImages.value = (s.images?.blockImages ?? false) as boolean;
+  retryEnabled.value = (retry?.enabled ?? true) as boolean;
+  imageAutoResize.value = (images?.autoResize ?? true) as boolean;
+  blockImages.value = (images?.blockImages ?? false) as boolean;
   shellPath.value = (s.shellPath ?? "") as string;
   shellCommandPrefix.value = (s.shellCommandPrefix ?? "") as string;
   if (s.npmCommand && Array.isArray(s.npmCommand)) npmCommand.value = s.npmCommand.join(" ");
   httpIdleTimeoutMs.value = (s.httpIdleTimeoutMs ?? 0) as number;
   if (s.extensionPaths && Array.isArray(s.extensionPaths)) extensionPaths.value = s.extensionPaths.join(", ");
   if (s.skillPaths && Array.isArray(s.skillPaths)) skillPaths.value = s.skillPaths.join(", ");
-  if (s.promptTemplatePaths && Array.isArray(s.promptTemplatePaths)) promptTemplatePaths.value = s.promptTemplatePaths.join(", ");
+  if (s.promptTemplatePaths && Array.isArray(s.promptTemplatePaths))
+    promptTemplatePaths.value = s.promptTemplatePaths.join(", ");
   if (s.themePaths && Array.isArray(s.themePaths)) themePaths.value = s.themePaths.join(", ");
   enableSkillCommands.value = (s.enableSkillCommands ?? true) as boolean;
   autocompleteMaxVisible.value = (s.autocompleteMaxVisible ?? 5) as number;
 }
 
 function commaList(value: string): string[] {
-  return value.split(",").map((item) => item.trim()).filter(Boolean);
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function optionalCommaList(value: string): string[] | undefined {
@@ -339,13 +662,70 @@ function optionalCommaList(value: string): string[] | undefined {
 }
 
 function optionalSpaceList(value: string): string[] | undefined {
-  const items = value.split(/\s+/).map((item) => item.trim()).filter(Boolean);
+  const items = value
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
   return items.length > 0 ? items : undefined;
 }
 
 async function saveSettings(): Promise<void> {
+  if (saving.value || loading.value) return;
+  saveError.value = "";
+  if (piReady.value && piSnapshot.value !== piBaseline.value && !rpc.isConnected.value) {
+    saveError.value = "Agent 配置尚未保存，请恢复会话连接后重试。";
+    return;
+  }
+  if (wslEnabled.value && !wslDefaultCwdValid.value) {
+    saveError.value = "请输入以 / 开头且不含反斜杠的 Linux 路径。";
+    selectSection("environment");
+    return;
+  }
+  if (
+    !Number.isInteger(agentTaskMaxConcurrent.value) ||
+    agentTaskMaxConcurrent.value < 1 ||
+    agentTaskMaxConcurrent.value > AGENT_TASK_MAX_RUNNING_SLOTS
+  ) {
+    saveError.value = "Agent 并发上限须为 1–8 的整数。";
+    selectSection("plan");
+    return;
+  }
+  if (
+    !Number.isInteger(autocompleteMaxVisible.value) ||
+    autocompleteMaxVisible.value < 3 ||
+    autocompleteMaxVisible.value > 20
+  ) {
+    saveError.value = "自动补全显示数须为 3–20 的整数。";
+    selectSection("advanced");
+    return;
+  }
   saving.value = true;
   saved.value = false;
+  const submittedForm = formSnapshot.value;
+  const submittedPi = piSnapshot.value;
+  const setters: [string, unknown][] = [
+    ["steeringMode", steeringMode.value],
+    ["followUpMode", followUpMode.value],
+    ["executionMode", executionMode.value],
+    ["verificationGate", verificationGate.value],
+    ["compactEnabled", autoCompact.value],
+    ["quietStartup", quietStartup.value],
+    ["enabledModels", optionalCommaList(enabledModels.value)],
+    ["transport", transport.value],
+    ["retryEnabled", retryEnabled.value],
+    ["autoResizeImages", imageAutoResize.value],
+    ["blockImages", blockImages.value],
+    ["shellPath", shellPath.value || undefined],
+    ["shellCommandPrefix", shellCommandPrefix.value || undefined],
+    ["npmCommand", optionalSpaceList(npmCommand.value)],
+    ["httpIdleTimeoutMs", httpIdleTimeoutMs.value || 0],
+    ["extensionPaths", commaList(extensionPaths.value)],
+    ["skillPaths", commaList(skillPaths.value)],
+    ["promptTemplatePaths", commaList(promptTemplatePaths.value)],
+    ["themePaths", commaList(themePaths.value)],
+    ["enableSkillCommands", enableSkillCommands.value],
+    ["autocompleteMaxVisible", autocompleteMaxVisible.value],
+  ];
   try {
     const selectedEyeModel = parseModelKey(takeHerEyesModel.value);
     const selectedPlanModel = parseModelKey(planModelKey.value);
@@ -373,33 +753,34 @@ async function saveSettings(): Promise<void> {
         defaultCwd: wslDefaultCwd.value.trim() || "/home",
       },
     });
-    if (rpc.isConnected.value) {
-      const setters: [string, unknown][] = [
-        ["steeringMode", steeringMode.value], ["followUpMode", followUpMode.value],
-        ["executionMode", executionMode.value], ["verificationGate", verificationGate.value],
-        ["compactEnabled", autoCompact.value], ["quietStartup", quietStartup.value],
-        ["enabledModels", optionalCommaList(enabledModels.value)],
-        ["transport", transport.value], ["retryEnabled", retryEnabled.value],
-        ["autoResizeImages", imageAutoResize.value], ["blockImages", blockImages.value],
-        ["shellPath", shellPath.value || undefined], ["shellCommandPrefix", shellCommandPrefix.value || undefined],
-        ["npmCommand", optionalSpaceList(npmCommand.value)],
-        ["httpIdleTimeoutMs", httpIdleTimeoutMs.value || 0],
-        ["extensionPaths", commaList(extensionPaths.value)],
-        ["skillPaths", commaList(skillPaths.value)],
-        ["promptTemplatePaths", commaList(promptTemplatePaths.value)],
-        ["themePaths", commaList(themePaths.value)],
-        ["enableSkillCommands", enableSkillCommands.value],
-        ["autocompleteMaxVisible", autocompleteMaxVisible.value],
-      ];
+    if (rpc.isConnected.value && piReady.value) {
       await rpc.setPiSettings(setters.map(([key, value]) => ({ key, value })));
+      piBaseline.value = submittedPi;
       await Promise.all([rpc.refreshState(), rpc.refreshModels(), rpc.refreshCommands()]);
     }
-    saved.value = true;
-    setTimeout(() => (saved.value = false), 2000);
-  } finally { saving.value = false; }
+    baseline.value = submittedForm;
+    saved.value = !dirty.value;
+  } catch (error) {
+    saveError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    saving.value = false;
+  }
 }
 
-function goBack(): void { router.back(); }
+function goBack(): void {
+  if (saving.value || authBusy.value) return;
+  if (dirty.value || providersDirty.value || Object.values(editingKeys.value).some((key) => key.trim() !== "")) {
+    showDiscardDialog.value = true;
+    return;
+  }
+  leaveSettings();
+}
+
+function leaveSettings(): void {
+  showDiscardDialog.value = false;
+  if (typeof router.push === "function") void router.push(rpc.isConnected.value ? "/workspace" : "/");
+  else router.back();
+}
 
 async function checkForUpdates(): Promise<void> {
   checkingUpdate.value = true;
@@ -444,714 +825,1259 @@ async function downloadAndInstall(): Promise<void> {
 
 <template>
   <div class="settings-page">
-    <div class="drag-bar"></div>
-    <div class="settings-layout">
-      <!-- Sidebar -->
-      <nav class="settings-sidebar">
-        <div class="sidebar-header">
-          <v-btn variant="text" prepend-icon="mdi-arrow-left" @click="goBack">返回</v-btn>
-        </div>
-        <v-list density="default" nav bg-color="transparent">
-          <v-list-item
-            v-for="section in sections"
+    <nav ref="navigation" class="settings-sidebar" :class="{ open: navigationOpen }" aria-label="设置分类">
+      <div class="sidebar-brand"><span class="brand-mark">P</span><strong>PiX</strong><span>设置</span></div>
+      <input
+        v-model="searchQuery"
+        class="settings-search"
+        type="search"
+        placeholder="搜索设置…"
+        aria-label="搜索设置"
+      />
+      <div class="navigation-groups">
+        <div v-for="group in filteredGroups" :key="group.label" class="navigation-group">
+          <h2>{{ group.label }}</h2>
+          <button
+            v-for="section in group.sections"
             :key="section.key"
-            :title="section.label"
-            :prepend-icon="section.icon"
-            :active="activeSection === section.key"
-            color="primary"
-            @click="activeSection = section.key"
             class="sidebar-item"
-            rounded="lg"
-          />
-        </v-list>
-      </nav>
-
-      <!-- Content -->
-      <div class="settings-content">
-        <!-- ============ 常规 ============ -->
-        <div v-show="activeSection === 'general'" class="section-panel">
-          <h2 class="section-title">常规</h2>
-          <p class="section-desc">默认模型与会话行为设置。</p>
-          <div class="form-fields">
-            <v-text-field v-model="defaultProvider" label="默认提供商" placeholder="例如 anthropic, openai" hint="新会话使用的提供商名称。" persistent-hint class="mb-4" />
-            <v-text-field v-model="defaultModel" label="默认模型" placeholder="例如 claude-sonnet-4-6" hint="新会话使用的模型 ID。" persistent-hint class="mb-4" />
-            <v-select v-model="defaultThinkingLevel" label="默认思考级别" :items="thinkingLevelItems" item-title="title" item-value="value" class="mb-4" />
-            <v-select v-model="steeringMode" label="引导消息模式" :items="steeringModeItems" item-title="title" item-value="value" hint="流式输出期间引导消息的排队方式。" persistent-hint class="mb-4" />
-            <v-select v-model="followUpMode" label="跟进消息模式" :items="steeringModeItems" item-title="title" item-value="value" hint="流式输出期间跟进消息的发送方式。" persistent-hint class="mb-4" />
-            <v-select v-model="executionMode" label="执行模式" :items="executionModeItems" item-title="title" item-value="value" hint="只读模式禁止修改；审批模式拦截高风险操作；无监管模式不弹出审批。" persistent-hint class="mb-4">
-              <template #item="{ props, item }">
-                <v-list-item v-bind="props" :prepend-icon="item.raw.icon" :subtitle="item.raw.subtitle" />
-              </template>
-              <template #selection="{ item }">
-                <div class="execution-selection">
-                  <v-icon size="18" :icon="item.raw.icon" />
-                  <span>{{ item.raw.title }}</span>
-                </div>
-              </template>
-            </v-select>
-            <v-switch v-model="verificationGate" label="完成前验证提醒" hint="代码或配置被修改后，提醒 Agent 在收尾前运行针对性的测试、类型检查、构建或打包。" persistent-hint class="mb-4" />
-            <v-switch v-model="autoCompact" label="自动压缩" hint="达到阈值时自动压缩上下文。" persistent-hint class="mb-4" />
-            <v-switch
-              v-model="defaultAcp"
-              data-test="default-acp-switch"
-              label="新会话默认主动压缩"
-              hint="仅作用于全新空会话的初值，不影响已有会话。与自动压缩相互独立。"
-              persistent-hint
-              class="mb-4"
-            />
-            <v-switch v-model="quietStartup" label="静默启动" hint="隐藏启动消息。" persistent-hint class="mb-4" />
-          </div>
+            :class="{ active: activeSection === section.key }"
+            :aria-current="activeSection === section.key ? 'page' : undefined"
+            @click="selectSection(section.key)"
+          >
+            <v-icon :icon="section.icon" size="18" /><span>{{ section.label }}</span>
+          </button>
         </div>
-
-        <!-- ============ 模型 ============ -->
-        <div v-show="activeSection === 'model'" class="section-panel">
-          <h2 class="section-title">模型</h2>
-          <p class="section-desc">模型可用性与传输配置。</p>
-          <div class="form-fields">
-            <v-text-field v-model="enabledModels" label="启用的模型（glob 模式）" placeholder="anthropic/*, openai/gpt-5*" hint="逗号分隔的 glob 模式。留空则启用所有模型。" persistent-hint class="mb-4" />
-            <v-select v-model="transport" label="传输方式" :items="transportOptions" item-title="title" item-value="value" hint="API 请求的 HTTP 传输方式。" persistent-hint class="mb-4" />
-            <v-switch v-model="retryEnabled" label="自动重试" hint="自动重试失败的 API 请求。" persistent-hint class="mb-4" />
-            <v-switch v-model="imageAutoResize" label="自动调整图片大小" hint="发送给模型前自动调整大图片尺寸。" persistent-hint class="mb-4" />
-            <v-switch v-model="blockImages" label="阻止图片" hint="完全阻止将图片发送给模型。" persistent-hint class="mb-4" />
-            <v-divider class="my-4" />
-            <div class="eye-model-config">
-              <div class="setting-subheader">
-                <v-icon size="20" icon="mdi-eye-outline" />
-                <div>
-                  <div class="setting-subtitle">眼睛模型</div>
-                  <div class="setting-caption">当主模型不能看图时，自动用视觉模型生成图片上下文。</div>
-                </div>
-              </div>
-              <v-switch
-                v-model="takeHerEyesEnabled"
-                label="启用 takeHerEyes"
-                hint="主模型支持图片或已开启阻止图片时不会调用眼睛模型。"
-                persistent-hint
+        <p v-if="filteredGroups.length === 0" class="empty-search">没有匹配的设置</p>
+      </div>
+      <button class="sidebar-back" :disabled="saving || !!authBusy" @click="goBack"><v-icon icon="mdi-arrow-left" size="18" />返回对话</button>
+    </nav>
+    <button
+      v-if="navigationOpen"
+      class="navigation-backdrop"
+      tabindex="-1"
+      aria-label="关闭设置分类"
+      @click="closeNavigation"
+    />
+    <main class="settings-main" :inert="navigationOpen">
+      <WindowTitlebar class="settings-topbar">
+        <button
+          ref="menuButton"
+          class="settings-mobile-menu"
+          aria-label="打开设置分类"
+          :aria-expanded="navigationOpen"
+          @click="navigationOpen = true"
+        >
+          <v-icon icon="mdi-menu" size="20" />
+        </button>
+        <span>设置</span><span class="breadcrumb-separator">/</span><strong>{{ currentSection.label }}</strong>
+      </WindowTitlebar>
+      <div ref="settingsScroll" class="settings-scroll">
+        <div class="settings-content">
+          <div v-if="loading" class="load-notice" role="status">正在读取设置…</div>
+          <v-alert v-if="loadError" type="error" density="compact" class="mb-4"
+            >{{ loadError }}<button class="inline-retry" @click="loadSettings">重试</button></v-alert
+          >
+          <div v-if="!loading && (!rpc.isConnected.value || !piReady)" class="connection-notice" role="status">
+            {{ rpc.isConnected.value ? "Agent 配置尚未读取。" : "会话未连接，Agent 配置暂不可编辑。" }}
+          </div>
+          <div :inert="loading || !guiReady" class="settings-panels">
+            <section v-show="activeSection === 'general'" class="section-panel" aria-label="general">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "general")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "general")?.description }}</p>
+              <SettingsGroup title="权限">
+                <SettingsRow
+                  title="默认执行模式"
+                  control-id="setting-executionMode"
+                  description="高风险操作执行前，向你请求批准。"
+                >
+                  <v-select
+                    v-model="executionMode"
+                    data-test="execution-mode-select"
+                    id="setting-executionMode"
+                    aria-label="默认执行模式"
+                    density="compact"
+                    :items="executionModeItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="完成前验证"
+                  control-id="setting-verificationGate"
+                  description="提醒 Agent 在宣告完成前检查结果。"
+                >
+                  <v-switch
+                    v-model="verificationGate"
+                    id="setting-verificationGate"
+                    aria-label="完成前验证"
+                    density="compact"
+                    label="完成前验证"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <SettingsGroup title="对话">
+                <SettingsRow
+                  title="默认思考强度"
+                  control-id="setting-defaultThinkingLevel"
+                  description="新会话采用的推理深度，可在对话中调整。"
+                >
+                  <v-select
+                    v-model="defaultThinkingLevel"
+                    id="setting-defaultThinkingLevel"
+                    aria-label="默认思考强度"
+                    density="compact"
+                    :items="thinkingLevelItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="运行中的引导消息"
+                  control-id="setting-steeringMode"
+                  description="Agent 运行时发送的新消息如何进入当前流程。"
+                >
+                  <v-select
+                    v-model="steeringMode"
+                    id="setting-steeringMode"
+                    aria-label="运行中的引导消息"
+                    density="compact"
+                    :items="steeringModeItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="后续消息"
+                  control-id="setting-followUpMode"
+                  description="本轮结束后，如何处理等待中的消息。"
+                >
+                  <v-select
+                    v-model="followUpMode"
+                    id="setting-followUpMode"
+                    aria-label="后续消息"
+                    density="compact"
+                    :items="steeringModeItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <SettingsGroup title="上下文与启动">
+                <SettingsRow
+                  title="自动压缩上下文"
+                  control-id="setting-autoCompact"
+                  description="接近上下文容量上限时自动压缩。"
+                >
+                  <v-switch
+                    v-model="autoCompact"
+                    id="setting-autoCompact"
+                    aria-label="自动压缩上下文"
+                    density="compact"
+                    label="自动压缩上下文"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="新会话默认主动压缩"
+                  control-id="setting-defaultAcp"
+                  description="仅影响新建的空会话，当前会话可在对话中切换。"
+                >
+                  <v-switch
+                    v-model="defaultAcp"
+                    id="setting-defaultAcp"
+                    aria-label="新会话默认主动压缩"
+                    density="compact"
+                    label="新会话默认主动压缩"
+                    hide-details
+                    data-test="default-acp-switch"
+                  />
+                </SettingsRow>
+                <SettingsRow title="安静启动" control-id="setting-quietStartup" description="减少启动时的提示信息。">
+                  <v-switch
+                    v-model="quietStartup"
+                    id="setting-quietStartup"
+                    aria-label="安静启动"
+                    density="compact"
+                    label="安静启动"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+            </section>
+            <section v-show="activeSection === 'plan'" class="section-panel" aria-label="plan">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "plan")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "plan")?.description }}</p>
+              <SettingsGroup title="规划">
+                <SettingsRow
+                  title="规划模型"
+                  control-id="setting-planModelKey"
+                  description="未指定时继承当前会话模型。"
+                >
+                  <v-select
+                    v-model="planModelKey"
+                    id="setting-planModelKey"
+                    aria-label="规划模型"
+                    density="compact"
+                    :items="planModelItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    data-test="plan-model-select"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="规划思考强度"
+                  control-id="setting-planThinkingLevel"
+                  description="未指定时继承会话默认。"
+                >
+                  <v-select
+                    v-model="planThinkingLevel"
+                    id="setting-planThinkingLevel"
+                    aria-label="规划思考强度"
+                    density="compact"
+                    :items="planThinkingLevelItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    data-test="plan-thinking-select"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <SettingsGroup title="Agent 任务">
+                <SettingsRow
+                  title="自动后台化阈值"
+                  control-id="setting-autoBackgroundMs"
+                  description="到达阈值后显示后台提示，父 Agent 仍等待结果；手动转后台或 run_in_background 才会立即返回。"
+                >
+                  <v-select
+                    v-model="autoBackgroundMs"
+                    id="setting-autoBackgroundMs"
+                    aria-label="自动后台化阈值"
+                    density="compact"
+                    :items="autoBackgroundMsItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    data-test="auto-background-select"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="子 Agent 并发上限"
+                  control-id="setting-agentTaskMaxConcurrent"
+                  description="运行和等待输入的任务合计，超额排队。"
+                >
+                  <v-slider
+                    v-model="agentTaskMaxConcurrent"
+                    id="setting-agentTaskMaxConcurrent"
+                    aria-label="子 Agent 并发上限"
+                    density="compact"
+                    :min="1"
+                    :max="AGENT_TASK_MAX_RUNNING_SLOTS"
+                    :step="1"
+                    show-ticks="always"
+                    :ticks="agentTaskConcurrentTicks"
+                    tick-size="4"
+                    thumb-label="always"
+                    hide-details
+                    data-test="agent-task-max-concurrent-slider"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+            </section>
+            <section v-show="activeSection === 'images'" class="section-panel" aria-label="images">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "images")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "images")?.description }}</p>
+              <SettingsGroup title="图片输入">
+                <SettingsRow
+                  title="自动调整图片大小"
+                  control-id="setting-imageAutoResize"
+                  description="发送前自动缩放大图片。"
+                >
+                  <v-switch
+                    v-model="imageAutoResize"
+                    id="setting-imageAutoResize"
+                    aria-label="自动调整图片大小"
+                    density="compact"
+                    label="自动调整图片大小"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="阻止图片"
+                  control-id="setting-blockImages"
+                  description="阻止向任何模型发送图片，优先于眼睛模型。"
+                >
+                  <v-switch
+                    v-model="blockImages"
+                    id="setting-blockImages"
+                    aria-label="阻止图片"
+                    density="compact"
+                    label="阻止图片"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <SettingsGroup title="眼睛模型">
+                <SettingsRow
+                  title="启用眼睛模型"
+                  control-id="setting-takeHerEyesEnabled"
+                  description="主模型不支持图片时，使用视觉模型生成图片上下文。"
+                >
+                  <v-switch
+                    v-model="takeHerEyesEnabled"
+                    id="setting-takeHerEyesEnabled"
+                    aria-label="启用眼睛模型"
+                    density="compact"
+                    label="启用眼睛模型"
+                    hide-details
+                    :disabled="blockImages"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="眼睛模型"
+                  control-id="setting-takeHerEyesModel"
+                  description="仅显示已认证且支持图片输入的模型。"
+                >
+                  <v-select
+                    v-model="takeHerEyesModel"
+                    id="setting-takeHerEyesModel"
+                    aria-label="眼睛模型"
+                    density="compact"
+                    :items="visionModelItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    :disabled="!takeHerEyesEnabled || blockImages"
+                    no-data-text="没有可用的视觉模型"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+            </section>
+            <section v-show="activeSection === 'environment'" class="section-panel" aria-label="environment">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "environment")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "environment")?.description }}</p>
+              <SettingsGroup title="Shell 与网络">
+                <SettingsRow
+                  title="Shell 路径"
+                  control-id="setting-shellPath"
+                  description="Shell 可执行文件路径；WSL 在下方配置。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="shellPath"
+                    id="setting-shellPath"
+                    aria-label="Shell 路径"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                    placeholder="自动检测"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="Shell 命令前缀"
+                  control-id="setting-shellCommandPrefix"
+                  description="每个 Bash 命令的前缀。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="shellCommandPrefix"
+                    id="setting-shellCommandPrefix"
+                    aria-label="Shell 命令前缀"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                    placeholder="无"
+                  />
+                </SettingsRow>
+                <SettingsRow title="npm 命令" control-id="setting-npmCommand" description="命令与参数使用空格分隔。">
+                  <v-text-field
+                    v-model="npmCommand"
+                    id="setting-npmCommand"
+                    aria-label="npm 命令"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                    placeholder="npm"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="HTTP 空闲超时（毫秒）"
+                  control-id="setting-httpIdleTimeoutMs"
+                  description="0 使用服务器默认值。"
+                >
+                  <v-text-field
+                    v-model.number="httpIdleTimeoutMs"
+                    id="setting-httpIdleTimeoutMs"
+                    aria-label="HTTP 空闲超时（毫秒）"
+                    density="compact"
+                    type="number"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                    min="0"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <v-alert
+                v-if="settingsStore.wslDiagnostic"
+                type="warning"
+                variant="tonal"
+                density="compact"
                 class="mb-4"
-              />
-              <v-select
-                v-model="takeHerEyesModel"
-                label="选择眼睛模型"
-                :items="visionModelItems"
-                item-title="title"
-                item-value="value"
-                no-data-text="没有可用的视觉模型"
-                :disabled="!takeHerEyesEnabled || blockImages"
-                hint="这里只显示已配置且支持图片输入的聊天模型。"
-                persistent-hint
-                class="mb-4"
-              />
-              <div v-if="blockImages && takeHerEyesEnabled" class="inline-hint">
-                已开启“阻止图片”，takeHerEyes 会保持关闭效果，不会把图片发送给任何模型。
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ============ 规划 ============ -->
-        <div v-show="activeSection === 'plan'" class="section-panel">
-          <h2 class="section-title">规划</h2>
-          <p class="section-desc">规划模式的模型、匿名使用数据、自动后台与子 Agent 并发。</p>
-          <div class="form-fields">
-            <v-select
-              v-model="planModelKey"
-              data-test="plan-model-select"
-              label="规划模型"
-              :items="planModelItems"
-              item-title="title"
-              item-value="value"
-              hint="规划模式使用的模型；「继承当前会话模型」时跟随当前会话。"
-              persistent-hint
-              class="mb-4"
-            />
-            <v-select
-              v-model="planThinkingLevel"
-              data-test="plan-thinking-select"
-              label="规划思考级别"
-              :items="planThinkingLevelItems"
-              item-title="title"
-              item-value="value"
-              hint="规划模式使用的思考级别；「继承会话默认」时跟随当前会话。"
-              persistent-hint
-              class="mb-4"
-            />
-            <v-divider class="my-4" />
-            <v-switch
-              v-model="enableProductAnalytics"
-              data-test="analytics-switch"
-              label="匿名使用数据"
-              hint="收集匿名产品使用数据以改进 PiX。默认关闭，与安装遥测相互独立。"
-              persistent-hint
-              class="mb-4"
-            />
-            <v-divider class="my-4" />
-            <v-select
-              v-model="autoBackgroundMs"
-              data-test="auto-background-select"
-              label="自动后台化阈值"
-              :items="autoBackgroundMsItems"
-              item-title="title"
-              item-value="value"
-              hint="超过该时长后，任务在面板中显示为后台，但父会话仍等待结果。选择「关闭」则始终以前台展示。真正转后台（立即返回、完成后自动回传）仅在明确设置 run_in_background 或在任务面板手动转后台时发生。"
-              persistent-hint
-              class="mb-4"
-            />
-            <v-divider class="my-4" />
-            <v-slider
-              v-model="agentTaskMaxConcurrent"
-              data-test="agent-task-max-concurrent-slider"
-              :min="1"
-              :max="AGENT_TASK_MAX_RUNNING_SLOTS"
-              :step="1"
-              show-ticks="always"
-              :ticks="agentTaskConcurrentTicks"
-              tick-size="4"
-              thumb-label="always"
-              label="子 Agent 并发上限"
-              hint="同时处于 running / waiting_input 的子任务数。超出的排队等待。默认 4，最高 8。"
-              persistent-hint
-              class="mb-4 concurrent-slot-slider"
-            />
-          </div>
-        </div>
-
-        <!-- ============ Shell ============ -->
-        <div v-show="activeSection === 'shell'" class="section-panel">
-          <h2 class="section-title">Shell</h2>
-          <p class="section-desc">Bash 执行与网络配置。</p>
-          <div class="form-fields">
-            <v-text-field v-model="shellPath" label="Shell 路径" placeholder="自动检测" hint="Shell 可执行文件路径。如需在 WSL 中运行，请在「WSL」分区配置，不要在此填入 wsl。" persistent-hint class="mb-4" />
-            <v-text-field v-model="shellCommandPrefix" label="Shell 命令前缀" placeholder="无" hint="每个 bash 命令的前缀。不要填入 wsl——WSL 执行请在「WSL」分区启用，否则会触发 Shell 配置错误。" persistent-hint class="mb-4" />
-            <v-text-field v-model="npmCommand" label="npm 命令" placeholder="npm" hint="空格分隔的 npm 命令及参数。" persistent-hint class="mb-4" />
-            <v-text-field v-model.number="httpIdleTimeoutMs" label="HTTP 空闲超时（毫秒）" type="number" min="0" placeholder="服务器默认" hint="HTTP 空闲超时毫秒数。0 = 服务器默认值。" persistent-hint style="max-width:240px" class="mb-4" />
-          </div>
-        </div>
-
-        <!-- ============ WSL ============ -->
-        <div v-show="activeSection === 'wsl'" class="section-panel">
-          <h2 class="section-title">WSL2</h2>
-          <p class="section-desc">全局 WSL2 默认值，用于新建项目对话框的初始环境。</p>
-          <div class="form-fields">
-            <v-alert
-              v-if="settingsStore.wslDiagnostic"
-              type="warning"
-              variant="tonal"
-              density="comfortable"
-              class="mb-4"
-              title="WSL 不可用"
-            >
-              {{ settingsStore.wslDiagnostic }}
-            </v-alert>
-
-            <v-switch
-              v-model="wslEnabled"
-              label="启用 WSL2"
-              hint="开启后，打开项目时可选择 WSL2 发行版作为执行环境。不影响已打开的项目。"
-              persistent-hint
-              class="mb-4"
-            />
-
-            <v-select
-              v-model="wslDistro"
-              label="默认发行版"
-              :items="wslDistroItems"
-              item-title="title"
-              item-value="value"
-              no-data-text="未发现 WSL2 发行版"
-              hint="仅作为新项目对话框的默认值；每个项目必须显式选择发行版，不会使用系统默认发行版。"
-              persistent-hint
-              :disabled="!wslEnabled || wslDistroItems.length === 0"
-              class="mb-4"
-            >
-              <template #item="{ props: itemProps, item }">
-                <v-list-item v-bind="itemProps" :subtitle="item.raw.subtitle" />
-              </template>
-            </v-select>
-
-            <v-text-field
-              v-model="wslDefaultCwd"
-              label="默认项目目录（Linux 路径）"
-              placeholder="/home"
-              hint="新项目对话框中 WSL 工作目录的初始值，需为绝对 POSIX 路径。"
-              persistent-hint
-              :disabled="!wslEnabled"
-              :error-messages="wslDefaultCwd && !wslDefaultCwdValid ? '请输入以 / 开头的绝对 Linux 路径' : ''"
-              style="max-width:420px"
-              class="mb-4"
-            />
-
-            <div class="inline-hint">
-              全局默认值仅影响新建项目。已打开项目的执行环境以该项目记录为准；更改发行版或目录需停止并重新打开项目会话。
-            </div>
-          </div>
-        </div>
-
-        <!-- ============ 资源 ============ -->
-        <div v-show="activeSection === 'resources'" class="section-panel">
-          <h2 class="section-title">资源</h2>
-          <p class="section-desc">扩展、技能、提示模板与主题。</p>
-          <div class="form-fields">
-            <v-text-field v-model="extensionPaths" label="扩展路径" placeholder="/path/to/ext1, /path/to/ext2" hint="逗号分隔的扩展文件或目录路径。" persistent-hint class="mb-4" />
-            <v-text-field v-model="skillPaths" label="技能路径" placeholder="/path/to/skills1, /path/to/skills2" hint="逗号分隔的技能目录路径。" persistent-hint class="mb-4" />
-            <v-text-field v-model="promptTemplatePaths" label="提示模板路径" placeholder="/path/to/prompts1, /path/to/prompts2" hint="逗号分隔的提示模板目录路径。" persistent-hint class="mb-4" />
-            <v-text-field v-model="themePaths" label="主题路径" placeholder="/path/to/themes1, /path/to/themes2" hint="逗号分隔的自定义主题目录路径。" persistent-hint class="mb-4" />
-            <v-switch v-model="enableSkillCommands" label="启用技能命令" hint="允许技能注册斜杠命令。" persistent-hint class="mb-4" />
-            <div class="resource-actions">
-              <v-btn variant="outlined" :disabled="!rpc.isConnected.value" @click="async () => { await rpc.reloadResources(); }">重新加载资源</v-btn>
-              <span class="inline-hint">重新加载所有扩展、技能、提示和主题。</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- ============ MCP ============ -->
-        <div v-show="activeSection === 'mcp'" class="section-panel">
-          <McpSettings />
-        </div>
-
-        <!-- ============ 自定义模型 ============ -->
-        <div v-show="activeSection === 'custom'" class="section-panel">
-          <CustomProviders />
-        </div>
-
-        <!-- ============ 认证 ============ -->
-        <div v-show="activeSection === 'auth'" class="section-panel">
-          <h2 class="section-title">认证</h2>
-          <p class="section-desc">配置各模型提供商的 API 密钥。密钥存储在 <code>~/.pi/agent/auth.json</code>。</p>
-          <div v-if="!rpc.isConnected.value" class="auth-notice"><p>请先启动会话再配置 API 密钥。</p></div>
-          <div v-else-if="authStore.providerCount === 0" class="auth-notice"><p>未检测到模型提供商。</p></div>
-          <div v-else class="auth-list">
-            <v-card v-for="(status, provider) in authStore.authStatus" :key="provider" :border="status.configured ? 'success' : undefined" variant="outlined" class="auth-card mb-3">
-              <div class="auth-provider-row" @click="toggleEditProvider(provider)">
-                <div class="auth-provider-info">
-                  <span class="auth-provider-name">{{ provider }}</span>
-                  <span v-if="status.label" class="auth-provider-label">{{ status.label }}</span>
-                  <span v-if="customProviderNames.has(provider)" class="auth-custom-hint">密钥在「自定义模型」分区管理</span>
-                </div>
-                <div class="auth-status-info">
-                  <v-icon size="small" :color="status.configured ? 'success' : undefined" :icon="status.configured ? 'mdi-check-circle' : 'mdi-circle-outline'" />
-                  <span class="auth-status-text">{{ status.configured ? '已配置' : '未配置' }}</span>
-                  <span v-if="status.source" class="auth-source">来源 {{ status.source }}</span>
-                  <v-icon v-if="customProviderNames.has(provider)" size="small" class="ml-2" icon="mdi-lock-outline" />
-                  <v-icon v-else size="small" class="ml-2">{{ editingProvider === provider ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
-                </div>
-              </div>
-              <div v-if="editingProvider === provider" class="auth-edit-row">
-                <v-text-field v-model="editingKeys[provider]" type="password" :disabled="customProviderNames.has(provider)" :placeholder="status.configured ? '输入新密钥以替换...' : '粘贴 API 密钥...'" hide-details density="comfortable" @keydown.enter="saveKey(provider)" class="mb-3" />
-                <div class="auth-btn-group">
-                  <v-btn size="small" color="primary" variant="tonal" :disabled="customProviderNames.has(provider) || !editingKeys[provider]?.trim()" @click="saveKey(provider)">保存</v-btn>
-                  <v-btn v-if="status.configured" size="small" color="error" variant="text" :disabled="customProviderNames.has(provider)" @click="deleteKey(provider)">删除</v-btn>
-                </div>
-              </div>
-            </v-card>
-          </div>
-        </div>
-
-        <!-- ============ 高级 ============ -->
-        <div v-show="activeSection === 'advanced'" class="section-panel">
-          <h2 class="section-title">高级</h2>
-          <p class="section-desc">少量调试与底层行为设置。</p>
-          <div class="form-fields">
-            <v-text-field v-model.number="autocompleteMaxVisible" label="自动补全最大显示数" type="number" min="3" max="20" hint="自动补全建议的最大显示数量 (3-20)。" persistent-hint style="max-width:200px" class="mb-4" />
-
-            <v-divider class="my-4" />
-            <div class="update-section">
-              <div class="setting-subheader">
-                <v-icon size="20" icon="mdi-update" />
-                <div>
-                  <div class="setting-subtitle">应用更新</div>
-                  <div class="setting-caption">检查并安装最新版本。</div>
-                </div>
-              </div>
-              <div class="update-actions">
-                <v-btn
+                title="WSL 不可用"
+                >{{ settingsStore.wslDiagnostic
+                }}<button class="inline-retry" @click="settingsStore.loadWslDistros()">重新探测</button></v-alert
+              ><SettingsGroup title="WSL2">
+                <SettingsRow
+                  title="启用 WSL2"
+                  control-id="setting-wslEnabled"
+                  description="作为新建项目的默认环境，不影响当前项目。"
+                >
+                  <v-switch
+                    v-model="wslEnabled"
+                    id="setting-wslEnabled"
+                    aria-label="启用 WSL2"
+                    density="compact"
+                    label="启用 WSL2"
+                    hide-details
+                  />
+                </SettingsRow>
+                <SettingsRow title="默认发行版" control-id="setting-wslDistro" description="新项目须显式选择发行版。">
+                  <v-select
+                    v-model="wslDistro"
+                    id="setting-wslDistro"
+                    aria-label="默认发行版"
+                    density="compact"
+                    :items="wslDistroItems"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    :disabled="!wslEnabled || !settingsStore.wslDistrosLoaded || wslDistroItems.length === 0"
+                    no-data-text="未发现 WSL2 发行版"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="默认项目目录"
+                  control-id="setting-wslDefaultCwd"
+                  description="绝对 Linux 路径，以 / 开头。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="wslDefaultCwd"
+                    id="setting-wslDefaultCwd"
+                    aria-label="默认项目目录"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!wslEnabled"
+                    :error-messages="wslDefaultCwd && !wslDefaultCwdValid ? '请输入绝对 Linux 路径' : ''"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+            </section>
+            <section v-show="activeSection === 'resources'" class="section-panel" aria-label="resources">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "resources")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "resources")?.description }}</p>
+              <SettingsGroup title="资源路径">
+                <SettingsRow
+                  title="扩展路径"
+                  control-id="setting-extensionPaths"
+                  description="逗号分隔的扩展文件或目录路径。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="extensionPaths"
+                    id="setting-extensionPaths"
+                    aria-label="扩展路径"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="技能路径"
+                  control-id="setting-skillPaths"
+                  description="逗号分隔的技能目录路径。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="skillPaths"
+                    id="setting-skillPaths"
+                    aria-label="技能路径"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="提示模板路径"
+                  control-id="setting-promptTemplatePaths"
+                  description="逗号分隔的提示模板目录路径。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="promptTemplatePaths"
+                    id="setting-promptTemplatePaths"
+                    aria-label="提示模板路径"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="主题路径"
+                  control-id="setting-themePaths"
+                  description="逗号分隔的主题目录路径。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="themePaths"
+                    id="setting-themePaths"
+                    aria-label="主题路径"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <SettingsGroup title="加载">
+                <SettingsRow
+                  title="启用技能命令"
+                  control-id="setting-enableSkillCommands"
+                  description="允许技能注册斜杠命令。"
+                >
+                  <v-switch
+                    v-model="enableSkillCommands"
+                    id="setting-enableSkillCommands"
+                    aria-label="启用技能命令"
+                    density="compact"
+                    label="启用技能命令"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow title="重新加载资源"
+                  ><v-btn
+                    variant="outlined"
+                    :loading="reloadingResources"
+                    :disabled="!rpc.isConnected.value"
+                    @click="reloadResources"
+                    >重新加载资源</v-btn
+                  ></SettingsRow
+                >
+                <p v-if="resourceFeedback" class="resource-feedback" :class="{ error: resourceError }" role="status">
+                  {{ resourceFeedback }}
+                </p></SettingsGroup
+              >
+            </section>
+            <section v-show="activeSection === 'model'" class="section-panel" aria-label="model">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "model")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "model")?.description }}</p>
+              <SettingsGroup title="模型目录">
+                <SettingsRow
+                  title="启用的模型"
+                  control-id="setting-enabledModels"
+                  description="逗号分隔的 glob 规则；留空启用所有模型。"
+                  wide
+                >
+                  <v-text-field
+                    v-model="enabledModels"
+                    id="setting-enabledModels"
+                    aria-label="启用的模型"
+                    density="compact"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                    placeholder="anthropic/*, openai/gpt-5*"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <SettingsGroup title="连接">
+                <SettingsRow title="传输方式" control-id="setting-transport">
+                  <v-select
+                    v-model="transport"
+                    id="setting-transport"
+                    aria-label="传输方式"
+                    density="compact"
+                    :items="transportOptions"
+                    item-title="title"
+                    item-value="value"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+                <SettingsRow title="自动重试" control-id="setting-retryEnabled" description="自动重试失败的 API 请求。">
+                  <v-switch
+                    v-model="retryEnabled"
+                    id="setting-retryEnabled"
+                    aria-label="自动重试"
+                    density="compact"
+                    label="自动重试"
+                    hide-details
+                    :disabled="!piReady || !rpc.isConnected.value"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+            </section>
+            <div v-show="activeSection === 'custom'" class="section-panel"><CustomProviders @dirty-change="providersDirty = $event" /></div>
+            <div v-show="activeSection === 'mcp'" class="section-panel"><McpSettings /></div>
+            <section v-show="activeSection === 'auth'" class="section-panel" aria-label="auth">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "auth")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "auth")?.description }}</p>
+              <v-alert v-if="authError" type="error" density="compact" class="mb-4">{{ authError }}</v-alert>
+              <div v-if="!rpc.isConnected.value" class="auth-notice"><p>请先启动会话再配置 API 密钥。</p></div>
+              <div v-else-if="authStore.providerCount === 0" class="auth-notice"><p>未检测到模型提供商。</p></div>
+              <div v-else class="auth-list">
+                <v-card
+                  v-for="(status, provider) in authStore.authStatus"
+                  :key="provider"
+                  :border="status.configured ? 'success' : undefined"
                   variant="outlined"
-                  :loading="checkingUpdate"
-                  :disabled="downloading"
-                  @click="checkForUpdates"
+                  class="auth-card mb-3"
                 >
-                  检查更新
-                </v-btn>
-                <v-btn
-                  v-if="updateInfo?.hasUpdate"
-                  color="primary"
-                  variant="tonal"
-                  :loading="downloading"
-                  :disabled="checkingUpdate"
-                  @click="downloadAndInstall"
+                  <div
+                    class="auth-provider-row"
+                    role="button"
+                    tabindex="0"
+                    @keydown.enter="toggleEditProvider(provider)"
+                    @keydown.space.prevent="toggleEditProvider(provider)"
+                    @click="toggleEditProvider(provider)"
+                  >
+                    <div class="auth-provider-info">
+                      <span class="auth-provider-name">{{ provider }}</span>
+                      <span v-if="status.label" class="auth-provider-label">{{ status.label }}</span>
+                      <button v-if="customProviderNames.has(provider)" class="auth-custom-hint" type="button" @click.stop="selectSection('custom')"
+                        >前往「自定义提供商」管理密钥</button
+                      >
+                    </div>
+                    <div class="auth-status-info">
+                      <v-icon
+                        size="small"
+                        :color="status.configured ? 'success' : undefined"
+                        :icon="status.configured ? 'mdi-check-circle' : 'mdi-circle-outline'"
+                      />
+                      <span class="auth-status-text">{{ status.configured ? "已配置" : "未配置" }}</span>
+                      <span v-if="status.source" class="auth-source">来源 {{ status.source }}</span>
+                      <v-icon
+                        v-if="customProviderNames.has(provider)"
+                        size="small"
+                        class="ml-2"
+                        icon="mdi-lock-outline"
+                      />
+                      <v-icon v-else size="small" class="ml-2">{{
+                        editingProvider === provider ? "mdi-chevron-up" : "mdi-chevron-down"
+                      }}</v-icon>
+                    </div>
+                  </div>
+                  <div v-if="editingProvider === provider" class="auth-edit-row">
+                    <v-text-field
+                      v-model="editingKeys[provider]"
+                      type="password"
+                      aria-label="API 密钥"
+                      :disabled="customProviderNames.has(provider)"
+                      :placeholder="status.configured ? '输入新密钥以替换...' : '粘贴 API 密钥...'"
+                      hide-details
+                      density="comfortable"
+                      @keydown.enter="saveKey(provider)"
+                      class="mb-3"
+                    />
+                    <div class="auth-btn-group">
+                      <v-btn
+                        size="small"
+                        color="primary"
+                        variant="tonal"
+                        :loading="authBusy === provider"
+                        :disabled="!!authBusy || customProviderNames.has(provider) || !editingKeys[provider]?.trim()"
+                        @click="saveKey(provider)"
+                        >保存</v-btn
+                      >
+                      <v-btn
+                        v-if="status.configured"
+                        size="small"
+                        color="error"
+                        variant="text"
+                        :disabled="!!authBusy || customProviderNames.has(provider)"
+                        @click="pendingAuthDelete = provider"
+                        >删除</v-btn
+                      >
+                    </div>
+                  </div>
+                </v-card>
+              </div>
+            </section>
+            <section v-show="activeSection === 'advanced'" class="section-panel" aria-label="advanced">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "advanced")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "advanced")?.description }}</p>
+              <SettingsGroup title="交互与使用数据">
+                <SettingsRow
+                  title="自动补全最大显示数"
+                  control-id="setting-autocompleteMaxVisible"
+                  description="显示 3–20 条补全建议。"
                 >
-                  下载并安装
-                </v-btn>
-              </div>
-              <div v-if="updateInfo && !updateInfo.hasUpdate" class="update-status success">
-                <v-icon size="small" icon="mdi-check-circle" />
-                <span>当前已是最新版本 ({{ updateInfo.currentVersion }})</span>
-              </div>
-              <div v-if="updateInfo?.hasUpdate" class="update-status info">
-                <v-icon size="small" icon="mdi-information" />
-                <span>发现新版本 {{ updateInfo.latestVersion }} (当前: {{ updateInfo.currentVersion }})</span>
-              </div>
-              <div v-if="updateError" class="update-status error">
-                <v-icon size="small" icon="mdi-alert-circle" />
-                <span>{{ updateError }}</span>
-              </div>
-            </div>
-
-            <v-divider class="my-4" />
-            <div class="advanced-info">
-              <h3>诊断信息</h3>
-              <div class="info-row"><span>集成方式</span><span>AgentSession 进程内直连</span></div>
-              <div class="info-row"><span>数据目录</span><code>~/.pi/agent/</code></div>
-              <div class="info-row"><span>会话存储</span><code>~/.pi/agent/sessions/</code></div>
-              <div class="info-row"><span>设置文件</span><code>~/.pi/agent/settings.json</code></div>
-            </div>
+                  <v-text-field
+                    v-model.number="autocompleteMaxVisible"
+                    id="setting-autocompleteMaxVisible"
+                    aria-label="自动补全最大显示数"
+                    density="compact"
+                    type="number"
+                    hide-details="auto"
+                    :disabled="!piReady || !rpc.isConnected.value"
+                    min="3"
+                    max="20"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title="匿名使用数据"
+                  control-id="setting-enableProductAnalytics"
+                  description="收集匿名规划使用数据，默认关闭。"
+                >
+                  <v-switch
+                    v-model="enableProductAnalytics"
+                    id="setting-enableProductAnalytics"
+                    aria-label="匿名使用数据"
+                    density="compact"
+                    label="匿名使用数据"
+                    hide-details
+                    data-test="analytics-switch"
+                  />
+                </SettingsRow>
+              </SettingsGroup>
+              <SettingsGroup title="应用更新">
+                <div class="update-section">
+                  <div class="setting-subheader">
+                    <v-icon size="20" icon="mdi-update" />
+                    <div>
+                      <div class="setting-subtitle">应用更新</div>
+                      <div class="setting-caption">检查并安装最新版本。</div>
+                    </div>
+                  </div>
+                  <div class="update-actions">
+                    <v-btn
+                      variant="outlined"
+                      :loading="checkingUpdate"
+                      :disabled="downloading"
+                      @click="checkForUpdates"
+                    >
+                      检查更新
+                    </v-btn>
+                    <v-btn
+                      v-if="updateInfo?.hasUpdate"
+                      color="primary"
+                      variant="tonal"
+                      :loading="downloading"
+                      :disabled="checkingUpdate"
+                      @click="downloadAndInstall"
+                    >
+                      下载并安装
+                    </v-btn>
+                  </div>
+                  <div v-if="updateInfo && !updateInfo.hasUpdate" class="update-status success">
+                    <v-icon size="small" icon="mdi-check-circle" />
+                    <span>当前已是最新版本 ({{ updateInfo.currentVersion }})</span>
+                  </div>
+                  <div v-if="updateInfo?.hasUpdate" class="update-status info">
+                    <v-icon size="small" icon="mdi-information" />
+                    <span>发现新版本 {{ updateInfo.latestVersion }} (当前: {{ updateInfo.currentVersion }})</span>
+                  </div>
+                  <div v-if="updateError" class="update-status error">
+                    <v-icon size="small" icon="mdi-alert-circle" />
+                    <span>{{ updateError }}</span>
+                  </div>
+                </div>
+              </SettingsGroup>
+              <SettingsGroup title="诊断信息">
+                <div class="advanced-info">
+                  <div class="info-row"><span>集成方式</span><span>AgentSession 进程内直连</span></div>
+                  <div class="info-row"><span>数据目录</span><code>~/.pi/agent/</code></div>
+                  <div class="info-row"><span>会话存储</span><code>~/.pi/agent/sessions/</code></div>
+                  <div class="info-row"><span>设置文件</span><code>~/.pi/agent/settings.json</code></div>
+                </div></SettingsGroup
+              >
+            </section>
           </div>
-        </div>
-
-        <!-- Save -->
-        <div class="settings-actions">
-          <v-btn color="primary" variant="tonal" size="large" :loading="saving" @click="saveSettings">
-            {{ saved ? '已保存！' : '保存设置' }}
-          </v-btn>
         </div>
       </div>
-    </div>
+      <footer class="settings-actions">
+        <div class="save-feedback" role="status" :class="{ error: saveError }">
+          <span v-if="saveError">{{ saveError }}</span>
+          <span v-else-if="saving">正在保存…</span>
+          <span v-else-if="dirty || providersDirty">有未保存的修改</span>
+          <span v-else-if="saved">{{ rpc.isConnected.value && piReady ? "已保存" : "应用设置已保存" }}</span>
+          <span v-else-if="activeSection === 'custom'">提供商配置单独保存</span>
+          <span v-else-if="activeSection === 'auth'">密钥单独保存</span>
+          <span v-else-if="activeSection === 'mcp'">编辑配置文件后刷新连接</span>
+          <span v-else>尚未修改</span>
+        </div>
+        <v-btn
+          v-if="!['custom', 'auth', 'mcp'].includes(activeSection)"
+          color="primary"
+          variant="flat"
+          :loading="saving"
+          :disabled="loading || !guiReady || saving"
+          @click="saveSettings"
+          >保存设置</v-btn
+        >
+      </footer>
+    </main>
+    <v-dialog v-model="showDiscardDialog" max-width="420">
+      <v-card title="放弃未保存的修改？">
+        <v-card-text>离开后，未保存的设置和密钥输入将丢失。</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showDiscardDialog = false">继续编辑</v-btn>
+          <v-btn color="error" variant="tonal" @click="leaveSettings">放弃并返回</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+    <v-dialog v-model="showAuthDeleteDialog" max-width="420">
+      <v-card title="删除 API 密钥">
+        <v-card-text>确定删除「{{ pendingAuthDelete }}」已保存的 API 密钥？删除后需重新输入才能恢复。</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="pendingAuthDelete = null">取消</v-btn>
+          <v-btn color="error" variant="tonal" :disabled="!!authBusy" @click="confirmDeleteKey">确认删除</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
-
 <style scoped>
 .settings-page {
   height: 100%;
   display: flex;
-  flex-direction: column;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(247, 248, 252, 0.96)),
-    var(--pix-bg-app);
-}
-
-.drag-bar {
-  height: var(--pix-window-controls-height);
-  min-height: var(--pix-window-controls-height);
-  -webkit-app-region: drag;
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  background: var(--pix-bg-topbar);
-  border-bottom: 1px solid var(--pix-border-light);
-  margin-right: var(--pix-window-controls-width);
-}
-
-.settings-layout {
-  flex: 1;
-  display: flex;
   overflow: hidden;
-  gap: var(--pix-space-lg);
-  padding: 0 var(--pix-space-lg) var(--pix-space-lg);
+  position: relative;
+  background: white;
 }
-
-/* Sidebar */
 .settings-sidebar {
-  width: 220px;
-  min-width: 220px;
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-xl);
-  background: rgba(255, 255, 255, 0.9);
+  width: 258px;
+  flex: 0 0 258px;
   display: flex;
   flex-direction: column;
-  padding: var(--pix-space-sm);
-  box-shadow: var(--pix-shadow-sm);
+  min-height: 0;
+  border-right: 1px solid var(--pix-border-light);
+  background: var(--pix-bg-left);
 }
-
-.sidebar-header {
-  padding: var(--pix-space-sm) var(--pix-space-sm) var(--pix-space-md);
-}
-
-.sidebar-item {
-  border-radius: var(--pix-radius-lg);
-  margin-bottom: 4px;
-}
-
-.settings-sidebar :deep(.v-list-item--active) {
-  background: var(--pix-accent-light);
-  color: var(--pix-accent);
-}
-
-/* Content */
-.settings-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 0;
+.sidebar-brand {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+  min-height: 76px;
+  padding: 0 22px;
+  -webkit-app-region: drag;
 }
-
-.section-panel {
-  width: min(760px, 100%);
-  background: rgba(255, 255, 255, 0.94);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-xl);
-  box-shadow: var(--pix-shadow-sm);
-  padding: var(--pix-space-2xl);
+.sidebar-brand strong {
+  font-size: 22px;
 }
-
-.section-title {
-  font-size: var(--pix-text-xl);
+.sidebar-brand > span:last-child {
+  border-left: 1px solid var(--pix-border);
+  padding-left: 12px;
+  margin-left: 3px;
+  font-size: 16px;
   font-weight: 600;
-  margin-bottom: var(--pix-space-xs);
 }
-
-.section-desc {
-  font-size: var(--pix-text-sm);
-  color: var(--pix-text-secondary);
-  margin-bottom: var(--pix-space-xl);
-}
-
-.form-fields {
-  display: flex;
-  flex-direction: column;
-}
-
-.execution-selection {
+.brand-mark {
+  width: 30px;
+  height: 30px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-}
-
-.eye-model-config {
-  display: flex;
-  flex-direction: column;
-  gap: var(--pix-space-xs);
-}
-
-.setting-subheader {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin-bottom: var(--pix-space-sm);
-  color: var(--pix-text-primary);
-}
-
-.setting-subtitle {
-  font-size: var(--pix-text-md);
+  justify-content: center;
+  background: var(--pix-accent);
+  color: white;
+  border-radius: 9px;
+  font-size: 23px;
   font-weight: 600;
-  line-height: 1.3;
 }
-
-.setting-caption {
-  margin-top: 2px;
-  font-size: var(--pix-text-xs);
+.settings-search {
+  height: 38px;
+  min-height: 38px;
+  margin: 0 16px 16px;
+  padding: 0 12px;
+  background: white;
+  border: 1px solid var(--pix-border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.navigation-groups {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 12px 20px;
+}
+.navigation-group {
+  margin-bottom: 16px;
+}
+.navigation-group h2 {
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--pix-text-secondary);
 }
-
-.mb-3 { margin-bottom: 12px; }
-.mb-4 { margin-bottom: 20px; }
-
-.resource-actions {
-  margin-top: var(--pix-space-lg);
-  padding-top: var(--pix-space-lg);
-  border-top: 1px solid var(--pix-border-light);
+.sidebar-item {
   display: flex;
-  flex-direction: column;
-  gap: var(--pix-space-sm);
-}
-
-.inline-hint {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-secondary);
-}
-
-.advanced-info {
-  margin-top: var(--pix-space-xl);
-  padding: var(--pix-space-lg);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-lg);
-  background: var(--pix-bg-code);
-}
-
-.advanced-info h3 {
-  font-size: var(--pix-text-md);
-  font-weight: 600;
-  margin-bottom: var(--pix-space-md);
-}
-
-.info-row {
-  display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: 4px 0;
-  font-size: var(--pix-text-sm);
-  color: var(--pix-text-secondary);
+  gap: 12px;
+  width: 100%;
+  min-height: 40px;
+  padding: 10px 13px;
+  border-radius: 7px;
+  font-size: 14px;
+  text-align: left;
 }
-
-.info-row code {
-  font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
+.sidebar-item.active {
+  color: var(--pix-accent);
+  background: #eeeaf9;
+  font-weight: 600;
+}
+.sidebar-item:hover {
+  background: var(--pix-accent-light);
+}
+.sidebar-back {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 65px;
+  border-top: 1px solid var(--pix-border-light);
+  padding: 0 24px;
+  font-size: 14px;
+}
+.sidebar-back:hover {
+  color: var(--pix-accent);
+}
+.settings-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.settings-topbar {
+  --pix-titlebar-padding: 38px;
+  gap: 12px;
+  font-size: 14px;
+}
+.settings-topbar strong {
+  font-weight: 600;
+}
+.breadcrumb-separator {
+  color: var(--pix-text-muted);
+}
+.settings-mobile-menu {
+  display: none;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  -webkit-app-region: no-drag;
+}
+.settings-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.settings-content {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 32px 44px;
+}
+.section-panel {
+  width: 100%;
+  min-width: 0;
+}
+.section-title,
+.settings-content :deep(.section-title) {
+  font-size: 26px;
+  font-weight: 600;
+  margin: 0 0 6px;
+  line-height: 1.4;
+}
+.section-desc,
+.settings-content :deep(.section-desc) {
+  font-size: 12.5px;
+  color: #747b87;
+  margin-bottom: 30px;
+  line-height: 1.7;
+}
+.settings-actions {
+  min-height: 65px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 44px;
+  border-top: 1px solid var(--pix-border-light);
+  flex-shrink: 0;
+}
+.save-feedback {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.save-feedback.error {
+  color: var(--pix-error);
+}
+.resource-feedback {
+  padding: 10px 0;
+  font-size: 13px;
+  color: var(--pix-success);
+}
+.resource-feedback.error {
+  color: var(--pix-error);
+}
+.settings-actions .v-btn {
+  min-width: 104px;
+  height: 34px;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.load-notice,
+.connection-notice {
+  padding: 12px 14px;
+  margin-bottom: 20px;
   background: var(--pix-bg-code);
-  padding: 2px 6px;
-  border-radius: var(--pix-radius-sm);
+  border: 1px solid var(--pix-border);
+  border-radius: 8px;
+  font-size: 13px;
 }
-
-.auth-notice {
-  padding: var(--pix-space-2xl);
-  text-align: center;
-  color: var(--pix-text-secondary);
-  font-size: var(--pix-text-sm);
-  border: 1px dashed var(--pix-border);
-  border-radius: var(--pix-radius-lg);
-  background: var(--pix-bg-code);
+.inline-retry {
+  margin-left: 12px;
+  color: var(--pix-accent);
+  font-size: 13px;
 }
-
+.empty-search {
+  padding: 20px 12px;
+  font-size: 13px;
+  color: var(--pix-text-muted);
+}
 .auth-list {
   display: flex;
   flex-direction: column;
 }
-
 .auth-card {
-  padding: var(--pix-space-sm);
-  border-radius: var(--pix-radius-lg) !important;
-  background: var(--pix-bg-card);
+  padding: 0 18px;
+  border: 1px solid var(--pix-border);
+  border-radius: 11px !important;
+  margin-bottom: 14px;
+  box-shadow: none;
 }
-
 .auth-provider-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 16px;
+  min-height: 70px;
+  padding: 13px 0;
   cursor: pointer;
-  user-select: none;
-  padding: var(--pix-space-sm) 0;
+  flex-wrap: wrap;
 }
-
-.auth-provider-info {
-  display: flex;
-  align-items: center;
-  gap: var(--pix-space-sm);
-}
-
-.auth-provider-name {
-  font-weight: 600;
-  font-size: var(--pix-text-md);
-  font-family: var(--pix-font-ui);
-}
-
-.auth-provider-label {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-secondary);
-}
-
-.auth-custom-hint {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-accent);
-}
-
+.auth-provider-info,
 .auth-status-info {
   display: flex;
+  gap: 8px;
   align-items: center;
-  gap: var(--pix-space-xs);
+  flex-wrap: wrap;
+  min-width: 0;
 }
-
+.auth-provider-name {
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.auth-provider-label,
+.auth-source,
+.auth-custom-hint {
+  font-size: 12px;
+  color: var(--pix-text-muted);
+}
+.auth-custom-hint {
+  color: var(--pix-accent);
+}
 .auth-status-text {
-  font-size: var(--pix-text-sm);
-  font-weight: 500;
+  font-size: 13px;
 }
-
-.auth-source {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-secondary);
-}
-
 .auth-edit-row {
-  margin-top: var(--pix-space-md);
-  padding-top: var(--pix-space-md);
   border-top: 1px solid var(--pix-border-light);
-  display: flex;
-  flex-direction: column;
+  padding: 14px 0;
 }
-
+.auth-btn-group {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.auth-notice {
+  padding: 20px;
+  background: var(--pix-bg-code);
+  border: 1px solid var(--pix-border);
+  border-radius: 11px;
+  font-size: 14px;
+}
 .update-section {
+  padding: 16px 0;
   display: flex;
   flex-direction: column;
-  gap: var(--pix-space-sm);
+  gap: 12px;
 }
-
+.setting-subheader {
+  display: none;
+}
 .update-actions {
   display: flex;
-  gap: var(--pix-space-md);
-  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
-
 .update-status {
   display: flex;
   align-items: center;
-  gap: var(--pix-space-sm);
-  font-size: var(--pix-text-sm);
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  border-radius: var(--pix-radius-md);
+  gap: 8px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
 }
-
 .update-status.success {
-  color: rgb(var(--v-theme-success));
-  background: rgba(var(--v-theme-success), 0.1);
+  color: var(--pix-success);
 }
-
-.update-status.info {
-  color: rgb(var(--v-theme-info));
-  background: rgba(var(--v-theme-info), 0.1);
-}
-
 .update-status.error {
-  color: rgb(var(--v-theme-error));
-  background: rgba(var(--v-theme-error), 0.1);
+  color: var(--pix-error);
 }
-
-.auth-btn-group {
+.advanced-info {
+  padding: 8px 0;
+}
+.info-row {
   display: flex;
-  gap: var(--pix-space-sm);
-  justify-content: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  font-size: 13px;
 }
-
-.settings-actions {
-  margin-top: var(--pix-space-2xl);
-  width: min(760px, 100%);
-  padding: var(--pix-space-md) 0 0;
-  display: flex;
-  justify-content: flex-end;
+.info-row + .info-row {
+  border-top: 1px solid var(--pix-border-light);
 }
-
-.settings-content :deep(.v-field) {
-  border-radius: var(--pix-radius-lg);
+.info-row code {
+  text-align: right;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
-
-.settings-content :deep(.v-input) {
-  color: var(--pix-text-primary);
+.settings-content :deep(.v-field__outline) {
+  color: var(--pix-border) !important;
 }
-
-.concurrent-slot-slider {
-  padding-top: var(--pix-space-sm);
-}
-
-/* ── High-contrast settings text ──
-   A global rule forces every Vuetify label and hint to --pix-text-muted
-   (#7d859a), which washes out the settings form. Within settings, restore
-   clear, readable colors: labels in primary (near-black), hints and helper
-   text in secondary (readable slate). Scoped here so the rest of the app is
-   untouched. Only color is overridden - Vuetify's own disabled/focus opacity
-   is left intact. */
-.settings-page :deep(.v-label) {
+.settings-content :deep(.v-label) {
   color: var(--pix-text-primary) !important;
 }
-
-.settings-page :deep(.v-messages) {
+.settings-content :deep(.v-messages) {
+  color: #747b87 !important;
+}
+.settings-content :deep(.v-messages__message) {
+  line-height: 1.6;
+}
+.settings-content :deep(.v-input--error .v-messages) {
+  color: var(--pix-error) !important;
+}
+.settings-content :deep(.text-medium-emphasis) {
   color: var(--pix-text-secondary) !important;
 }
-
-.settings-page :deep(.text-medium-emphasis) {
-  color: var(--pix-text-secondary) !important;
+.settings-content :deep(.section-panel > .d-flex) {
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start !important;
 }
-
-/* Sidebar nav: inactive titles default to medium-emphasis gray; make them
-   primary so the navigation reads clearly. Active items keep their accent. */
-.settings-sidebar :deep(.v-list-item:not(.v-list-item--active) .v-list-item__title) {
-  color: var(--pix-text-primary);
+.settings-content :deep(.section-panel > .d-flex > div:first-child) {
+  flex: 1;
+  min-width: 200px;
 }
-
-.ml-2 { margin-left: var(--pix-space-sm); }
+.mb-3 {
+  margin-bottom: 12px;
+}
+.mb-4 {
+  margin-bottom: 20px;
+}
+.navigation-backdrop {
+  display: none;
+}
+@media (min-width: 1700px) {
+  .settings-content {
+    max-width: 1160px;
+  }
+}
+@media (max-width: 1100px) {
+  .settings-sidebar {
+    width: 230px;
+    flex-basis: 230px;
+  }
+  .settings-content {
+    padding: 28px;
+  }
+  .settings-topbar {
+    --pix-titlebar-padding: 28px;
+  }
+  .settings-actions {
+    padding-left: 28px;
+    padding-right: 28px;
+  }
+}
+@media (max-width: 760px) {
+  .settings-sidebar {
+    width: 205px;
+    flex-basis: 205px;
+  }
+  .sidebar-brand {
+    padding: 0 16px;
+  }
+  .settings-content {
+    padding: 24px 20px;
+  }
+  .settings-topbar {
+    --pix-titlebar-padding: 20px;
+  }
+  .settings-actions {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+}
+@media (max-width: 560px) {
+  .settings-sidebar {
+    display: none;
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 250px;
+    z-index: 21;
+    box-shadow: var(--pix-shadow-lg);
+  }
+  .settings-sidebar.open {
+    display: flex;
+  }
+  .navigation-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    background: #20273740;
+    z-index: 20;
+  }
+  .settings-mobile-menu {
+    display: inline-flex;
+  }
+  .settings-topbar {
+    --pix-titlebar-padding: 14px;
+    gap: 8px;
+  }
+  .settings-content {
+    padding: 24px 16px 32px;
+  }
+  .section-title,
+  .settings-content :deep(.section-title) {
+    font-size: 24px;
+  }
+  .settings-actions {
+    padding: 12px 16px;
+  }
+}
 </style>

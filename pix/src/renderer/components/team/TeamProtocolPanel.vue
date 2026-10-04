@@ -7,7 +7,7 @@
  * A pause never drops these (H23), so the cards stay until answered here or on
  * the roundtable attention surface.
  */
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useTeamStore } from "../../stores/team-store";
 import { seatLabel } from "./roundtable-display";
 import type { PermissionRequest } from "@shared/types.js";
@@ -15,6 +15,20 @@ import type { PermissionRequest } from "@shared/types.js";
 const teamStore = useTeamStore();
 
 const requests = computed(() => teamStore.pendingPermissions);
+const submitting = ref<Set<string>>(new Set());
+const errors = ref<Record<string, string>>({});
+
+async function respond(requestId: string, approved: boolean): Promise<void> {
+  if (submitting.value.has(requestId)) return;
+  submitting.value.add(requestId);
+  delete errors.value[requestId];
+  try {
+    const accepted = await teamStore.respondPermission(requestId, approved, approved ? undefined : "用户拒绝");
+    if (!accepted) errors.value[requestId] = teamStore.lastError || "提交失败，请重试。";
+  } catch (error) {
+    errors.value[requestId] = error instanceof Error ? error.message : String(error);
+  } finally { submitting.value.delete(requestId); }
+}
 
 function seatName(seatId: string | undefined): string {
   return seatId === undefined ? "未知席位" : seatLabel(seatId, teamStore.seats);
@@ -52,22 +66,26 @@ function reasonText(req: PermissionRequest): string {
           请求使用 <strong>{{ req.tool }}</strong>
         </span>
         <span v-if="reasonText(req)" class="protocol-reason" data-test="protocol-reason">{{ reasonText(req) }}</span>
+        <span v-if="errors[req.id]" class="protocol-error" role="alert">{{ errors[req.id] }}</span>
         <div class="protocol-actions">
           <v-btn
             size="x-small"
-            color="green"
+            color="primary"
             variant="flat"
             density="compact"
-            @click="teamStore.respondPermission(req.id, true)"
+            :loading="submitting.has(req.id)"
+            :disabled="submitting.has(req.id)"
+            @click="respond(req.id, true)"
           >
             允许
           </v-btn>
           <v-btn
             size="x-small"
-            color="red"
+            color="error"
             variant="tonal"
             density="compact"
-            @click="teamStore.respondPermission(req.id, false, '用户拒绝')"
+            :disabled="submitting.has(req.id)"
+            @click="respond(req.id, false)"
           >
             拒绝
           </v-btn>
@@ -82,7 +100,7 @@ function reasonText(req: PermissionRequest): string {
   display: flex;
   flex-direction: column;
   gap: var(--pix-space-xs);
-  padding: var(--pix-space-sm) var(--pix-space-md) 0;
+  padding: 0 0 12px;
   flex-shrink: 0;
   max-height: 220px;
   overflow-y: auto;
@@ -91,8 +109,8 @@ function reasonText(req: PermissionRequest): string {
 .protocol-card {
   background: #ffffff;
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-md);
-  padding: var(--pix-space-sm);
+  border-radius: 10px;
+  padding: 14px;
 }
 
 .card-title {
@@ -117,8 +135,9 @@ function reasonText(req: PermissionRequest): string {
 }
 
 .protocol-card--attention {
-  border-color: var(--pix-warning-light);
-  background: var(--pix-warning-bg);
+  border-color: var(--pix-perm-border);
+  border-left: 3px solid var(--pix-perm-accent);
+  background: var(--pix-perm-bg);
 }
 
 .protocol-item {
@@ -141,8 +160,8 @@ function reasonText(req: PermissionRequest): string {
 
 .protocol-text,
 .protocol-reason {
-  font-size: 11px;
-  line-height: 1.45;
+  font-size: 13px;
+  line-height: 1.65;
   color: var(--pix-text-secondary);
 }
 
@@ -163,4 +182,6 @@ function reasonText(req: PermissionRequest): string {
   position: relative;
   z-index: 1;
 }
+.protocol-actions :deep(.v-btn) { min-height: 36px; }
+.protocol-error { color: var(--pix-error); font-size: 13px; }
 </style>

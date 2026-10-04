@@ -44,7 +44,7 @@ const html = computed(() => renderMarkdown(props.content));
 .agent-content {
   font-size: var(--pix-text-base);
   line-height: var(--pix-leading-relaxed);
-  color: #000000;
+  color: var(--pix-text-body);
   max-width: 100%;
 }
 
@@ -77,7 +77,7 @@ const html = computed(() => renderMarkdown(props.content));
   padding-top: 38px;
   background: #f7f8fc;
   border-color: var(--pix-border-light);
-  color: #000000;
+  color: var(--pix-text-body);
   font-size: var(--pix-text-sm);
   line-height: 1.65;
 }

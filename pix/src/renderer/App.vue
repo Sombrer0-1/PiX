@@ -47,6 +47,7 @@ async function windowClose(): Promise<void> {
 
 <template>
   <v-app>
+    <router-view />
     <div class="window-controls" role="group" aria-label="窗口控制">
       <button
         class="window-control"
@@ -85,7 +86,6 @@ async function windowClose(): Promise<void> {
         </svg>
       </button>
     </div>
-    <router-view />
   </v-app>
 </template>
 
@@ -105,7 +105,6 @@ async function windowClose(): Promise<void> {
   pointer-events: auto;
   user-select: none;
   background: var(--pix-bg-topbar);
-  border-bottom: 1px solid var(--pix-border-light);
 }
 
 .window-control {

@@ -430,8 +430,13 @@ onUnmounted(() => {
     <template #left>
       <LeftPanel />
     </template>
-    <template #center>
+    <template #center="{ toggleLeft, toggleRight, leftOpen, rightOpen, reserveWindowControls }">
       <CenterPanel
+        :left-open="leftOpen"
+        :right-open="rightOpen"
+        :reserve-window-controls="reserveWindowControls"
+        @toggle-left="toggleLeft"
+        @toggle-right="toggleRight"
         :pending-user-input="pendingUserInput"
         :current-question-index="currentQuestionIndex"
         :current-answer="currentAnswer"

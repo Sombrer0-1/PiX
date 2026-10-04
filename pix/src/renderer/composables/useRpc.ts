@@ -442,7 +442,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
   }
 
   async function setApiKey(provider: string, key: string): Promise<void> {
-    await sendCommand({ type: "set_api_key", provider, key });
+    await sendCommandOrThrow({ type: "set_api_key", provider, key });
     await Promise.all([refreshModels(), refreshState()]);
   }
 
@@ -478,7 +478,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
   }
 
   async function removeAuth(provider: string): Promise<void> {
-    await sendCommand({ type: "remove_auth", provider });
+    await sendCommandOrThrow({ type: "remove_auth", provider });
     await Promise.all([refreshModels(), refreshState()]);
   }
 
@@ -547,7 +547,7 @@ export function createRpcClient(transport: RpcTransport, label: string) {
   }
 
   async function reloadResources(): Promise<void> {
-    await sendCommand({ type: "reload_resources" });
+    await sendCommandOrThrow({ type: "reload_resources" });
     await Promise.all([refreshCommands(), refreshModels(), refreshState()]);
   }
 

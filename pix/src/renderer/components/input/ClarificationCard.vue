@@ -53,6 +53,7 @@ function onTextareaInput(e: Event): void {
       <textarea
         class="card-textarea"
         :value="answer"
+        :aria-label="question.question"
         :placeholder="question.options?.length ? '其他回答...' : '输入回答...'"
         rows="2"
         @input="onTextareaInput"
@@ -121,7 +122,7 @@ function onTextareaInput(e: Event): void {
 }
 
 .question-text {
-  font-size: var(--pix-text-sm);
+  font-size: 14px;
   color: var(--pix-text-primary);
   line-height: var(--pix-leading-base);
   margin: 0;
@@ -179,6 +180,7 @@ function onTextareaInput(e: Event): void {
   width: 100%;
   resize: vertical;
   min-height: 52px;
+  max-height: 180px;
   padding: var(--pix-space-sm) var(--pix-space-md);
   border: 1px solid var(--pix-border-light);
   border-radius: var(--pix-radius-md);

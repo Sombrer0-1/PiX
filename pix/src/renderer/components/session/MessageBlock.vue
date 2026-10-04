@@ -108,17 +108,7 @@ function kindLabel(kind: ChatMessageAttachment["kind"]): string {
 }
 
 .message-content {
-  max-width: min(78%, 760px);
-  font-size: var(--pix-text-base);
-  line-height: var(--pix-leading-relaxed);
-  color: #000000;
-  white-space: pre-wrap;
-  word-break: break-word;
-  padding: 10px 14px;
-  background: linear-gradient(180deg, #fbfbff 0%, #f7f8ff 100%);
-  border-radius: var(--pix-radius-lg);
-  border: 1px solid var(--pix-border-light);
-  box-shadow: var(--pix-shadow-xs);
+  max-width: min(78%, 760px); font-size: 14px; line-height: 1.75; color: var(--pix-text-body); white-space: pre-wrap; word-break: break-word; padding: 10px 14px; background: #f8f7fc; border-radius: 12px 3px 12px 12px; border: 1px solid #e8e7f1;
 }
 
 .message-attachments {
@@ -220,5 +210,8 @@ function kindLabel(kind: ChatMessageAttachment["kind"]): string {
     opacity: 1;
     transform: translateY(0);
   }
+}
+@media (max-width: 760px) {
+  .message-content, .message-attachments { max-width: 85%; }
 }
 </style>

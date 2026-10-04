@@ -95,34 +95,19 @@ function rowText(item: TodoItem): string {
 /* 卡片壳/标题沿用 RightPanel 的 .info-card / .card-title 语言（组件内复制语义，
    与 GitWorkdirCard 同款，不改 RightPanel 既有样式类）。 */
 .info-card {
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-xl);
-  padding: var(--pix-space-lg);
-  box-shadow: var(--pix-shadow-xs);
-  transition:
-    border-color var(--pix-transition-fast),
-    box-shadow var(--pix-transition-fast);
+  background: white; border: 1px solid var(--pix-border-card); border-radius: 10px; padding: 14px; flex-shrink: 0;
 }
 
 .info-card:hover {
-  border-color: #dfe2f0;
-  box-shadow: var(--pix-shadow-sm);
+  border-color: #bfc8db;
 }
 
 .card-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: var(--pix-space-sm);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px;
 }
 
 .card-title {
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  text-transform: none;
-  letter-spacing: 0;
+  font-size: 15px; font-weight: 600; color: var(--pix-text-primary);
 }
 
 .todo-header-right {
@@ -132,7 +117,7 @@ function rowText(item: TodoItem): string {
 }
 
 .todo-progress {
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
   color: var(--pix-text-muted);
 }
@@ -169,7 +154,7 @@ function rowText(item: TodoItem): string {
   gap: 7px;
   min-height: 24px;
   padding: 2px 0;
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   color: var(--pix-text-primary);
 }
 

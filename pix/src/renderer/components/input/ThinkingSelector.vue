@@ -58,7 +58,7 @@ watch(currentModel, () => {
 
 <template>
   <div class="thinking-selector">
-    <div class="thinking-panel">
+    <div class="thinking-panel" role="dialog" aria-label="选择思考深度" aria-modal="true">
       <div class="thinking-header">
         <span>选择思考深度</span>
         <button class="thinking-close-btn" title="关闭" @click="emit('close')">

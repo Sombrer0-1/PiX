@@ -4,6 +4,23 @@ import { getModel } from "../src/models.ts";
 import { convertMessages } from "../src/providers/openai-completions.ts";
 import { streamSimple } from "../src/stream.ts";
 import type { AssistantMessage, Model, Tool, ToolResultMessage } from "../src/types.ts";
+import { opencodeGoKimi } from "./fixtures/opencode-go-kimi.ts";
+
+const groqQwen: Model<"openai-completions"> = {
+	...opencodeGoKimi,
+	id: "qwen/qwen3-32b",
+	name: "Groq Qwen reasoning fixture",
+	provider: "groq",
+	baseUrl: "https://api.groq.com/openai/v1",
+	thinkingLevelMap: { minimal: null, low: null, medium: null, high: "default" },
+	compat: undefined,
+};
+const zaiWithoutToolStream: Model<"openai-completions"> = {
+	...getModel("zai", "glm-4.7"),
+	id: "glm-4.5-air",
+	name: "Z.ai non-streaming tools fixture",
+	compat: { supportsDeveloperRole: false, thinkingFormat: "zai" },
+};
 
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
@@ -157,7 +174,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("maps groq qwen3 reasoning levels to default reasoning_effort", async () => {
-		const model = getModel("groq", "qwen/qwen3-32b")!;
+		const model = groqQwen;
 		let payload: unknown;
 
 		await streamSimple(
@@ -213,7 +230,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("enables tool_stream for supported z.ai models with tools", async () => {
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getModel("zai", "glm-5.3")!;
 		const tools: Tool[] = [
 			{
 				name: "ping",
@@ -250,15 +267,15 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("stores z.ai tool_stream support in model compat metadata", () => {
-		expect(getModel("zai", "glm-5.1")?.compat?.zaiToolStream).toBe(true);
+		expect(getModel("zai", "glm-5.3")?.compat?.zaiToolStream).toBe(true);
 		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
+		expect(getModel("zai", "glm-5.2")?.compat?.zaiToolStream).toBe(true);
 		expect(getModel("zai", "glm-5-turbo")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.5-air")?.compat?.zaiToolStream).toBeUndefined();
+		expect(zaiWithoutToolStream.compat?.zaiToolStream).toBeUndefined();
 	});
 
 	it("omits tool_stream for unsupported z.ai models", async () => {
-		const model = getModel("zai", "glm-4.5-air")!;
+		const model = zaiWithoutToolStream;
 		const tools: Tool[] = [
 			{
 				name: "ping",
@@ -295,7 +312,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("respects explicit z.ai tool_stream compat override", async () => {
-		const baseModel = getModel("zai", "glm-4.5-air")!;
+		const baseModel = zaiWithoutToolStream;
 		const model = {
 			...baseModel,
 			compat: {
@@ -339,7 +356,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("omits tool_stream when no tools are provided", async () => {
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getModel("zai", "glm-5.3")!;
 		let payload: unknown;
 
 		await streamSimple(
@@ -381,7 +398,7 @@ describe("openai-completions tool_choice", () => {
 			},
 		];
 
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getModel("zai", "glm-5.3")!;
 		const response = await streamSimple(
 			model,
 			{
@@ -940,7 +957,7 @@ describe("openai-completions tool_choice", () => {
 			},
 		];
 
-		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
+		const { compat: _compat, ...baseModel } = opencodeGoKimi;
 		const model = { ...baseModel, api: "openai-completions" } as const;
 		const response = await streamSimple(
 			model,
@@ -987,7 +1004,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("replays OpenCode Go reasoning thinking blocks as reasoning_content", () => {
-		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
+		const { compat: _compat, ...baseModel } = opencodeGoKimi;
 		const model = { ...baseModel, api: "openai-completions" } as Model<"openai-completions">;
 		const messages = convertMessages(
 			model,
@@ -1041,7 +1058,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends thinking disabled for OpenCode Go Kimi K2.6 when thinking is off", async () => {
-		const model = getModel("opencode-go", "kimi-k2.6")!;
+		const model = opencodeGoKimi;
 		let payload: unknown;
 
 		await streamSimple(
@@ -1063,7 +1080,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends thinking enabled for OpenCode Go Kimi K2.6 when thinking is enabled", async () => {
-		const model = getModel("opencode-go", "kimi-k2.6")!;
+		const model = opencodeGoKimi;
 		let payload: unknown;
 
 		await streamSimple(

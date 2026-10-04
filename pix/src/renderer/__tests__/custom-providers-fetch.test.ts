@@ -10,6 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
+import { ref } from "vue";
 import { components as vuetifyComponents, createVuetify, directives as vuetifyDirectives } from "vuetify/dist/vuetify.js";
 import type { CustomProviderConfig } from "@shared/custom-providers";
 import CustomProviders from "../components/settings/CustomProviders.vue";
@@ -26,15 +27,17 @@ const rpcMock = vi.hoisted(() => ({
   setCustomProviders: vi.fn(),
   fetchProviderModels: vi.fn(),
   refreshModels: vi.fn().mockResolvedValue(undefined),
+  getAuthStatus: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("../composables/useWorkspaceRpc", () => ({
   useWorkspaceRpc: () => ({
     isConnected: rpcMock.state.isConnected,
-    getCustomProviders: rpcMock.state.getCustomProviders ?? rpcMock.getCustomProviders,
+    getCustomProviders: rpcMock.getCustomProviders,
     setCustomProviders: rpcMock.setCustomProviders,
     fetchProviderModels: rpcMock.fetchProviderModels,
     refreshModels: rpcMock.refreshModels,
+    getAuthStatus: rpcMock.getAuthStatus,
   }),
 }));
 
@@ -78,6 +81,7 @@ function dialogButtons(): HTMLButtonElement[] {
 
 beforeEach(() => {
   setActivePinia(createPinia());
+  rpcMock.state.isConnected = ref(true);
   // happy-dom 没有 visualViewport；VOverlay（v-dialog/v-tooltip）的 connected 策略会读它。
   vi.stubGlobal("visualViewport", {
     addEventListener: () => {},
@@ -289,5 +293,124 @@ describe("CustomProviders 从 API 获取模型", () => {
       .findAll(".model-block .model-id-field input")
       .map((i) => (i.element as HTMLInputElement).value);
     expect(modelIds).toEqual(["from-alpha"]);
+  });
+});
+
+
+describe("CustomProviders save recovery", () => {
+  it("keeps a pending deletion blocked during reload and rejects its stale target afterwards", async () => {
+    const beta: CustomProviderConfig = { baseUrl: 'https://beta.example.com/v1', api: 'openai-completions', models: [] };
+    providersFixture({ alpha: { ...beta }, beta });
+    const panel = mountPanel();
+    await flushPromises();
+    await expandFirstProvider();
+    await panel.findAll('button').find(button => button.text() === '删除')!.trigger('click');
+    await flushPromises();
+    rpcMock.state.isConnected.value = false;
+    await flushPromises();
+    let finishLoad!: (value: { providers: Record<string, CustomProviderConfig> }) => void;
+    rpcMock.getCustomProviders.mockReturnValueOnce(new Promise(resolve => { finishLoad = resolve; }));
+    rpcMock.state.isConnected.value = true;
+    await flushPromises();
+    const confirm = dialogButtons().find(button => button.textContent?.trim() === '确认删除')!;
+    expect(confirm.disabled).toBe(true);
+    confirm.click();
+    expect(panel.findAll('.provider-card')).toHaveLength(2);
+    expect(rpcMock.setCustomProviders).not.toHaveBeenCalled();
+    finishLoad({ providers: { beta } });
+    await flushPromises();
+    confirm.click();
+    await flushPromises();
+    expect(panel.findAll('.provider-card')).toHaveLength(1);
+    expect(panel.get('.provider-name').text()).toBe('beta');
+    expect(rpcMock.setCustomProviders).not.toHaveBeenCalled();
+    expect(panel.text()).toContain('请重新选择要删除的 Provider');
+  });
+
+  it("locks deletion and editing while a provider write is pending", async () => {
+    providersFixture({ relay: { baseUrl: 'https://relay.example.com/v1', api: 'openai-completions', models: [] } });
+    let finishSave!: (value: { success: boolean }) => void;
+    rpcMock.setCustomProviders.mockReturnValueOnce(new Promise(resolve => { finishSave = resolve; }));
+    const panel = mountPanel();
+    await flushPromises();
+    await expandFirstProvider();
+    await panel.findAll('button').find(button => button.text() === '保存全部')!.trigger('click');
+    await flushPromises();
+    const deleteButton = panel.findAll('button').find(button => button.text() === '删除')!;
+    expect(deleteButton.attributes('disabled')).toBeDefined();
+    expect(panel.get<HTMLInputElement>('input[aria-label="Provider 名"]').element.disabled).toBe(true);
+    await deleteButton.trigger('click');
+    expect(panel.findAll('.provider-card')).toHaveLength(1);
+    expect(document.body.textContent).not.toContain('确认删除');
+    finishSave({ success: true });
+    await flushPromises();
+    expect(deleteButton.attributes('disabled')).toBeUndefined();
+  });
+
+  it("preserves opened cards, model details and advanced options after saving", async () => {
+    providersFixture({ relay: { baseUrl: 'https://relay.example.com/v1', api: 'openai-completions', models: [{ id: 'model', input: ['text'], reasoning: true }] } });
+    rpcMock.setCustomProviders.mockResolvedValue({ success: true });
+    const panel = mountPanel();
+    await flushPromises();
+    await expandFirstProvider();
+    for (const details of panel.findAll<HTMLDetailsElement>('details')) {
+      details.element.open = true;
+      await details.trigger('toggle');
+    }
+    await panel.findAll('button').find(button => button.text().includes('高级：compat'))!.trigger('click');
+    await panel.findAll('button').find(button => button.text().includes('思考档位映射 thinkingLevelMap'))!.trigger('click');
+    await panel.findAll('button').find(button => button.text() === '保存全部')!.trigger('click');
+    await flushPromises();
+    expect(panel.get('.provider-header').attributes('aria-expanded')).toBe('true');
+    expect(panel.findAll<HTMLDetailsElement>('details').every(details => details.element.open)).toBe(true);
+    expect(panel.find('textarea[aria-label="compat 覆盖 JSON"]').exists()).toBe(true);
+    expect(panel.find('textarea[aria-label="思考档位映射 JSON"]').exists()).toBe(true);
+    expect(panel.text()).not.toContain('有未保存的修改');
+  });
+
+  it("focuses and scrolls to the newly added provider", async () => {
+    providersFixture({});
+    const panel = mountPanel();
+    await flushPromises();
+    const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {});
+    await panel.findAll('button').find(button => button.text() === '添加 Provider')!.trigger('click');
+    await flushPromises();
+    expect(document.activeElement).toBe(panel.get('input[aria-label="Provider 名"]').element);
+    expect(scroll).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' });
+    scroll.mockRestore();
+  });
+
+  it("retains the edited provider after the write is rejected", async () => {
+    providersFixture({ relay: { baseUrl: "https://relay.example.com/v1", api: "openai-completions", models: [{ id: "model", input: ["text"], reasoning: false }] } });
+    rpcMock.setCustomProviders.mockResolvedValue({ success: false, error: "配置写入失败" });
+    const panel = mountPanel();
+    await flushPromises();
+    await expandFirstProvider();
+    await panel.get('input[aria-label="Provider 名"]').setValue("edited-relay");
+    await panel.findAll('button').find(button => button.text() === '保存全部')!.trigger('click');
+    await flushPromises();
+    expect(panel.text()).toContain("配置写入失败");
+    expect((panel.get('input[aria-label="Provider 名"]').element as HTMLInputElement).value).toBe("edited-relay");
+    expect(panel.text()).toContain("有未保存的修改");
+  });
+
+  it("restores a deleted card and retains sibling edits when deletion cannot persist", async () => {
+    providersFixture({
+      alpha: { baseUrl: "https://alpha.example.com/v1", api: "openai-completions", models: [{ id: "alpha", input: ["text"], reasoning: false }] },
+      beta: { baseUrl: "https://beta.example.com/v1", api: "openai-completions", models: [{ id: "beta", input: ["text"], reasoning: false }] },
+    });
+    rpcMock.setCustomProviders.mockResolvedValue({ success: false, error: "配置写入失败" });
+    const panel = mountPanel();
+    await flushPromises();
+    await panel.findAll('.provider-header')[1].trigger('click');
+    await panel.get('input[aria-label="Provider 名"]').setValue('edited-beta');
+    await panel.findAll('.provider-header')[0].trigger('click');
+    await panel.findAll('.provider-card')[0].findAll('button').find(button => button.text() === '删除')!.trigger('click');
+    await flushPromises();
+    dialogButtons().find(button => button.textContent?.trim() === '确认删除')!.click();
+    await flushPromises();
+    expect(panel.findAll('.provider-card')).toHaveLength(2);
+    expect(panel.findAll('input[aria-label="Provider 名"]').map(input => (input.element as HTMLInputElement).value)).toEqual(['alpha', 'edited-beta']);
+    expect(panel.text()).toContain('配置写入失败');
   });
 });

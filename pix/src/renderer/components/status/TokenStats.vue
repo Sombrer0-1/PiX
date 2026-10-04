@@ -13,17 +13,7 @@ const stats = computed(() => rpc.sessionStats.value);
 const contextUsage = computed(() => stats.value?.contextUsage);
 const contextPercent = computed(() => contextUsage.value?.percent ?? null);
 
-// SVG ring geometry. r = 34 inside an 80x80 viewBox; the progress arc is drawn
-// via stroke-dashoffset so it animates smoothly when the percent changes.
-const RING_RADIUS = 34;
-const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
-
-const ringDashoffset = computed(() => {
-  const percent = contextPercent.value;
-  if (percent === null) return RING_CIRCUMFERENCE;
-  const safe = Math.max(0, Math.min(100, percent));
-  return RING_CIRCUMFERENCE * (1 - safe / 100);
-});
+const contextWidth = computed(() => `${Math.max(0, Math.min(100, contextPercent.value ?? 0))}%`);
 
 const contextClass = computed(() => {
   const percent = contextPercent.value ?? 0;
@@ -59,33 +49,16 @@ function formatPercent(n: number | null): string {
   <div class="token-stats">
     <div v-if="stats" class="stats-content">
       <div v-if="stats.contextUsage" class="context-usage" :class="contextClass">
-        <div class="context-ring">
-          <svg width="80" height="80" viewBox="0 0 80 80">
-            <circle class="ring-track" cx="40" cy="40" :r="RING_RADIUS" fill="none" stroke-width="7" />
-            <circle
-              class="ring-progress"
-              cx="40"
-              cy="40"
-              :r="RING_RADIUS"
-              fill="none"
-              stroke-width="7"
-              stroke-linecap="round"
-              :stroke-dasharray="RING_CIRCUMFERENCE"
-              :stroke-dashoffset="ringDashoffset"
-            />
-          </svg>
-          <div class="context-ring-label">
-            <span class="context-percent">{{ formatPercent(stats.contextUsage.percent) }}</span>
-          </div>
-        </div>
         <div class="context-meta">
           <span class="context-meta-label">上下文占用</span>
+          <span class="context-percent">{{ formatPercent(stats.contextUsage.percent) }}</span>
           <span class="context-meta-value">
             {{ formatContextTokens(stats.contextUsage.tokens) }}
             <span class="context-meta-divider">/</span>
             {{ formatNumber(stats.contextUsage.contextWindow) }}
           </span>
         </div>
+        <div class="context-track" role="progressbar" aria-label="上下文占用" :aria-valuenow="stats.contextUsage.percent ?? undefined" aria-valuemin="0" aria-valuemax="100"><span :class="{ 'has-usage': (contextPercent ?? 0) > 0 }" :style="{ width: contextWidth }"></span></div>
       </div>
 
       <div class="stats-grid">
@@ -135,89 +108,19 @@ function formatPercent(n: number | null): string {
   gap: var(--pix-space-md);
 }
 
-/* ── Context usage ring ── */
-.context-usage {
-  display: flex;
-  align-items: center;
-  gap: var(--pix-space-md);
-  padding: var(--pix-space-md);
-  background: var(--pix-bg-code);
-  border: 1px solid var(--pix-border-subtle);
-  border-radius: var(--pix-radius-lg);
-}
-
-.context-ring {
-  position: relative;
-  width: 80px;
-  height: 80px;
-  flex-shrink: 0;
-}
-
-.context-ring svg {
-  transform: rotate(-90deg);
-}
-
-.ring-track {
-  stroke: var(--pix-border);
-}
-
-.ring-progress {
-  stroke: var(--pix-accent);
-  transition: stroke-dashoffset var(--pix-transition-slow), stroke var(--pix-transition-base);
-}
-
-.context-ring-label {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.context-percent {
-  font-size: var(--pix-text-md);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  line-height: 1;
-}
-
-.context-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.context-meta-label {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
-}
-
-.context-meta-value {
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  line-height: 1.3;
-}
-
-.context-meta-divider {
-  color: var(--pix-text-muted);
-  margin: 0 2px;
-}
-
-.context-usage.warning .ring-progress {
-  stroke: var(--pix-warning);
-}
-.context-usage.warning .context-percent {
-  color: var(--pix-warning);
-}
-
-.context-usage.danger .ring-progress {
-  stroke: var(--pix-error);
-}
-.context-usage.danger .context-percent {
-  color: var(--pix-error);
-}
+.context-usage { padding-top: 5px; }
+.context-meta { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 6px; }
+.context-meta-label { grid-column: 1 / -1; font-size: 13px; color: var(--pix-text-secondary); }
+.context-percent { font-size: 23px; font-weight: 600; line-height: 1.3; }
+.context-meta-value { font-size: 12px; }
+.context-meta-divider { color: var(--pix-text-muted); margin: 0 2px; }
+.context-track { height: 4px; background: var(--pix-border); border-radius: 4px; overflow: hidden; margin-top: 10px; }
+.context-track span { display: block; height: 100%; border-radius: inherit; background: var(--pix-accent); transition: width var(--pix-transition-base); }
+.context-track span.has-usage { min-width: 8px; }
+.context-usage.warning .context-percent { color: var(--pix-warning); }
+.context-usage.warning .context-track span { background: var(--pix-warning); }
+.context-usage.danger .context-percent { color: var(--pix-error); }
+.context-usage.danger .context-track span { background: var(--pix-error); }
 
 /* ── Token stats grid ── */
 .stats-grid {
@@ -227,17 +130,11 @@ function formatPercent(n: number | null): string {
 }
 
 .stat-item {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: var(--pix-space-sm) var(--pix-space-md);
-  background: var(--pix-bg-code);
-  border: 1px solid var(--pix-border-subtle);
-  border-radius: var(--pix-radius-md);
+  display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 0;
 }
 
 .stat-label {
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   color: var(--pix-text-muted);
 }
 
@@ -251,8 +148,8 @@ function formatPercent(n: number | null): string {
 /* ── Summary (total + cost) ── */
 .stats-summary {
   display: flex;
-  flex-direction: column;
-  gap: var(--pix-space-xs);
+  justify-content: space-between;
+  gap: 14px;
   padding-top: var(--pix-space-sm);
   border-top: 1px solid var(--pix-border-light);
 }
@@ -260,11 +157,11 @@ function formatPercent(n: number | null): string {
 .summary-row {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
+  gap: 6px;
 }
 
 .summary-label {
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   color: var(--pix-text-muted);
 }
 
@@ -280,7 +177,7 @@ function formatPercent(n: number | null): string {
 
 .no-stats {
   color: var(--pix-text-secondary);
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   text-align: center;
   padding: var(--pix-space-sm) 0;
 }

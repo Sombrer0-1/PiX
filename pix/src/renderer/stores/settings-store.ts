@@ -61,6 +61,7 @@ export const useSettingsStore = defineStore("settings", () => {
     recentProjects: [],
   });
   const isLoaded = ref(false);
+  const loadError = ref<string | null>(null);
 
   // WSL defaults + distro probe state. `wslDistros`/`wslDiagnostic` are filled by
   // loadWslDistros(); an empty list with a diagnostic means WSL is unavailable.
@@ -69,7 +70,9 @@ export const useSettingsStore = defineStore("settings", () => {
   const wslDistrosLoaded = ref(false);
 
   async function load(): Promise<void> {
+    loadError.value = null;
     try {
+      if (!window.pixApi) throw new Error("应用接口不可用，无法读取设置");
       const s = await api().getSettings();
       settings.value = s;
       // Ensure piPath is not undefined for backward compat
@@ -80,18 +83,15 @@ export const useSettingsStore = defineStore("settings", () => {
         settings.value.wsl = { ...DEFAULT_WSL_SETTINGS };
       }
       isLoaded.value = true;
-    } catch {
-      // Use defaults
+    } catch (error) {
+      loadError.value = error instanceof Error ? error.message : String(error);
     }
   }
 
   async function save(partial: Partial<GuiSettings>): Promise<void> {
-    try {
-      await api().setSettings(partial);
-      settings.value = { ...settings.value, ...partial };
-    } catch (err) {
-      console.error("[settings] Failed to save settings:", err);
-    }
+    const result = await api().setSettings(partial);
+    if (!result.success) throw new Error("保存应用设置失败");
+    settings.value = { ...settings.value, ...partial };
   }
 
   /** Probe WSL distros via the main process. Stores the list and any diagnostic;
@@ -129,6 +129,7 @@ export const useSettingsStore = defineStore("settings", () => {
   return {
     settings,
     isLoaded,
+    loadError,
     load,
     save,
     detectPi,

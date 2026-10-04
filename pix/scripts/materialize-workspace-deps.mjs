@@ -18,9 +18,9 @@
 //   file lives under pix/node_modules and both asar packing and asarUnpack work.
 //
 // Runs as part of `npm run package` (and therefore package-with-proxy.bat),
-// after `npm run build` so fresh dist output and the nested node_modules
-// created by sync-nested-deps.mjs are included. Idempotent: a re-run replaces
-// whatever npm left there (symlink or previous copy) with a fresh copy.
+// after `npm run build` so fresh dist output is included, and BEFORE
+// sync-nested-deps.mjs so replacing these directories does not discard the
+// synchronized dependencies. A re-run replaces links or previous copies.
 
 import { readFileSync, existsSync, lstatSync, rmSync, cpSync, realpathSync, mkdirSync } from "fs";
 import { join, dirname, resolve } from "path";

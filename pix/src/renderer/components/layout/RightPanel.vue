@@ -10,9 +10,9 @@ import { useTeamStore } from "../../stores/team-store";
 import { useTodoStore } from "../../stores/todo-store";
 import AgentTaskLauncher from "../agent-task/AgentTaskLauncher.vue";
 import TokenStats from "../status/TokenStats.vue";
-import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
 import GitWorkdirCard from "../git/GitWorkdirCard.vue";
 import TodoCard from "../todo/TodoCard.vue";
+import WindowTitlebar from "./WindowTitlebar.vue";
 import type { McpServerInfo } from "../../../shared/types";
 
 const rpc = useWorkspaceRpc();
@@ -87,6 +87,7 @@ const goalTimeText = computed(() => {
 // ---- MCP status ----
 const router = useRouter();
 const mcpServers = ref<McpServerInfo[]>([]);
+const mcpError = ref("");
 const mcpConnected = computed(() => mcpServers.value.filter((s) => s.status === "connected").length);
 
 // ---- Background tasks ----
@@ -153,9 +154,9 @@ async function refreshMcp(): Promise<void> {
   const mode = teamStore.teamMode;
   try {
     const servers = await rpc.mcpGetServers();
-    if (teamStore.teamMode === mode) mcpServers.value = servers;
+    if (teamStore.teamMode === mode) { mcpServers.value = servers; mcpError.value = ""; }
   } catch {
-    if (teamStore.teamMode === mode) mcpServers.value = [];
+    if (teamStore.teamMode === mode) mcpError.value = "MCP 状态读取失败";
   }
 }
 
@@ -195,20 +196,11 @@ watch(() => teamStore.teamMode, () => {
 
 <template>
   <div class="right-panel">
-    <!-- ====================================================================== -->
-    <!-- Solo Mode: protocol requests + Git workdir card -->
-    <!-- ====================================================================== -->
-    <!-- Protocol requests (permission approvals) are visibility-critical: a
-         request raised while the user is outside team mode would otherwise
-         silently time out and fail the seat's task. In team mode the roundtable
-         attention surface owns them (TeamDashboard → AttentionSurface), so here
-         the panel only covers solo mode and points at the roundtable. -->
-    <TeamProtocolPanel v-if="!teamStore.teamMode" />
-    <div v-else class="info-card protocol-hint-card" data-test="team-protocol-hint">
+    <WindowTitlebar class="context-header">上下文</WindowTitlebar>
+    <div class="context-cards">
+    <div v-if="teamStore.teamMode && teamStore.pendingProtocolCount > 0" class="info-card protocol-hint-card" data-test="team-protocol-hint">
       <div class="card-title">协议与权限</div>
-      <div class="protocol-hint-text">
-        团队模式下权限与退出协商走圆桌的注意力面（当前 {{ teamStore.pendingProtocolCount }} 条待处理）。
-      </div>
+      <div class="protocol-hint-text">圆桌中有 {{ teamStore.pendingProtocolCount }} 条待处理请求。</div>
     </div>
 
     <!-- Git workdir card (project-level status; replaces the former session
@@ -264,7 +256,7 @@ watch(() => teamStore.teamMode, () => {
     </div>
 
     <!-- MCP card -->
-    <div v-if="mcpTotal > 0" class="info-card">
+    <div class="info-card">
       <div class="card-title-row">
         <span class="card-title">MCP 服务器</span>
         <button
@@ -275,7 +267,8 @@ watch(() => teamStore.teamMode, () => {
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
         </button>
       </div>
-      <div class="mcp-overview" :class="mcpFailed > 0 ? 'warning' : 'ok'">
+      <div v-if="mcpError" class="mcp-read-error" role="alert">{{ mcpError }}<button @click="refreshMcp">重试</button></div>
+      <div v-else class="mcp-overview" :class="mcpFailed > 0 ? 'warning' : 'ok'">
         <span class="mcp-count">{{ mcpConnected }}/{{ mcpTotal }}</span>
         <span class="mcp-count-label">已连接</span>
         <span v-if="mcpFailed > 0" class="mcp-failed-count">{{ mcpFailed }} 失败</span>
@@ -332,7 +325,7 @@ watch(() => teamStore.teamMode, () => {
     <!-- Background tasks card (hidden on WSL projects; the agent task entry above stays) -->
     <div v-if="backgroundTasks.length > 0 && !isWsl" class="info-card">
       <div class="card-title-row">
-        <span class="card-title">后台任务</span>
+        <span class="card-title">Shell 后台任务</span>
         <button
           class="card-action-btn"
           @click="refreshBackgroundTasks"
@@ -372,19 +365,16 @@ watch(() => teamStore.teamMode, () => {
       <div class="card-title error-title">最近错误</div>
       <div class="error-text">{{ rpc.lastError.value }}</div>
     </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.context-header { font-size: 14px; }
+.context-cards { display: flex; flex-direction: column; gap: 12px; padding: 16px 14px; overflow-y: auto; min-height: 0; }
+
 .right-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  padding: 46px var(--pix-space-md) var(--pix-space-md);
-  gap: var(--pix-space-md);
-  user-select: none;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(251, 252, 255, 0.82));
+  display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--pix-bg-right); font-size: 13px;
 }
 
 /* ── Status indicator ── */
@@ -398,7 +388,7 @@ watch(() => teamStore.teamMode, () => {
   gap: 6px;
   padding: 4px 12px;
   border-radius: 12px;
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   font-weight: var(--pix-weight-medium);
   width: 100%;
 }
@@ -438,35 +428,19 @@ watch(() => teamStore.teamMode, () => {
 
 /* ── Info cards ── */
 .info-card {
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-xl);
-  padding: var(--pix-space-lg);
-  box-shadow: var(--pix-shadow-xs);
-  transition:
-    border-color var(--pix-transition-fast),
-    box-shadow var(--pix-transition-fast);
+  background: white; border: 1px solid var(--pix-border-card); border-radius: 10px; padding: 14px; flex-shrink: 0;
 }
 
 .info-card:hover {
-  border-color: #dfe2f0;
-  box-shadow: var(--pix-shadow-sm);
+  border-color: #bfc8db;
 }
 
 .card-title {
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  text-transform: none;
-  letter-spacing: 0;
-  margin-bottom: var(--pix-space-md);
+  font-size: 15px; font-weight: 600; color: var(--pix-text-primary);
 }
 
 .card-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: var(--pix-space-md);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px;
 }
 
 .card-action-btn {
@@ -500,7 +474,7 @@ watch(() => teamStore.teamMode, () => {
 }
 
 .acp-badge {
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   font-weight: var(--pix-weight-semibold);
   letter-spacing: 0.04em;
   color: var(--pix-accent);
@@ -513,7 +487,7 @@ watch(() => teamStore.teamMode, () => {
 /* 团队模式：这张卡是圆桌合计，不是 host 会话用量。 */
 .card-scope-note,
 .protocol-hint-text {
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   color: var(--pix-text-muted);
 }
 
@@ -632,7 +606,7 @@ watch(() => teamStore.teamMode, () => {
 
 .mcp-count-label,
 .mcp-failed-count {
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   font-weight: var(--pix-weight-medium);
   color: var(--pix-text-secondary);
 }
@@ -652,7 +626,7 @@ watch(() => teamStore.teamMode, () => {
   align-items: center;
   gap: 7px;
   min-height: 24px;
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   padding: 2px 0;
 }
 
@@ -787,7 +761,7 @@ watch(() => teamStore.teamMode, () => {
 
 .bg-task-cmd {
   font-family: var(--pix-font-mono);
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   color: var(--pix-text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -830,5 +804,7 @@ watch(() => teamStore.teamMode, () => {
 .bg-task-stop-btn:hover {
   background: var(--pix-error-light);
 }
+.mcp-read-error { font-size: 13px; color: var(--pix-error); }
+.mcp-read-error button { margin-left: 8px; color: var(--pix-accent); }
 
 </style>

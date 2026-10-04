@@ -259,6 +259,11 @@ const visibleBlocks = computed(() =>
   windowingEnabled.value ? props.blocks.slice(windowStart.value) : props.blocks,
 );
 
+function isAgentTurnStart(index: number): boolean {
+  const actualIndex = hiddenPrefixCount.value + index;
+  return actualIndex === 0 || ["user-message", "turn-separator"].includes(props.blocks[actualIndex - 1].type);
+}
+
 function hasHiddenPrefix(): boolean {
   return windowingEnabled.value && windowStart.value > 0;
 }
@@ -402,7 +407,11 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
     >
       更早的 {{ hiddenPrefixCount }} 条记录已折叠，向上滚动工作记录可加载更旧页
     </div>
-    <template v-for="block in visibleBlocks" :key="block.id">
+    <template v-for="(block, index) in visibleBlocks" :key="block.id">
+      <div v-if="['agent-message', 'thinking', 'work-status', 'vision-status'].includes(block.type) && isAgentTurnStart(index)" class="agent-heading">
+        <span class="agent-mark" aria-hidden="true">P</span><strong>PiX</strong><span class="agent-badge">Agent</span>
+        <time v-if="'timestamp' in block">{{ formatTime(block.timestamp) }}</time>
+      </div>
       <!-- Turn separator -->
       <div
         v-if="block.type === 'turn-separator'"
@@ -463,11 +472,12 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         <button class="ws-header" @click="block.tools.length > 0 && toggleExpand(block.id)">
           <span class="ws-icon">
             <span v-if="block.isStreaming" class="spinner"></span>
+            <v-icon v-else-if="block.tools.some(tool => tool.isError)" icon="mdi-alert-circle-outline" size="14" color="error" />
             <span v-else class="ws-dot done"></span>
           </span>
           <span class="ws-summary">
-            <template v-if="block.isStreaming">已运行 {{ block.tools.length }} 条命令...</template>
-            <template v-else>已运行 {{ block.tools.length }} 条命令</template>
+            <template v-if="block.isStreaming">执行中 · {{ block.tools.filter(tool => tool.result != null && !tool.isError).length }} 条成功</template>
+            <template v-else>已运行 {{ block.tools.filter(tool => tool.result != null).length }} 条命令<span v-if="block.tools.some(tool => tool.isError)"> · {{ block.tools.filter(tool => tool.isError).length }} 条失败</span></template>
           </span>
           <span class="ws-tool-names">{{ toolSummary(block.tools) }}</span>
           <span v-if="hasDiff(workDiff(block.tools))" class="ws-diff">
@@ -499,8 +509,9 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
             />
             <div v-else class="ws-tool-item" :class="{ error: tool.isError }">
               <button class="ws-tool-header" @click="toggleTool(block.id, tool.toolCallId)">
-                <span class="ws-tool-dot" :class="tool.isError ? 'err' : 'ok'"></span>
+                <span class="ws-tool-dot" :class="tool.isError ? 'err' : tool.result == null ? 'pending' : 'ok'"></span>
                 <span class="ws-tool-name">{{ tool.toolName || 'task' }}</span>
+                <span v-if="tool.result == null" class="ws-tool-pending">执行中</span>
                 <span v-if="tool.args" class="ws-tool-preview">{{ previewSummary(tool) }}</span>
                 <span v-else-if="tool.result !== null" class="ws-tool-preview">{{ resultPreview(tool.result) }}</span>
                 <span v-if="hasDiff(toolDiff(tool))" class="ws-tool-diff">
@@ -570,6 +581,13 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 </template>
 
 <style scoped>
+.agent-heading { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; font-size: 13px; }
+.agent-mark { width: 23px; height: 23px; display: inline-flex; align-items: center; justify-content: center; background: var(--pix-accent); color: white; border-radius: 6px; font-weight: 600; font-size: 18px; }
+.agent-badge { padding: 2px 5px; color: var(--pix-accent); background: var(--pix-accent-light); font-size: 10px; border-radius: 3px; }
+.agent-heading time { color: var(--pix-text-muted); font-size: 11px; }
+
+.ws-tool-dot.pending { background: var(--pix-accent); }
+.ws-tool-pending { font-size: 12px; color: var(--pix-accent); white-space: nowrap; }
 .session-view {
   max-width: var(--pix-content-max-width);
   margin: 0 auto;
@@ -651,19 +669,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 }
 
 .work-status-block {
-  width: fit-content;
-  max-width: 100%;
-  margin-bottom: var(--pix-space-md);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-lg);
-  overflow: hidden;
-  background: rgba(255, 255, 255, 0.95);
-  box-shadow: var(--pix-shadow-xs);
-  animation: block-in 0.16s ease-out;
-  transition:
-    border-color var(--pix-transition-fast),
-    transform var(--pix-transition-fast),
-    opacity var(--pix-transition-fast);
+  width: 100%; margin-bottom: 18px; border: 1px solid var(--pix-border-light); border-radius: 8px; overflow: hidden; background: white;
 }
 
 .work-status-block.expanded {
@@ -687,20 +693,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 }
 
 .ws-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-height: 32px;
-  padding: 6px 11px;
-  text-align: left;
-  font-size: var(--pix-text-xs);
-  background: rgba(255, 255, 255, 0.96);
-  cursor: pointer;
-  border: none;
-  color: var(--pix-text-primary);
-  font-family: var(--pix-font-ui);
-  transition: background var(--pix-transition-fast);
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 42px; padding: 10px 12px; text-align: left; font-size: 12px; background: #fcfcfe; color: var(--pix-text-secondary);
 }
 
 .ws-header:hover {

@@ -533,9 +533,8 @@ function confirmAbandon(): void {
   display: flex;
   flex-direction: column;
   border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-xl);
-  background: rgba(255, 255, 255, 0.96);
-  box-shadow: var(--pix-shadow-lg);
+  border-radius: 9px;
+  background: white;
   overflow: hidden;
 }
 
@@ -545,8 +544,8 @@ function confirmAbandon(): void {
   align-items: center;
   gap: 8px;
   width: 100%;
-  min-height: 38px;
-  padding: 7px 12px;
+  min-height: 44px;
+  padding: 10px 12px;
   border: none;
   background: transparent;
   color: var(--pix-accent);

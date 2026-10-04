@@ -11,7 +11,8 @@
  * 细调并自动回写预设为「自定义」，JSON 覆盖合并于其上。thinkingLevelMap 按模型分别
  * 配置，落实「模型自声明支持的推理档位」。
  */
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, watch, onMounted, nextTick } from "vue";
+import SettingsRow from "./SettingsRow.vue";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import { useAuthStore } from "../../stores/auth-store";
 import { SENTINEL } from "../../../shared/custom-providers";
@@ -58,6 +59,7 @@ interface ModelDraft {
 	thinkingLevelMapJson: string;
 	thinkingLevelMapError: string;
 	showThinking: boolean;
+	expanded: boolean;
 }
 
 interface ProviderDraft {
@@ -80,6 +82,8 @@ interface ProviderDraft {
 	compatOverrideError: string;
 	compatOverrideWarning: string;
 	showAdvanced: boolean;
+	headersOpen: boolean;
+	compatOpen: boolean;
 	expanded: boolean;
 	/** 「从 API 获取模型」进行中（每张 provider 卡片独立）。 */
 	fetchingModels: boolean;
@@ -98,6 +102,8 @@ const rpc = useWorkspaceRpc() as ReturnType<typeof useWorkspaceRpc> & {
 	}): Promise<FetchProviderModelsResult | null>;
 };
 const authStore = useAuthStore();
+const emit = defineEmits<{ "dirty-change": [dirty: boolean] }>();
+const providerList = ref<HTMLElement | null>(null);
 
 const loading = ref(true);
 const saving = ref(false);
@@ -105,6 +111,11 @@ const drafts = ref<ProviderDraft[]>([]);
 const loadError = ref("");
 const saveError = ref("");
 const savedNotice = ref("");
+const loadedDrafts = ref("");
+const draftSnapshot = computed(() => JSON.stringify(drafts.value, (key: string, value: unknown) =>
+  ["expanded", "showAdvanced", "showThinking", "headersOpen", "compatOpen", "fetchingModels", "fetchModelsError", "compatOverrideError", "compatOverrideWarning", "thinkingLevelMapError"].includes(key) ? undefined : value));
+const dirty = computed(() => loadedDrafts.value !== "" && draftSnapshot.value !== loadedDrafts.value);
+watch(dirty, (value) => emit("dirty-change", value), { immediate: true });
 
 const apiTypeItems: { title: string; value: CustomApi }[] = [
 	{ title: "anthropic-messages", value: "anthropic-messages" },
@@ -310,6 +321,7 @@ function toDraft(key: string, cfg: CustomProviderConfig): ProviderDraft {
 				thinkingLevelMapJson: m.thinkingLevelMap ? JSON.stringify(m.thinkingLevelMap, null, 2) : "",
 				thinkingLevelMapError: "",
 				showThinking: false,
+				expanded: false,
 			})),
 		},
 		keyConfigured: configured,
@@ -326,6 +338,8 @@ function toDraft(key: string, cfg: CustomProviderConfig): ProviderDraft {
 		compatOverrideError: "",
 		compatOverrideWarning: "",
 		showAdvanced: false,
+		headersOpen: false,
+		compatOpen: false,
 		expanded: false,
 		fetchingModels: false,
 		fetchModelsError: "",
@@ -335,12 +349,32 @@ function toDraft(key: string, cfg: CustomProviderConfig): ProviderDraft {
 	return draft;
 }
 
-async function load(): Promise<void> {
+async function load(preserveDrafts = false): Promise<void> {
 	loading.value = true;
 	loadError.value = "";
 	try {
 		const result = await rpc.getCustomProviders();
-		drafts.value = Object.entries(result.providers).map(([key, cfg]) => toDraft(key, cfg));
+		if (!result) throw new Error("读取提供商配置失败，请重试。");
+		if (!preserveDrafts) {
+			const previous = new Map(drafts.value.map((draft) => [draft.key.trim(), draft]));
+			drafts.value = Object.entries(result.providers).map(([key, cfg]) => {
+				const draft = toDraft(key, cfg);
+				const old = previous.get(key);
+				if (old) {
+					draft.expanded = old.expanded;
+					draft.showAdvanced = old.showAdvanced;
+					draft.headersOpen = old.headersOpen;
+					draft.compatOpen = old.compatOpen;
+					for (const model of draft.config.models) {
+						const oldModel = old.config.models.find((item) => item.id.trim() === model.id);
+						model.showThinking = oldModel?.showThinking ?? false;
+						model.expanded = oldModel?.expanded ?? false;
+					}
+				}
+				return draft;
+			});
+			loadedDrafts.value = draftSnapshot.value;
+		}
 		if (result.schemaError) loadError.value = result.schemaError;
 	} catch (err) {
 		loadError.value = err instanceof Error ? err.message : String(err);
@@ -349,7 +383,8 @@ async function load(): Promise<void> {
 	}
 }
 
-function addDraft(): void {
+async function addDraft(): Promise<void> {
+	if (loading.value || saving.value) return;
 	drafts.value.push({
 		key: "",
 		config: {
@@ -372,10 +407,16 @@ function addDraft(): void {
 		compatOverrideError: "",
 		compatOverrideWarning: "",
 		showAdvanced: false,
+		headersOpen: false,
+		compatOpen: false,
 		expanded: true,
 		fetchingModels: false,
 		fetchModelsError: "",
 	});
+	await nextTick();
+	const input = providerList.value?.querySelector<HTMLInputElement>('.provider-card:last-child input[aria-label="Provider 名"]');
+	input?.scrollIntoView({ behavior: "smooth", block: "center" });
+	input?.focus({ preventScroll: true });
 }
 
 function toggleExpand(idx: number): void {
@@ -395,6 +436,7 @@ function addModel(draft: ProviderDraft): void {
 		thinkingLevelMapJson: "",
 		thinkingLevelMapError: "",
 		showThinking: false,
+		expanded: true,
 	});
 }
 
@@ -600,20 +642,21 @@ function buildAndValidate(): { record: Record<string, CustomProviderConfig> } | 
 	return { record };
 }
 
-async function saveAll(): Promise<void> {
+async function saveAll(): Promise<boolean> {
+	if (saving.value || loading.value) return false;
 	saveError.value = "";
 	savedNotice.value = "";
 	const built = buildAndValidate();
 	if ("error" in built) {
 		saveError.value = built.error;
-		return;
+		return false;
 	}
 	saving.value = true;
 	try {
 		const result = await rpc.setCustomProviders(built.record);
-		if (result.error) {
-			saveError.value = result.error;
-			return;
+		if (!result?.success) {
+			saveError.value = result?.error || "保存提供商配置失败，请重试。";
+			return false;
 		}
 		try {
 			await rpc.refreshModels();
@@ -635,48 +678,45 @@ async function saveAll(): Promise<void> {
 			savedNotice.value = "配置已保存。团队模式下 worker 会话需重启后生效，leader 已即时更新。";
 		} else if (result.sessionActive === false) {
 			savedNotice.value = "配置已保存，将在下次启动会话时校验。";
+		} else {
+			savedNotice.value = "提供商配置已保存。";
 		}
+		return true;
 	} catch (err) {
 		saveError.value = err instanceof Error ? err.message : String(err);
+		return false;
 	} finally {
 		saving.value = false;
 	}
 }
 
-// #11: confirm before persisting a deletion (no undo). The dialog is bound to
-// pendingDeleteIdx via a computed so closing it clears the pending index.
-const pendingDeleteIdx = ref<number | null>(null);
+const pendingDeleteDraft = ref<ProviderDraft | null>(null);
 const deleteDialogOpen = computed({
-	get: () => pendingDeleteIdx.value !== null,
-	set: (open: boolean) => { if (!open) pendingDeleteIdx.value = null; },
+	get: () => pendingDeleteDraft.value !== null,
+	set: (open: boolean) => { if (!open) pendingDeleteDraft.value = null; },
 });
-const deleteTargetName = computed(() => {
-	const idx = pendingDeleteIdx.value;
-	return idx !== null ? (drafts.value[idx]?.key || "（未命名）") : "";
-});
+const deleteTargetName = computed(() => pendingDeleteDraft.value?.key || "（未命名）");
 
 function requestDelete(idx: number): void {
-	pendingDeleteIdx.value = idx;
+	if (!loading.value && !saving.value) pendingDeleteDraft.value = drafts.value[idx];
 }
 
 async function confirmDelete(): Promise<void> {
-	const idx = pendingDeleteIdx.value;
-	pendingDeleteIdx.value = null;
-	if (idx === null) return;
+	if (loading.value || saving.value) return;
+	const target = pendingDeleteDraft.value;
+	pendingDeleteDraft.value = null;
+	const idx = target === null ? -1 : drafts.value.indexOf(target);
+	if (idx < 0) {
+		saveError.value = "提供商配置已重新加载，请重新选择要删除的 Provider。";
+		return;
+	}
 	await deleteProvider(idx);
 }
 
 async function deleteProvider(idx: number): Promise<void> {
-	drafts.value.splice(idx, 1);
-	await saveAll();
-	// #6: if the save did not persist (a sibling validation error aborted the
-	// whole-file write), re-sync drafts from disk so the UI matches what is
-	// actually stored -- otherwise the deleted provider vanishes from the UI
-	// but remains on disk. (Generic saveAll validation errors are NOT reloaded;
-	// only delete re-syncs, so in-progress edits elsewhere are preserved.)
-	if (saveError.value) {
-		await load();
-	}
+	const [removed] = drafts.value.splice(idx, 1);
+	const persisted = await saveAll();
+	if (!persisted && removed) drafts.value.splice(idx, 0, removed);
 }
 
 // ============================================================================
@@ -776,6 +816,7 @@ function confirmImportModels(): void {
 				thinkingLevelMapJson: "",
 				thinkingLevelMapError: "",
 				showThinking: false,
+				expanded: false,
 			}),
 		);
 	}
@@ -807,7 +848,7 @@ watch(
 	() => rpc.isConnected.value,
 	(connected, prev) => {
 		if (connected && !prev && !saving.value && !loading.value) {
-			void load();
+			void load(dirty.value);
 		}
 	},
 );
@@ -817,7 +858,7 @@ watch(
   <div class="section-panel">
     <div class="d-flex align-center justify-space-between mb-4">
       <div>
-        <h2 class="section-title">自定义模型</h2>
+        <h1 class="section-title">自定义提供商</h1>
         <p class="section-desc">
           添加第三方 provider 与中转站。配置写入
           <code>~/.pi/agent/models.json</code>，保存后热加载。
@@ -825,20 +866,21 @@ watch(
         </p>
       </div>
       <div class="d-flex align-center" style="gap: var(--pix-space-sm);">
-        <v-btn color="primary" :loading="saving" @click="saveAll">保存全部</v-btn>
-        <v-btn color="primary" variant="outlined" prepend-icon="mdi-plus" @click="addDraft">
+        <v-btn color="primary" :loading="saving" :disabled="loading || saving" @click="saveAll">保存全部</v-btn>
+        <v-btn color="primary" variant="outlined" prepend-icon="mdi-plus" :disabled="loading || saving" @click="addDraft">
           添加 Provider
         </v-btn>
       </div>
     </div>
 
     <div class="inline-hint mb-3">
-      保存采用整体替换：任一 Provider 卡片或上方「保存全部」按钮都会写入<strong>全部</strong> Provider 配置。
-      每张卡片独立校验，但保存时所有错误会一并列出，修复后再次保存即生效。
+      「保存全部」与卡片保存按钮均写入全部提供商配置。
+      <span v-if="dirty">有未保存的修改。</span>
     </div>
 
     <v-alert v-if="loadError" type="error" closable density="compact" class="mb-4">
       {{ loadError }}
+      <button class="provider-retry" @click="load(dirty)">重试</button>
     </v-alert>
     <v-alert v-if="saveError" type="error" closable density="compact" class="mb-4">
       {{ saveError }}
@@ -855,7 +897,8 @@ watch(
       未配置自定义 provider。点击「添加 Provider」新建。
     </v-alert>
 
-    <div v-if="drafts.length > 0" class="provider-list mb-4">
+    <v-form v-if="drafts.length > 0" :disabled="loading || saving" @submit.prevent>
+    <div ref="providerList" class="provider-list mb-4" :inert="loading || saving">
       <v-card
         v-for="(draft, idx) in drafts"
         :key="idx"
@@ -863,7 +906,7 @@ watch(
         :border="draft.keyConfigured ? 'success' : undefined"
         class="provider-card mb-3"
       >
-        <div class="provider-header" @click="toggleExpand(idx)">
+        <div class="provider-header" role="button" tabindex="0" :aria-expanded="draft.expanded" @keydown.enter="toggleExpand(idx)" @keydown.space.prevent="toggleExpand(idx)" @click="toggleExpand(idx)">
           <div class="provider-info">
             <span class="provider-name">{{ draft.key || "（未命名）" }}</span>
             <v-chip v-if="draft.config.api" size="x-small" variant="tonal" :text="draft.config.api" label />
@@ -884,34 +927,31 @@ watch(
         </div>
 
         <div v-if="draft.expanded" class="provider-edit">
-          <v-text-field
+          <SettingsRow title="Provider 名" description="填 anthropic/openai 覆盖内置 provider 走中转站；填新名字新增独立 provider。">
+<v-text-field
             v-model="draft.key"
-            label="Provider 名"
+            aria-label="Provider 名"
             required
-            hint="填 anthropic/openai 覆盖内置 provider 走中转站；填新名字新增独立 provider。"
-            persistent-hint
-            density="comfortable"
-            class="mb-3"
-          />
-          <v-text-field
+            density="compact"
+          hide-details="auto" />
+</SettingsRow>
+          <SettingsRow title="baseUrl" :description="baseUrlHints(draft.config.api).hint">
+<v-text-field
             v-model="draft.config.baseUrl"
-            label="baseUrl"
+            aria-label="baseUrl"
             required
             :placeholder="baseUrlHints(draft.config.api).placeholder"
-            :hint="baseUrlHints(draft.config.api).hint"
-            persistent-hint
-            density="comfortable"
-            class="mb-3"
-          />
-          <v-select
+            density="compact"
+          hide-details="auto" />
+</SettingsRow>
+          <SettingsRow title="API 类型" description="openai-completions 最兼容，适配大多数中转站与 OpenAI 兼容服务器。">
+<v-select
             v-model="draft.config.api"
             :items="apiTypeItems"
-            label="API 类型"
-            hint="openai-completions 最兼容，适配大多数中转站与 OpenAI 兼容服务器。"
-            persistent-hint
-            density="comfortable"
-            class="mb-3"
-          />
+            aria-label="API 类型"
+            density="compact"
+          hide-details="auto" />
+</SettingsRow>
 
           <v-alert
             v-if="authJsonOverridesKey(draft)"
@@ -958,17 +998,16 @@ watch(
             <span>密钥已保存。留空保存将保留原密钥不变，<strong>无需重新输入</strong>；仅在替换时输入新值。</span>
           </div>
 
-          <v-switch
+          <SettingsRow title="使用 Bearer 认证头 (authHeader)" description="仅 anthropic 中转站且代理期望 Authorization: Bearer 而非 x-api-key 时开启。">
+<v-switch
             v-model="draft.config.authHeader"
-            label="使用 Bearer 认证头 (authHeader)"
-            hint="仅 anthropic 中转站且代理期望 Authorization: Bearer 而非 x-api-key 时开启。"
-            persistent-hint
+            aria-label="使用 Bearer 认证头 (authHeader)"
             density="compact"
-            class="mb-3"
-          />
+          hide-details="auto" />
+</SettingsRow>
 
-          <div class="subsection mb-3">
-            <div class="subsection-title">Headers（可选）</div>
+          <details class="subsection mb-3" :open="draft.headersOpen" @toggle="draft.headersOpen = ($event.target as HTMLDetailsElement).open">
+            <summary class="subsection-title">Headers（可选）</summary>
             <div class="inline-hint mb-2">
               已配置的 Header 值经 IPC 脱敏为掩码显示，保存时自动保留原值；输入新值替换，留空则删除该 Header。
             </div>
@@ -981,13 +1020,13 @@ watch(
                 density="comfortable"
                 hide-details
               />
-              <v-btn size="small" variant="text" color="error" icon="mdi-delete" @click="removeHeader(draft, hIdx)" />
+              <v-btn size="small" variant="text" color="error" aria-label="删除 Header" icon="mdi-delete" @click="removeHeader(draft, hIdx)" />
             </div>
             <v-btn size="small" variant="text" prepend-icon="mdi-plus" @click="addHeader(draft)">添加 Header</v-btn>
-          </div>
+          </details>
 
-          <div class="subsection mb-3">
-            <div class="subsection-title">兼容性 (compat)</div>
+          <details class="subsection mb-3" :open="draft.compatOpen" @toggle="draft.compatOpen = ($event.target as HTMLDetailsElement).open">
+            <summary class="subsection-title">兼容性 (compat)</summary>
             <v-alert v-if="draft.config.api === 'openai-completions'" type="info" density="compact" variant="tonal" class="mb-3">
               报错 503/400 或 <code>unknown variant `developer`</code>？非 OpenAI 官方的中转站通常不支持 <code>developer</code> 角色与 <code>reasoning_effort</code> 字段。切换「兼容预设」或关掉对应开关：OpenRouter 走 <code>reasoning.effort</code> 嵌套；DeepSeek/Qwen/Zai 走各自 <code>enable_thinking</code>；完全不支持 reasoning 则选「纯透传」或关掉模型「推理」。
             </v-alert>
@@ -1005,27 +1044,37 @@ watch(
               @update:model-value="applyPreset(draft, $event)"
             />
             <div class="compat-grid mb-2">
-              <v-select
+              <SettingsRow title="thinkingFormat">
+<v-select
                 v-model="draft.compatThinkingFormat"
                 :items="thinkingFormatItems"
-                label="thinkingFormat"
-                density="comfortable"
+                aria-label="thinkingFormat"
+                density="compact"
                 hide-details
                 @update:model-value="syncPreset(draft)"
               />
-              <v-select
+</SettingsRow>
+              <SettingsRow title="maxTokensField">
+<v-select
                 v-model="draft.compatMaxTokensField"
                 :items="maxTokensFieldItems"
-                label="maxTokensField"
-                density="comfortable"
+                aria-label="maxTokensField"
+                density="compact"
                 hide-details
                 @update:model-value="syncPreset(draft)"
               />
+</SettingsRow>
             </div>
             <div class="compat-switches mb-2">
-              <v-switch v-model="draft.compatSupportsReasoningEffort" label="supportsReasoningEffort" density="compact" hide-details @update:model-value="syncPreset(draft)" />
-              <v-switch v-model="draft.compatSupportsStore" label="supportsStore" density="compact" hide-details @update:model-value="syncPreset(draft)" />
-              <v-switch v-model="draft.compatSupportsDeveloperRole" label="supportsDeveloperRole" density="compact" hide-details @update:model-value="syncPreset(draft)" />
+              <SettingsRow title="supportsReasoningEffort">
+<v-switch v-model="draft.compatSupportsReasoningEffort" aria-label="supportsReasoningEffort" density="compact" hide-details @update:model-value="syncPreset(draft)" />
+</SettingsRow>
+              <SettingsRow title="supportsStore">
+<v-switch v-model="draft.compatSupportsStore" aria-label="supportsStore" density="compact" hide-details @update:model-value="syncPreset(draft)" />
+</SettingsRow>
+              <SettingsRow title="supportsDeveloperRole">
+<v-switch v-model="draft.compatSupportsDeveloperRole" aria-label="supportsDeveloperRole" density="compact" hide-details @update:model-value="syncPreset(draft)" />
+</SettingsRow>
             </div>
             <div class="advanced-section">
               <v-btn
@@ -1039,6 +1088,7 @@ watch(
               <div v-if="draft.showAdvanced">
                 <v-textarea
                   v-model="draft.compatOverrideJson"
+                  aria-label="compat 覆盖 JSON"
                   rows="3"
                   density="comfortable"
                   placeholder='{ "requiresToolResultName": true }'
@@ -1053,12 +1103,13 @@ watch(
                 </div>
               </div>
             </div>
-          </div>
+          </details>
 
           <div class="subsection mb-3">
             <div class="subsection-title">模型列表</div>
             <div class="inline-hint mb-2">覆盖内置 provider 时留空模型列表即保留全部内置模型。每个模型可单独配置思考档位映射。</div>
-            <div v-for="(model, mIdx) in draft.config.models" :key="mIdx" class="model-block">
+            <details v-for="(model, mIdx) in draft.config.models" :key="mIdx" class="model-block" :open="model.expanded" @toggle="model.expanded = ($event.target as HTMLDetailsElement).open">
+              <summary>{{ model.name || model.id || "新模型" }}<span>{{ model.id }}</span></summary>
               <div class="model-row">
                 <v-text-field v-model="model.id" label="模型 ID" placeholder="如 gpt-5.6-luna" density="comfortable" hide-details class="model-id-field" />
                 <v-text-field v-model="model.name" label="显示名" density="comfortable" hide-details />
@@ -1066,7 +1117,7 @@ watch(
                 <v-select v-model="model.input" :items="inputItems" label="输入" multiple chips density="comfortable" hide-details />
                 <v-text-field v-model.number="model.contextWindow" label="上下文窗口" type="number" density="comfortable" hide-details />
                 <v-text-field v-model.number="model.maxTokens" label="最大输出" type="number" density="comfortable" hide-details />
-                <v-btn size="small" variant="text" color="error" icon="mdi-delete" @click="removeModel(draft, mIdx)" />
+                <v-btn size="small" variant="text" color="error" aria-label="删除模型" icon="mdi-delete" @click="removeModel(draft, mIdx)" />
               </div>
               <div class="model-thinking">
                 <v-btn size="x-small" variant="text" @click="model.showThinking = !model.showThinking">
@@ -1076,6 +1127,7 @@ watch(
                 <div v-if="model.showThinking" class="thinking-section">
                   <v-textarea
                     v-model="model.thinkingLevelMapJson"
+                    aria-label="思考档位映射 JSON"
                     rows="3"
                     density="comfortable"
                     placeholder='{ "low": null, "medium": null, "high": "high", "xhigh": "max" }'
@@ -1086,7 +1138,7 @@ watch(
                   />
                 </div>
               </div>
-            </div>
+            </details>
             <div class="model-list-actions">
               <v-btn size="small" variant="text" prepend-icon="mdi-plus" @click="addModel(draft)">添加模型</v-btn>
               <!-- disabled 的 v-btn 不参与命中测试（.v-btn--disabled{pointer-events:none}），tooltip 必须挂在包裹元素上才能在禁用态显示原因 -->
@@ -1115,12 +1167,13 @@ watch(
           </div>
 
           <div class="provider-actions">
-            <v-btn color="primary" variant="tonal" :loading="saving" @click="saveAll">保存</v-btn>
-            <v-btn color="error" variant="text" :loading="saving" @click="requestDelete(idx)">删除</v-btn>
+            <v-btn color="primary" variant="tonal" :loading="saving" :disabled="loading || saving" @click="saveAll">保存</v-btn>
+            <v-btn color="error" variant="text" :disabled="loading || saving" @click="requestDelete(idx)">删除</v-btn>
           </div>
         </div>
       </v-card>
     </div>
+    </v-form>
 
     <v-dialog v-model="deleteDialogOpen" max-width="420" persistent>
       <v-card>
@@ -1131,7 +1184,7 @@ watch(
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" :disabled="saving" @click="deleteDialogOpen = false">取消</v-btn>
-          <v-btn color="error" variant="tonal" :loading="saving" @click="confirmDelete">确认删除</v-btn>
+          <v-btn color="error" variant="tonal" :loading="saving" :disabled="loading || saving" @click="confirmDelete">确认删除</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1146,7 +1199,7 @@ watch(
           <v-list density="compact" lines="two" class="candidate-list">
             <v-list-item v-for="c in fetchCandidates" :key="c.id">
               <template #prepend>
-                <v-checkbox-btn v-model="c.picked" :disabled="c.exists" class="mr-2" />
+                <v-checkbox-btn v-model="c.picked" :aria-label="`导入 ${c.id}`" :disabled="c.exists" class="mr-2" />
               </template>
               <template #append>
                 <v-chip v-if="c.exists" size="x-small" variant="tonal" label>已存在</v-chip>
@@ -1175,8 +1228,9 @@ watch(
 }
 
 .provider-card {
-  padding: var(--pix-space-sm);
-  border-radius: var(--pix-radius-lg) !important;
+  padding: 0 18px;
+  border: 1px solid var(--pix-border);
+  border-radius: 11px !important;
   background: var(--pix-bg-card);
 }
 
@@ -1186,8 +1240,10 @@ watch(
   align-items: center;
   cursor: pointer;
   user-select: none;
-  padding: var(--pix-space-sm) 0;
-  gap: var(--pix-space-sm);
+  padding: 16px 0;
+  min-height: 70px;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .provider-info {
@@ -1219,8 +1275,7 @@ watch(
 }
 
 .provider-edit {
-  margin-top: var(--pix-space-md);
-  padding-top: var(--pix-space-md);
+  padding: 0 0 16px;
   border-top: 1px solid var(--pix-border-light);
   display: flex;
   flex-direction: column;
@@ -1250,10 +1305,7 @@ watch(
 }
 
 .subsection {
-  display: flex;
-  flex-direction: column;
-  gap: var(--pix-space-xs);
-  padding: var(--pix-space-sm) 0;
+  padding: 14px 0;
   border-top: 1px solid var(--pix-border-light);
 }
 
@@ -1272,7 +1324,7 @@ watch(
 }
 
 .model-id-field {
-  min-width: 200px;
+  min-width: 0;
 }
 
 .compat-grid {
@@ -1364,4 +1416,18 @@ watch(
   font-size: var(--pix-text-sm);
   word-break: break-all;
 }
+.provider-retry { color: var(--pix-accent); margin-left: 12px; }
+
+.subsection summary { cursor: pointer; padding: 6px 0; font-size: 14px; }
+.subsection[open] > summary { margin-bottom: 14px; }
+.model-block summary { cursor: pointer; font-size: 14px; font-weight: 600; padding: 8px 0; overflow-wrap: anywhere; }
+.model-block summary span { font-size: 12px; font-weight: 400; color: var(--pix-text-muted); margin-left: 12px; }
+.model-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding-top: 14px; }
+.model-row > * { min-width: 0; }
+.provider-edit :deep(.v-input) { min-width: 0; }
+.provider-baseurl, .inline-hint, .key-cleared-note, .key-configured-hint { overflow-wrap: anywhere; white-space: normal; }
+.provider-meta { flex-wrap: wrap; }
+.provider-actions { padding-top: 14px; border-top: 1px solid var(--pix-border-light); }
+.provider-list :deep(.v-btn) { font-size: 13px; height: 34px; }
+@media (max-width: 760px) { .compat-grid, .model-row { grid-template-columns: minmax(0, 1fr); } .kv-row, .field-row { flex-wrap: wrap; } .kv-row > .v-input { flex: 1 1 100%; } }
 </style>

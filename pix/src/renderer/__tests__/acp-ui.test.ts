@@ -54,7 +54,7 @@ const rpcMock = vi.hoisted(() => ({
     mcpGetServers: vi.fn().mockResolvedValue([]),
     compact: vi.fn().mockResolvedValue(undefined),
     setAcp: vi.fn().mockResolvedValue(undefined),
-    getPiSettings: vi.fn().mockResolvedValue(null),
+    getPiSettings: vi.fn().mockResolvedValue({}),
     getAuthStatus: vi.fn().mockResolvedValue({}),
     getCustomProviders: vi.fn().mockResolvedValue({ providers: {} }),
     reloadResources: vi.fn().mockResolvedValue(undefined),
@@ -245,7 +245,7 @@ beforeEach(() => {
   rpcMock.state.lastError.value = null;
   rpcMock.state.commands.value = [];
   rpcMock.state.availableModels.value = [];
-  rpcMock.state.getPiSettings.mockResolvedValue(null);
+  rpcMock.state.getPiSettings.mockResolvedValue({});
   rpcMock.state.getAuthStatus.mockResolvedValue({});
   rpcMock.state.getCustomProviders.mockResolvedValue({ providers: {} });
   rpcMock.state.getBackgroundTasks.mockResolvedValue([]);

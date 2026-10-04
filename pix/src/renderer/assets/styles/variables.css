@@ -7,12 +7,12 @@
 
 :root {
   /* ── Background colors ── */
-  --pix-bg-app: #f7f8fc;
-  --pix-bg-left: rgba(255, 255, 255, 0.86);
+  --pix-bg-app: #ffffff;
+  --pix-bg-left: #f8f9fb;
   --pix-bg-content: #ffffff;
-  --pix-bg-right: rgba(255, 255, 255, 0.82);
+  --pix-bg-right: #f7f8fc;
   --pix-bg-bottom: #ffffff;
-  --pix-bg-topbar: rgba(255, 255, 255, 0.9);
+  --pix-bg-topbar: #ffffff;
   --pix-bg-hover: #f2f3fb;
   --pix-bg-active: #ebe9ff;
   --pix-bg-card: #ffffff;
@@ -21,35 +21,40 @@
   --pix-bg-elevated: #ffffff;
 
   /* ── Border colors ── */
-  --pix-border: #dfe3ee;
-  --pix-border-light: #e8ebf4;
+  --pix-border: #dfe3eb;
+  --pix-border-card: #d5dbe7;
+  --pix-text-body: #151b2c;
+  --pix-border-light: #e8eaf0;
   --pix-border-focus: #7567f5;
   --pix-border-subtle: #f0f2f8;
 
   /* ── Text colors ── */
-  --pix-text-primary: #12182f;
-  --pix-text-secondary: #4f5871;
-  --pix-text-muted: #7d859a;
+  --pix-text-primary: #202737;
+  --pix-text-secondary: #30394b;
+  --pix-text-muted: #747c8c;
   --pix-text-inverse: #ffffff;
-  --pix-text-link: #6356f3;
+  --pix-text-link: #6b5ce7;
 
   /* ── Accent ── */
-  --pix-accent: #6254f3;
-  --pix-accent-hover: #5142df;
+  --pix-accent: #6b5ce7;
+  --pix-accent-hover: #584bcc;
   --pix-accent-soft: #8b7cf6;
-  --pix-accent-light: #eeecff;
+  --pix-accent-light: #f0edff;
   --pix-accent-light-hover: #e4e0ff;
 
   /* ── Status colors ── */
-  --pix-success: #16a34a;
+  --pix-success: #368967;
   --pix-success-bg: #ecfdf3;
   --pix-success-light: #d9fbe7;
-  --pix-error: #ef4444;
+  --pix-error: #bf575d;
   --pix-error-bg: #fff1f2;
   --pix-error-light: #ffe4e8;
   --pix-warning: #f59e0b;
   --pix-warning-bg: #fff8e6;
   --pix-warning-light: #ffefc2;
+  --pix-perm-bg: #fffaf0;
+  --pix-perm-border: #d9bf85;
+  --pix-perm-accent: #bb8a35;
 
   /* ── Spacing scale ── */
   --pix-space-xs: 6px;
@@ -61,7 +66,7 @@
   --pix-space-3xl: 40px;
 
   /* ── Typography ── */
-  --pix-font-ui: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --pix-font-ui: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif;
   --pix-font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
 
   /* Font sizes */

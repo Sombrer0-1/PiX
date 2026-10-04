@@ -10,6 +10,7 @@ import { useSessionStore, useTeamLeaderSessionStore } from "../stores/session-st
 import { useRpc } from "../composables/useRpc";
 import { useTeamStore } from "../stores/team-store";
 import ProjectOpenDialog from "../components/project/ProjectOpenDialog.vue";
+import WindowTitlebar from "../components/layout/WindowTitlebar.vue";
 import { toPlain } from "../utils/plain";
 import type {
   ProjectEnvironment,
@@ -223,7 +224,7 @@ function formatDate(timestamp: number): string {
 
 <template>
   <div class="home-page">
-    <div class="drag-bar"></div>
+    <WindowTitlebar />
     <div class="home-container-wrapper">
       <div class="home-container">
         <header class="home-header">
@@ -335,16 +336,6 @@ function formatDate(timestamp: number): string {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(247, 248, 252, 0.96)),
     var(--pix-bg-app);
-}
-
-.drag-bar {
-  height: var(--pix-window-controls-height);
-  min-height: var(--pix-window-controls-height);
-  -webkit-app-region: drag;
-  flex-shrink: 0;
-  margin-right: var(--pix-window-controls-width);
-  background: var(--pix-bg-topbar);
-  border-bottom: 1px solid var(--pix-border-light);
 }
 
 .home-container-wrapper {

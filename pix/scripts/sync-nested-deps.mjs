@@ -18,7 +18,8 @@
 //   from the packaged context, copy the build-context version into the
 //   packaged package's nested node_modules. Transitive mismatches are followed.
 //
-// Runs as part of `npm run build` (and therefore `npm run package`).
+// Runs during `npm run build`, and again during packaging AFTER workspace
+// materialization so the final copies retain their nested runtime versions.
 
 import { readFileSync, existsSync, lstatSync, rmSync, mkdirSync, cpSync, readdirSync } from "fs";
 import { join, dirname } from "path";

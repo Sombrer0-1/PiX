@@ -37,7 +37,7 @@ const rpcMock = vi.hoisted(() => ({
   state: {
     availableModels: { value: [] as ModelInfo[] },
     isConnected: { value: true },
-    getPiSettings: vi.fn().mockResolvedValue(null),
+    getPiSettings: vi.fn().mockResolvedValue({}),
     getAuthStatus: vi.fn().mockResolvedValue({}),
     getCustomProviders: vi.fn().mockResolvedValue({ providers: {} }),
     refreshModels: vi.fn().mockResolvedValue(undefined),
@@ -67,9 +67,10 @@ vi.mock("../composables/useWorkspaceRpc", () => ({
   }),
 }));
 
+const navigationMock = vi.hoisted(() => ({ back: vi.fn() }));
 vi.mock("vue-router", () => ({
   useRoute: () => ({ query: {} }),
-  useRouter: () => ({ back: vi.fn() }),
+  useRouter: () => ({ back: navigationMock.back }),
 }));
 
 // ============================================================================
@@ -139,12 +140,16 @@ function lastSetSettingsCall(): Partial<GuiSettings> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubGlobal('visualViewport', {
+    addEventListener: () => {}, removeEventListener: () => {},
+    width: 1024, height: 768, offsetLeft: 0, offsetTop: 0, scale: 1, pageLeft: 0, pageTop: 0,
+  });
   pinia = createPinia();
   setActivePinia(pinia);
   // Restore hoisted defaults (clearAllMocks keeps implementations).
   rpcMock.state.availableModels.value = [];
   rpcMock.state.isConnected.value = true;
-  rpcMock.state.getPiSettings.mockResolvedValue(null);
+  rpcMock.state.getPiSettings.mockResolvedValue({});
   rpcMock.state.getAuthStatus.mockResolvedValue({});
   rpcMock.state.getCustomProviders.mockResolvedValue({ providers: {} });
   installPixApiMock();
@@ -152,6 +157,7 @@ beforeEach(() => {
 
 afterEach(() => {
   wrapper?.unmount();
+  vi.unstubAllGlobals();
   wrapper = undefined;
   document.body.innerHTML = "";
 });
@@ -232,7 +238,7 @@ describe("settings store (1.4.0)", () => {
 // ============================================================================
 
 describe("SettingsPage plan section (1.4.0)", () => {
-  it("mounts the real settings page with a 规划 section containing all three controls", async () => {
+  it("places planning controls in 规划 and analytics in 高级", async () => {
     const page = mountPage();
     await flushPromises();
     await openPlanSection(page);
@@ -246,6 +252,8 @@ describe("SettingsPage plan section (1.4.0)", () => {
     expect(thinkingSelect.text()).toContain("继承会话默认");
 
     const analytics = page.get('[data-test="analytics-switch"]');
+    expect(analytics.isVisible()).toBe(false);
+    await page.findAll(".sidebar-item").find((el) => el.text() === "高级")!.trigger("click");
     expect(analytics.isVisible()).toBe(true);
     expect(analytics.text()).toContain("匿名使用数据");
     const checkbox = analytics.find("input");
@@ -416,7 +424,7 @@ describe("settings store (agentTaskMaxConcurrent)", () => {
 
 /** Emit the numeric selection Vuetify would emit for the auto-background select. */
 async function pickAutoBackground(page: ReturnType<typeof mount>, value: number): Promise<void> {
-  const vueSelect = page.getComponent('[data-test="auto-background-select"]') as VueWrapper;
+  const vueSelect = (page.getComponent('[data-test="auto-background-select"]') as VueWrapper) as VueWrapper;
   await vueSelect.vm.$emit("update:modelValue", value);
   await flushPromises();
 }
@@ -432,7 +440,7 @@ describe("SettingsPage auto background (1.4.1)", () => {
     expect(select.text()).toContain("关闭");
 
     const items = (
-      page.getComponent('[data-test="auto-background-select"]') as VueWrapper<{
+      (page.getComponent('[data-test="auto-background-select"]') as VueWrapper) as VueWrapper<{
         $props: { items: Array<{ title: string; value: number }> };
       }>
     ).props("items");
@@ -662,5 +670,176 @@ describe("main SettingsStore migration (1.4.1)", () => {
     expect(store.get("agentTaskMaxConcurrent")).toBeUndefined();
 
     rmSync(cwd, { recursive: true, force: true });
+  });
+});
+
+
+describe("settings rebuild persistence and navigation", () => {
+  it("retains edits made while a GUI save is pending and submits Agent values from the same snapshot", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+    await pickAutoBackground(page, 120_000);
+    let finishSave!: (value: { success: boolean }) => void;
+    setSettingsMock.mockReturnValueOnce(new Promise(resolve => { finishSave = resolve; }));
+    await page.get('.settings-actions button.v-btn').trigger('click');
+    await flushPromises();
+    expect(lastSetSettingsCall().autoBackgroundMs).toBe(120_000);
+    await pickAutoBackground(page, 300_000);
+    await pickSelectOption(page, 'execution-mode-select', 'read-only');
+    finishSave({ success: true });
+    await flushPromises();
+    expect(page.get('.save-feedback').text()).toBe('有未保存的修改');
+    const entries = rpcMock.state.setPiSettings.mock.calls.at(-1)?.[0] as Array<{ key: string; value: unknown }>;
+    expect(entries.find(entry => entry.key === 'executionMode')?.value).toBe('approval');
+    await clickSave(page);
+    expect(lastSetSettingsCall().autoBackgroundMs).toBe(300_000);
+    const retry = rpcMock.state.setPiSettings.mock.calls.at(-1)?.[0] as Array<{ key: string; value: unknown }>;
+    expect(retry.find(entry => entry.key === 'executionMode')?.value).toBe('read-only');
+    expect(page.get('.save-feedback').text()).toBe('已保存');
+  });
+
+  it("resets category scrolling and confirms leaving a dirty form", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+    await pickAutoBackground(page, 120_000);
+    const scroll = page.get<HTMLElement>('.settings-scroll').element;
+    scroll.scrollTop = 600;
+    await page.findAll('.sidebar-item').find(item => item.text() === '常规')!.trigger('click');
+    await flushPromises();
+    expect(scroll.scrollTop).toBe(0);
+    await page.get('.sidebar-back').trigger('click');
+    await flushPromises();
+    expect(navigationMock.back).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain('放弃未保存的修改？');
+    [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.trim() === '继续编辑')!.click();
+    await flushPromises();
+    expect(navigationMock.back).not.toHaveBeenCalled();
+    expect(page.get('.save-feedback').text()).toBe('有未保存的修改');
+    await page.get('.sidebar-back').trigger('click');
+    await flushPromises();
+    [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.trim() === '放弃并返回')!.click();
+    await flushPromises();
+    expect(navigationMock.back).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows independently edited provider drafts in the footer and leave confirmation", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await page.findAll('.sidebar-item').find(item => item.text() === '自定义提供商')!.trigger('click');
+    await page.getComponent({ name: 'CustomProviders' }).vm.$emit('dirty-change', true);
+    await flushPromises();
+    expect(page.get('.save-feedback').text()).toBe('有未保存的修改');
+    await page.get('.sidebar-back').trigger('click');
+    await flushPromises();
+    expect(document.body.textContent).toContain('放弃未保存的修改？');
+    expect(navigationMock.back).not.toHaveBeenCalled();
+  });
+
+  it("requires confirmation to delete a stored API key", async () => {
+    rpcMock.state.getAuthStatus.mockResolvedValue({ openai: { configured: true, source: 'stored' } });
+    const page = mountPage();
+    await flushPromises();
+    await page.findAll('.sidebar-item').find(item => item.text() === '认证')!.trigger('click');
+    await flushPromises();
+    await page.get('.auth-provider-row').trigger('click');
+    await page.findAll('.auth-edit-row button').find(button => button.text() === '删除')!.trigger('click');
+    await flushPromises();
+    expect(rpcMock.state.removeAuth).not.toHaveBeenCalled();
+    [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.trim() === '取消')!.click();
+    await flushPromises();
+    expect(rpcMock.state.removeAuth).not.toHaveBeenCalled();
+    await page.findAll('.auth-edit-row button').find(button => button.text() === '删除')!.trigger('click');
+    await flushPromises();
+    [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.trim() === '确认删除')!.click();
+    await flushPromises();
+    expect(rpcMock.state.removeAuth).toHaveBeenCalledWith('openai');
+  });
+
+  it("disables eye model activation when image input is blocked", async () => {
+    rpcMock.state.getPiSettings.mockResolvedValue({ images: { blockImages: true } });
+    const page = mountPage();
+    await flushPromises();
+    expect(page.get<HTMLInputElement>('#setting-takeHerEyesEnabled').element.disabled).toBe(true);
+  });
+
+  it("blocks saving after a GUI read failure and restores persisted values on retry", async () => {
+    getSettingsMock.mockRejectedValueOnce(new Error("读取应用设置失败"));
+    const page = mountPage();
+    await flushPromises();
+    expect(page.text()).toContain("读取应用设置失败");
+    expect(page.get('.settings-panels').attributes('inert')).toBeDefined();
+    const saveButton = page.findAll('button.v-btn').find(button => button.text().includes('保存设置'))!;
+    expect(saveButton.attributes('disabled')).toBeDefined();
+    expect(rpcMock.state.getPiSettings).not.toHaveBeenCalled();
+    getSettingsMock.mockResolvedValue({ theme: "light", recentProjects: [], autoBackgroundMs: 120_000 });
+    await page.get('.inline-retry').trigger('click');
+    await flushPromises();
+    await openPlanSection(page);
+    expect((page.getComponent('[data-test="auto-background-select"]') as VueWrapper<{ $props: { modelValue: string | number; disabled?: boolean } }>).props('modelValue')).toBe(120_000);
+    expect(page.get('.settings-panels').attributes('inert')).toBeUndefined();
+    expect(saveButton.attributes('disabled')).toBeUndefined();
+  });
+
+  it("filters navigation by setting keywords without discarding edited values", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+    await pickAutoBackground(page, 120_000);
+    await page.get('input[aria-label="搜索设置"]').setValue("WSL");
+    expect(page.findAll(".sidebar-item").map(item => item.text())).toEqual(["执行环境"]);
+    await clickSave(page);
+    expect(lastSetSettingsCall().autoBackgroundMs).toBe(120_000);
+  });
+
+  it("preserves the conversation model while saving unrelated settings", async () => {
+    installPixApiMock({ defaultProvider: "anthropic", defaultModel: "claude-sonnet-4-6" });
+    const page = mountPage();
+    await flushPromises();
+    expect(page.find('#setting-defaultModel').exists()).toBe(false);
+    await clickSave(page);
+    expect(lastSetSettingsCall().defaultProvider).toBe("anthropic");
+    expect(lastSetSettingsCall().defaultModel).toBe("claude-sonnet-4-6");
+  });
+
+  it("retains edited values and dirty feedback when the GUI write fails", async () => {
+    setSettingsMock.mockResolvedValue({ success: false });
+    const page = mountPage();
+    await flushPromises();
+    await openPlanSection(page);
+    await pickAutoBackground(page, 120_000);
+    await clickSave(page);
+    expect(page.get('.save-feedback').text()).toContain("保存应用设置失败");
+    expect((page.getComponent('[data-test="auto-background-select"]') as VueWrapper<{ $props: { modelValue: string | number; disabled?: boolean } }>).props('modelValue')).toBe(120_000);
+    expect(rpcMock.state.setPiSettings).not.toHaveBeenCalled();
+    setSettingsMock.mockResolvedValue({ success: true });
+    await clickSave(page);
+    expect(page.get('.save-feedback').text()).toBe("已保存");
+  });
+
+  it("keeps Agent controls unavailable on a failed read and supports retry", async () => {
+    rpcMock.state.getPiSettings.mockResolvedValue(null);
+    const page = mountPage();
+    await flushPromises();
+    expect(page.text()).toContain("读取 Agent 配置失败");
+    expect((page.getComponent('[data-test="execution-mode-select"]') as VueWrapper<{ $props: { modelValue: string | number; disabled?: boolean } }>).props('disabled')).toBe(true);
+    rpcMock.state.getPiSettings.mockResolvedValue({ execution: { mode: "read-only" } });
+    await page.get('.inline-retry').trigger('click');
+    await flushPromises();
+    expect((page.getComponent('[data-test="execution-mode-select"]') as VueWrapper<{ $props: { modelValue: string | number; disabled?: boolean } }>).props('disabled')).toBe(false);
+    expect((page.getComponent('[data-test="execution-mode-select"]') as VueWrapper<{ $props: { modelValue: string | number; disabled?: boolean } }>).props('modelValue')).toBe('read-only');
+  });
+
+  it("shows Agent save errors while retaining the draft for retry", async () => {
+    rpcMock.state.setPiSettings.mockRejectedValueOnce(new Error("写入 Agent 设置失败"));
+    const page = mountPage();
+    await flushPromises();
+    await (page.getComponent('[data-test="execution-mode-select"]') as VueWrapper).vm.$emit('update:modelValue', 'read-only');
+    await clickSave(page);
+    expect(page.get('.save-feedback').text()).toContain("写入 Agent 设置失败");
+    expect((page.getComponent('[data-test="execution-mode-select"]') as VueWrapper<{ $props: { modelValue: string | number; disabled?: boolean } }>).props('modelValue')).toBe('read-only');
+    await clickSave(page);
+    expect(page.get('.save-feedback').text()).toBe("已保存");
   });
 });

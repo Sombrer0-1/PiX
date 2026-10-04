@@ -288,6 +288,7 @@ function goSettings(): void { void router.push("/settings"); }
 
 <template>
   <div class="left-panel" :class="{ 'team-mode': teamStore.teamMode }">
+    <div class="sidebar-brand"><span class="brand-mark">P</span><strong>PiX</strong></div>
     <div class="panel-header">
       <div class="project-name-row">
         <div class="project-icon">
@@ -309,7 +310,7 @@ function goSettings(): void { void router.push("/settings"); }
         @click="newSession"
       >
         <span class="btn-icon">+</span>
-        <span>{{ teamStore.teamMode ? "新建单人会话" : "新建会话" }}</span>
+        <span>新建单人会话</span>
       </button>
       <button
         class="new-team-session-btn"
@@ -330,6 +331,7 @@ function goSettings(): void { void router.push("/settings"); }
           v-model="searchQuery"
           type="text"
           class="search-input"
+          aria-label="搜索会话"
           :placeholder="teamStore.teamMode ? '搜索团队会话...' : '搜索会话...'"
           spellcheck="false"
         />
@@ -350,6 +352,11 @@ function goSettings(): void { void router.push("/settings"); }
         v-for="session in filteredSessions"
         :key="session.id"
         class="session-item"
+        role="button"
+        tabindex="0"
+        :aria-current="currentSessionId === session.id ? 'true' : undefined"
+        @keydown.enter.self="handleSelectSession(session)"
+        @keydown.space.self.prevent="handleSelectSession(session)"
         :class="{
           active: currentSessionId === session.id,
           'team-session': isCurrentTeamSession(session),
@@ -403,10 +410,10 @@ function goSettings(): void { void router.push("/settings"); }
 
     <div class="panel-footer">
       <button class="footer-btn" title="设置" aria-label="设置" @click="goSettings">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>设置</span>
       </button>
       <button class="footer-btn" title="首页" aria-label="首页" @click="goHome">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>首页</span>
       </button>
     </div>
 
@@ -461,61 +468,31 @@ function goSettings(): void { void router.push("/settings"); }
 </template>
 
 <style scoped>
+.sidebar-brand { display: flex; align-items: center; gap: 9px; height: 64px; padding: 0 20px; flex-shrink: 0; -webkit-app-region: drag; }
+.sidebar-brand strong { font-size: 22px; }
+.brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px; background: var(--pix-accent); color: white; font-size: 23px; font-weight: 600; }
 .left-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  user-select: none;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(252, 252, 255, 0.9));
+  display: flex; flex-direction: column; min-height: 0; height: 100%; user-select: none; background: var(--pix-bg-left);
 }
 
 .panel-header {
-  padding: var(--pix-space-lg) var(--pix-space-lg) var(--pix-space-md);
-  flex-shrink: 0;
+  padding: 14px; margin: 0 16px 16px; border: 1px solid var(--pix-border-light); border-radius: 10px; background: white; flex-shrink: 0;
 }
 
 .project-name-row {
-  display: flex;
-  align-items: center;
-  gap: var(--pix-space-sm);
+  display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap;
 }
 
 .project-icon {
-  width: 38px;
-  height: 38px;
-  border-radius: 11px;
-  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
-  color: var(--pix-text-inverse);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  font-size: var(--pix-text-lg);
-  font-weight: var(--pix-weight-bold);
-  box-shadow: 0 10px 22px rgba(98, 84, 243, 0.26);
+  width: 32px; height: 32px; border-radius: 8px; background: var(--pix-accent-light); color: var(--pix-accent); display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 18px; font-weight: 600;
 }
 
 .project-name {
-  font-size: var(--pix-text-base);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  line-height: 1.3;
+  font-size: 15px; font-weight: 600; flex: 1; min-width: 50px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
 .project-mode-label {
-  display: inline-flex;
-  align-items: center;
-  min-height: 20px;
-  padding: 2px 6px;
-  border-radius: var(--pix-radius-sm);
-  background: var(--pix-bg-hover);
-  color: var(--pix-text-muted);
-  font-size: 9px;
-  font-weight: var(--pix-weight-semibold);
-  text-transform: uppercase;
+  padding: 2px 5px; border-radius: 4px; background: var(--pix-bg-hover); color: var(--pix-text-secondary); font-size: 12px;
 }
 
 .team-mode .project-mode-label {
@@ -524,21 +501,7 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .project-env-label {
-  display: inline-flex;
-  align-items: center;
-  min-height: 20px;
-  padding: 2px 6px;
-  border-radius: var(--pix-radius-sm);
-  background: var(--pix-bg-code);
-  color: var(--pix-text-secondary);
-  font-size: 9px;
-  font-weight: var(--pix-weight-semibold);
-  text-transform: uppercase;
-  letter-spacing: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 120px;
+  padding: 2px 5px; border-radius: 4px; background: var(--pix-bg-code); color: var(--pix-text-secondary); font-size: 12px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
 .team-mode .project-icon {
@@ -547,43 +510,20 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .project-path {
-  font-size: var(--pix-text-xs);
-  color: var(--pix-text-muted);
-  margin-top: 4px;
-  margin-left: calc(38px + var(--pix-space-sm));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 13px; color: var(--pix-text-secondary); margin-top: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
 .panel-actions {
-  display: grid;
-  gap: var(--pix-space-xs);
-  padding: 0 var(--pix-space-lg) var(--pix-space-md);
-  flex-shrink: 0;
+  display: grid; gap: 8px; padding: 0 16px; flex-shrink: 0;
 }
 
 .new-session-btn,
 .new-team-session-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--pix-space-sm);
-  width: 100%;
-  min-height: 40px;
-  border-radius: var(--pix-radius-lg);
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-medium);
-  font-family: var(--pix-font-ui);
-  cursor: pointer;
-  transition: box-shadow var(--pix-transition-fast), transform var(--pix-transition-fast), filter var(--pix-transition-fast);
+  display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 40px; border-radius: 8px; font-size: 14px; font-weight: 500; transition: background var(--pix-transition-fast);
 }
 
 .team-mode .new-session-btn {
-  border: 1px solid var(--pix-border-light);
-  background: #ffffff;
-  color: var(--pix-accent);
-  box-shadow: none;
+  background: var(--pix-accent); color: white; border: 1px solid var(--pix-accent);
 }
 
 .team-mode .new-team-session-btn {
@@ -594,9 +534,9 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .new-session-btn {
-  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
+  background: var(--pix-accent);
   color: var(--pix-text-inverse);
-  box-shadow: 0 12px 24px rgba(98, 84, 243, 0.22);
+  box-shadow: none;
 }
 
 .new-team-session-btn {
@@ -607,9 +547,7 @@ function goSettings(): void { void router.push("/settings"); }
 
 .new-session-btn:hover,
 .new-team-session-btn:hover {
-  box-shadow: 0 12px 24px rgba(98, 84, 243, 0.18);
-  filter: saturate(1.05);
-  transform: translateY(-1px);
+  background: var(--pix-accent-light); color: var(--pix-accent);
 }
 
 .new-session-btn:disabled,
@@ -627,8 +565,7 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .panel-search {
-  padding: 0 var(--pix-space-lg) var(--pix-space-md);
-  flex-shrink: 0;
+  padding: 18px 16px 12px; flex-shrink: 0;
 }
 
 .search-wrapper {
@@ -646,16 +583,7 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .search-input {
-  width: 100%;
-  height: 40px;
-  padding: 8px 30px 8px 32px;
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-lg);
-  font-size: var(--pix-text-sm);
-  font-family: var(--pix-font-ui);
-  background: var(--pix-bg-input);
-  color: var(--pix-text-primary);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  width: 100%; height: 40px; padding: 8px 30px 8px 32px; border: 1px solid var(--pix-border-light); border-radius: 8px; font-size: 14px; background: white;
 }
 
 .search-input::placeholder {
@@ -686,22 +614,11 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .session-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 0 var(--pix-space-sm) var(--pix-space-sm);
+  flex: 1; min-height: 0; overflow-y: auto; padding: 0 12px 12px;
 }
 
 .session-item {
-  display: flex;
-  align-items: center;
-  gap: var(--pix-space-sm);
-  min-height: 44px;
-  padding: 9px var(--pix-space-md);
-  margin-bottom: 4px;
-  border: 1px solid transparent;
-  border-radius: var(--pix-radius-lg);
-  cursor: pointer;
-  position: relative;
+  display: flex; align-items: center; gap: 8px; min-height: 50px; padding: 10px 11px; margin: 3px 0; border-radius: 8px; cursor: pointer; position: relative;
 }
 
 .session-item:hover {
@@ -710,9 +627,7 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .session-item.active {
-  background: linear-gradient(90deg, #f0eeff 0%, rgba(240, 238, 255, 0.4) 100%);
-  border-color: #e4e0ff;
-  box-shadow: inset 3px 0 0 var(--pix-accent);
+  background: #eeebf8;
 }
 
 .session-item.team-session {
@@ -728,13 +643,7 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .session-name {
-  font-size: var(--pix-text-sm);
-  color: var(--pix-text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  min-width: 0;
+  font-size: 14px; color: var(--pix-text-primary); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
 .session-item.active .session-name {
@@ -816,11 +725,13 @@ function goSettings(): void { void router.push("/settings"); }
   flex-shrink: 0;
 }
 
-.session-item:hover .hover-actions {
+.session-item:hover .hover-actions,
+.session-item:focus-within .hover-actions {
   display: flex;
 }
 
-.session-item:hover .session-time {
+.session-item:hover .session-time,
+.session-item:focus-within .session-time {
   display: none;
 }
 
@@ -857,24 +768,11 @@ function goSettings(): void { void router.push("/settings"); }
 }
 
 .panel-footer {
-  display: flex;
-  justify-content: center;
-  gap: var(--pix-space-sm);
-  padding: var(--pix-space-md);
-  border-top: 1px solid var(--pix-border-light);
-  flex-shrink: 0;
-  background: rgba(255, 255, 255, 0.74);
+  display: flex; justify-content: space-between; gap: 12px; padding: 14px 20px; border-top: 1px solid var(--pix-border-light); flex-shrink: 0;
 }
 
 .footer-btn {
-  width: 34px;
-  height: 34px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--pix-radius-md);
-  color: var(--pix-text-secondary);
-  cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 8px; padding: 6px 10px; min-height: 34px; border-radius: 6px; color: var(--pix-text-primary); font-size: 14px;
 }
 
 .footer-btn:hover {

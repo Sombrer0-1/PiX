@@ -469,6 +469,12 @@ function getBedrockBaseUrl(modelId: string): string {
 		: "https://bedrock-runtime.us-east-1.amazonaws.com";
 }
 
+export function tokenPricePerMillion(value: string | undefined): number {
+	const price = Number.parseFloat(value ?? "0");
+	// OpenRouter uses negative prices for routes whose actual model is unknown.
+	return Number.isFinite(price) && price > 0 ? price * 1_000_000 : 0;
+}
+
 async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from OpenRouter API...");
@@ -494,10 +500,10 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 			}
 
 			// Convert pricing from $/token to $/million tokens
-			const inputCost = parseFloat(model.pricing?.prompt || "0") * 1_000_000;
-			const outputCost = parseFloat(model.pricing?.completion || "0") * 1_000_000;
-			const cacheReadCost = parseFloat(model.pricing?.input_cache_read || "0") * 1_000_000;
-			const cacheWriteCost = parseFloat(model.pricing?.input_cache_write || "0") * 1_000_000;
+			const inputCost = tokenPricePerMillion(model.pricing?.prompt);
+			const outputCost = tokenPricePerMillion(model.pricing?.completion);
+			const cacheReadCost = tokenPricePerMillion(model.pricing?.input_cache_read);
+			const cacheWriteCost = tokenPricePerMillion(model.pricing?.input_cache_write);
 
 			const normalizedModel: Model<any> = {
 				id: modelKey,

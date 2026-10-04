@@ -225,38 +225,19 @@ function fileChips(file: GitChangedFile): GitChip[] {
 /* 卡片壳/标题/操作按钮沿用 RightPanel 的 .info-card / .card-title /
    .card-action-btn 语言（组件内复制语义，不改 RightPanel 既有样式类）。 */
 .info-card {
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-xl);
-  padding: var(--pix-space-lg);
-  box-shadow: var(--pix-shadow-xs);
-  transition:
-    border-color var(--pix-transition-fast),
-    box-shadow var(--pix-transition-fast);
+  background: white; border: 1px solid var(--pix-border-card); border-radius: 10px; padding: 14px; flex-shrink: 0;
 }
 
 .info-card:hover {
-  border-color: #dfe2f0;
-  box-shadow: var(--pix-shadow-sm);
+  border-color: #bfc8db;
 }
 
 .card-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  text-transform: none;
-  letter-spacing: 0;
-  margin-bottom: var(--pix-space-md);
+  font-size: 15px; font-weight: 600; color: var(--pix-text-primary);
 }
 
 .card-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: var(--pix-space-md);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px;
 }
 
 .git-actions {
@@ -305,7 +286,7 @@ function fileChips(file: GitChangedFile): GitChip[] {
 .git-stats,
 .git-clean,
 .git-incomplete {
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   line-height: var(--pix-leading-base);
   margin-bottom: var(--pix-space-sm);
 }
@@ -335,7 +316,7 @@ function fileChips(file: GitChangedFile): GitChip[] {
   align-items: center;
   padding: 1px 8px;
   border-radius: 10px;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: var(--pix-weight-medium);
   color: var(--pix-warning);
   background: var(--pix-warning-bg);
@@ -357,7 +338,7 @@ function fileChips(file: GitChangedFile): GitChip[] {
   gap: 8px;
   min-height: 24px;
   padding: 2px 0;
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .git-file-path {
@@ -383,7 +364,7 @@ function fileChips(file: GitChangedFile): GitChip[] {
   padding: 0 6px;
   height: 16px;
   border-radius: 8px;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: var(--pix-weight-medium);
   white-space: nowrap;
 }
@@ -436,7 +417,7 @@ function fileChips(file: GitChangedFile): GitChip[] {
 
 .git-more {
   padding: 4px 0 2px;
-  font-size: 10px;
+  font-size: 12px;
   color: var(--pix-text-muted);
   text-align: center;
 }
@@ -457,7 +438,7 @@ function fileChips(file: GitChangedFile): GitChip[] {
   border: 1px solid var(--pix-error-light);
   background: var(--pix-error-bg);
   color: var(--pix-error);
-  font-size: var(--pix-text-xs);
+  font-size: 13px;
   font-weight: var(--pix-weight-medium);
   cursor: pointer;
   transition: background var(--pix-transition-fast);

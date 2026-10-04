@@ -12,6 +12,8 @@ import { useRpc } from "../../composables/useRpc";
 import { useComposerStore } from "../../stores/composer-store";
 import { useBtw } from "../../composables/useBtw";
 import { useProjectStore } from "../../stores/project-store";
+import TeamProtocolPanel from "../team/TeamProtocolPanel.vue";
+import WindowTitlebar from "./WindowTitlebar.vue";
 import SessionView from "../session/SessionView.vue";
 import SessionTreeView from "../session/SessionTreeView.vue";
 import ForkDialog from "../session/ForkDialog.vue";
@@ -70,6 +72,9 @@ function switchSessionView(mode: ViewMode): void {
 
 // Clarification props are driven by WorkspacePage request_user_input handling.
 const props = defineProps<{
+  leftOpen?: boolean;
+  rightOpen?: boolean;
+  reserveWindowControls?: boolean;
   pendingUserInput: RequestUserInputRequest | null;
   currentQuestionIndex: number;
   currentAnswer: string;
@@ -83,6 +88,8 @@ const emit = defineEmits<{
   advanceQuestion: [];
   jumpToQuestion: [index: number];
   cancelClarification: [];
+  "toggle-left": [];
+  "toggle-right": [];
 }>();
 
 type ViewMode = "session" | "tree";
@@ -144,6 +151,43 @@ const searchQuery = ref("");
 const showCommandPalette = ref(false);
 const showModelSelector = ref(false);
 const showThinkingSelector = ref(false);
+const modelSelectorAnchor = ref<HTMLElement | null>(null);
+const thinkingSelectorAnchor = ref<HTMLElement | null>(null);
+const activeSelectorPanel = computed(() => {
+  if (showModelSelector.value) return modelSelectorAnchor.value?.querySelector<HTMLElement>(".model-panel");
+  if (showThinkingSelector.value) return thinkingSelectorAnchor.value?.querySelector<HTMLElement>(".thinking-panel");
+  return null;
+});
+let selectorReturnFocus: HTMLElement | null = null;
+watch([showModelSelector, showThinkingSelector], async ([model, thinking], [previousModel, previousThinking]) => {
+  if ((model || thinking) && !previousModel && !previousThinking) selectorReturnFocus = document.activeElement as HTMLElement;
+  await nextTick();
+  if (model || thinking) {
+    activeSelectorPanel.value?.querySelector<HTMLElement>(model ? ".search-input" : "button")?.focus({ preventScroll: true });
+  } else {
+    selectorReturnFocus?.focus({ preventScroll: true });
+  }
+});
+function handleSelectorKey(event: KeyboardEvent): void {
+  if (!showModelSelector.value && !showThinkingSelector.value) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    showModelSelector.value = false;
+    showThinkingSelector.value = false;
+  } else if (event.key === "Tab") {
+    const controls = Array.from(activeSelectorPanel.value?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)') ?? []);
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last?.focus({ preventScroll: true });
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first?.focus({ preventScroll: true });
+    }
+  }
+}
 const isSending = ref(false);
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const isDraggingFiles = ref(false);
@@ -1142,11 +1186,12 @@ function sendQuickStart(prompt: string): void {
 </script>
 
 <template>
-  <div class="center-panel">
+  <div class="center-panel" @keydown="handleSelectorKey">
     <!-- TopBar -->
-    <div class="center-topbar">
+    <WindowTitlebar class="center-topbar" :reserve-window-controls="reserveWindowControls">
       <div class="topbar-left">
-        <span class="topbar-brand">PiX</span>
+        <button class="panel-toggle" aria-label="切换会话列表" :aria-expanded="leftOpen" @click="emit('toggle-left')"><v-icon icon="mdi-dock-left" size="18" /></button>
+        <span class="topbar-brand">{{ teamStore.teamMode ? "圆桌讨论" : "Agent 对话" }}</span>
         <template v-if="projectName">
           <span class="topbar-sep">&rsaquo;</span>
           <span class="topbar-path">{{ projectName }}</span>
@@ -1167,34 +1212,6 @@ function sendQuickStart(prompt: string): void {
         </span>
       </div>
 
-      <div class="topbar-center">
-        <button
-          class="view-tab"
-          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'session' }"
-          @click="switchSessionView('session')"
-        >会话</button>
-        <button
-          class="view-tab"
-          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'tree' }"
-          @click="switchSessionView('tree')"
-        >分支树</button>
-        <button
-          class="view-tab"
-          :class="{ active: agentTaskStore.centerOpen }"
-          @click="agentTaskStore.openTaskCenter()"
-        >任务</button>
-        <button class="topbar-action" @click="showForkDialog = true">创建分支</button>
-        <!-- 导出走 host 会话（solo）；圆桌的记录导出在交付物面板里。 -->
-        <v-menu v-if="!teamStore.teamMode" v-model="showExportMenu" :close-on-content-click="true" location="bottom end">
-          <template #activator="{ props: menuProps }">
-            <button class="topbar-action" v-bind="menuProps">导出</button>
-          </template>
-          <v-list density="compact">
-            <v-list-item @click="exportHtml(); showExportMenu = false" title="导出为 HTML" />
-            <v-list-item @click="exportJsonl(); showExportMenu = false" title="导出为 JSONL" />
-          </v-list>
-        </v-menu>
-      </div>
 
       <div class="topbar-right">
         <!-- 移交：绑定最新一版可移交交付物，切前台到 solo 后交出（FR-12 / H15）。 -->
@@ -1279,8 +1296,38 @@ function sendQuickStart(prompt: string): void {
             </button>
           </div>
         </v-menu>
+        <button class="panel-toggle" aria-label="切换上下文面板" :aria-expanded="rightOpen" @click="emit('toggle-right')"><v-icon icon="mdi-dock-right" size="18" /></button>
       </div>
-    </div>
+    </WindowTitlebar>
+
+      <nav class="workspace-toolbar" aria-label="会话视图">
+        <button
+          class="view-tab"
+          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'session' }"
+          @click="switchSessionView('session')"
+        >会话</button>
+        <button
+          class="view-tab"
+          :class="{ active: !agentTaskStore.centerOpen && sessionViewMode === 'tree' }"
+          @click="switchSessionView('tree')"
+        >分支树</button>
+        <button
+          class="view-tab"
+          :class="{ active: agentTaskStore.centerOpen }"
+          @click="agentTaskStore.openTaskCenter()"
+        >任务</button>
+        <button class="topbar-action create-branch-action" @click="showForkDialog = true">创建分支</button>
+        <!-- 导出走 host 会话（solo）；圆桌的记录导出在交付物面板里。 -->
+        <v-menu v-if="!teamStore.teamMode" v-model="showExportMenu" :close-on-content-click="true" location="bottom end">
+          <template #activator="{ props: menuProps }">
+            <button class="topbar-action" v-bind="menuProps">导出</button>
+          </template>
+          <v-list density="compact">
+            <v-list-item @click="exportHtml(); showExportMenu = false" title="导出为 HTML" />
+            <v-list-item @click="exportJsonl(); showExportMenu = false" title="导出为 JSONL" />
+          </v-list>
+        </v-menu>
+      </nav>
 
     <!-- 任务中心:顶层渲染于 team/solo 两分支之上(假设 6:team 模式同样生效);
          打开前记住会话视图模式,关闭后回打开前视图(假设 5 期间隐藏 composer 与
@@ -1307,7 +1354,12 @@ function sendQuickStart(prompt: string): void {
     <template v-else>
       <div class="session-pane">
         <div class="session-content" ref="contentArea" @scroll="handleContentScroll">
-          <div v-if="isEmptySession" class="empty-state">
+          <div class="conversation-inner" :class="{ 'conversation-empty': isEmptySession && sessionViewMode === 'session', 'conversation-tree': sessionViewMode === 'tree' }">
+          <header v-if="!isEmptySession && sessionViewMode === 'session'" class="conversation-heading">
+            <h1>{{ sessionName }}</h1>
+            <span>{{ projectName }} · {{ modelOnlyDisplay }}</span>
+          </header>
+          <div v-if="isEmptySession && sessionViewMode === 'session'" class="empty-state">
             <div class="empty-orbit" aria-hidden="true">
               <span class="empty-planet"></span>
               <span class="empty-ring"></span>
@@ -1333,6 +1385,7 @@ function sendQuickStart(prompt: string): void {
 
           <SessionView v-if="sessionViewMode === 'session'" ref="sessionViewRef" :blocks="sessionStore.displayBlocks.value" :active-retry-block-id="activeRetryBlockId" windowed @retry="retryLastTurn" @cancel="cancelRetry" />
           <SessionTreeView v-else />
+          </div>
           <!-- PlanCard 随内容滚动（Stage A）：session-content 内、SessionView 之后，
                不再是消息区与 composer 之间的固定夹层。控制器初始快照的 phase
                "cancelled" 且无 plan 是未进入过规划的哨兵，仅该情况隐藏；真正
@@ -1347,7 +1400,7 @@ function sendQuickStart(prompt: string): void {
         </div>
         <!-- 浮动导航（TeamTimeline 同款 absolute 定位）：距顶/距底超过阈值时出现。 -->
         <button
-          v-if="!isNearTop"
+          v-if="sessionViewMode === 'session' && !isNearTop"
           type="button"
           class="scroll-float-btn scroll-float-top"
           title="回到顶部"
@@ -1357,7 +1410,7 @@ function sendQuickStart(prompt: string): void {
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
         </button>
         <button
-          v-if="!isNearBottom"
+          v-if="sessionViewMode === 'session' && !isNearBottom"
           type="button"
           class="scroll-float-btn scroll-float-bottom"
           title="回到底部"
@@ -1372,8 +1425,10 @@ function sendQuickStart(prompt: string): void {
     <!-- Composer 只在 solo 渲染：团队模式的输入是圆桌的 RoundtableComposer，
          它走 TeamCommand，绝不经过 host 会话的 prompt。
          任务中心打开时隐藏(假设 5:任务中心为完整中心视图)。 -->
-    <div v-if="!agentTaskStore.centerOpen && !teamStore.teamMode" class="center-composer">
+    <div v-if="!teamStore.teamMode && (!agentTaskStore.centerOpen || teamStore.pendingProtocolCount > 0)" class="center-composer" :class="{ 'requests-only': agentTaskStore.centerOpen }">
+      <TeamProtocolPanel v-if="teamStore.pendingProtocolCount > 0" />
       <div
+        v-if="!agentTaskStore.centerOpen"
         class="composer-inner"
         :class="{ 'dragging-files': isDraggingFiles }"
         @dragenter="handleDragEnter"
@@ -1440,7 +1495,7 @@ function sendQuickStart(prompt: string): void {
               class="onboarding-chip"
               @click="sendQuickStart(hint.prompt)"
             >
-              <span class="hint-icon">{{ hint.icon }}</span>
+              <v-icon :icon="hint.icon" size="16" />
               <span>{{ hint.label }}</span>
             </button>
           </div>
@@ -1463,11 +1518,13 @@ function sendQuickStart(prompt: string): void {
           </span>
         </div>
 
+        <div v-if="!pendingUserInput" class="composer-topline">{{ isBusy ? statusText : "描述任务" }}</div>
         <textarea
           v-if="!pendingUserInput"
           ref="textareaRef"
           v-model="inputText"
           class="composer-textarea"
+          aria-label="输入任务"
           :placeholder="composerPlaceholder"
           @input="handleInput"
           @keydown="handleKeydown"
@@ -1494,10 +1551,12 @@ function sendQuickStart(prompt: string): void {
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
-            <span class="selector-anchor">
+            <span ref="modelSelectorAnchor" class="selector-anchor">
               <button
                 class="model-btn"
                 :title="modelOnlyDisplay"
+                :aria-expanded="showModelSelector"
+                aria-haspopup="dialog"
                 @click="showModelSelector = !showModelSelector; showThinkingSelector = false"
               >
                 <span>{{ modelOnlyDisplay }}</span>
@@ -1505,15 +1564,17 @@ function sendQuickStart(prompt: string): void {
               </button>
               <ModelSelector v-if="showModelSelector" @close="showModelSelector = false" />
             </span>
-            <span class="selector-anchor">
+            <span ref="thinkingSelectorAnchor" class="selector-anchor">
               <button
                 class="thinking-btn"
                 :title="thinkingButtonDisplay"
+                :aria-expanded="showThinkingSelector"
+                aria-haspopup="dialog"
                 :disabled="thinkingButtonDisabled"
                 @click="showThinkingSelector = !showThinkingSelector; showModelSelector = false"
               >
                 <v-icon icon="mdi-brain" size="14" />
-                <span>{{ thinkingButtonDisplay }}</span>
+                <span>{{ cleanThinkingDisplay }}</span>
                 <span class="model-btn-chevron">&#9660;</span>
               </button>
               <ThinkingSelector v-if="showThinkingSelector" @close="showThinkingSelector = false" />
@@ -1528,6 +1589,7 @@ function sendQuickStart(prompt: string): void {
             </span>
           </div>
           <div class="composer-right">
+            <button class="composer-icon-btn" aria-label="使用斜杠命令" title="使用斜杠命令" @click="showCommandPalette = !showCommandPalette; searchQuery = ''; textareaRef?.focus()">/</button>
             <button
               v-if="isBusy"
               class="composer-action-btn primary-action"
@@ -1573,6 +1635,7 @@ function sendQuickStart(prompt: string): void {
           </div>
         </div>
       </div>
+      <p v-if="!agentTaskStore.centerOpen && !pendingUserInput" class="composer-help">Enter 发送 · Shift + Enter 换行</p>
     </div>
 
     <ForkDialog v-if="showForkDialog" @close="showForkDialog = false" @fork="handleFork" />
@@ -1594,32 +1657,30 @@ function sendQuickStart(prompt: string): void {
 </template>
 
 <style scoped>
+.panel-toggle { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 6px; flex-shrink: 0; -webkit-app-region: no-drag; }
+.panel-toggle:hover { background: var(--pix-accent-light); }
+.workspace-toolbar { min-height: 44px; display: flex; align-items: center; padding: 0 24px; border-bottom: 1px solid var(--pix-border-light); flex-shrink: 0; overflow-x: auto; }
+.create-branch-action { margin-left: auto; }
+.conversation-inner { width: 100%; min-height: 100%; max-width: var(--pix-content-max-width); margin: 0 auto; padding: 24px 28px 30px; }
+.conversation-empty { display: flex; flex-direction: column; }
+.conversation-tree { height: 100%; }
+.conversation-heading { margin-bottom: 26px; }
+.conversation-heading h1 { font-size: 22px; line-height: 1.45; font-weight: 600; overflow-wrap: anywhere; }
+.conversation-heading > span { display: block; margin-top: 8px; color: var(--pix-text-muted); font-size: 12px; overflow-wrap: anywhere; }
+.composer-topline { font-size: 12px; color: var(--pix-accent); }
+.composer-help { margin-top: 8px; color: var(--pix-text-muted); font-size: 12px; }
+.center-composer.requests-only { padding-top: 0; padding-bottom: 0; }
+
+
 .center-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  overflow: hidden;
-  container-type: inline-size;
-  container-name: center-panel;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0.94)),
-    var(--pix-bg-content);
+  display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; container-type: inline-size; container-name: center-panel; background: white;
 }
 
 /* Topbar */
 .center-topbar {
-  display: flex;
-  align-items: center;
-  height: var(--pix-topbar-height);
-  min-height: var(--pix-topbar-height);
-  padding: 0 var(--pix-space-lg) 0 var(--pix-space-xl);
-  background: var(--pix-bg-topbar);
-  border-bottom: 1px solid var(--pix-border-light);
-  -webkit-app-region: drag;
+  --pix-titlebar-padding: 24px;
   user-select: none;
-  flex-shrink: 0;
-  gap: var(--pix-space-md);
-  backdrop-filter: blur(14px);
+  gap: 12px;
 }
 
 .topbar-left {
@@ -1632,11 +1693,7 @@ function sendQuickStart(prompt: string): void {
 }
 
 .topbar-brand {
-  font-size: var(--pix-text-sm);
-  font-weight: var(--pix-weight-semibold);
-  color: var(--pix-text-primary);
-  flex-shrink: 0;
-  letter-spacing: 0;
+  font-size: 14px; font-weight: 500; flex-shrink: 0;
 }
 
 .topbar-sep {
@@ -1733,29 +1790,10 @@ function sendQuickStart(prompt: string): void {
   50% { opacity: 0.3; }
 }
 
-.topbar-center {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  flex-shrink: 0;
-  -webkit-app-region: no-drag;
-  padding: 3px;
-  border: 1px solid var(--pix-border-subtle);
-  border-radius: var(--pix-radius-lg);
-  background: rgba(248, 249, 255, 0.88);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
-}
 
 /* View mode tabs */
 .view-tab {
-  padding: 5px 12px;
-  border-radius: var(--pix-radius-md);
-  font-size: var(--pix-text-sm);
-  font-family: var(--pix-font-ui);
-  color: var(--pix-text-secondary);
-  cursor: pointer;
-  transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
-  font-weight: var(--pix-weight-normal);
+  align-self: stretch; padding: 0 1px; margin-right: 18px; border-bottom: 2px solid transparent; font-size: 14px; color: var(--pix-text-primary); white-space: nowrap;
 }
 
 .view-tab:hover {
@@ -1764,10 +1802,7 @@ function sendQuickStart(prompt: string): void {
 }
 
 .view-tab.active {
-  background: #ffffff;
-  color: var(--pix-accent);
-  font-weight: var(--pix-weight-medium);
-  box-shadow: var(--pix-shadow-xs);
+  color: var(--pix-accent); border-bottom-color: var(--pix-accent); font-weight: 500;
 }
 
 .team-tab-badge {
@@ -1839,18 +1874,7 @@ function sendQuickStart(prompt: string): void {
 }
 
 .workspace-mode-option {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  min-width: 66px;
-  min-height: 28px;
-  padding: 4px 9px;
-  border-radius: var(--pix-radius-md);
-  color: var(--pix-text-secondary);
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-medium);
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 28px; padding: 3px 7px; border-radius: 5px; font-size: 14px; color: var(--pix-text-primary);
 }
 
 .workspace-mode-option:hover:not(:disabled) {
@@ -1869,21 +1893,7 @@ function sendQuickStart(prompt: string): void {
 }
 
 .execution-mode-select {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border: 1px solid var(--pix-border-light);
-  border-radius: 12px;
-  background: #ffffff;
-  color: var(--pix-text-secondary);
-  font-size: var(--pix-text-xs);
-  font-weight: var(--pix-weight-medium);
-  cursor: pointer;
-  transition:
-    background var(--pix-transition-fast),
-    border-color var(--pix-transition-fast),
-    color var(--pix-transition-fast);
+  display: inline-flex; align-items: center; gap: 5px; padding: 5px; border-radius: 6px; color: var(--pix-text-primary); font-size: 14px; white-space: nowrap;
 }
 
 .execution-mode-select:hover {
@@ -2004,8 +2014,7 @@ function sendQuickStart(prompt: string): void {
 
 @media (max-width: 1100px) {
   .center-topbar {
-    padding-right: var(--pix-space-md);
-    padding-left: var(--pix-space-md);
+    --pix-titlebar-padding: 14px;
   }
 
   .topbar-path:last-of-type {
@@ -2015,16 +2024,10 @@ function sendQuickStart(prompt: string): void {
 
 @media (max-width: 900px) {
   .topbar-left .status-pill,
-  .execution-mode-select span,
-  .workspace-mode-option span:not(.team-tab-badge) {
+  .execution-mode-select span {
     display: none;
   }
 
-  .workspace-mode-option {
-    min-width: 30px;
-    width: 30px;
-    padding: 4px;
-  }
 }
 
 /* Session content */
@@ -2036,14 +2039,14 @@ function sendQuickStart(prompt: string): void {
 }
 
 .session-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: var(--pix-space-3xl) var(--pix-space-xl) var(--pix-space-xl);
+  flex: 1; min-width: 0; overflow-y: auto;
 }
 
 /* PlanCard 容器：随内容滚动，与 transcript 保持一段间距 */
 .session-plan-card {
-  margin-top: var(--pix-space-lg);
+  max-width: var(--pix-content-max-width);
+  padding: 0 28px 30px;
+  margin: 0 auto;
 }
 
 .scroll-float-btn {
@@ -2079,11 +2082,12 @@ function sendQuickStart(prompt: string): void {
 }
 
 .empty-state {
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  height: 100%;
+  min-height: 0;
   text-align: center;
   padding-bottom: 9vh;
 }
@@ -2178,26 +2182,15 @@ function sendQuickStart(prompt: string): void {
 
 /* Composer */
 .center-composer {
-  flex-shrink: 0;
-  padding: var(--pix-space-md) var(--pix-space-xl) var(--pix-space-xl);
+  flex-shrink: 0; padding: 12px 24px 14px; width: 100%; max-width: var(--pix-content-max-width); margin: 0 auto;
 }
 
 .composer-inner {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: var(--pix-space-sm);
-  background: rgba(255, 255, 255, 0.96);
-  border: 1px solid var(--pix-border-light);
-  border-radius: var(--pix-radius-xl);
-  padding: 12px;
-  box-shadow: var(--pix-shadow-lg);
-  transition: border-color var(--pix-transition-base), box-shadow var(--pix-transition-base);
+  position: relative; display: flex; flex-direction: column; gap: 8px; background: white; border: 1px solid #dadce7; border-radius: 12px; padding: 12px 14px; box-shadow: 0 2px 10px #26213c03;
 }
 
 .composer-inner:focus-within {
-  border-color: var(--pix-accent);
-  box-shadow: var(--pix-shadow-lg), 0 0 0 3px rgba(98, 84, 243, 0.12);
+  border-color: var(--pix-accent); box-shadow: 0 0 0 2px var(--pix-accent-light);
 }
 
 /* 后台任务提示条（R4c）：composer 顶部全宽细条，hover 提亮 */
@@ -2348,17 +2341,7 @@ function sendQuickStart(prompt: string): void {
 }
 
 .composer-textarea {
-  width: 100%;
-  padding: var(--pix-space-sm) var(--pix-space-sm);
-  border: none;
-  border-radius: var(--pix-radius-sm);
-  font-size: var(--pix-text-base);
-  line-height: var(--pix-leading-base);
-  background: transparent;
-  color: var(--pix-text-primary);
-  resize: none;
-  font-family: var(--pix-font-ui);
-  min-height: 46px;
+  width: 100%; padding: 0; border: none; font-size: 14px; line-height: 1.6; background: transparent; resize: none; min-height: 52px;
 }
 
 .composer-textarea:focus {
@@ -2379,12 +2362,7 @@ function sendQuickStart(prompt: string): void {
 }
 
 .composer-left {
-  display: flex;
-  gap: var(--pix-space-xs);
-  position: relative;
-  align-items: center;
-  min-width: 0;
-  flex: 1;
+  display: flex; gap: 4px; position: relative; align-items: center; min-width: 0; flex: 1; flex-wrap: wrap;
 }
 
 .composer-right {
@@ -2414,7 +2392,7 @@ function sendQuickStart(prompt: string): void {
 }
 
 .selector-anchor {
-  position: relative;
+  position: static;
   display: inline-flex;
   align-items: center;
   min-width: 0;
@@ -2427,27 +2405,14 @@ function sendQuickStart(prompt: string): void {
 /* Composer */
 .model-btn,
 .thinking-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 10px;
-  border-radius: var(--pix-radius-md);
-  font-size: var(--pix-text-sm);
-  font-family: var(--pix-font-ui);
-  color: var(--pix-text-secondary);
-  cursor: pointer;
-  transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
-  white-space: nowrap;
-  min-width: 0;
-  max-width: 220px;
-  overflow: hidden;
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 7px; min-height: 32px; max-width: 180px; color: var(--pix-text-primary); flex-shrink: 0; background: transparent; border-radius: 6px; font-size: 13px; white-space: nowrap;
 }
 
 .thinking-btn {
   max-width: 148px;
   flex-shrink: 0;
-  color: var(--pix-accent);
-  background: var(--pix-accent-light);
+  color: var(--pix-text-secondary);
+  background: transparent;
 }
 
 .thinking-btn:disabled {
@@ -2460,6 +2425,7 @@ function sendQuickStart(prompt: string): void {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  white-space: nowrap;
 }
 
 .model-btn:hover,
@@ -2517,14 +2483,11 @@ function sendQuickStart(prompt: string): void {
 }
 
 .composer-action-btn.primary-action {
-  background: linear-gradient(135deg, #7567f5 0%, #5142df 100%);
-  color: var(--pix-text-inverse);
-  box-shadow: 0 12px 24px rgba(98, 84, 243, 0.26);
+  background: var(--pix-accent); color: white;
 }
 
 .composer-action-btn.primary-action:hover:not(:disabled) {
-  box-shadow: 0 15px 30px rgba(98, 84, 243, 0.32);
-  transform: translateY(-1px);
+  background: var(--pix-accent-hover);
 }
 
 .composer-action-btn.primary-action:disabled {
@@ -2594,5 +2557,23 @@ function sendQuickStart(prompt: string): void {
   .thinking-btn {
     max-width: 120px;
   }
+}
+@container center-panel (max-width: 620px) {
+  .topbar-left .topbar-sep, .topbar-left .topbar-path, .topbar-env-badge, .topbar-left .status-pill { display: none; }
+  .center-topbar { --pix-titlebar-padding: 14px; gap: 8px; }
+  .execution-mode-select > span { display: none; }
+  .workspace-toolbar { padding: 0 16px; }
+  .conversation-inner { padding: 24px 18px; }
+  .center-composer { padding: 10px 14px 14px; }
+  .composer-controls { align-items: flex-end; }
+  .model-btn { max-width: 155px; }
+}
+@container center-panel (max-width: 450px) {
+  .topbar-brand { display: none; }
+  .topbar-right { gap: 6px; }
+  .workspace-mode-option > span:not(.team-tab-badge) { display: none; }
+  .workspace-mode-option { width: 28px; padding: 3px; }
+  .model-btn { max-width: 125px; }
+  .thinking-btn { max-width: 100px; }
 }
 </style>

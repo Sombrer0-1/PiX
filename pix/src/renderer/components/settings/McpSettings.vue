@@ -5,7 +5,7 @@
  * Displays connected MCP server status, tools, errors, and config paths.
  * Read-only; server configuration is managed via mcp.json files.
  */
-import { ref, onMounted } from "vue";
+import { ref, onMounted, watch } from "vue";
 import { useWorkspaceRpc } from "../../composables/useWorkspaceRpc";
 import type { McpServerInfo, McpConfigInfo } from "../../../shared/types";
 
@@ -14,6 +14,7 @@ const loading = ref(true);
 const servers = ref<McpServerInfo[]>([]);
 const configInfo = ref<McpConfigInfo>({ configPaths: [], errors: [] });
 const error = ref("");
+const reloadError = ref("");
 
 const statusColor: Record<string, string> = {
   connected: "success",
@@ -47,14 +48,16 @@ async function load(): Promise<void> {
 }
 
 async function refresh(): Promise<void> {
+  if (loading.value) return;
+  loading.value = true;
+  reloadError.value = "";
   try {
     await rpc.reloadResources();
-    // Wait briefly for MCP servers to reconnect
-    await new Promise((r) => setTimeout(r, 500));
-  } catch {
-    // reload may throw if session not ready; that's ok
+  } catch (err) {
+    reloadError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    await load();
   }
-  await load();
 }
 
 function truncatedStderr(stderr: string): string {
@@ -63,6 +66,7 @@ function truncatedStderr(stderr: string): string {
 }
 
 onMounted(load);
+watch(() => rpc.isConnected.value, (connected) => { if (connected) void load(); });
 </script>
 
 <template>
@@ -80,12 +84,16 @@ onMounted(load);
         variant="outlined"
         prepend-icon="mdi-refresh"
         :loading="loading"
+        :disabled="loading || !rpc.isConnected.value"
         @click="refresh"
       >
         刷新
       </v-btn>
     </div>
 
+    <v-alert v-if="reloadError" type="error" density="compact" class="mb-4">
+      重新加载失败：{{ reloadError }}
+    </v-alert>
     <v-alert
       v-if="error"
       type="error"
@@ -93,7 +101,7 @@ onMounted(load);
       class="mb-4"
       density="compact"
     >
-      {{ error }}
+      读取状态失败：{{ error }}
     </v-alert>
 
     <!-- Loading skeleton -->
@@ -108,7 +116,7 @@ onMounted(load);
 
     <!-- No servers -->
     <v-alert
-      v-else-if="servers.length === 0"
+      v-else-if="servers.length === 0 && !error"
       type="info"
       density="compact"
       class="mb-4"
@@ -242,7 +250,12 @@ onMounted(load);
 }
 
 .config-list {
-  border: 1px solid rgb(var(--v-theme-border-light));
-  border-radius: 4px;
+  border: 1px solid var(--pix-border);
+  border-radius: 11px;
 }
+.section-panel :deep(.v-expansion-panel) { border: 1px solid var(--pix-border); border-radius: 11px !important; margin-bottom: 12px; }
+.section-panel :deep(.v-expansion-panel__shadow) { display: none; }
+.section-panel :deep(.v-expansion-panel-title) { min-height: 70px; font-size: 14px; padding: 16px 18px; }
+.section-panel :deep(.v-list-item-title) { white-space: normal; overflow-wrap: anywhere; font-size: 13px; }
+.section-panel :deep(.v-btn) { height: 34px; font-size: 13px; }
 </style>

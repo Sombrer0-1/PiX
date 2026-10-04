@@ -80,7 +80,7 @@ watch(isConnected, (connected) => {
 
 <template>
   <div class="model-selector">
-    <div class="model-panel">
+    <div class="model-panel" role="dialog" aria-label="选择模型" aria-modal="true">
       <div class="panel-header">
         <span class="panel-title">选择模型</span>
         <div class="header-actions">
