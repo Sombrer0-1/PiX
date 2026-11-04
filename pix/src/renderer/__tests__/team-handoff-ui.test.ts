@@ -31,6 +31,7 @@ import WorkspacePage from "../pages/WorkspacePage.vue";
 import HomePage from "../pages/HomePage.vue";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import type { DeliverableVersion } from "@shared/team-types.js";
+import { computerUseApiMocks } from "./helpers/computer-use-fixtures";
 
 // ============================================================================
 // Mocks (module-level, hoisted)
@@ -339,6 +340,8 @@ function installPixApiMock(): void {
     onWorkflowEvent: vi.fn(() => () => {}),
     sendTodoCommand: vi.fn().mockResolvedValue({ success: true }),
     onTodoEvent: vi.fn(() => () => {}),
+    // CenterPanel 挂载 ComputerUseToggle/ActivityBar → store.start() 走的 computer-use IPC 表面。
+    ...computerUseApiMocks(),
     btwAsk: vi.fn().mockResolvedValue({ status: "error", errorMessage: "unused" }),
   } as unknown as PixApi;
 }

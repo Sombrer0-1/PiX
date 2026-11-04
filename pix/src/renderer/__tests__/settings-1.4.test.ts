@@ -26,6 +26,7 @@ import type { GuiSettings, ModelInfo } from "@shared/types.js";
 import { useAuthStore } from "../stores/auth-store";
 import { useSettingsStore } from "../stores/settings-store";
 import SettingsPage from "../pages/SettingsPage.vue";
+import { computerUseApiMocks } from "./helpers/computer-use-fixtures";
 
 // ============================================================================
 // Mocks
@@ -85,15 +86,23 @@ const vuetify = createVuetify({
 let pinia: ReturnType<typeof createPinia>;
 let getSettingsMock: ReturnType<typeof vi.fn>;
 let setSettingsMock: ReturnType<typeof vi.fn>;
+let computerUseCommandMock: ReturnType<typeof vi.fn>;
 let wrapper: ReturnType<typeof mount> | undefined;
 
 function installPixApiMock(settings: Partial<GuiSettings> = {}): void {
   getSettingsMock = vi.fn().mockResolvedValue({ theme: "light", recentProjects: [], ...settings });
   setSettingsMock = vi.fn().mockResolvedValue({ success: true });
+  const computerUseMocks = computerUseApiMocks({ availability: "stopped" });
+  computerUseCommandMock = computerUseMocks.sendComputerUseCommand;
   window.pixApi = {
     getSettings: getSettingsMock,
     setSettings: setSettingsMock,
     listWslDistros: vi.fn().mockResolvedValue({ distros: [], diagnostic: null }),
+    // ComputerUseSettings onMounted → computer-use store.start() 走到的 IPC 表面
+    // （useComputerUseRpc → preload）。onComputerUseEvent 返回退订函数，缺了它
+    // start() 吞掉 TypeError 后 started=false，refresh 永不执行。
+    sendComputerUseCommand: computerUseCommandMock,
+    onComputerUseEvent: computerUseMocks.onComputerUseEvent,
   } as unknown as PixApi;
 }
 
@@ -841,5 +850,59 @@ describe("settings rebuild persistence and navigation", () => {
     expect((page.getComponent('[data-test="execution-mode-select"]') as VueWrapper<{ $props: { modelValue: string | number; disabled?: boolean } }>).props('modelValue')).toBe('read-only');
     await clickSave(page);
     expect(page.get('.save-feedback').text()).toBe("已保存");
+  });
+});
+
+// ============================================================================
+// SettingsPage computer-use section
+// ============================================================================
+
+/** Open the 电脑操控 section through the sidebar, as a user would. */
+async function openComputerUseSection(page: ReturnType<typeof mount>): Promise<void> {
+  const item = page.findAll(".sidebar-item").find((el) => el.text().includes("电脑操控"));
+  expect(item, "sidebar 电脑操控 entry exists").toBeTruthy();
+  await item!.trigger("click");
+  await flushPromises();
+}
+
+describe("SettingsPage computer-use section", () => {
+  it("switches to 电脑操控 and hydrates the persisted computerUse settings", async () => {
+    getSettingsMock.mockResolvedValue({
+      theme: "light",
+      recentProjects: [],
+      computerUse: { enabled: true, maxImageDimension: 2048, keepRecentScreenshots: 5 },
+    });
+
+    const page = mountPage();
+    await flushPromises();
+
+    const section = page.get('[aria-label="computer-use"]');
+    expect(section.isVisible()).toBe(false);
+    await openComputerUseSection(page);
+
+    expect(section.isVisible()).toBe(true);
+    // ComputerUseSettings 全局开关与数值字段的 hydration。
+    expect(page.get<HTMLInputElement>("#setting-computerUseEnabled").element.checked).toBe(true);
+    expect(page.get<HTMLInputElement>("#setting-computerUseMaxImageDimension").element.value).toBe("2048");
+    expect(page.get<HTMLInputElement>("#setting-computerUseKeepRecentScreenshots").element.value).toBe("5");
+    // store.start() 集成：订阅成功后追平快照——get_snapshot 已发出、
+    // 驱动状态徽标来自快照而非“未连接”空路径。
+    expect(computerUseCommandMock).toHaveBeenCalledWith({ type: "get_snapshot" });
+    expect(page.get(".cu-driver-badge").text()).toBe("已就绪（未启动）");
+  });
+
+  it("persists computerUse through the existing save flow", async () => {
+    const page = mountPage();
+    await flushPromises();
+    await openComputerUseSection(page);
+
+    await page.get("#setting-computerUseEnabled").setValue(true);
+    await flushPromises();
+    expect(page.get(".save-feedback").text()).toBe("有未保存的修改");
+
+    await clickSave(page);
+
+    expect(lastSetSettingsCall().computerUse).toEqual({ enabled: true });
+    expect(page.get(".save-feedback").text()).toBe("已保存");
   });
 });

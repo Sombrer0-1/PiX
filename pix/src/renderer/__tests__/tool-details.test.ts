@@ -26,6 +26,7 @@ import BashToolDetails from "../components/session/tool-details/BashToolDetails.
 import ReadFileToolDetails from "../components/session/tool-details/ReadFileToolDetails.vue";
 import JsonToolDetails from "../components/session/tool-details/JsonToolDetails.vue";
 import TodoToolDetails from "../components/session/tool-details/TodoToolDetails.vue";
+import ComputerToolDetails from "../components/session/tool-details/ComputerToolDetails.vue";
 import {
   countDiffRows,
   extractToolResultDetails,
@@ -140,6 +141,30 @@ describe("ToolCallDetails dispatcher", () => {
       tool: makeTool({ toolName: "fancy_tool", args: { thing: 1 }, result: "done" }),
       viewClass: ".td-json",
     },
+    {
+      label: "exact computer_observe",
+      tool: makeTool({
+        toolName: "computer_observe",
+        args: { view: "window", pid: 7, window_id: 3 },
+        result: {
+          content: [{ type: "text", text: "window state" }],
+          details: { kind: "observe", view: "window", grant: "background", durationMs: 12 },
+        },
+      }),
+      viewClass: ".td-computer",
+    },
+    {
+      label: "exact computer_act",
+      tool: makeTool({
+        toolName: "computer_act",
+        args: { action: "click", pid: 7, window_id: 3, x: 10, y: 20 },
+        result: {
+          content: [{ type: "text", text: "clicked" }],
+          details: { kind: "act", action: "click", grant: "background", durationMs: 40 },
+        },
+      }),
+      viewClass: ".td-computer",
+    },
   ];
 
   for (const { label, tool, viewClass } of cases) {
@@ -164,6 +189,26 @@ describe("ToolCallDetails dispatcher", () => {
     expect(wrapper.find(".td-running").exists()).toBe(true);
     expect(wrapper.find(".td-running").text()).toContain("运行中");
     expect(wrapper.find(".td-bash").exists()).toBe(false);
+  });
+
+  it("dispatches computer_act to the real ComputerToolDetails view", () => {
+    wrapper = mount(ToolCallDetails, {
+      props: {
+        tool: makeTool({
+          toolName: "computer_act",
+          args: { action: "click", pid: 4242, window_id: 77, x: 5, y: 6 },
+          result: {
+            content: [{ type: "text", text: "Clicked 保存" }],
+            details: { kind: "act", action: "click", grant: "background", durationMs: 640 },
+          },
+        }),
+      },
+    });
+
+    const view = wrapper.findComponent(ComputerToolDetails);
+    expect(view.exists()).toBe(true);
+    expect(wrapper.find(".td-cu-summary").text()).toBe("操作 · 点击");
+    expect(wrapper.find(".td-cu-chip").text()).toBe("后台授权");
   });
 });
 

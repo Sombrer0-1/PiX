@@ -83,6 +83,7 @@ import SubagentToolView from "../components/session/SubagentToolView.vue";
 import SessionView from "../components/session/SessionView.vue";
 import RightPanel from "../components/layout/RightPanel.vue";
 import CenterPanel from "../components/layout/CenterPanel.vue";
+import { computerUseApiMocks, makeComputerUseSnapshot } from "./helpers/computer-use-fixtures";
 
 // ============================================================================
 // Mocks (module-level, hoisted) for RightPanel / CenterPanel dependencies
@@ -473,6 +474,7 @@ const vuetify = createVuetify({
 let sendAgentTaskCommand: ReturnType<typeof vi.fn>;
 let onAgentTaskEvent: ReturnType<typeof vi.fn>;
 let onAgentTaskInputRequest: ReturnType<typeof vi.fn>;
+let sendComputerUseCommand: ReturnType<typeof vi.fn>;
 let agentTaskEventCallback: ((event: AgentTaskEvent) => void) | null;
 let inputRequestCallback: ((request: AgentTaskInputRequest) => void) | null;
 const eventUnsubscribers: Array<() => void> = [];
@@ -498,7 +500,11 @@ function installPixApiMock(): void {
     inputUnsubscribers.push(unsubscribe);
     return unsubscribe;
   });
-  window.pixApi = { sendAgentTaskCommand, onAgentTaskEvent, onAgentTaskInputRequest, sendTodoCommand: vi.fn().mockResolvedValue({ success: true }), onTodoEvent: vi.fn(() => () => {}) } as unknown as PixApi;
+  // CenterPanel 挂载 ComputerUseToggle/ComputerUseActivityBar → store.start() 走的
+  // computer-use IPC 表面（缺 onComputerUseEvent 时 start 吞 TypeError 后停在未启动）。
+  const computerUseApi = computerUseApiMocks();
+  sendComputerUseCommand = computerUseApi.sendComputerUseCommand;
+  window.pixApi = { sendAgentTaskCommand, onAgentTaskEvent, onAgentTaskInputRequest, sendComputerUseCommand, onComputerUseEvent: computerUseApi.onComputerUseEvent, sendTodoCommand: vi.fn().mockResolvedValue({ success: true }), onTodoEvent: vi.fn(() => () => {}) } as unknown as PixApi;
 }
 
 /** Deliver an AgentTaskEvent through the currently registered onAgentTaskEvent callback. */
@@ -2157,13 +2163,14 @@ describe("CenterPanel task center", () => {
     await nextTick();
     expect(w.find("session-tree-view-stub").exists()).toBe(true);
 
-    // 打开任务中心:顶层渲染 TaskCenterView,会话上下文与 composer 隐藏
+    // 打开任务中心:顶层渲染 TaskCenterView,会话上下文与 composer 输入区隐藏
+    // (composer 容器在 solo 常驻以承载电脑操控活动条)。
     await tabButton(w, "任务").trigger("click");
     await nextTick();
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(true);
     expect(w.find("session-tree-view-stub").exists()).toBe(false);
     expect(w.find("session-view-stub").exists()).toBe(false);
-    expect(w.find(".center-composer").exists()).toBe(false);
+    expect(w.find(".composer-inner").exists()).toBe(false);
     expect(tabButton(w, "任务").classes()).toContain("active");
 
     // 关闭:点击既有 tab 回打开前的分支树视图
@@ -2172,6 +2179,41 @@ describe("CenterPanel task center", () => {
     expect(w.find('[data-test="task-center-view"]').exists()).toBe(false);
     expect(w.find("session-tree-view-stub").exists()).toBe(true);
     expect(w.find(".center-composer").exists()).toBe(true);
+  });
+
+  it("任务中心打开时电脑操控活动条仍在 DOM（停止入口常驻）", async () => {
+    // 会话活动中：快照带 sessionEnabled + 桌面租约 + 运行中的电脑动作，
+    // store.start() 的 get_snapshot 应答即让活动条自显示。
+    sendComputerUseCommand.mockResolvedValue({
+      success: true,
+      data: makeComputerUseSnapshot({
+        availability: "ready",
+        session: {
+          sessionId: "session-1",
+          sessionEnabled: true,
+          grant: "background",
+          holdsLease: true,
+          halted: false,
+          toolsActive: true,
+          activity: { toolCallId: "t-1", tool: "act", summary: "点击 记事本 · 保存 按钮", startedAt: 5, state: "running" },
+        },
+      }),
+    });
+    const w = mountCenterPanel();
+    await flushPromises();
+    // 正常视图：活动条挂在 composer 上方（isVisible：v-if 根被改成 v-show 也会假通过 exists）。
+    expect(w.find(".cu-activity-bar").isVisible()).toBe(true);
+
+    // 任务中心打开：输入区卸载，但活动条与停止按钮仍渲染且可用。
+    await tabButton(w, "任务").trigger("click");
+    await nextTick();
+    expect(w.find('[data-test="task-center-view"]').exists()).toBe(true);
+    expect(w.find(".composer-inner").exists()).toBe(false);
+    expect(w.find(".cu-activity-bar").isVisible()).toBe(true);
+    expect(w.find(".cu-activity-stop").exists()).toBe(true);
+
+    await w.find(".cu-activity-stop").trigger("click");
+    expect(sendComputerUseCommand).toHaveBeenCalledWith({ type: "emergency_stop" });
   });
 
   it("team 模式下打开中心渲染 TaskCenterView 不落会话视图，关闭后回圆桌主表面", async () => {

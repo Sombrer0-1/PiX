@@ -1,0 +1,13 @@
+/**
+ * Extensionless node entry point for the fake cua-driver (test helper, no extension on purpose).
+ *
+ * `McpDriverClientOptions.args` defaults to `DRIVER_MCP_ARGS` (`["mcp", "--direct"]`), so the client
+ * spawns `<executablePath> mcp --direct`. With `executablePath = process.execPath` and `cwd` set to
+ * this directory, node resolves this file for the `mcp` argument, which is how the driver-client test
+ * proves the default argv end-to-end through the real spawn path (see
+ * computer-use-driver-client.test.ts, "default DRIVER_MCP_ARGS").
+ */
+
+// Dynamic import keeps this file valid under both module systems: node's syntax detection may load
+// an extensionless file as CommonJS on older releases, where a static `import` would be a SyntaxError.
+import("./fake-cua-driver.mjs");

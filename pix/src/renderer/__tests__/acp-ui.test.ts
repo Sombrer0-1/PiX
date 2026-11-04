@@ -13,6 +13,7 @@ import { components as vuetifyComponents, createVuetify, directives as vuetifyDi
 import type { PixApi } from "../../main/preload";
 import type { GuiSettings, ModelInfo } from "@shared/types.js";
 import { useSettingsStore } from "../stores/settings-store";
+import { computerUseApiMocks } from "./helpers/computer-use-fixtures";
 import SettingsPage from "../pages/SettingsPage.vue";
 import RightPanel from "../components/layout/RightPanel.vue";
 import CenterPanel from "../components/layout/CenterPanel.vue";
@@ -225,6 +226,8 @@ function installPixApiMock(settings: Partial<GuiSettings> = {}): void {
     onWorkflowEvent: vi.fn(() => () => {}),
     sendTodoCommand: vi.fn().mockResolvedValue({ success: true }),
     onTodoEvent: vi.fn(() => () => {}),
+    // CenterPanel 挂载 ComputerUseToggle/ActivityBar → store.start() 走的 computer-use IPC 表面。
+    ...computerUseApiMocks(),
     selectChatFiles: vi.fn().mockResolvedValue([]),
   } as unknown as PixApi;
 }

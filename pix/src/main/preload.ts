@@ -38,6 +38,7 @@ import type {
   WorkflowViewState,
   WslDistroListResult,
 } from "../shared/types.js";
+import type { ComputerUseCommand, ComputerUseEvent, ComputerUseSnapshot } from "../shared/computer-use-types.js";
 import type { TodoCommand, TodoEvent, TodoSnapshot } from "../shared/todo-types.js";
 
 export interface PixApi {
@@ -181,6 +182,10 @@ export interface PixApi {
   // Git workdir panel (PiX 1.5.0)
   gitGetStatus: (location: ProjectLocation) => Promise<GitWorkdirSnapshot>;
   gitOpenFolder: (location: ProjectLocation) => Promise<{ success: boolean; error?: string }>;
+
+  // Computer use commands (PiX 1.5.0)
+  sendComputerUseCommand: (command: ComputerUseCommand) => Promise<PixCommandResult<ComputerUseSnapshot>>;
+  onComputerUseEvent: (callback: (event: ComputerUseEvent) => void) => () => void;
 }
 
 const api: PixApi = {
@@ -397,6 +402,15 @@ const api: PixApi = {
   // Git workdir panel (PiX 1.5.0)
   gitGetStatus: (location: ProjectLocation) => ipcRenderer.invoke("git-get-status", location),
   gitOpenFolder: (location: ProjectLocation) => ipcRenderer.invoke("git-open-folder", location),
+
+  // Computer use commands (PiX 1.5.0)
+  sendComputerUseCommand: (command: ComputerUseCommand) =>
+    ipcRenderer.invoke("computer-use-command", command) as Promise<PixCommandResult<ComputerUseSnapshot>>,
+  onComputerUseEvent: (callback: (event: ComputerUseEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: ComputerUseEvent) => callback(data);
+    ipcRenderer.on("computer-use-event", handler);
+    return () => ipcRenderer.removeListener("computer-use-event", handler);
+  },
 };
 
 contextBridge.exposeInMainWorld("pixApi", api);

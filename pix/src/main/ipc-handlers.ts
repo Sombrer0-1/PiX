@@ -33,6 +33,8 @@ import type {
 import { USER_SEAT_ID } from "../shared/team-types.js";
 import type { AgentTaskService } from "./agent-task/agent-task-service.js";
 import { parseAgentTaskMaxConcurrent } from "../shared/agent-task-types.js";
+import { sanitizeComputerUseSettings } from "../shared/computer-use-types.js";
+import type { ComputerUseService } from "./computer-use/computer-use-service.js";
 // Plan/agent-task command registration and dispatch live in pure modules that
 // do not import electron at the top level, so plan-ipc.test.ts and
 // agent-task-ipc.test.ts exercise the REAL handlers with a fake adapter
@@ -42,6 +44,10 @@ import {
   subscribeAgentTaskEventForwarding,
 } from "./ipc-agent-task-adapters.js";
 import { registerBtwIpcHandlers } from "./ipc-btw-adapters.js";
+import {
+  registerComputerUseIpcHandlers,
+  subscribeComputerUseEventForwarding,
+} from "./ipc-computer-use-adapters.js";
 import { registerGitIpcHandlers } from "./ipc-git-adapters.js";
 import {
   registerPlanIpcHandlers,
@@ -88,6 +94,7 @@ const SETTING_KEYS = new Set([
   "autoBackgroundMs",
   "agentTaskMaxConcurrent",
   "defaultAcp",
+  "computerUse",
 ]);
 
 const AUTO_BACKGROUND_MS_VALUES = new Set<number>([0, 60_000, 120_000, 300_000]);
@@ -281,6 +288,17 @@ function sanitizeSettings(settings: Record<string, unknown>): Partial<GuiSetting
       sanitized.defaultAcp = value;
     }
   }
+  // Explicit `computerUse: undefined` deletes the stored settings; an invalid
+  // value (no boolean `enabled` anchor) is ignored, mirroring takeHerEyes.
+  if (Object.hasOwn(settings, "computerUse")) {
+    const value = settings.computerUse;
+    if (value === undefined) {
+      sanitized.computerUse = undefined;
+    } else {
+      const cleaned = sanitizeComputerUseSettings(value);
+      if (cleaned) sanitized.computerUse = cleaned;
+    }
+  }
 
   return sanitized;
 }
@@ -417,6 +435,7 @@ export function registerIpcHandlers(
   settingsStore: SettingsStore,
   teamManager: TeamManager,
   agentTaskService: AgentTaskService,
+  computerUseService?: ComputerUseService,
 ): void {
   setCurrentWindow(win);
 
@@ -723,6 +742,12 @@ export function registerIpcHandlers(
   registerAgentTaskIpcHandlers(ipcMain, agentTaskService);
 
   // =========================================================================
+  // Computer Use Commands (PiX 1.5.0; app-level ComputerUseService)
+  // =========================================================================
+
+  registerComputerUseIpcHandlers(ipcMain, () => computerUseService ?? null);
+
+  // =========================================================================
   // Git Workdir Commands (PiX 1.5.0; read-only git status + open folder,
   // design plan §4.3.4)
   // =========================================================================
@@ -850,11 +875,17 @@ export function registerIpcHandlers(
     if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
       return { success: false, error: "invalid_settings" };
     }
-    settingsStore.setMany(sanitizeSettings(settings as Record<string, unknown>));
+    const sanitizedSettings = sanitizeSettings(settings as Record<string, unknown>);
+    settingsStore.setMany(sanitizedSettings);
     const nextSettings = settingsStore.getAll();
     singleSessionBridge.updateGuiSettings(nextSettings);
     teamLeaderSessionBridge.updateGuiSettings(nextSettings);
     agentTaskService.syncMaxConcurrentSlotsFromSettings();
+    // Computer use is app-level: the global switch fan-out (revoke/stop) goes
+    // straight to the service, not through the bridge.
+    if (Object.hasOwn(sanitizedSettings, "computerUse")) {
+      computerUseService?.updateSettings(nextSettings.computerUse);
+    }
     return { success: true };
   });
 
@@ -1267,6 +1298,7 @@ export function setupEventForwarding(
   teamLeaderSessionBridge: SessionBridge,
   teamManager: TeamManager,
   agentTaskService: AgentTaskService,
+  computerUseService?: ComputerUseService,
 ): void {
   if (eventForwardingSetup) return;
   eventForwardingSetup = true;
@@ -1448,6 +1480,21 @@ export function setupEventForwarding(
       agentTaskService,
     ),
   );
+
+  // Forward ComputerUseService events (PiX 1.5.0) on the dedicated
+  // computer-use-event channel. Same app-level lifetime as AgentTaskService:
+  // one subscription at setup time, released by teardownEventForwarding.
+  if (computerUseService) {
+    eventForwardingUnsubscribes.push(
+      subscribeComputerUseEventForwarding(
+        computerUseService,
+        () => {
+          const win = getWin();
+          return win && !win.isDestroyed() ? win.webContents : null;
+        },
+      ),
+    );
+  }
 
   // Forward Team leader AgentSession events on dedicated channels. Same
   // message_update coalescing as the pi-event channel above (perf SDD §4.2).

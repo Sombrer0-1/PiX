@@ -6,7 +6,7 @@
  */
 
 import { randomUUID } from "crypto";
-import { BrowserWindow, Menu, app, shell } from "electron";
+import { BrowserWindow, Menu, app, globalShortcut, shell } from "electron";
 import { dirname, join } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -23,6 +23,7 @@ import {
 } from "./agent-task/agent-task-store.js";
 import { AgentTaskService } from "./agent-task/agent-task-service.js";
 import { setRestoreGate } from "./ipc-agent-task-adapters.js";
+import { ComputerUseService } from "./computer-use/computer-use-service.js";
 
 // ESM doesn't have __dirname; derive it from import.meta.url.
 const __filename = fileURLToPath(import.meta.url);
@@ -38,6 +39,7 @@ let teamManager: TeamManager | null = null;
 let productEventCollector: ProductEventCollector | null = null;
 let agentTaskStore: AgentTaskStore | null = null;
 let agentTaskService: AgentTaskService | null = null;
+let computerUseService: ComputerUseService | null = null;
 /** Frozen at service construction; prepareShutdown writes matching close markers with it. */
 let agentTaskRunId = "";
 
@@ -148,6 +150,16 @@ async function cleanup(): Promise<void> {
       console.error("[main] Error during team manager cleanup:", err);
     }
   }
+  // Computer use (PiX 1.5.0) disposes BEFORE the bridges: cancelAll, controller
+  // dispose (end_session), driver stop and shortcut unregister happen while the
+  // sessions that own the controllers are still alive.
+  if (computerUseService) {
+    try {
+      await computerUseService.dispose();
+    } catch (err) {
+      console.error("[main] Error during computer use cleanup:", err);
+    }
+  }
   if (teamLeaderSessionBridge) {
     try {
       // 1.4.2 (R4): only the app cleanup marks the bridges as app-shutting-down;
@@ -239,11 +251,45 @@ app.whenReady().then(async () => {
   const whenRestored = restorePromise.catch(() => {});
   setRestoreGate(whenRestored);
 
+  // App-level computer-use service (PiX 1.5.0): constructed BEFORE the single
+  // bridge so the first generation can build its controller; init() is deferred
+  // to after createWindow (fire-and-forget) so a slow custom driver path can
+  // never delay the window. init() only sweeps stale files, locates the driver
+  // (skipped while globally disabled) and computes availability (no process
+  // start); a failure is logged and never blocks startup. Electron-facing
+  // capabilities arrive through deps.electron (shortcut, surface facts, macOS
+  // permission deep links), keeping the service testable in pure Node.
+  // appVersion feeds the driver handshake's clientInfo (mcp-driver-client falls
+  // back to a built-in literal).
+  try {
+    computerUseService = new ComputerUseService({
+      agentDir: getAgentDir(),
+      initialSettings: settingsStore.getAll().computerUse,
+      appVersion: app.getVersion(),
+      electron: {
+        registerShortcut: (accelerator, cb) =>
+          globalShortcut.register(accelerator, cb) && globalShortcut.isRegistered(accelerator),
+        unregisterShortcut: (accelerator) => globalShortcut.unregister(accelerator),
+        surface: {
+          getPixPids: () => app.getAppMetrics().map((metric) => metric.pid),
+          isPixFocused: () => BrowserWindow.getFocusedWindow() !== null,
+        },
+        openExternal: async (url) => {
+          await shell.openExternal(url);
+        },
+      },
+    });
+  } catch (err) {
+    console.error("[main] ComputerUseService FAILED:", err);
+    computerUseService = null;
+  }
+
   try {
     singleSessionBridge = new SessionBridge({
       role: "single",
       productEventCollector: productEventCollector ?? undefined,
       agentTaskService: agentTaskService ?? undefined,
+      computerUseService: computerUseService ?? undefined,
     });
   } catch (err) {
     console.error("[main] Single SessionBridge FAILED:", err);
@@ -273,9 +319,19 @@ app.whenReady().then(async () => {
   createWindow();
   activeWin = mainWindow;
 
+  // Computer-use init runs AFTER the window exists and is never awaited: the
+  // driver location/probe can stall on a slow custom path (network share) and
+  // must not delay the first paint. Failures are logged only; the first
+  // ensureReady()/recheck_driver re-resolves lazily anyway.
+  if (computerUseService) {
+    computerUseService.init().catch((err: unknown) => {
+      console.warn("[main] ComputerUseService init failed:", err);
+    });
+  }
+
   if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager && agentTaskService) {
-    registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager, agentTaskService);
-    setupEventForwarding(() => activeWin, singleSessionBridge, teamLeaderSessionBridge, teamManager, agentTaskService);
+    registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager, agentTaskService, computerUseService ?? undefined);
+    setupEventForwarding(() => activeWin, singleSessionBridge, teamLeaderSessionBridge, teamManager, agentTaskService, computerUseService ?? undefined);
   } else {
     setRestoreGate(Promise.resolve());
   }
@@ -293,7 +349,7 @@ app.whenReady().then(async () => {
       activeWin = mainWindow;
       if (activeWin && singleSessionBridge && teamLeaderSessionBridge && teamManager && agentTaskService) {
         // Re-register IPC handlers for the new window (handler guard prevents duplicates)
-        registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager, agentTaskService);
+        registerIpcHandlers(activeWin, singleSessionBridge, teamLeaderSessionBridge, settingsStore, teamManager, agentTaskService, computerUseService ?? undefined);
         // Event forwarding is already set up with a getter; updating activeWin is enough.
       }
     }

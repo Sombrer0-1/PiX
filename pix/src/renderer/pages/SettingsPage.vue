@@ -12,12 +12,15 @@ import { useAuthStore } from "../stores/auth-store";
 import { useWorkspaceRpc } from "../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 import { thinkingLevelItems } from "../utils/thinking-labels";
+import { toPlain } from "../utils/plain";
 import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, AGENT_TASK_MAX_RUNNING_SLOTS } from "@shared/agent-task-types.js";
+import { isAbsoluteComputerUseDriverPath, type ComputerUseSettings } from "@shared/computer-use-types.js";
 import SettingsGroup from "../components/settings/SettingsGroup.vue";
 import SettingsRow from "../components/settings/SettingsRow.vue";
 import WindowTitlebar from "../components/layout/WindowTitlebar.vue";
 import McpSettings from "../components/settings/McpSettings.vue";
 import CustomProviders from "../components/settings/CustomProviders.vue";
+import ComputerUseSettingsSection from "../components/settings/ComputerUseSettings.vue";
 
 const router = useRouter();
 const route = useRoute();
@@ -30,6 +33,7 @@ type SettingsSection =
   | "general"
   | "plan"
   | "images"
+  | "computer-use"
   | "environment"
   | "resources"
   | "model"
@@ -74,6 +78,14 @@ const sections: {
     group: "使用偏好",
     description: "管理图片输入与眼睛模型。",
     keywords: "自动缩放 禁图 阻止图片 视觉 takeHerEyes 提供商",
+  },
+  {
+    key: "computer-use",
+    label: "电脑操控",
+    icon: "mdi-monitor-screenshot",
+    group: "使用偏好",
+    description: "让 Agent 观察并操作本机桌面。",
+    keywords: "computer use 电脑操控 桌面 截图 驱动 cua 自动化",
   },
   {
     key: "environment",
@@ -216,6 +228,10 @@ const blockImages = ref(false);
 const takeHerEyesEnabled = ref(false);
 const takeHerEyesModel = ref("");
 
+// computer-use（电脑操控）全局设置；缺省 = 全局关闭 + 全部默认值
+// （数值夹取由主进程的 resolveComputerUseSettings 读取时完成，这里保留用户原值）。
+const computerUse = ref<ComputerUseSettings>({ enabled: false });
+
 // Plan-mode settings (1.4.0). Empty planModelKey/planThinkingLevel mean
 // "inherit the current session model" and persist as undefined.
 const planModelKey = ref("");
@@ -316,6 +332,7 @@ const formSnapshot = computed(() =>
     blockImages.value,
     takeHerEyesEnabled.value,
     takeHerEyesModel.value,
+    computerUse.value,
     planModelKey.value,
     planThinkingLevel.value,
     enableProductAnalytics.value,
@@ -552,6 +569,7 @@ async function loadSettings(): Promise<void> {
     settingsStore.settings.takeHerEyes?.provider && settingsStore.settings.takeHerEyes?.modelId
       ? `${settingsStore.settings.takeHerEyes.provider}/${settingsStore.settings.takeHerEyes.modelId}`
       : "";
+  computerUse.value = settingsStore.settings.computerUse ?? { enabled: false };
   planModelKey.value =
     settingsStore.settings.planModel?.provider && settingsStore.settings.planModel?.modelId
       ? `${settingsStore.settings.planModel.provider}/${settingsStore.settings.planModel.modelId}`
@@ -699,6 +717,12 @@ async function saveSettings(): Promise<void> {
     selectSection("advanced");
     return;
   }
+  const driverPath = computerUse.value.driverPath;
+  if (typeof driverPath === "string" && driverPath !== "" && !isAbsoluteComputerUseDriverPath(driverPath)) {
+    saveError.value = "自定义驱动路径须为绝对路径（例如 C:\\tools\\cua-driver.exe 或 /usr/local/bin/cua-driver）。";
+    selectSection("computer-use");
+    return;
+  }
   saving.value = true;
   saved.value = false;
   const submittedForm = formSnapshot.value;
@@ -738,6 +762,11 @@ async function saveSettings(): Promise<void> {
         provider: selectedEyeModel?.provider,
         modelId: selectedEyeModel?.modelId,
       },
+      // computer-use 设置：与 takeHerEyes 同模式，
+      // 全量提交当前表单值（可选字段缺省即用主进程默认）。
+      // toPlain：computerUse.value 是深层 reactive Proxy，直接放进 IPC 负载会
+      // 让结构化克隆抛 DataCloneError，导致设置页所有保存失败。
+      computerUse: toPlain(computerUse.value),
       // 1.4.0 plan-mode settings; empty selection persists as undefined
       // ("inherit the session model").
       planModel: selectedPlanModel,
@@ -1166,6 +1195,11 @@ async function downloadAndInstall(): Promise<void> {
                   />
                 </SettingsRow>
               </SettingsGroup>
+            </section>
+            <section v-show="activeSection === 'computer-use'" class="section-panel" aria-label="computer-use">
+              <h1 class="section-title">{{ sections.find((section) => section.key === "computer-use")?.label }}</h1>
+              <p class="section-desc">{{ sections.find((section) => section.key === "computer-use")?.description }}</p>
+              <ComputerUseSettingsSection v-model="computerUse" />
             </section>
             <section v-show="activeSection === 'environment'" class="section-panel" aria-label="environment">
               <h1 class="section-title">{{ sections.find((section) => section.key === "environment")?.label }}</h1>

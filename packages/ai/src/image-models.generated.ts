@@ -7,7 +7,22 @@ export const IMAGE_MODELS = {
 	"openrouter": {
 		"black-forest-labs/flux-3-image": {
 			id: "black-forest-labs/flux-3-image",
-			name: "Black Forest Labs: FLUX.3 Image",
+			name: "Black Forest Labs: FLUX 3 Image",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"black-forest-labs/flux-3-image-klein": {
+			id: "black-forest-labs/flux-3-image-klein",
+			name: "Black Forest Labs: FLUX 3 Image Klein",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
@@ -245,24 +260,9 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
-		"inclusionai/ming-image-0.1-design": {
-			id: "inclusionai/ming-image-0.1-design",
-			name: "inclusionAI: Ming Image 0.1 Design",
-			api: "openrouter-images",
-			provider: "openrouter",
-			baseUrl: "https://openrouter.ai/api/v1",
-			input: ["text"],
-			output: ["image"],
-			cost: 	{
-	  "input": 0,
-	  "output": 0,
-	  "cacheRead": 0,
-	  "cacheWrite": 0
-	}
-		} satisfies ImagesModel<"openrouter-images">,
-		"inclusionai/ming-image-0.1-design-layer": {
-			id: "inclusionai/ming-image-0.1-design-layer",
-			name: "inclusionAI: Ming Image 0.1 Design Layer",
+		"krea/k3-edit": {
+			id: "krea/k3-edit",
+			name: "Krea: K3 Edit",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
@@ -541,6 +541,36 @@ export const IMAGE_MODELS = {
 			cost: 	{
 	  "input": -1000000,
 	  "output": -1000000,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"qwen/qwen-image-2.1-pro": {
+			id: "qwen/qwen-image-2.1-pro",
+			name: "Qwen: Qwen Image 2.1 Pro",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"qwen/qwen-image-2.1-turbo": {
+			id: "qwen/qwen-image-2.1-turbo",
+			name: "Qwen: Qwen Image 2.1 Turbo",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
 	  "cacheRead": 0,
 	  "cacheWrite": 0
 	}
@@ -875,6 +905,21 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
+		"sourceful/riverflow-v2.6-pro": {
+			id: "sourceful/riverflow-v2.6-pro",
+			name: "Sourceful: Riverflow V2.6 Pro",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 0,
+	  "output": 0,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
 		"tencent/hy-image-v3.5-preview": {
 			id: "tencent/hy-image-v3.5-preview",
 			name: "Tencent: Hy Image 3.5 Preview",
@@ -893,21 +938,6 @@ export const IMAGE_MODELS = {
 		"x-ai/grok-imagine-image-2.0": {
 			id: "x-ai/grok-imagine-image-2.0",
 			name: "xAI: Grok Imagine Image 2.0",
-			api: "openrouter-images",
-			provider: "openrouter",
-			baseUrl: "https://openrouter.ai/api/v1",
-			input: ["text","image"],
-			output: ["image"],
-			cost: 	{
-	  "input": 0,
-	  "output": 0,
-	  "cacheRead": 0,
-	  "cacheWrite": 0
-	}
-		} satisfies ImagesModel<"openrouter-images">,
-		"x-ai/grok-imagine-image-quality": {
-			id: "x-ai/grok-imagine-image-quality",
-			name: "SpaceXAI: Grok Imagine Image Quality",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",

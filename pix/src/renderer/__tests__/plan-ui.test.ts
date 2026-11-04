@@ -43,6 +43,7 @@ import PlanModeToggle from "../components/plan/PlanModeToggle.vue";
 import PlanCard from "../components/plan/PlanCard.vue";
 import PlanStepCard from "../components/plan/PlanStepCard.vue";
 import { useTodoStore } from "../stores/todo-store";
+import { computerUseApiMocks } from "./helpers/computer-use-fixtures";
 
 // ============================================================================
 // Mocks (module-level, hoisted)
@@ -278,6 +279,8 @@ function installPixApiMock(): void {
     onWorkflowEvent,
     sendTodoCommand: vi.fn().mockResolvedValue({ success: true }),
     onTodoEvent,
+    // CenterPanel 挂载 ComputerUseToggle/ActivityBar → store.start() 走的 computer-use IPC 表面。
+    ...computerUseApiMocks(),
     selectChatFiles,
   } as unknown as PixApi;
 }

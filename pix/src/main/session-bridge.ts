@@ -42,7 +42,7 @@ import type { SubagentExecutionContext, SubagentToolHost } from "./subagent/type
 import { SHELL_BACKGROUND_TOOLS, SubagentRunner } from "./subagent/subagent-runner.js";
 import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "./subagent/subagent-tool.js";
 import { createInspectAgentTaskTool } from "./subagent/inspect-agent-task.js";
-import { PlanController } from "./plan/plan-controller.js";
+import { isPlanRestrictedPhase, PlanController } from "./plan/plan-controller.js";
 import type {
   PlanControllerContext,
   PlanDisposeReason,
@@ -114,6 +114,11 @@ import type {
 import { type CustomApi, type CustomProviderConfig, SENTINEL, type FetchProviderModelsResult } from "../shared/custom-providers.js";
 import { fetchProviderModels, resolveApiKeyForProbe } from "./providers/fetch-models.js";
 import { processChatFiles } from "./chat-files.js";
+import { SCREENSHOT_RETENTION_CHUNK } from "./computer-use/contracts.js";
+import { createComputerActTool, createComputerObserveTool } from "./computer-use/computer-tools.js";
+import { createComputerUseExtension } from "./computer-use/computer-use-extension.js";
+import type { ComputerUseService } from "./computer-use/computer-use-service.js";
+import type { ComputerUseSessionController } from "./computer-use/session-controller.js";
 
 interface ExitPayload {
 	code: number | null;
@@ -156,6 +161,8 @@ export interface SessionBridgeOptions {
 	productEventCollector?: ProductEventCollector;
 	/** App-level agent task service (1.4.1); injected by index.ts. */
 	agentTaskService?: AgentTaskService;
+	/** App-level computer-use service (PiX 1.5.0); injected by index.ts for the solo bridge only (team-leader ignores it). */
+	computerUseService?: ComputerUseService;
 }
 
 const TAKE_HER_EYES_TIMEOUT_MS = 45_000;
@@ -278,6 +285,8 @@ interface RuntimeGeneration {
 	readonly planController: PlanController;
 	/** Session todo list of this generation (R3); in-memory, model-written via todo_write. */
 	readonly todoController: TodoController;
+	/** Computer-use controller of this generation (PiX 1.5.0); null when the service is absent/disabled or the global switch is off. */
+	readonly computerUse: ComputerUseSessionController | null;
 	/** Workflow engine of this generation (PiX 1.4.3): children spawn through the generation's AgentTaskService via the injected spawner (host/engine never import AgentTaskService). */
 	readonly workflowEngine: WorkerThreadWorkflowEngine;
 	/** Durable projection + V143 lifecycle binding of this generation's workflow runs. */
@@ -603,6 +612,8 @@ export class SessionBridge {
 	private _productEventCollector: ProductEventCollector | undefined;
 	/** App-level agent task service (1.4.1); owned by index.ts, borrowed. */
 	private _agentTaskService: AgentTaskService | undefined;
+	/** App-level computer-use service (PiX 1.5.0); owned by index.ts, solo bridge only. */
+	private _computerUseService: ComputerUseService | undefined;
 	/** First activate in this process is app_restart; later session switches are session_reopen. */
 	private _planTaskLinkHydration: PlanTaskLinkHydration = "app_restart";
 	private _session: AgentSession | null = null;
@@ -681,6 +692,14 @@ export class SessionBridge {
 		this._teamManager = this._role === "team-leader" ? options.teamManager ?? null : null;
 		this._productEventCollector = options.productEventCollector;
 		this._agentTaskService = options.agentTaskService;
+		// Computer use is solo-only: the team-leader bridge ignores the
+		// injection; subagent / workflow / AgentTask sessions never mount the tools.
+		this._computerUseService = this._role === "single" ? options.computerUseService : undefined;
+		if (this._computerUseService) {
+			// The service reads the foreground controller through this provider;
+			// the bridge never exposes the driver client itself.
+			this._computerUseService.setForegroundControllerProvider(() => this._generation?.computerUse ?? null);
+		}
 	}
 
 	async start(location: ProjectLocation | string, guiSettings?: GuiSettings): Promise<void> {
@@ -803,7 +822,6 @@ export class SessionBridge {
 	getSessionWorkflowEntries(): SessionEntry[] {
 		return this._sessionManager?.getEntries() ?? [];
 	}
-
 
 	/** Get the current working directory (empty if no session started). */
 	getCwd(): string {
@@ -2625,6 +2643,13 @@ export class SessionBridge {
 		this._userInputState = userInputState;
 
 		let parentSessionRef: AgentSession | null = null;
+		// Computer-use controller for this candidate solo generation. Declared
+		// outside the try because createController registers it in the service
+		// registry the moment it is built: until the generation record at
+		// the bottom takes ownership, ANY failure in between must dispose it here
+		// or it leaks in the registry forever (ownership is handed over by
+		// nulling this local right after the generation is assigned).
+		let computerUseController: ComputerUseSessionController | null = null;
 		try {
 			if (isSolo) {
 				// Solo runtime: the generation owns its auth storage and model
@@ -2635,6 +2660,26 @@ export class SessionBridge {
 				this._authStorage = generationAuthStorage;
 				const generationModelRegistry = ModelRegistry.create(generationAuthStorage, join(agentDir, "models.json"));
 
+				// Computer use (PiX 1.5.0): one controller per solo
+				// generation, created BEFORE the resource loader because the
+				// extensionFactories array literal is evaluated immediately by the
+				// DefaultResourceLoader constructor while planController and the
+				// generation literal are declared below - the isPlanRestricted
+				// closure only runs on tool execution / hook firing, by which time
+				// those block bindings are initialized (a deferred closure never
+				// trips TS2448). getSession resolves lazily: session_start fires
+				// inside bindExtensions, after parentSessionRef is assigned.
+				computerUseController = this._computerUseService?.isGloballyEnabled()
+					? this._computerUseService.createController({
+						genId,
+						getSession: () => parentSessionRef,
+						getSessionManager: () => sessionManager,
+						isForeground: () => this._generation?.genId === genId,
+						requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
+						isPlanRestricted: () => isPlanRestrictedPhase(planController.getSnapshot().phase),
+					})
+					: null;
+
 				const resourceLoader = new DefaultResourceLoader({
 					cwd,
 					agentDir,
@@ -2642,6 +2687,17 @@ export class SessionBridge {
 					extensionFactories: [
 						(pi) => { mcpAdapter.register(pi); },
 						createActiveCompressionExtension(() => sessionManager),
+						// Appended AFTER the compression extension: context handlers
+						// chain in registration order, so screenshot
+						// retention sees the compressed message list. The keep-count
+						// is read from the service's resolved settings on EVERY call
+						// so a settings change takes effect without a session rebuild.
+						...(computerUseController
+							? [createComputerUseExtension(computerUseController, () => ({
+								keepRecent: this._computerUseService!.getResolvedSettings().keepRecentScreenshots,
+								chunk: SCREENSHOT_RETENTION_CHUNK,
+							}))]
+							: []),
 					],
 				});
 				await resourceLoader.reload();
@@ -2887,6 +2943,7 @@ export class SessionBridge {
 					mcpAdapter,
 					planController,
 					todoController,
+					computerUse: computerUseController,
 					workflowEngine,
 					workflowRecorder,
 				};
@@ -2921,6 +2978,15 @@ export class SessionBridge {
 						createWorkflowToolDefinition(workflowHost) as ToolDefinition,
 						createRalphToolDefinition(workflowHost) as ToolDefinition,
 						createTodoWriteTool(todoController) as ToolDefinition,
+						// Computer-use tools (PiX 1.5.0). Mounted only when the global
+						// switch is on at generation creation; the controller's
+						// reconcileTools decides per-turn visibility.
+						...(computerUseController
+							? [
+								createComputerObserveTool(computerUseController) as ToolDefinition,
+								createComputerActTool(computerUseController) as ToolDefinition,
+							]
+							: []),
 					],
 					// Authoritative host tool policy during planning/revising;
 					// survives extension reloads (PiX 1.4.0 F1).
@@ -2930,6 +2996,12 @@ export class SessionBridge {
 				});
 				parentSessionRef = result.session;
 				generation.session = result.session;
+				// Ownership of the controller fully transferred to the live
+				// generation: later failures go through the normal generation
+				// teardown. Nulling here keeps the catch-side leak guard from
+				// disposing an already-owned controller (dispose is idempotent, so
+				// even a createAgentSession failure between the two lines is safe).
+				computerUseController = null;
 				this._applyEnabledModelScope(result.session);
 				return result;
 			}
@@ -2974,6 +3046,13 @@ export class SessionBridge {
 			// close this generation's input queue and clear bridge fields -
 			// not just null the references (design plan 4.9).
 			await this._disposeCandidateRuntime(parentSessionRef);
+			// A controller built before the generation record exists is not
+			// covered by _disposeCandidateRuntime (which only disposes generation.
+			// computerUse) but is already registered in the service registry -
+			// dispose it here or it leaks there forever (its dispose is wrapped
+			// by the service to unregister itself; also idempotent, so the brief
+			// window where the generation owns it is double-dispose safe).
+			await this._disposeComputerUseController(computerUseController);
 			throw err;
 		}
 	}
@@ -3015,6 +3094,10 @@ export class SessionBridge {
 			}
 			// R3: generation-bound todo listeners (in-memory items die with the instance).
 			generation.todoController.dispose();
+			// Computer use (PiX 1.5.0): dispose the generation's controller
+			// (end_session on the backend, release the lease); a dispose failure
+			// is logged and never blocks the remaining teardown.
+			void this._disposeComputerUseController(generation.computerUse);
 			try {
 				await generation.runner.dispose();
 			} catch (err) {
@@ -3045,6 +3128,16 @@ export class SessionBridge {
 		}
 		this._mcpAdapter = null;
 		this._authStorage = null;
+	}
+
+	private async _disposeComputerUseController(
+		controller: ComputerUseSessionController | null | undefined,
+	): Promise<void> {
+		try {
+			await controller?.dispose();
+		} catch (err: unknown) {
+			console.error("[SessionBridge] Error during computer-use controller dispose:", err);
+		}
 	}
 
 	private async _activateSession(session: AgentSession): Promise<void> {
@@ -3523,6 +3616,10 @@ export class SessionBridge {
 		// (the background-session close path routes through this same teardown,
 		// so all three conceptual close sites are covered by the two blocks).
 		generation?.todoController.dispose();
+		// Computer use (PiX 1.5.0): same placement as the todo dispose - the active
+		// close and every background-close site route through here; dispose
+		// errors are logged, never blocking.
+		void this._disposeComputerUseController(generation?.computerUse);
 		teardownActiveFields();
 
 		// Mark the input queue closing and invalidate the generation FIRST.
@@ -3685,6 +3782,9 @@ export class SessionBridge {
 			this._onBackgroundSessionEvent(record, event as AgentSessionEvent);
 		});
 		this._backgroundSessions.set(path, record);
+		// Computer use: the detached generation is no longer foreground -
+		// revoke grants, release the desktop lease and abort an in-flight act.
+		generation.computerUse?.onBackgrounded();
 		// D2.7: broadcast the new live set.
 		this._broadcastSessionsState();
 		// D2.8: cap enforcement is fire-and-forget so the switch is not blocked
@@ -3728,6 +3828,9 @@ export class SessionBridge {
 		this._auxiliaryUsage = record.generation.auxiliaryUsage;
 		this._eyeUsage = record.eyeUsage;
 		this._userInputState = record.userInput;
+		// Computer use: the re-attached generation is foreground again -
+		// re-read the session toggle entry and reconcile the active tool set.
+		record.generation.computerUse?.onForegrounded();
 		// D3.3: the suspended active request is re-sent once (the renderer has
 		// no card after the switch); queued items pump through the normal FIFO
 		// now that the state is active again.

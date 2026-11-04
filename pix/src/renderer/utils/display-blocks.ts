@@ -350,6 +350,8 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   // text / tool call / agent end) clears it; thinking_end deliberately does not,
   // so the next move can still locate the block.
   let openThinkingBlockId: string | null = null;
+  const thinkingBlockIds = new Map<number, string>();
+  let thinkingMessageTimestamp: number | undefined;
   let legacyVisionStatusId: string | null = null;
   let visionStatusIds = new Map<string, string>();
   let optimisticUserMessages: Array<{ blockId: string; fingerprint: string; separatorId: string | null }> = [];
@@ -378,6 +380,9 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i];
       blockById.set(block.id, block);
+    }
+    for (const [index, id] of thinkingBlockIds) {
+      if (!blockById.has(id)) thinkingBlockIds.delete(index);
     }
   }
 
@@ -458,19 +463,9 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     pushBlock(block);
   }
 
-  /**
-   * 从累计快照回填当前 thinking 段（中途加入的组装器自愈）。
-   *
-   * message_update 的 message.content 是累计快照：任务详情/团队等中途挂载的
-   * 组装器错过了加入前已流出的 thinking 前缀，这里按 ame.contentIndex 从快照
-   * 取该段完整文本，净化后比本地块长才采用（正常流等长 no-op）。无
-   * contentIndex（防御路径）时仅当快照恰有一个 thinking 段才采用，多段不兜底
-   * （盲目取某段全文会污染另一段）。
-   */
-  function reconcileThinkingFromSnapshot(ame: AssistantMessageEventLike, message: AgentMessage | undefined): void {
-    if (!message || !Array.isArray(message.content) || !openThinkingBlockId) return;
-    const block = blockById.get(openThinkingBlockId);
-    if (!block || block.type !== "thinking") return;
+  /** Cumulative partials may advance while queued; use their segment, not delta + snapshot. */
+  function thinkingSnapshotContent(ame: AssistantMessageEventLike, message: AgentMessage | undefined): string | undefined {
+    if (!message || !Array.isArray(message.content)) return undefined;
     let segment: string | undefined;
     if (typeof ame.contentIndex === "number") {
       // contentIndex 是 message.content 的下标（跨 provider 已验证：anthropic/openai/google/faux）。
@@ -487,9 +482,36 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       );
       if (segments.length === 1) segment = segments[0].thinking;
     }
-    if (segment === undefined) return;
-    const full = stripAcpDisplayTags(segment);
-    if (full.length > block.content.length) block.content = full; // 净化后比较，只在更长时采用
+    return segment === undefined ? undefined : stripAcpDisplayTags(segment);
+  }
+
+  function beginThinkingMessage(message: AgentMessage, start = false): void {
+    const timestamp = typeof message.timestamp === "number" ? message.timestamp : undefined;
+    if (!start && timestamp === thinkingMessageTimestamp) return;
+    const open = openThinkingBlockId ? blockById.get(openThinkingBlockId) : undefined;
+    if (open?.type === "thinking" && open.content !== "") supersedeOpenThinking();
+    thinkingBlockIds.clear();
+    thinkingMessageTimestamp = timestamp;
+  }
+
+  /** Segment identity survives superseding so late events update the original row. */
+  function thinkingBlockForEvent(ame: AssistantMessageEventLike, timestamp: number): Extract<DisplayBlock, { type: "thinking" }> | undefined {
+    const index = typeof ame.contentIndex === "number" ? ame.contentIndex : undefined;
+    const knownId = index === undefined ? undefined : thinkingBlockIds.get(index);
+    const known = knownId ? blockById.get(knownId) : undefined;
+    if (known?.type === "thinking") return known;
+
+    const open = openThinkingBlockId ? blockById.get(openThinkingBlockId) : undefined;
+    const differentSegment = index !== undefined && [...thinkingBlockIds].some(([otherIndex, id]) => otherIndex !== index && id === openThinkingBlockId);
+    if (ame.type === "thinking_end" && differentSegment) return undefined;
+    if (open?.type === "thinking" && (differentSegment || (ame.type === "thinking_start" && open.phase === "ended"))) {
+      supersedeOpenThinking();
+    }
+    if (!openThinkingBlockId && ame.type !== "thinking_end") showThinkingBlock(timestamp);
+    const block = openThinkingBlockId ? blockById.get(openThinkingBlockId) : undefined;
+    if (block?.type !== "thinking") return undefined;
+    if (index !== undefined) thinkingBlockIds.set(index, block.id);
+    return block;
   }
 
   /**
@@ -504,33 +526,23 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
   function applyAssistantMessageEvent(ame: AssistantMessageEventLike, timestamp: number, message: AgentMessage | undefined): void {
     switch (ame.type) {
       case "thinking_start": {
-        // Adjacent thinking segment (两段思考之间无正文/工具事件): thinking_end
-        // keeps the block open, so an ended open block means a new segment
-        // starts — supersede it first so each segment folds into its own block
-        // (matches the replay path, which folds each thinking block separately).
-        const openBlock = openThinkingBlockId ? blockById.get(openThinkingBlockId) : null;
-        if (openBlock && openBlock.type === "thinking" && openBlock.phase === "ended") {
-          supersedeOpenThinking();
-        }
-        if (!openThinkingBlockId) showThinkingBlock(timestamp);
+        thinkingBlockForEvent(ame, timestamp);
         break;
       }
       case "thinking_delta": {
-        if (!openThinkingBlockId) showThinkingBlock(timestamp);
-        const block = openThinkingBlockId ? blockById.get(openThinkingBlockId) : null;
-        if (block && block.type === "thinking" && typeof ame.delta === "string") {
-          block.content = stripAcpDisplayTags(block.content + ame.delta);
+        const block = thinkingBlockForEvent(ame, timestamp);
+        if (block) {
+          const full = thinkingSnapshotContent(ame, message);
+          if (full !== undefined) block.content = full;
+          else if (typeof ame.delta === "string") block.content = stripAcpDisplayTags(block.content + ame.delta);
         }
-        // 追加 delta 后按累计快照对齐（中途加入的组装器自愈；正常流等长 no-op）。
-        reconcileThinkingFromSnapshot(ame, message);
         break;
       }
       case "thinking_end": {
-        // 快照回填先于 redacted 回填执行：快照采用后块非空，redacted 分支的
-        // "仅空块回填"守卫自然跳过；redacted 段快照为空串，"更长才采用"不覆盖。
-        reconcileThinkingFromSnapshot(ame, message);
-        const block = openThinkingBlockId ? blockById.get(openThinkingBlockId) : null;
-        if (block && block.type === "thinking") {
+        const block = thinkingBlockForEvent(ame, timestamp);
+        if (block) {
+          const full = thinkingSnapshotContent(ame, message);
+          if (full !== undefined) block.content = full;
           // Redacted thinking (Anthropic safety filter) and any provider that
           // emits no thinking_delta: the final value only arrives here.
           // Backfill an empty block so it survives into the timeline instead of
@@ -815,6 +827,8 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       case "agent_end": {
         currentAgentBlockId = null;
         supersedeOpenThinking();
+        thinkingBlockIds.clear();
+        thinkingMessageTimestamp = undefined;
         closeCurrentWorkStatus(true);
         // Sweep：封口后悬置的组（seal 时仍有 result===null 的工具）统一收尾
         // —— closeCurrentWorkStatus(true) 只覆盖 current 一块。结果仍可晚到
@@ -841,9 +855,10 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
             showThinkingBlock(messageTimestamp(msg));
           }
         } else if (msg.role === "assistant") {
+          beginThinkingMessage(msg, true);
           const text = extractContentText(msg);
           // Only create agent block when there's real text — skip empty tool-call-only messages
-          if (text) {
+          if (text && !(Array.isArray(msg.content) && msg.content.some((block) => block.type === "thinking"))) {
             currentAgentBlockId = createAgentBlock(text, true);
           }
         }
@@ -853,12 +868,14 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         const msg = event.message;
         if (isFoldableRole(msg.role) && foldedMessageKeys.has(foldKeyOf(msg))) break;
         if (msg.role === "assistant") {
+          beginThinkingMessage(msg);
           // Consume the streamed assistantMessageEvent (thinking / tool call
           // markers) before the text fold: a pure tool turn has no text
           // content, and the early return below would skip toolcall_start's
           // supersede.
           if (isAssistantMessageEvent(event.assistantMessageEvent)) {
             applyAssistantMessageEvent(event.assistantMessageEvent, messageTimestamp(msg), msg);
+            if (!event.assistantMessageEvent.type.startsWith("text_")) break;
           }
           const text = extractContentText(msg);
           if (!text) return;
@@ -878,6 +895,16 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
       case "message_end": {
         const msg = event.message;
         if (isFoldableRole(msg.role) && foldedMessageKeys.has(foldKeyOf(msg))) break;
+        if (msg.role === "assistant") {
+          const text = extractContentText(msg);
+          if (text) {
+            const current = currentAgentBlockId ? blockById.get(currentAgentBlockId) : undefined;
+            if (current?.type === "agent-message") current.content = stripAcpDisplayTags(text);
+            else currentAgentBlockId = createAgentBlock(text, false, messageTimestamp(msg));
+          }
+          thinkingBlockIds.clear();
+          thinkingMessageTimestamp = undefined;
+        }
         if (currentAgentBlockId) {
           const block = blockById.get(currentAgentBlockId);
           if (block && block.type === "agent-message") {
@@ -1232,11 +1259,14 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
         };
         const tool = toolsById.get(tr.toolCallId);
         if (tool) {
-          // The `agent` / `workflow` / `ralph` / `edit` / `write` tools keep the
-          // full { content, details } result shape on replay so their rich
+          // The `agent` / `workflow` / `ralph` / `edit` / `write` /
+          // `computer_observe` / `computer_act` tools keep the full
+          // { content, details } result shape on replay so their rich
           // renderers (SubagentToolView / WorkflowRunPanel / tool-details
-          // diff rows) can draw from the persisted details (edit/write 的
-          // details.diff / firstChangedLine 留作后续增强，本期渲染不依赖);
+          // diff rows / ComputerToolDetails) can draw from the persisted
+          // details (edit/write 的 details.diff / firstChangedLine 留作后续增强，
+          // 本期渲染不依赖; computer 的 details 只有元数据、不含 base64，
+          // 见 shared/computer-use-types.ts 的 ComputerToolDetails);
           // other tools keep the legacy content-only shape to avoid replay
           // bloat.
           const keepsDetails =
@@ -1244,7 +1274,9 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
             tr.toolName === "workflow" ||
             tr.toolName === "ralph" ||
             tr.toolName === "edit" ||
-            tr.toolName === "write";
+            tr.toolName === "write" ||
+            tr.toolName === "computer_observe" ||
+            tr.toolName === "computer_act";
           tool.result = keepsDetails ? { content: tr.content, details: tr.details } : tr.content;
           tool.isError = tr.isError;
           if (!tool.toolName && tr.toolName) tool.toolName = tr.toolName;
@@ -1265,6 +1297,8 @@ export function createDisplayBlockAssembler(options: DisplayBlockAssemblerOption
     currentAgentBlockId = null;
     currentWorkStatusId = null;
     openThinkingBlockId = null;
+    thinkingBlockIds.clear();
+    thinkingMessageTimestamp = undefined;
     legacyVisionStatusId = null;
     visionStatusIds = new Map();
     optimisticUserMessages = [];

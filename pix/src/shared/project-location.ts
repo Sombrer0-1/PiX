@@ -19,7 +19,9 @@
  * `takeHerEyes.modelId` and assign `defaultThinkingLevel` to a `ThinkingLevel`
  * ref. GuiSettings shape changes so far: the §4.3 additions (`schemaVersion`,
  * `wsl`), the 1.4.0 additions (`planModel`, `planThinkingLevel`,
- * `enableProductAnalytics`) and the 1.4.1 addition (`autoBackgroundMs`).
+ * `enableProductAnalytics`), the 1.4.1 addition (`autoBackgroundMs`) and the
+ * 1.5.0 addition (`computerUse`, whose `ComputerUseSettings` is co-located with
+ * `TakeHerEyesSettings` below).
  * `agentTaskMaxConcurrent` is optional; absent means the consumer default
  * (AGENT_TASK_DEFAULT_RUNNING_SLOTS = 4).
  * Migrations are per-version and never write the optional fields: an absent
@@ -99,6 +101,26 @@ export interface TakeHerEyesSettings {
   modelId?: string;
 }
 
+/**
+ * Computer-use（电脑操控）全局设置（1.5.0）。缺省（键不存在）= 全局关闭 + 全部
+ * 默认值；数值范围由 shared/computer-use-types.ts 的
+ * `resolveComputerUseSettings` 在读取时夹取（store 保留用户原值）。
+ */
+export interface ComputerUseSettings {
+  /** 全局功能开关，默认 false。 */
+  enabled: boolean;
+  /** 自定义 cua-driver 可执行文件绝对路径；缺省 = 托管安装。 */
+  driverPath?: string;
+  /** 截图长边像素 768–2560，缺省 1568。 */
+  maxImageDimension?: number;
+  /** 单张截图 base64 字节上限 150_000–1_500_000，缺省 450_000。 */
+  screenshotMaxBytes?: number;
+  /** 上下文保留最近截图数 1–8，缺省 3。 */
+  keepRecentScreenshots?: number;
+  /** 新会话默认开启会话开关，缺省 false。 */
+  defaultSessionEnabled?: boolean;
+}
+
 // ============================================================================
 // GUI settings
 // ============================================================================
@@ -141,4 +163,8 @@ export interface GuiSettings {
    * 仅用于全新空会话的初值。缺省 / undefined = false。resume 不使用。
    */
   defaultAcp?: boolean;
+  /**
+   * 1.5.0: computer-use（电脑操控）设置；缺省 = 全局关闭 + 全部默认值。
+   */
+  computerUse?: ComputerUseSettings;
 }

@@ -5,6 +5,7 @@ import { createVuetify } from "vuetify/dist/vuetify.js";
 import type { PixApi } from "../../main/preload";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import { useSessionStore } from "../stores/session-store";
+import { computerUseApiMocks } from "./helpers/computer-use-fixtures";
 
 vi.mock("../composables/useWorkspaceRpc", () => ({
   useWorkspaceRpc: () => ({
@@ -29,6 +30,8 @@ beforeEach(() => {
     onPlanEvent: () => () => {},
     onWorkflowEvent: () => () => {},
     onTodoEvent: () => () => {},
+    // CenterPanel 挂载 ComputerUseToggle/ActivityBar → store.start() 走的 computer-use IPC 表面。
+    ...computerUseApiMocks(),
   } as unknown as PixApi;
   useSessionStore().displayBlocks = [{
     id: "history-thinking",

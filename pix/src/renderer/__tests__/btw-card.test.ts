@@ -24,6 +24,7 @@ import CenterPanel from "../components/layout/CenterPanel.vue";
 import BtwCard from "../components/input/BtwCard.vue";
 import { useBtw } from "../composables/useBtw";
 import { renderMarkdown } from "../utils/markdown";
+import { computerUseApiMocks } from "./helpers/computer-use-fixtures";
 
 // ============================================================================
 // Mocks (module-level, hoisted)
@@ -209,6 +210,8 @@ function installPixApiMock(): void {
     onWorkflowEvent,
     sendTodoCommand: vi.fn().mockResolvedValue({ success: true }),
     onTodoEvent: vi.fn(() => () => {}),
+    // CenterPanel 挂载 ComputerUseToggle/ActivityBar → store.start() 走的 computer-use IPC 表面。
+    ...computerUseApiMocks(),
     selectChatFiles,
   } as unknown as PixApi;
 }

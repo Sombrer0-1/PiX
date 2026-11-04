@@ -233,6 +233,13 @@ export class SettingsStore {
         this.store.set("defaultAcp", settings.defaultAcp);
       }
     }
+    if (Object.hasOwn(settings, "computerUse")) {
+      if (settings.computerUse === undefined) {
+        this.store.delete("computerUse");
+      } else {
+        this.store.set("computerUse", settings.computerUse);
+      }
+    }
   }
 
   addRecentProject(path: string, name: string): void {

@@ -534,6 +534,77 @@ describe("loadEntries", () => {
       expect(ws.tools[2].result).toEqual([{ type: "text", text: "line1\nline2" }]);
     }
   });
+
+  it("keeps the computer_observe/computer_act result shape with details on replay", () => {
+    const a = createDisplayBlockAssembler();
+    a.loadEntries([
+      {
+        type: "message", timestamp: "2026-01-01T00:00:00.000Z",
+        message: makeMessage({
+          role: "assistant",
+          content: [
+            toolCallBlock("co-1", "computer_observe", { view: "window", pid: 7, window_id: 3 }),
+            toolCallBlock("ca-1", "computer_act", { action: "click", pid: 7, window_id: 3, x: 10, y: 20 }),
+          ],
+          timestamp: 100,
+        }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:01.000Z",
+        message: makeMessage({
+          role: "toolResult",
+          toolCallId: "co-1",
+          toolName: "computer_observe",
+          content: [{ type: "text", text: "window state" }],
+          details: {
+            kind: "observe",
+            view: "window",
+            target: { pid: 7, windowId: 3, frame: "window" },
+            screenshot: { width: 1280, height: 800, mimeType: "image/png", bytes: 212344 },
+            grant: "background",
+            durationMs: 120,
+            driverTool: "get_window_state",
+          },
+          isError: false,
+          timestamp: 200,
+        }),
+      },
+      {
+        type: "message", timestamp: "2026-01-01T00:00:02.000Z",
+        message: makeMessage({
+          role: "toolResult",
+          toolCallId: "ca-1",
+          toolName: "computer_act",
+          content: [{ type: "text", text: "clicked" }],
+          details: { kind: "act", action: "click", grant: "background", durationMs: 40, driverTool: "click" },
+          isError: false,
+          timestamp: 300,
+        }),
+      },
+    ]);
+    const ws = a.blocks.find((b) => b.type === "work-status");
+    expect(ws?.type).toBe("work-status");
+    if (ws && ws.type === "work-status") {
+      // Both computer-use tools keep the { content, details } shape on replay so
+      // ComputerToolDetails can draw from the persisted (base64-free) details.
+      expect(ws.tools[0].result).toEqual({
+        content: [{ type: "text", text: "window state" }],
+        details: {
+          kind: "observe",
+          view: "window",
+          target: { pid: 7, windowId: 3, frame: "window" },
+          screenshot: { width: 1280, height: 800, mimeType: "image/png", bytes: 212344 },
+          grant: "background",
+          durationMs: 120,
+          driverTool: "get_window_state",
+        },
+      });
+      expect(ws.tools[1].result).toEqual({
+        content: [{ type: "text", text: "clicked" }],
+        details: { kind: "act", action: "click", grant: "background", durationMs: 40, driverTool: "click" },
+      });
+    }
+  });
 });
 
 describe("internal notification protocol", () => {

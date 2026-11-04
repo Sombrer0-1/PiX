@@ -23,6 +23,7 @@
     "@earendil-works/pi-ai": "file:../packages/ai",
     "@earendil-works/pi-coding-agent": "file:../packages/coding-agent",
     "@mdi/font": "^7.4.47",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "electron-store": "^8.1.0",
     "electron-updater": "^6.8.9",
     "highlight.js": "^11.9.0",

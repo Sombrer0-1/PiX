@@ -81,6 +81,11 @@ export const PLAN_GENERATION_TIMEOUT_MS = 600_000;
 export const PLAN_MAX_DEVIATIONS = 50;
 export const PLAN_ABORT_SETTLE_MS = 5_000;
 
+/** True in the plan phases whose host tool policy is restricted to the allowlist (decideToolPolicy). */
+export function isPlanRestrictedPhase(phase: PlanStatus): boolean {
+  return phase === "planning" || phase === "revising";
+}
+
 export type PlanDisposeReason = "session_close" | "app_shutdown" | "host_disposed";
 /** app_restart: crash/shutdown hydration rewrites waiting_input(agent_task) to interrupted. session_reopen: keep waiting_input. */
 export type PlanTaskLinkHydration = "app_restart" | "session_reopen";
@@ -966,7 +971,7 @@ export class PlanController {
    */
   decideToolPolicy(input: HostToolPolicyInput): ToolPolicyDecision | undefined {
     const phase = this._snapshot.phase;
-    if (phase !== "planning" && phase !== "revising") {
+    if (!isPlanRestrictedPhase(phase)) {
       return undefined;
     }
     if (PLAN_ALLOWLIST.includes(input.toolName)) {

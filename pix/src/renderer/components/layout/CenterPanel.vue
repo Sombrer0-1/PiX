@@ -30,10 +30,13 @@ import TeamDashboard from "../team/TeamDashboard.vue";
 import WorkerStatusBar from "../team/WorkerStatusBar.vue";
 import PlanModeToggle from "../plan/PlanModeToggle.vue";
 import PlanCard from "../plan/PlanCard.vue";
+import ComputerUseToggle from "../computer-use/ComputerUseToggle.vue";
+import ComputerUseActivityBar from "../computer-use/ComputerUseActivityBar.vue";
 import { usePlanStore } from "../../stores/plan-store";
 import { useWorkflowStore } from "../../stores/workflow-store";
 import { useTodoStore } from "../../stores/todo-store";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
+import { useComputerUseStore } from "../../stores/computer-use-store";
 import TaskCenterView from "../agent-task/TaskCenterView.vue";
 import { btwValidateQuestion } from "@shared/types.js";
 import type { AgentTaskInfo, PlanStatus } from "@shared/types.js";
@@ -52,6 +55,7 @@ const planStore = usePlanStore();
 const workflowStore = useWorkflowStore();
 const todoStore = useTodoStore();
 const agentTaskStore = useAgentTaskStore();
+const computerUseStore = useComputerUseStore();
 
 /** sessionId -> 会话名（任务中心行/详情来源展示）。team 模式下任务挂在 host
  *  运行时会话上，所以取团队会话列表；席位 session 与 agent-task 无关。 */
@@ -248,6 +252,12 @@ const isEmptySession = computed(() => sessionStore.displayBlocks.value.length ==
 const acpEnabled = computed(() => rpc.sessionState.value?.acp?.enabled === true);
 const acpLocked = computed(() => rpc.sessionState.value?.acp?.locked === true);
 const showAcpToggle = computed(() => isEmptySession.value && rpc.isConnected.value);
+
+// 电脑操控：前台会话切换时拉取一次权威快照，
+// 让开关与活动条反映新会话（真相在主进程；此处只触发刷新，快照由 store 镜像）。
+watch(currentSessionId, () => {
+  void computerUseStore.refresh();
+});
 
 async function onAcpToggle(enabled: boolean | null): Promise<void> {
   if (acpLocked.value) return;
@@ -1422,11 +1432,17 @@ function sendQuickStart(prompt: string): void {
       </div>
     </template>
 
-    <!-- Composer 只在 solo 渲染：团队模式的输入是圆桌的 RoundtableComposer，
-         它走 TeamCommand，绝不经过 host 会话的 prompt。
-         任务中心打开时隐藏(假设 5:任务中心为完整中心视图)。 -->
-    <div v-if="!teamStore.teamMode && (!agentTaskStore.centerOpen || teamStore.pendingProtocolCount > 0)" class="center-composer" :class="{ 'requests-only': agentTaskStore.centerOpen }">
+    <!-- Composer 容器在 solo 常驻（与 TaskCenterView 同级的持久层）：
+         输入区只在任务中心关闭时渲染（任务中心为完整中心视图），但容器
+         保持挂载，让电脑操控活动条（唯一 UI 停止入口）在任务中心
+         打开时仍可见可用。团队模式的输入是圆桌的 RoundtableComposer，它走
+         TeamCommand，绝不经过 host 会话的 prompt。 -->
+    <div v-if="!teamStore.teamMode" class="center-composer" :class="{ 'requests-only': agentTaskStore.centerOpen }">
       <TeamProtocolPanel v-if="teamStore.pendingProtocolCount > 0" />
+      <!-- 电脑操控活动条：composer 上方，
+           会话开启且持有租约/有活动时自显示（可见性在组件内判定，
+           非活动时渲染为空，故容器常驻不产生视觉占位）。 -->
+      <ComputerUseActivityBar />
       <div
         v-if="!agentTaskStore.centerOpen"
         class="composer-inner"
@@ -1543,6 +1559,7 @@ function sendQuickStart(prompt: string): void {
               :disable-reason="planToggleDisableReason"
               @update:armed="planArmed = $event"
             />
+            <ComputerUseToggle />
             <button
               class="composer-icon-btn"
               @click="pickFiles"

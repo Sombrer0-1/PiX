@@ -47,3 +47,5 @@ collect.sh
 *-with-proxy.bat
 openrouter-docs/
 workflow_build/
+
+.zcode/
