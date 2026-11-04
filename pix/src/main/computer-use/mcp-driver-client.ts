@@ -67,7 +67,7 @@ const CRASH_FUSE_COUNT = 3;
  * tests): this pure-Node module cannot call `app.getVersion()` without pulling
  * in `electron`, and the driver only logs the value.
  */
-const PIX_MCP_CLIENT_VERSION = "1.4.3";
+const PIX_MCP_CLIENT_VERSION = "1.5.0";
 
 const DRIVER_UNAVAILABLE_HINT =
 	"The computer-use driver is not available. Open Settings and install or repair it, then retry.";

@@ -309,7 +309,7 @@ await run("clientVersion: injected value is used, default falls back", async () 
 	try {
 		await fallback.client.ensureStarted();
 		const init = readReport(fallback.reportPath).find((line) => line.phase === "initialized");
-		assertEqual(init?.clientInfo?.version, "1.4.3", "without injection the built-in default is sent as clientInfo.version");
+		assertEqual(init?.clientInfo?.version, "1.5.0", "without injection the built-in default is sent as clientInfo.version");
 	} finally {
 		await fallback.client.stop();
 	}
