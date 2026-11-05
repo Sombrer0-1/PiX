@@ -515,6 +515,36 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
+		"openai/gpt-image-2.6-flare": {
+			id: "openai/gpt-image-2.6-flare",
+			name: "OpenAI: GPT Image 2.6 Flare",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 8,
+	  "output": 8,
+	  "cacheRead": 2,
+	  "cacheWrite": 10
+	}
+		} satisfies ImagesModel<"openrouter-images">,
+		"openai/gpt-image-2.6-sunburst": {
+			id: "openai/gpt-image-2.6-sunburst",
+			name: "OpenAI: GPT Image 2.6 Sunburst",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["image"],
+			cost: 	{
+	  "input": 8,
+	  "output": 8,
+	  "cacheRead": 2,
+	  "cacheWrite": 10
+	}
+		} satisfies ImagesModel<"openrouter-images">,
 		"openrouter/auto": {
 			id: "openrouter/auto",
 			name: "Auto Router",

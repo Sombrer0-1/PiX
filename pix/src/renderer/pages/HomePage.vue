@@ -320,32 +320,34 @@ const piStatusLabel = computed(() => {
             <v-list-item
               v-for="project in recentProjects"
               :key="`${project.environment.kind}:${project.physicalPath}`"
-              :title="project.name"
-              :subtitle="formatDate(project.lastOpened)"
               :aria-label="`打开项目 ${project.name}`"
               :disabled="opening"
               class="project-list-item"
               @click="openRecentProject(project)"
             >
-              <template #append>
-                <div class="project-list-actions">
-                  <span class="project-env" :class="{ 'env-wsl': project.environment.kind === 'wsl' }">{{ envLabel(project) }}</span>
-                  <span class="project-path-mono" :title="project.path">{{ project.path }}</span>
-                  <button
-                    class="project-delete-btn"
-                    type="button"
-                    title="从最近列表移除（不会删除磁盘上的文件）"
-                    aria-label="从最近列表移除，不会删除文件"
-                    :disabled="opening"
-                    @click.stop="removeRecentProject(project)"
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <polyline points="3 6 5 6 21 6" />
-                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-                      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                    </svg>
-                  </button>
+              <template #default>
+                <div class="project-open-title">{{ project.name }}</div>
+                <div class="project-meta">
+                  <span class="project-open-subtitle">{{ formatDate(project.lastOpened) }}</span>
+                  <span class="project-env" :class="{ 'env-wsl': project.environment.kind === 'wsl' }" :title="envLabel(project)">{{ envLabel(project) }}</span>
                 </div>
+                <div class="project-path-mono" :title="project.path">{{ project.path }}</div>
+              </template>
+              <template #append>
+                <button
+                  class="project-delete-btn"
+                  type="button"
+                  title="从最近列表移除（不会删除磁盘上的文件）"
+                  aria-label="从最近列表移除，不会删除文件"
+                  :disabled="opening"
+                  @click.stop="removeRecentProject(project)"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                    <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  </svg>
+                </button>
               </template>
             </v-list-item>
           </v-list>
@@ -605,6 +607,7 @@ const piStatusLabel = computed(() => {
 }
 
 .project-list-item {
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
   cursor: pointer;
   border-radius: var(--pix-radius-md);
   margin: 4px 6px;
@@ -616,25 +619,34 @@ const piStatusLabel = computed(() => {
   background: var(--pix-bg-hover);
 }
 
-.project-list-actions {
-  display: inline-flex;
+.project-meta {
+  display: flex;
   align-items: center;
   gap: var(--pix-space-xs);
   min-width: 0;
+  margin: 2px 0;
+}
+
+.project-meta .project-open-subtitle {
+  flex-shrink: 0;
 }
 
 .project-path-mono {
+  display: block;
   font-family: var(--pix-font-mono);
   font-size: var(--pix-text-xs);
   color: var(--pix-text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 250px;
+  max-width: 100%;
 }
 
 .project-env {
-  flex-shrink: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--pix-text-xs);
   font-family: var(--pix-font-mono);
   color: var(--pix-text-muted);
@@ -650,6 +662,7 @@ const piStatusLabel = computed(() => {
 
 .project-delete-btn {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: center;
   width: 28px;

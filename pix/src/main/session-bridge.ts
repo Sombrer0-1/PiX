@@ -3512,10 +3512,7 @@ export class SessionBridge {
 		const generation = this._generation;
 		const userInput = this._userInputState;
 		try {
-			const flush = (
-				session?.sessionManager as { flushIfHasUserMessages?: () => boolean } | undefined
-			)?.flushIfHasUserMessages;
-			flush?.();
+			session?.sessionManager.flushIfHasUserMessages();
 		} catch (err) {
 			console.warn("[SessionBridge] Failed to flush unpersisted user messages:", err);
 		}
@@ -3943,10 +3940,7 @@ export class SessionBridge {
 		record.unsubscribe();
 		record.unsubscribe = () => {};
 		try {
-			const flush = (
-				record.sessionManager as { flushIfHasUserMessages?: () => boolean } | undefined
-			)?.flushIfHasUserMessages;
-			flush?.();
+			record.sessionManager.flushIfHasUserMessages();
 		} catch (err) {
 			console.warn("[SessionBridge] Failed to flush unpersisted user messages:", err);
 		}
