@@ -456,6 +456,17 @@ const executionModeItems = [
   { title: "审批模式", value: "approval", icon: "mdi-shield-check-outline", subtitle: "高风险操作需要确认。" },
   { title: "无监管模式", value: "unattended", icon: "mdi-lightning-bolt-outline", subtitle: "工具调用不弹出审批。" },
 ] as const;
+
+const executionModeDescription = computed(() => {
+  switch (executionMode.value) {
+    case "read-only":
+      return "只允许读取和搜索，禁止修改文件或执行写操作。";
+    case "unattended":
+      return "工具调用不会弹出审批，请确认风险可接受。";
+    default:
+      return "高风险操作执行前，向你请求批准。";
+  }
+});
 const transportOptions = [
   { title: "自动", value: "auto" },
   { title: "SSE", value: "sse" },
@@ -918,7 +929,7 @@ async function downloadAndInstall(): Promise<void> {
                 <SettingsRow
                   title="默认执行模式"
                   control-id="setting-executionMode"
-                  description="高风险操作执行前，向你请求批准。"
+                  :description="executionModeDescription"
                 >
                   <v-select
                     v-model="executionMode"
@@ -1484,6 +1495,8 @@ async function downloadAndInstall(): Promise<void> {
                     class="auth-provider-row"
                     role="button"
                     tabindex="0"
+                    :aria-expanded="editingProvider === provider"
+                    :aria-controls="`auth-edit-${provider}`"
                     @keydown.enter="toggleEditProvider(provider)"
                     @keydown.space.prevent="toggleEditProvider(provider)"
                     @click="toggleEditProvider(provider)"
@@ -1491,9 +1504,15 @@ async function downloadAndInstall(): Promise<void> {
                     <div class="auth-provider-info">
                       <span class="auth-provider-name">{{ provider }}</span>
                       <span v-if="status.label" class="auth-provider-label">{{ status.label }}</span>
-                      <button v-if="customProviderNames.has(provider)" class="auth-custom-hint" type="button" @click.stop="selectSection('custom')"
-                        >前往「自定义提供商」管理密钥</button
-                      >
+                      <span
+                        v-if="customProviderNames.has(provider)"
+                        class="auth-custom-hint"
+                        role="link"
+                        tabindex="0"
+                        @click.stop="selectSection('custom')"
+                        @keydown.enter.stop.prevent="selectSection('custom')"
+                        @keydown.space.stop.prevent="selectSection('custom')"
+                      >前往「自定义提供商」管理密钥</span>
                     </div>
                     <div class="auth-status-info">
                       <v-icon
@@ -1514,12 +1533,12 @@ async function downloadAndInstall(): Promise<void> {
                       }}</v-icon>
                     </div>
                   </div>
-                  <div v-if="editingProvider === provider" class="auth-edit-row">
+                  <div v-if="editingProvider === provider" class="auth-edit-row" :id="`auth-edit-${provider}`">
                     <v-text-field
                       v-model="editingKeys[provider]"
                       type="password"
                       aria-label="API 密钥"
-                      :disabled="customProviderNames.has(provider)"
+                      :disabled="customProviderNames.has(provider) || saving || !!authBusy"
                       :placeholder="status.configured ? '输入新密钥以替换...' : '粘贴 API 密钥...'"
                       hide-details
                       density="comfortable"
@@ -1532,7 +1551,7 @@ async function downloadAndInstall(): Promise<void> {
                         color="primary"
                         variant="tonal"
                         :loading="authBusy === provider"
-                        :disabled="!!authBusy || customProviderNames.has(provider) || !editingKeys[provider]?.trim()"
+                        :disabled="saving || !!authBusy || customProviderNames.has(provider) || !editingKeys[provider]?.trim()"
                         @click="saveKey(provider)"
                         >保存</v-btn
                       >
@@ -1541,7 +1560,7 @@ async function downloadAndInstall(): Promise<void> {
                         size="small"
                         color="error"
                         variant="text"
-                        :disabled="!!authBusy || customProviderNames.has(provider)"
+                        :disabled="saving || !!authBusy || customProviderNames.has(provider)"
                         @click="pendingAuthDelete = provider"
                         >删除</v-btn
                       >

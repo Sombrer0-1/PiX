@@ -179,8 +179,8 @@ function fileChips(file: GitChangedFile): GitChip[] {
 
     <!-- 首次失败错误卡（无旧数据）：错误文案 + 重试 -->
     <template v-if="snapshot?.kind === 'unavailable'">
-      <div class="git-error-text">{{ errorText }}</div>
-      <button class="git-retry-btn" type="button" @click="git.refresh">重试</button>
+      <div class="git-error-text" role="alert">{{ errorText }}</div>
+      <button class="git-retry-btn" type="button" :disabled="git.loading.value" aria-label="重试刷新 Git 状态" @click="git.refresh">重试</button>
     </template>
 
     <!-- 常态 / stale（保留旧数据 + 数据异常标记） -->
@@ -294,9 +294,9 @@ function fileChips(file: GitChangedFile): GitChip[] {
 .git-top-line {
   color: var(--pix-text-primary);
   font-weight: var(--pix-weight-medium);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 
 .git-stats {

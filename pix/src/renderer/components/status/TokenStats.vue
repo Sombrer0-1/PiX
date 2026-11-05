@@ -40,9 +40,14 @@ function formatContextTokens(n: number | null): string {
 }
 
 function formatPercent(n: number | null): string {
-  if (n === null) return "?";
+  if (n === null) return "未知";
   return `${n.toFixed(1)}%`;
 }
+
+const progressValue = computed(() => {
+  if (contextPercent.value === null) return undefined;
+  return Math.max(0, Math.min(100, contextPercent.value));
+});
 </script>
 
 <template>
@@ -58,7 +63,7 @@ function formatPercent(n: number | null): string {
             {{ formatNumber(stats.contextUsage.contextWindow) }}
           </span>
         </div>
-        <div class="context-track" role="progressbar" aria-label="上下文占用" :aria-valuenow="stats.contextUsage.percent ?? undefined" aria-valuemin="0" aria-valuemax="100"><span :class="{ 'has-usage': (contextPercent ?? 0) > 0 }" :style="{ width: contextWidth }"></span></div>
+        <div class="context-track" role="progressbar" aria-label="上下文占用" :aria-valuenow="progressValue" aria-valuemin="0" aria-valuemax="100"><span :class="{ 'has-usage': (contextPercent ?? 0) > 0 }" :style="{ width: contextWidth }"></span></div>
       </div>
 
       <div class="stats-grid">

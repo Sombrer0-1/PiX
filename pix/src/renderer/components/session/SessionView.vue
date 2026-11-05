@@ -469,7 +469,14 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
         class="work-status-block"
         :class="{ streaming: block.isStreaming, expanded: expandedWorkStatus.has(block.id) }"
       >
-        <button class="ws-header" @click="block.tools.length > 0 && toggleExpand(block.id)">
+        <button
+          class="ws-header"
+          type="button"
+          :aria-expanded="expandedWorkStatus.has(block.id)"
+          :aria-disabled="block.tools.length === 0"
+          :disabled="block.tools.length === 0"
+          @click="block.tools.length > 0 && toggleExpand(block.id)"
+        >
           <span class="ws-icon">
             <span v-if="block.isStreaming" class="spinner"></span>
             <v-icon v-else-if="block.tools.some(tool => tool.isError)" icon="mdi-alert-circle-outline" size="14" color="error" />
@@ -511,7 +518,8 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
               <button class="ws-tool-header" @click="toggleTool(block.id, tool.toolCallId)">
                 <span class="ws-tool-dot" :class="tool.isError ? 'err' : tool.result == null ? 'pending' : 'ok'"></span>
                 <span class="ws-tool-name">{{ tool.toolName || 'task' }}</span>
-                <span v-if="tool.result == null" class="ws-tool-pending">执行中</span>
+                <span v-if="tool.result == null && !tool.isError" class="ws-tool-pending">执行中</span>
+                <span v-else-if="tool.isError && tool.result == null" class="ws-tool-pending ws-tool-failed">已失败</span>
                 <span v-if="tool.args" class="ws-tool-preview">{{ previewSummary(tool) }}</span>
                 <span v-else-if="tool.result !== null" class="ws-tool-preview">{{ resultPreview(tool.result) }}</span>
                 <span v-if="hasDiff(toolDiff(tool))" class="ws-tool-diff">
@@ -587,6 +595,7 @@ async function handleSessionClick(event: MouseEvent): Promise<void> {
 .agent-heading time { color: var(--pix-text-muted); font-size: 11px; }
 
 .ws-tool-dot.pending { background: var(--pix-accent); }
+.ws-tool-failed { color: var(--pix-error); }
 .ws-tool-pending { font-size: 12px; color: var(--pix-accent); white-space: nowrap; }
 .session-view {
   max-width: var(--pix-content-max-width);

@@ -27,6 +27,7 @@ function formatTime(ts: number): string {
 
 const resultText = computed(() => {
   if (props.result === null || props.result === undefined) {
+    if (props.isError) return "执行失败";
     return props.isStreaming ? "运行中..." : "无结果";
   }
 
@@ -83,10 +84,10 @@ function toggleExpand(): void {
 
 <template>
   <div class="tool-block" :class="{ error: isError, streaming: isStreaming }">
-    <button class="tool-header" @click="toggleExpand">
+    <button class="tool-header" type="button" :aria-expanded="expanded" @click="toggleExpand">
       <span class="tool-icon">
-        <span v-if="isStreaming" class="spinner"></span>
-        <span v-else-if="isError" class="status-mark error-mark" aria-label="失败"></span>
+        <span v-if="isError" class="status-mark error-mark" aria-label="失败"></span>
+        <span v-else-if="isStreaming" class="spinner" aria-label="执行中"></span>
         <span v-else class="status-mark success-mark" aria-label="成功"></span>
       </span>
       <span class="tool-name">{{ toolName }}</span>

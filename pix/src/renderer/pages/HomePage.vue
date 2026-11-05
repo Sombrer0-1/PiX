@@ -2,7 +2,7 @@
 /**
  * Home Page
  */
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted, computed, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useSettingsStore } from "../stores/settings-store";
 import { useProjectStore } from "../stores/project-store";
@@ -12,6 +12,7 @@ import { useTeamStore } from "../stores/team-store";
 import ProjectOpenDialog from "../components/project/ProjectOpenDialog.vue";
 import WindowTitlebar from "../components/layout/WindowTitlebar.vue";
 import { toPlain } from "../utils/plain";
+import { formatRelativeDay } from "../utils/relative-day";
 import type {
   ProjectEnvironment,
   ProjectInfo,
@@ -28,7 +29,11 @@ const teamStore = useTeamStore();
 const rpc = useRpc();
 
 const piDetection = ref<{ found: boolean; path: string; note?: string } | null>(null);
+const piDetecting = ref(true);
 const showOpenDialog = ref(false);
+const opening = ref(false);
+const openError = ref<string | null>(null);
+const bootError = ref<string | null>(null);
 
 /** 旧快照提示状态（AC-13）：一次确认即 ack，并与本次会话的记名表对齐。 */
 const showLegacyDialog = ref(false);
@@ -52,8 +57,14 @@ async function shouldPromptLegacyNotice(target: ProjectLocation): Promise<boolea
 }
 
 onMounted(async () => {
-  await projectStore.loadSettings();
-  await settingsStore.load();
+  bootError.value = null;
+  piDetecting.value = true;
+  try {
+    await projectStore.loadSettings();
+    await settingsStore.load();
+  } catch (err) {
+    bootError.value = err instanceof Error ? err.message : String(err);
+  }
   // Probe WSL distros so the open-project dialog can offer them; failures land
   // in wslDiagnostic and only disable the WSL option, never the Windows path.
   void settingsStore.loadWslDistros();
@@ -61,6 +72,8 @@ onMounted(async () => {
     piDetection.value = await settingsStore.detectPi();
   } catch {
     piDetection.value = { found: true, path: "direct", note: "AgentSession 进程内直连" };
+  } finally {
+    piDetecting.value = false;
   }
 });
 
@@ -103,6 +116,17 @@ async function finishSoloStartup(location: ProjectLocation): Promise<void> {
 }
 
 async function startFreshWorkspace(location: ProjectLocation): Promise<void> {
+  if (opening.value) return;
+  opening.value = true;
+  openError.value = null;
+  try {
+    await startFreshWorkspaceInner(location);
+  } finally {
+    opening.value = false;
+  }
+}
+
+async function startFreshWorkspaceInner(location: ProjectLocation): Promise<void> {
   // Store objects (recent projects, current project) are Vue reactive proxies;
   // strip reactivity before they cross the contextBridge/IPC boundary.
   const target = toPlain(location);
@@ -181,23 +205,45 @@ async function confirmLegacyNotice(): Promise<void> {
   if (!target) return;
   legacyNoticeAcked.add(workspaceKey(target));
   await window.pixApi.ackLegacyTeamSnapshot(target);
-  await launchWorkspace(target, false);
+  if (opening.value) return;
+  opening.value = true;
+  try {
+    await launchWorkspace(target, false);
+  } finally {
+    opening.value = false;
+  }
 }
+
 
 /** Open the project picker dialog (Windows folder browse or WSL distro + cwd). */
 function openProject(): void {
+  openError.value = null;
   showOpenDialog.value = true;
 }
 
+watch(showOpenDialog, (visible) => {
+  if (!visible) openError.value = null;
+});
+
 /** Resolve the dialog's ProjectLocationInput via the main process and launch. */
 async function handleOpenLocation(input: ProjectLocationInput): Promise<void> {
-  const result = await window.pixApi.resolveProjectLocation(input);
-  if (!result.success) {
-    // Error text is produced by the main process and must not leak UNC/drive.
-    alert(`打开项目失败：${result.error || "无法解析项目路径"}`);
-    return;
+  if (opening.value) return;
+  opening.value = true;
+  openError.value = null;
+  try {
+    const result = await window.pixApi.resolveProjectLocation(input);
+    if (!result.success) {
+      // Keep the dialog open with the typed path; surface the main-process error.
+      openError.value = result.error || "无法解析项目路径";
+      return;
+    }
+    showOpenDialog.value = false;
+    await startFreshWorkspaceInner(result.location);
+  } catch (err) {
+    openError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    opening.value = false;
   }
-  await startFreshWorkspace(result.location);
 }
 
 async function openRecentProject(project: ProjectInfo): Promise<void> {
@@ -213,13 +259,14 @@ function envLabel(project: ProjectInfo): string {
 }
 
 function formatDate(timestamp: number): string {
-  const d = new Date(timestamp);
-  const now = new Date();
-  const diff = now.getTime() - d.getTime();
-  if (diff < 86400000) return "今天";
-  if (diff < 172800000) return "昨天";
-  return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+  return formatRelativeDay(timestamp);
 }
+
+const piStatusLabel = computed(() => {
+  if (piDetecting.value) return "正在检测 Pi…";
+  if (piDetection.value?.found) return "Pi 就绪";
+  return "Pi 未检测到";
+});
 </script>
 
 <template>
@@ -236,10 +283,13 @@ function formatDate(timestamp: number): string {
         </header>
 
         <div class="home-card">
-          <div class="pi-status-row">
-            <span class="pi-status-dot" :class="{ ready: piDetection?.found }"></span>
-            <span>{{ piDetection?.found ? 'Pi 就绪' : 'Pi 未检测到' }}</span>
+          <div class="pi-status-row" role="status">
+            <span class="pi-status-dot" :class="{ ready: !!piDetection?.found, detecting: piDetecting }"></span>
+            <span>{{ piStatusLabel }}</span>
           </div>
+
+          <p v-if="bootError" class="home-error" role="alert">加载失败：{{ bootError }}</p>
+          <p v-if="opening" class="home-opening" role="status">正在打开项目…</p>
 
           <div class="home-actions">
             <v-btn
@@ -249,6 +299,8 @@ function formatDate(timestamp: number): string {
               size="large"
               block
               prepend-icon="mdi-folder-open-outline"
+              :loading="opening"
+              :disabled="opening || piDetecting"
               @click="openProject"
             >
               打开项目文件夹
@@ -259,24 +311,27 @@ function formatDate(timestamp: number): string {
         <section v-if="recentProjects.length > 0" class="home-section">
           <h2 class="section-title">最近项目</h2>
           <v-card class="recent-card" variant="flat">
-          <v-list density="default" bg-color="transparent">
+          <v-list density="default" bg-color="transparent" class="recent-list">
             <v-list-item
               v-for="project in recentProjects"
               :key="`${project.environment.kind}:${project.physicalPath}`"
               :title="project.name"
               :subtitle="formatDate(project.lastOpened)"
-              @click="openRecentProject(project)"
+              :aria-label="`打开项目 ${project.name}`"
+              :disabled="opening"
               class="project-list-item"
+              @click="openRecentProject(project)"
             >
               <template #append>
                 <div class="project-list-actions">
                   <span class="project-env" :class="{ 'env-wsl': project.environment.kind === 'wsl' }">{{ envLabel(project) }}</span>
-                  <span class="project-path-mono">{{ project.path }}</span>
+                  <span class="project-path-mono" :title="project.path">{{ project.path }}</span>
                   <button
                     class="project-delete-btn"
                     type="button"
-                    title="从最近项目中移除"
-                    aria-label="从最近项目中移除"
+                    title="从最近列表移除（不会删除磁盘上的文件）"
+                    aria-label="从最近列表移除，不会删除文件"
+                    :disabled="opening"
                     @click.stop="removeRecentProject(project)"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -309,6 +364,8 @@ function formatDate(timestamp: number): string {
       :distros="settingsStore.wslDistros"
       :distros-loading="!settingsStore.wslDistrosLoaded"
       :wsl-diagnostic="settingsStore.wslDiagnostic ?? undefined"
+      :submitting="opening"
+      :error="openError"
       @open="handleOpenLocation"
     />
 
@@ -428,6 +485,83 @@ function formatDate(timestamp: number): string {
 
 .pi-status-dot.ready {
   background: var(--pix-success);
+}
+
+.pi-status-dot.detecting {
+  background: var(--pix-accent);
+  animation: pix-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes pix-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.home-error,
+.home-opening {
+  margin: 0 0 var(--pix-space-md);
+  font-size: var(--pix-text-sm);
+  line-height: var(--pix-leading-base);
+}
+
+.home-error {
+  color: var(--pix-error);
+}
+
+.home-opening {
+  color: var(--pix-text-secondary);
+}
+
+.recent-list {
+  max-height: min(42vh, 360px);
+  overflow-y: auto;
+}
+
+.project-open-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+  max-width: 220px;
+  padding: 4px 2px;
+  text-align: left;
+  border-radius: var(--pix-radius-sm);
+}
+
+.project-open-btn:focus-visible {
+  outline: 2px solid var(--pix-border-focus);
+  outline-offset: 2px;
+}
+
+.project-open-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.project-open-title {
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-md);
+  font-weight: var(--pix-weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.project-open-subtitle {
+  color: var(--pix-text-muted);
+  font-size: var(--pix-text-xs);
+}
+
+.project-delete-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.project-delete-btn:focus-visible {
+  outline: 2px solid var(--pix-border-focus);
+  outline-offset: 2px;
 }
 
 .home-actions {

@@ -62,6 +62,7 @@ function rowText(item: TodoItem): string {
           type="button"
           :title="collapsed ? '展开任务清单' : '收起任务清单'"
           :aria-label="collapsed ? '展开任务清单' : '收起任务清单'"
+          :aria-expanded="!collapsed"
           data-test="todo-collapse-btn"
           @click="collapsed = !collapsed"
         >
@@ -171,6 +172,9 @@ function rowText(item: TodoItem): string {
   text-overflow: ellipsis;
   white-space: nowrap;
   line-height: var(--pix-leading-base);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 
 /* completed：弱化 + 划线。 */

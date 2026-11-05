@@ -1429,5 +1429,5 @@ watch(
 .provider-meta { flex-wrap: wrap; }
 .provider-actions { padding-top: 14px; border-top: 1px solid var(--pix-border-light); }
 .provider-list :deep(.v-btn) { font-size: 13px; height: 34px; }
-@media (max-width: 760px) { .compat-grid, .model-row { grid-template-columns: minmax(0, 1fr); } .kv-row, .field-row { flex-wrap: wrap; } .kv-row > .v-input { flex: 1 1 100%; } }
+@media (max-width: 980px) { .compat-grid, .model-row { grid-template-columns: minmax(0, 1fr); } .kv-row, .field-row { flex-wrap: wrap; } .kv-row > .v-input { flex: 1 1 100%; } .provider-actions { flex-wrap: wrap; } }
 </style>

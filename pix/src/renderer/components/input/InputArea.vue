@@ -26,6 +26,7 @@ function onInput(e: Event): void {
 }
 
 function onKeydown(e: KeyboardEvent): void {
+  if (e.isComposing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) return;
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     emit("send");
