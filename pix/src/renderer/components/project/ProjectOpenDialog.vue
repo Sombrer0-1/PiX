@@ -160,6 +160,9 @@ function submit(): void {
 function onFieldKeydown(e: KeyboardEvent): void {
   if (e.isComposing) return;
   if (e.key !== "Enter" || e.shiftKey) return;
+  // Append actions (e.g. 「浏览」) bubble Enter into the field; only submit from the input itself.
+  const target = e.target;
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
   e.preventDefault();
   submit();
 }

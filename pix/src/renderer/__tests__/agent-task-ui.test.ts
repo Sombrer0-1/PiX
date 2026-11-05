@@ -1355,7 +1355,7 @@ describe("AgentTaskDetail", () => {
     const spec = w.get('[data-test="agent-task-spec"]');
     expect(spec.find('[data-test="agent-task-spec-agent"]').text()).toBe("general-purpose");
     expect(spec.find('[data-test="agent-task-spec-model"]').text()).toBe("anthropic/claude-x");
-    expect(spec.find('[data-test="agent-task-spec-thinking"]').text()).toBe("high");
+    expect(spec.find('[data-test="agent-task-spec-thinking"]').text()).toBe("高");
     expect(spec.find('[data-test="agent-task-spec-mode"]').text()).toBe("需要审批");
     expect(spec.find('[data-test="agent-task-spec-maxturns"]').text()).toBe("最多 15 轮");
   });

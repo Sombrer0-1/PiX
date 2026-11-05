@@ -129,6 +129,45 @@ describe("ProjectOpenDialog", () => {
     expect(w.text()).not.toContain("pixApi");
     w.unmount();
   });
+
+  it("does not submit when Enter bubbles from the browse button", async () => {
+    const selectProject = vi.fn().mockResolvedValue("C:/from-browse");
+    window.pixApi = { selectProject } as unknown as PixApi;
+    const w = mount(ProjectOpenDialog, {
+      props: {
+        modelValue: true,
+        defaultEnvironment: { kind: "windows" },
+        defaultCwd: "/home",
+        distros: [],
+      },
+      global: { plugins: [vuetify], stubs: dialogStubs },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    const pathField = w.find("input");
+    await pathField.setValue("C:/typed-path");
+    await flushPromises();
+
+    const browseBtn = w.findAll("button").find((b) => b.text().includes("浏览"));
+    expect(browseBtn).toBeTruthy();
+    // Real DOM bubble: Enter on 「浏览」 must not preventDefault/submit via the field handler.
+    browseBtn!.element.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    await flushPromises();
+    expect(w.emitted("open")).toBeUndefined();
+
+    // Enter inside the path input still submits.
+    pathField.element.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    await flushPromises();
+    expect(w.emitted("open")?.[0]?.[0]).toMatchObject({
+      environment: { kind: "windows" },
+      physicalPath: "C:/typed-path",
+    });
+    w.unmount();
+  });
 });
 
 describe("ToolExecutionBlock error precedence", () => {
