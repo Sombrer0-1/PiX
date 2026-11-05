@@ -667,12 +667,13 @@ function confirmAbandon(): void {
 .plan-panel-title {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   color: var(--pix-text-primary);
   font-size: var(--pix-text-md);
   font-weight: var(--pix-weight-semibold);
+  line-height: var(--pix-leading-tight);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .plan-panel-meta {

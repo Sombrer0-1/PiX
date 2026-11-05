@@ -2403,6 +2403,11 @@ function sendQuickStart(prompt: string): void {
   transition: background var(--pix-transition-fast), color var(--pix-transition-fast);
 }
 
+.composer-icon-btn:focus-visible {
+  outline: 2px solid var(--pix-border-focus);
+  outline-offset: 2px;
+}
+
 .composer-icon-btn:hover {
   background: var(--pix-accent-light);
   color: var(--pix-text-primary);

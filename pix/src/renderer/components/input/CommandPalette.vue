@@ -37,7 +37,9 @@ watch(results, () => {
 });
 
 function handleKeydown(e: KeyboardEvent): void {
+  if (e.isComposing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) return;
   if (!["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(e.key)) return;
+  // Only intercept navigation keys for the palette; leave other keys to the input.
   e.stopPropagation();
   e.stopImmediatePropagation();
   switch (e.key) {

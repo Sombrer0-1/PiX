@@ -388,15 +388,22 @@ function goSettings(): void { void router.push("/settings"); }
         <span class="hover-actions">
           <button
             class="hover-btn"
+            type="button"
             :class="{ 'pin-active': pinnedIds.has(session.id) }"
             :title="pinnedIds.has(session.id) ? '取消置顶' : '置顶'"
+            :aria-label="pinnedIds.has(session.id) ? '取消置顶' : '置顶'"
+            :aria-pressed="pinnedIds.has(session.id)"
+            :disabled="!!deletingSession"
             @click.stop="togglePin(session.id)"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
           </button>
           <button
             class="hover-btn danger"
+            type="button"
             title="删除会话"
+            aria-label="删除会话"
+            :disabled="!!deletingSession"
             @click.stop="requestDelete(session)"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
@@ -460,7 +467,7 @@ function goSettings(): void { void router.push("/settings"); }
         <v-card-actions class="delete-dialog-actions">
           <v-spacer />
           <v-btn variant="text" @click="showDeleteDialog = false">取消</v-btn>
-          <v-btn color="error" variant="tonal" :loading="!!deletingSession" @click="executeDelete">删除</v-btn>
+          <v-btn color="error" variant="tonal" :loading="!!deletingSession" :disabled="!!deletingSession" @click="executeDelete">删除</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>

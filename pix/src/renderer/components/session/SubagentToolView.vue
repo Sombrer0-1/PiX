@@ -415,11 +415,12 @@ function liveDurationMs(item: SubagentSingleResult): number {
     <!-- Case 3: queued/starting placeholder derived from args -->
     <div v-if="props.result === null || props.result === undefined" class="subagent-placeholder" role="status" aria-live="polite">
       <span class="subagent-icon" aria-hidden="true">
-        <span class="spinner"></span>
+        <span v-if="!isError" class="spinner"></span>
+        <v-icon v-else icon="mdi-alert-circle-outline" size="14" color="error" />
       </span>
       <span class="subagent-title">{{ placeholderAgentName }}</span>
       <span class="subagent-source">{{ modeLabel(placeholderMode) }}</span>
-      <span class="subagent-status running">{{ isError ? "失败" : "排队中" }}</span>
+      <span class="subagent-status" :class="isError ? 'failed' : 'running'">{{ isError ? "失败" : "排队中" }}</span>
       <span v-if="placeholderSummary" class="subagent-summary">{{ placeholderSummary }}</span>
     </div>
 

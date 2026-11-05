@@ -414,7 +414,7 @@ async function addDraft(): Promise<void> {
 		fetchModelsError: "",
 	});
 	await nextTick();
-	const input = providerList.value?.querySelector<HTMLInputElement>('.provider-card:last-child input[aria-label="Provider 名"]');
+	const input = providerList.value?.querySelector<HTMLInputElement>('.provider-card:last-child input[aria-label="提供商名称"]');
 	input?.scrollIntoView({ behavior: "smooth", block: "center" });
 	input?.focus({ preventScroll: true });
 }
@@ -530,12 +530,12 @@ function buildAndValidate(): { record: Record<string, CustomProviderConfig> } | 
 	const errors: string[] = [];
 	for (const draft of drafts.value) {
 		const key = draft.key.trim();
-		if (!key) { errors.push("Provider 名不能为空。"); continue; }
-		if (seen.has(key)) { errors.push(`Provider 名「${key}」重复。`); continue; }
+		if (!key) { errors.push("提供商名称不能为空。"); continue; }
+		if (seen.has(key)) { errors.push(`提供商名称「${key}」重复。`); continue; }
 		seen.add(key);
 
 		const baseUrl = (draft.config.baseUrl ?? "").trim().replace(/\/+$/, "");
-		if (!baseUrl) errors.push(`Provider「${key}」的 baseUrl 不能为空。`);
+		if (!baseUrl) errors.push(`提供商「${key}」的接口地址不能为空。`);
 
 		// compat：5 个结构化字段由开关控制（所有 api 类型），覆盖 JSON 合并其上的额外
 		// 字段（如各 api 类型的专属 compat）；同名结构化键跳过，开关始终是唯一真相源（#16）。
@@ -546,12 +546,12 @@ function buildAndValidate(): { record: Record<string, CustomProviderConfig> } | 
 			try {
 				const parsed = JSON.parse(overrideText);
 				if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-					errors.push(`Provider「${key}」的 compat 覆盖 JSON 必须是对象。`);
+					errors.push(`提供商「${key}」的兼容覆盖 JSON 必须是对象。`);
 				} else {
 					overrideParsed = parsed as Record<string, unknown>;
 				}
 			} catch (e) {
-				errors.push(`Provider「${key}」的 compat 覆盖 JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
+				errors.push(`提供商「${key}」的 compat 覆盖 JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
 			}
 		}
 		const structured: Record<string, unknown> = {
@@ -586,7 +586,7 @@ function buildAndValidate(): { record: Record<string, CustomProviderConfig> } | 
 				try {
 					const parsed = JSON.parse(tlmText);
 					if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-						errors.push(`Provider「${key}」模型「${id}」的 thinkingLevelMap 必须是 JSON 对象。`);
+						errors.push(`提供商「${key}」模型「${id}」的 thinkingLevelMap 必须是 JSON 对象。`);
 					} else {
 						// #7: defend ThinkingLevelMapValueSchema (string | null) at build time
 						// too, so a stale draft that was never blurred cannot ship an invalid
@@ -596,13 +596,13 @@ function buildAndValidate(): { record: Record<string, CustomProviderConfig> } | 
 							.filter(([, v]) => v !== null && typeof v !== "string")
 							.map(([k]) => k);
 						if (badTlm.length) {
-							errors.push(`Provider「${key}」模型「${id}」的 thinkingLevelMap 值必须为字符串或 null，非法键：${badTlm.join("、")}。`);
+							errors.push(`提供商「${key}」模型「${id}」的 thinkingLevelMap 值必须为字符串或 null，非法键：${badTlm.join("、")}。`);
 						} else {
 							out.thinkingLevelMap = tlmObj as Record<string, string | null>;
 						}
 					}
 				} catch (e) {
-					errors.push(`Provider「${key}」模型「${id}」的 thinkingLevelMap JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
+					errors.push(`提供商「${key}」模型「${id}」的 thinkingLevelMap JSON 解析失败：${e instanceof Error ? e.message : String(e)}`);
 				}
 			}
 			models.push(out);
@@ -728,7 +728,7 @@ const FETCHABLE_APIS = new Set<CustomApi>(["openai-completions", "openai-respons
 
 /** 按钮禁用原因（空串 = 可点击）。 */
 function fetchModelsBlockedReason(draft: ProviderDraft): string {
-	if (!(draft.config.baseUrl ?? "").trim()) return "先填写 baseUrl 才能从 API 获取模型";
+	if (!(draft.config.baseUrl ?? "").trim()) return "先填写接口地址才能从 API 获取模型";
 	if (draft.config.api === undefined || !FETCHABLE_APIS.has(draft.config.api)) {
 		return "仅 openai-completions / openai-responses 支持获取模型列表";
 	}
@@ -860,15 +860,15 @@ watch(
       <div>
         <h1 class="section-title">自定义提供商</h1>
         <p class="section-desc">
-          添加第三方 provider 与中转站。配置写入
+          添加第三方模型服务或中转站。配置写入
           <code>~/.pi/agent/models.json</code>，保存后热加载。
-          覆盖 anthropic/openai 等内置 provider 时只需填名称与 baseUrl。
+          若要覆盖内置 anthropic / openai，填写同名并配置接口地址即可。
         </p>
       </div>
       <div class="d-flex align-center" style="gap: var(--pix-space-sm);">
         <v-btn color="primary" :loading="saving" :disabled="loading || saving" @click="saveAll">保存全部</v-btn>
         <v-btn color="primary" variant="outlined" prepend-icon="mdi-plus" :disabled="loading || saving" @click="addDraft">
-          添加 Provider
+          添加提供商
         </v-btn>
       </div>
     </div>
@@ -893,9 +893,9 @@ watch(
       <v-skeleton-loader v-for="i in 2" :key="i" type="card" class="mb-3" />
     </div>
 
-    <v-alert v-else-if="drafts.length === 0" type="info" density="compact" class="mb-4">
-      未配置自定义 provider。点击「添加 Provider」新建。
-    </v-alert>
+    <p v-else-if="drafts.length === 0 && !loadError && !saveError" class="provider-empty mb-4">
+      还没有自定义提供商。可点击右上角「添加提供商」新建。
+    </p>
 
     <v-form v-if="drafts.length > 0" :disabled="loading || saving" @submit.prevent>
     <div ref="providerList" class="provider-list mb-4" :inert="loading || saving">
@@ -911,7 +911,7 @@ watch(
             <span class="provider-name">{{ draft.key || "（未命名）" }}</span>
             <v-chip v-if="draft.config.api" size="x-small" variant="tonal" :text="draft.config.api" label />
             <span class="provider-baseurl text-caption text-medium-emphasis">
-              {{ draft.config.baseUrl || "未设置 baseUrl" }}
+              {{ draft.config.baseUrl || "未设置接口地址" }}
             </span>
           </div>
           <div class="provider-meta">
@@ -927,18 +927,18 @@ watch(
         </div>
 
         <div v-if="draft.expanded" class="provider-edit">
-          <SettingsRow title="Provider 名" description="填 anthropic/openai 覆盖内置 provider 走中转站；填新名字新增独立 provider。">
+          <SettingsRow title="提供商名称" description="填写 anthropic / openai 可覆盖内置服务并走中转；填写新名称则新增独立提供商。">
 <v-text-field
             v-model="draft.key"
-            aria-label="Provider 名"
+            aria-label="提供商名称"
             required
             density="compact"
           hide-details="auto" />
 </SettingsRow>
-          <SettingsRow title="baseUrl" :description="baseUrlHints(draft.config.api).hint">
+          <SettingsRow title="接口地址" :description="baseUrlHints(draft.config.api).hint">
 <v-text-field
             v-model="draft.config.baseUrl"
-            aria-label="baseUrl"
+            aria-label="接口地址"
             required
             :placeholder="baseUrlHints(draft.config.api).placeholder"
             density="compact"
@@ -1107,7 +1107,7 @@ watch(
 
           <div class="subsection mb-3">
             <div class="subsection-title">模型列表</div>
-            <div class="inline-hint mb-2">覆盖内置 provider 时留空模型列表即保留全部内置模型。每个模型可单独配置思考档位映射。</div>
+            <div class="inline-hint mb-2">覆盖内置服务时留空模型列表即保留全部内置模型。每个模型可单独配置思考档位映射。</div>
             <details v-for="(model, mIdx) in draft.config.models" :key="mIdx" class="model-block" :open="model.expanded" @toggle="model.expanded = ($event.target as HTMLDetailsElement).open">
               <summary>{{ model.name || model.id || "新模型" }}<span>{{ model.id }}</span></summary>
               <div class="model-row">
@@ -1370,6 +1370,16 @@ watch(
   color: rgb(var(--v-theme-warning));
 }
 
+.provider-empty {
+	margin: 0;
+	padding: 14px 16px;
+	border: 1px dashed var(--pix-border);
+	border-radius: 8px;
+	background: var(--pix-bg-code);
+	color: var(--pix-text-muted);
+	font-size: 13px;
+	line-height: 1.6;
+}
 .inline-hint {
   font-size: var(--pix-text-xs);
   color: var(--pix-text-secondary);
@@ -1429,5 +1439,5 @@ watch(
 .provider-meta { flex-wrap: wrap; }
 .provider-actions { padding-top: 14px; border-top: 1px solid var(--pix-border-light); }
 .provider-list :deep(.v-btn) { font-size: 13px; height: 34px; }
-@media (max-width: 760px) { .compat-grid, .model-row { grid-template-columns: minmax(0, 1fr); } .kv-row, .field-row { flex-wrap: wrap; } .kv-row > .v-input { flex: 1 1 100%; } }
+@media (max-width: 980px) { .compat-grid, .model-row { grid-template-columns: minmax(0, 1fr); } .kv-row, .field-row { flex-wrap: wrap; } .kv-row > .v-input { flex: 1 1 100%; } .provider-actions { flex-wrap: wrap; } }
 </style>

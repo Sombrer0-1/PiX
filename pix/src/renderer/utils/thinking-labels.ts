@@ -2,6 +2,15 @@ import type { ThinkingLevel } from "@/types/rpc";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
+export const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
+  off: "关闭",
+  minimal: "极低",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "极高",
+};
+
 export const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
   off: "不启用额外推理，适合直接任务",
   minimal: "最低推理开销，适合快速回答",
@@ -12,7 +21,7 @@ export const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 };
 
 export function thinkingLevelLabel(level: string): string {
-  return THINKING_LEVELS.includes(level as ThinkingLevel) ? level : level;
+  return THINKING_LEVEL_LABELS[level as ThinkingLevel] ?? "未知";
 }
 
 export function thinkingLevelDescription(level: string): string {
@@ -20,6 +29,6 @@ export function thinkingLevelDescription(level: string): string {
 }
 
 export const thinkingLevelItems: Array<{ title: string; value: ThinkingLevel }> = THINKING_LEVELS.map((value) => ({
-  title: value,
+  title: THINKING_LEVEL_LABELS[value],
   value,
 }));

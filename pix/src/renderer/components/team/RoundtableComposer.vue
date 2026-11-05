@@ -49,6 +49,13 @@ const canSend = computed(() =>
 const isPaused = computed(() => teamStore.lifecycle === "paused");
 const isStopped = computed(() => teamStore.lifecycle === "stopped");
 
+function onComposerKeydown(e: KeyboardEvent): void {
+  if (e.isComposing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) return;
+  if (e.key !== "Enter" || e.shiftKey) return;
+  e.preventDefault();
+  void send();
+}
+
 async function send(): Promise<void> {
   if (!canSend.value) return;
   const body = text.value.trim();
@@ -219,7 +226,7 @@ async function togglePause(): Promise<void> {
           :placeholder="target === '*' ? '向全员说一句…' : `单独与所选席位说话…`"
           class="rc-input"
           data-test="composer-input"
-          @keydown.enter.exact.prevent="send"
+          @keydown="onComposerKeydown"
         />
         <v-btn
           icon="mdi-paperclip"

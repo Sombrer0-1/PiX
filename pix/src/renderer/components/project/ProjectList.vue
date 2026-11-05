@@ -9,6 +9,7 @@
  */
 import { computed } from "vue";
 import type { ProjectInfo, ProjectEnvironment } from "@/types/session";
+import { formatRelativeDay } from "@/utils/relative-day";
 
 const props = defineProps<{
   projects: ProjectInfo[];
@@ -38,14 +39,9 @@ function projectKey(project: ProjectInfo): string {
 }
 
 function formatDate(timestamp: number): string {
-  const d = new Date(timestamp);
-  const now = new Date();
-  const diff = now.getTime() - d.getTime();
-  if (diff < 3600000) return "刚刚";
-  if (diff < 86400000) return "今天";
-  if (diff < 172800000) return "昨天";
-  if (diff < 604800000) return `${Math.ceil(diff / 86400000)} 天前`;
-  return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+  const diffMs = Date.now() - timestamp;
+  if (diffMs >= 0 && diffMs < 3_600_000) return "刚刚";
+  return formatRelativeDay(timestamp);
 }
 </script>
 

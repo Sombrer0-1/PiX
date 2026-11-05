@@ -58,7 +58,17 @@ const html = computed(() => renderMarkdown(props.content));
 .agent-content :deep(h3) { font-size: var(--pix-text-md); }
 .agent-content :deep(h4) { font-size: var(--pix-text-base); }
 .agent-content :deep(blockquote) { border-left: 3px solid var(--pix-border); padding-left: var(--pix-space-md); color: var(--pix-text-secondary); margin: var(--pix-space-md) 0; }
-.agent-content :deep(table) { border-collapse: collapse; margin: var(--pix-space-md) 0; font-size: var(--pix-text-sm); width: 100%; }
+.agent-content :deep(table) {
+  border-collapse: collapse;
+  margin: var(--pix-space-md) 0;
+  font-size: var(--pix-text-sm);
+  width: 100%;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.agent-content :deep(img) { max-width: 100%; height: auto; }
+.agent-content :deep(pre) { max-width: 100%; overflow-x: auto; }
 .agent-content :deep(th), .agent-content :deep(td) { border: 1px solid var(--pix-border-light); padding: var(--pix-space-xs) var(--pix-space-md); text-align: left; }
 .agent-content :deep(th) { background: var(--pix-bg-code); font-weight: var(--pix-weight-semibold); }
 .agent-content :deep(hr) { border: none; border-top: 1px solid var(--pix-border-light); margin: var(--pix-space-lg) 0; }

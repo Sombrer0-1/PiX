@@ -15,6 +15,7 @@
  */
 import { ref, computed, watch } from "vue";
 import type { ProjectEnvironment, ProjectLocationInput, WslDistroInfo } from "@/types/session";
+import { DESKTOP_API_UNAVAILABLE, isDesktopApiAvailable, mapDesktopApiError, sanitizeUserDiagnostic } from "../../utils/desktop-api";
 
 const props = defineProps<{
   modelValue: boolean;
@@ -24,6 +25,10 @@ const props = defineProps<{
   wslDiagnostic?: string;
   /** True while the WSL distro probe is in flight (wsl_plan §5.1 step 2). */
   distrosLoading?: boolean;
+  /** Parent is resolving/opening the chosen location. */
+  submitting?: boolean;
+  /** Resolve/open failure to keep the dialog usable. */
+  error?: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -37,6 +42,10 @@ const mode = ref<Mode>("windows");
 const windowsPath = ref("");
 const distro = ref("");
 const linuxCwd = ref("");
+/** Once the user picks a mode, late WSL probes must not override it. */
+const userChoseMode = ref(false);
+const browseBusy = ref(false);
+const browseError = ref<string | null>(null);
 
 const open = computed<boolean>({
   get: () => props.modelValue,
@@ -44,6 +53,8 @@ const open = computed<boolean>({
 });
 
 const wslUnavailable = computed(() => props.distros.length === 0);
+
+const wslDiagnosticDisplay = computed(() => sanitizeUserDiagnostic(props.wslDiagnostic));
 
 const isWindowsMode = computed(() => mode.value === "windows");
 
@@ -59,7 +70,7 @@ const linuxCwdValid = computed(() => {
 
 const canSubmit = computed(() => {
   if (isWindowsMode.value) return windowsPath.value.trim().length > 0;
-  if (props.wslDiagnostic) return false;
+  if (wslDiagnosticDisplay.value) return false;
   return distroValid.value && linuxCwdValid.value;
 });
 
@@ -86,6 +97,8 @@ watch(
   () => props.modelValue,
   (visible) => {
     if (!visible) return;
+    userChoseMode.value = false;
+    browseError.value = null;
     applyEnvironmentDefaults();
     linuxCwd.value = props.defaultCwd || "/home";
     windowsPath.value = "";
@@ -103,25 +116,55 @@ watch(
     if (!props.modelValue) return;
     if (distros.length === 0) return;
     if (prev && prev.length > 0) return;
+    if (userChoseMode.value) return;
     if (mode.value === "wsl") return;
+    if (windowsPath.value.trim()) return;
     if (props.defaultEnvironment.kind !== "wsl") return;
     applyEnvironmentDefaults();
   },
 );
 
 async function browseWindowsPath(): Promise<void> {
-  const picked = await window.pixApi.selectProject();
-  if (picked) windowsPath.value = picked;
+  if (browseBusy.value || props.submitting) return;
+  browseBusy.value = true;
+  browseError.value = null;
+  try {
+    if (!isDesktopApiAvailable()) {
+      browseError.value = DESKTOP_API_UNAVAILABLE;
+      return;
+    }
+    const picked = await window.pixApi.selectProject();
+    if (picked) windowsPath.value = picked;
+  } catch (err) {
+    browseError.value = mapDesktopApiError(err, "选择目录失败，请重试");
+  } finally {
+    browseBusy.value = false;
+  }
+}
+
+function chooseMode(next: Mode): void {
+  mode.value = next;
+  userChoseMode.value = true;
 }
 
 function submit(): void {
-  if (!canSubmit.value) return;
+  if (!canSubmit.value || props.submitting) return;
   if (isWindowsMode.value) {
     emit("open", { environment: { kind: "windows" }, physicalPath: windowsPath.value.trim() });
   } else {
     emit("open", { environment: { kind: "wsl", distro: distro.value }, logicalPath: linuxCwd.value.trim() });
   }
-  open.value = false;
+  // Parent closes on success and keeps the dialog open on failure.
+}
+
+function onFieldKeydown(e: KeyboardEvent): void {
+  if (e.isComposing) return;
+  if (e.key !== "Enter" || e.shiftKey) return;
+  // Append actions (e.g. 「浏览」) bubble Enter into the field; only submit from the input itself.
+  const target = e.target;
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+  e.preventDefault();
+  submit();
 }
 </script>
 
@@ -130,10 +173,30 @@ function submit(): void {
     <v-card class="open-dialog-card">
       <div class="open-dialog-title">打开项目</div>
       <div class="open-dialog-body">
-        <v-btn-toggle v-model="mode" mandatory divided color="primary" class="mb-4" density="comfortable">
-          <v-btn value="windows" :disabled="false">Windows</v-btn>
+        <v-btn-toggle
+          :model-value="mode"
+          mandatory
+          divided
+          color="primary"
+          class="mb-4"
+          density="comfortable"
+          :disabled="!!submitting"
+          @update:model-value="(value) => value && chooseMode(value as Mode)"
+        >
+          <v-btn value="windows">Windows</v-btn>
           <v-btn value="wsl" :disabled="wslUnavailable">WSL2</v-btn>
         </v-btn-toggle>
+
+        <v-alert
+          v-if="error || browseError"
+          type="error"
+          variant="tonal"
+          density="comfortable"
+          class="mb-4"
+          title="无法打开"
+        >
+          {{ error || browseError }}
+        </v-alert>
 
         <v-alert
           v-if="distrosLoading"
@@ -147,14 +210,14 @@ function submit(): void {
         </v-alert>
 
         <v-alert
-          v-if="wslDiagnostic"
+          v-if="wslDiagnosticDisplay"
           type="warning"
           variant="tonal"
           density="comfortable"
           class="mb-4"
           title="WSL 不可用"
         >
-          {{ wslDiagnostic }}
+          {{ wslDiagnosticDisplay }}
         </v-alert>
 
         <!-- Windows mode -->
@@ -162,13 +225,21 @@ function submit(): void {
           <v-text-field
             v-model="windowsPath"
             label="项目文件夹"
-            placeholder="点击右侧按钮选择目录"
-            hint="Windows 本地目录路径。"
+            hint="点击右侧「浏览」选择目录，或直接粘贴 Windows 路径。"
             persistent-hint
             class="mb-2"
+            :disabled="!!submitting"
+            @keydown="onFieldKeydown"
           >
             <template #append>
-              <v-btn variant="tonal" density="comfortable" prepend-icon="mdi-folder-open-outline" @click="browseWindowsPath">
+              <v-btn
+                variant="tonal"
+                density="comfortable"
+                prepend-icon="mdi-folder-open-outline"
+                :loading="browseBusy"
+                :disabled="!!submitting || browseBusy"
+                @click="browseWindowsPath"
+              >
                 浏览
               </v-btn>
             </template>
@@ -186,7 +257,7 @@ function submit(): void {
             no-data-text="未发现 WSL2 发行版"
             hint="必须显式选择发行版，不会使用默认发行版。"
             persistent-hint
-            :disabled="wslUnavailable"
+            :disabled="wslUnavailable || !!submitting"
             class="mb-4"
           >
             <template #item="{ props: itemProps, item }">
@@ -200,16 +271,17 @@ function submit(): void {
             placeholder="/home/user/project"
             hint="发行版内的绝对 POSIX 路径，例如 /home/user/project。"
             persistent-hint
-            :disabled="wslUnavailable"
+            :disabled="wslUnavailable || !!submitting"
             :error-messages="linuxCwd && !linuxCwdValid ? '请输入以 / 开头的绝对 Linux 路径' : ''"
             class="mb-2"
+            @keydown="onFieldKeydown"
           />
         </template>
       </div>
       <v-card-actions class="open-dialog-actions">
         <v-spacer />
-        <v-btn variant="text" @click="open = false">取消</v-btn>
-        <v-btn color="primary" variant="flat" :disabled="!canSubmit" @click="submit">打开</v-btn>
+        <v-btn variant="text" :disabled="!!submitting" @click="open = false">取消</v-btn>
+        <v-btn color="primary" variant="flat" :loading="!!submitting" :disabled="!canSubmit || !!submitting" @click="submit">打开</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
