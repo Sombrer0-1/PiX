@@ -13,6 +13,7 @@ import ProjectOpenDialog from "../components/project/ProjectOpenDialog.vue";
 import WindowTitlebar from "../components/layout/WindowTitlebar.vue";
 import { toPlain } from "../utils/plain";
 import { formatRelativeDay } from "../utils/relative-day";
+import { DESKTOP_API_UNAVAILABLE, isDesktopApiAvailable, mapDesktopApiError } from "../utils/desktop-api";
 import type {
   ProjectEnvironment,
   ProjectInfo,
@@ -63,7 +64,7 @@ onMounted(async () => {
     await projectStore.loadSettings();
     await settingsStore.load();
   } catch (err) {
-    bootError.value = err instanceof Error ? err.message : String(err);
+    bootError.value = mapDesktopApiError(err, "应用启动失败，请从 PiX 桌面端打开");
   }
   // Probe WSL distros so the open-project dialog can offer them; failures land
   // in wslDiagnostic and only disable the WSL option, never the Windows path.
@@ -231,16 +232,20 @@ async function handleOpenLocation(input: ProjectLocationInput): Promise<void> {
   opening.value = true;
   openError.value = null;
   try {
+    if (!isDesktopApiAvailable()) {
+      openError.value = DESKTOP_API_UNAVAILABLE;
+      return;
+    }
     const result = await window.pixApi.resolveProjectLocation(input);
     if (!result.success) {
-      // Keep the dialog open with the typed path; surface the main-process error.
-      openError.value = result.error || "无法解析项目路径";
+      // Keep the dialog open with the typed path; surface a readable error.
+      openError.value = mapDesktopApiError(result.error || "无法解析项目路径");
       return;
     }
     showOpenDialog.value = false;
     await startFreshWorkspaceInner(result.location);
   } catch (err) {
-    openError.value = err instanceof Error ? err.message : String(err);
+    openError.value = mapDesktopApiError(err);
   } finally {
     opening.value = false;
   }

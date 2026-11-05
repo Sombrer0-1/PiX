@@ -11,6 +11,7 @@ import { ref } from "vue";
 import { toPlain } from "../utils/plain";
 import type { ProjectInfo, ProjectLocation, SessionInfo } from "@/types/session";
 import type { PixApi } from "../../main/preload";
+import { DESKTOP_API_UNAVAILABLE } from "../utils/desktop-api";
 
 function api(): PixApi {
   if (!window.pixApi) {
@@ -38,8 +39,8 @@ function api(): PixApi {
       onUserInputRequest: () => () => {},
       listSessions: async () => [],
       listTeamLeaderSessions: async () => [],
-      listWslDistros: async () => ({ distros: [], diagnostic: "pixApi 不可用" }),
-      resolveProjectLocation: async () => ({ success: false, error: "pixApi 不可用" }),
+      listWslDistros: async () => ({ distros: [], diagnostic: DESKTOP_API_UNAVAILABLE }),
+      resolveProjectLocation: async () => ({ success: false, error: DESKTOP_API_UNAVAILABLE }),
       windowMinimize: async () => {},
       windowMaximize: async () => {},
       windowClose: async () => {},

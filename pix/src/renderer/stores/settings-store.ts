@@ -10,6 +10,7 @@ import { ref, computed } from "vue";
 import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, DEFAULT_AUTO_BACKGROUND_MS } from "@shared/agent-task-types.js";
 import type { GuiSettings, WslDistroInfo, WslSettings } from "@/types/session";
 import type { PixApi } from "../../main/preload";
+import { DESKTOP_API_UNAVAILABLE, mapDesktopApiError, sanitizeUserDiagnostic } from "../utils/desktop-api";
 
 function api(): PixApi {
   if (!window.pixApi) {
@@ -36,8 +37,8 @@ function api(): PixApi {
       onPiReady: () => () => {},
       onUserInputRequest: () => () => {},
       listSessions: async () => [],
-      listWslDistros: async () => ({ distros: [], diagnostic: "pixApi 不可用" }),
-      resolveProjectLocation: async () => ({ success: false, error: "pixApi 不可用" }),
+      listWslDistros: async () => ({ distros: [], diagnostic: DESKTOP_API_UNAVAILABLE }),
+      resolveProjectLocation: async () => ({ success: false, error: DESKTOP_API_UNAVAILABLE }),
       windowMinimize: async () => {},
       windowMaximize: async () => {},
       windowClose: async () => {},
@@ -84,7 +85,7 @@ export const useSettingsStore = defineStore("settings", () => {
       }
       isLoaded.value = true;
     } catch (error) {
-      loadError.value = error instanceof Error ? error.message : String(error);
+      loadError.value = mapDesktopApiError(error, "应用接口不可用，无法读取设置");
     }
   }
 
@@ -103,10 +104,10 @@ export const useSettingsStore = defineStore("settings", () => {
     try {
       const result = await api().listWslDistros();
       wslDistros.value = result.distros ?? [];
-      wslDiagnostic.value = result.diagnostic ?? null;
+      wslDiagnostic.value = sanitizeUserDiagnostic(result.diagnostic);
     } catch (err) {
       wslDistros.value = [];
-      wslDiagnostic.value = err instanceof Error ? err.message : "无法列举 WSL 发行版";
+      wslDiagnostic.value = mapDesktopApiError(err, "无法列举 WSL 发行版");
     } finally {
       wslDistrosLoaded.value = true;
     }

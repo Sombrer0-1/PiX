@@ -338,7 +338,7 @@ describe("CustomProviders save recovery", () => {
     await flushPromises();
     const deleteButton = panel.findAll('button').find(button => button.text() === '删除')!;
     expect(deleteButton.attributes('disabled')).toBeDefined();
-    expect(panel.get<HTMLInputElement>('input[aria-label="Provider 名"]').element.disabled).toBe(true);
+    expect(panel.get<HTMLInputElement>('input[aria-label="提供商名称"]').element.disabled).toBe(true);
     await deleteButton.trigger('click');
     expect(panel.findAll('.provider-card')).toHaveLength(1);
     expect(document.body.textContent).not.toContain('确认删除');
@@ -373,9 +373,9 @@ describe("CustomProviders save recovery", () => {
     const panel = mountPanel();
     await flushPromises();
     const scroll = vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {});
-    await panel.findAll('button').find(button => button.text() === '添加 Provider')!.trigger('click');
+    await panel.findAll('button').find(button => button.text() === '添加提供商')!.trigger('click');
     await flushPromises();
-    expect(document.activeElement).toBe(panel.get('input[aria-label="Provider 名"]').element);
+    expect(document.activeElement).toBe(panel.get('input[aria-label="提供商名称"]').element);
     expect(scroll).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' });
     scroll.mockRestore();
   });
@@ -386,11 +386,11 @@ describe("CustomProviders save recovery", () => {
     const panel = mountPanel();
     await flushPromises();
     await expandFirstProvider();
-    await panel.get('input[aria-label="Provider 名"]').setValue("edited-relay");
+    await panel.get('input[aria-label="提供商名称"]').setValue("edited-relay");
     await panel.findAll('button').find(button => button.text() === '保存全部')!.trigger('click');
     await flushPromises();
     expect(panel.text()).toContain("配置写入失败");
-    expect((panel.get('input[aria-label="Provider 名"]').element as HTMLInputElement).value).toBe("edited-relay");
+    expect((panel.get('input[aria-label="提供商名称"]').element as HTMLInputElement).value).toBe("edited-relay");
     expect(panel.text()).toContain("有未保存的修改");
   });
 
@@ -403,14 +403,14 @@ describe("CustomProviders save recovery", () => {
     const panel = mountPanel();
     await flushPromises();
     await panel.findAll('.provider-header')[1].trigger('click');
-    await panel.get('input[aria-label="Provider 名"]').setValue('edited-beta');
+    await panel.get('input[aria-label="提供商名称"]').setValue('edited-beta');
     await panel.findAll('.provider-header')[0].trigger('click');
     await panel.findAll('.provider-card')[0].findAll('button').find(button => button.text() === '删除')!.trigger('click');
     await flushPromises();
     dialogButtons().find(button => button.textContent?.trim() === '确认删除')!.click();
     await flushPromises();
     expect(panel.findAll('.provider-card')).toHaveLength(2);
-    expect(panel.findAll('input[aria-label="Provider 名"]').map(input => (input.element as HTMLInputElement).value)).toEqual(['alpha', 'edited-beta']);
+    expect(panel.findAll('input[aria-label="提供商名称"]').map(input => (input.element as HTMLInputElement).value)).toEqual(['alpha', 'edited-beta']);
     expect(panel.text()).toContain('配置写入失败');
   });
 });

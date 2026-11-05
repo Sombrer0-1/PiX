@@ -910,6 +910,14 @@ async function downloadAndInstall(): Promise<void> {
         >
           <v-icon icon="mdi-menu" size="20" />
         </button>
+        <button
+          class="settings-canvas-back"
+          :disabled="saving || !!authBusy"
+          aria-label="返回对话"
+          @click="goBack"
+        >
+          <v-icon icon="mdi-arrow-left" size="18" />返回对话
+        </button>
         <span>设置</span><span class="breadcrumb-separator">/</span><strong>{{ currentSection.label }}</strong>
       </WindowTitlebar>
       <div ref="settingsScroll" class="settings-scroll">
@@ -1834,6 +1842,36 @@ async function downloadAndInstall(): Promise<void> {
   justify-content: center;
   -webkit-app-region: no-drag;
 }
+.settings-canvas-back {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--pix-text-secondary);
+  -webkit-app-region: no-drag;
+  flex-shrink: 0;
+}
+.settings-canvas-back:hover:not(:disabled) {
+  color: var(--pix-accent);
+  background: var(--pix-bg-hover, rgba(0, 0, 0, 0.04));
+}
+.settings-canvas-back:disabled {
+  opacity: 0.45;
+}
+.settings-panels[inert] {
+  opacity: 0.55;
+  filter: grayscale(0.08);
+}
+.settings-panels[inert] :deep(.v-field),
+.settings-panels[inert] :deep(.v-btn),
+.settings-panels[inert] :deep(.v-selection-control),
+.settings-panels[inert] :deep(.v-switch),
+.settings-panels[inert] :deep(.v-select) {
+  opacity: 0.9;
+}
 .settings-scroll {
   flex: 1;
   min-height: 0;
@@ -2116,6 +2154,9 @@ async function downloadAndInstall(): Promise<void> {
     z-index: 20;
   }
   .settings-mobile-menu {
+    display: inline-flex;
+  }
+  .settings-canvas-back {
     display: inline-flex;
   }
   .settings-topbar {

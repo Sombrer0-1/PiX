@@ -8,6 +8,8 @@ import InputArea from "../components/input/InputArea.vue";
 import ProjectOpenDialog from "../components/project/ProjectOpenDialog.vue";
 import ToolExecutionBlock from "../components/session/ToolExecutionBlock.vue";
 import type { PixApi } from "../../main/preload";
+import { DESKTOP_API_UNAVAILABLE, mapDesktopApiError, sanitizeUserDiagnostic } from "../utils/desktop-api";
+import { thinkingLevelItems, thinkingLevelLabel } from "../utils/thinking-labels";
 
 const vuetify = createVuetify();
 
@@ -111,6 +113,22 @@ describe("ProjectOpenDialog", () => {
     expect(w.text()).toContain("目录不存在");
     w.unmount();
   });
+  it("sanitizes internal pixApi diagnostic for the WSL banner", async () => {
+    const w = mount(ProjectOpenDialog, {
+      props: {
+        modelValue: true,
+        defaultEnvironment: { kind: "windows" },
+        defaultCwd: "/home",
+        distros: [],
+        wslDiagnostic: "pixApi 不可用",
+      },
+      global: { plugins: [vuetify], stubs: dialogStubs },
+    });
+    await flushPromises();
+    expect(w.text()).toContain(DESKTOP_API_UNAVAILABLE);
+    expect(w.text()).not.toContain("pixApi");
+    w.unmount();
+  });
 });
 
 describe("ToolExecutionBlock error precedence", () => {
@@ -129,5 +147,25 @@ describe("ToolExecutionBlock error precedence", () => {
     expect(w.find(".error-mark").exists()).toBe(true);
     expect(w.find(".spinner").exists()).toBe(false);
     expect(w.get(".tool-header").attributes("aria-expanded")).toBe("false");
+  });
+});
+
+describe("desktop-api error mapping", () => {
+  it("maps undefined property access and pixApi mentions to Chinese", () => {
+    expect(mapDesktopApiError(new Error("Cannot read properties of undefined (reading 'resolveProjectLocation')"))).toBe(
+      DESKTOP_API_UNAVAILABLE,
+    );
+    expect(mapDesktopApiError(new Error("pixApi 不可用"))).toBe(DESKTOP_API_UNAVAILABLE);
+    expect(mapDesktopApiError(new Error("目录不存在"))).toBe("目录不存在");
+    expect(sanitizeUserDiagnostic("pixApi 不可用")).toBe(DESKTOP_API_UNAVAILABLE);
+  });
+});
+
+describe("thinking level labels", () => {
+  it("exposes Chinese titles and unknown fallback", () => {
+    expect(thinkingLevelLabel("xhigh")).toBe("极高");
+    expect(thinkingLevelLabel("not-a-level")).toBe("未知");
+    expect(thinkingLevelItems.find((item) => item.value === "xhigh")?.title).toBe("极高");
+    expect(thinkingLevelItems.find((item) => item.value === "off")?.title).toBe("关闭");
   });
 });

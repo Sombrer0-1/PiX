@@ -15,6 +15,7 @@
  */
 import { ref, computed, watch } from "vue";
 import type { ProjectEnvironment, ProjectLocationInput, WslDistroInfo } from "@/types/session";
+import { DESKTOP_API_UNAVAILABLE, isDesktopApiAvailable, mapDesktopApiError, sanitizeUserDiagnostic } from "../../utils/desktop-api";
 
 const props = defineProps<{
   modelValue: boolean;
@@ -53,6 +54,8 @@ const open = computed<boolean>({
 
 const wslUnavailable = computed(() => props.distros.length === 0);
 
+const wslDiagnosticDisplay = computed(() => sanitizeUserDiagnostic(props.wslDiagnostic));
+
 const isWindowsMode = computed(() => mode.value === "windows");
 
 const distroValid = computed(
@@ -67,7 +70,7 @@ const linuxCwdValid = computed(() => {
 
 const canSubmit = computed(() => {
   if (isWindowsMode.value) return windowsPath.value.trim().length > 0;
-  if (props.wslDiagnostic) return false;
+  if (wslDiagnosticDisplay.value) return false;
   return distroValid.value && linuxCwdValid.value;
 });
 
@@ -126,10 +129,14 @@ async function browseWindowsPath(): Promise<void> {
   browseBusy.value = true;
   browseError.value = null;
   try {
+    if (!isDesktopApiAvailable()) {
+      browseError.value = DESKTOP_API_UNAVAILABLE;
+      return;
+    }
     const picked = await window.pixApi.selectProject();
     if (picked) windowsPath.value = picked;
   } catch (err) {
-    browseError.value = err instanceof Error ? err.message : "选择目录失败，请重试";
+    browseError.value = mapDesktopApiError(err, "选择目录失败，请重试");
   } finally {
     browseBusy.value = false;
   }
@@ -200,14 +207,14 @@ function onFieldKeydown(e: KeyboardEvent): void {
         </v-alert>
 
         <v-alert
-          v-if="wslDiagnostic"
+          v-if="wslDiagnosticDisplay"
           type="warning"
           variant="tonal"
           density="comfortable"
           class="mb-4"
           title="WSL 不可用"
         >
-          {{ wslDiagnostic }}
+          {{ wslDiagnosticDisplay }}
         </v-alert>
 
         <!-- Windows mode -->
@@ -215,8 +222,7 @@ function onFieldKeydown(e: KeyboardEvent): void {
           <v-text-field
             v-model="windowsPath"
             label="项目文件夹"
-            placeholder="点击右侧按钮选择目录"
-            hint="Windows 本地目录路径。"
+            hint="点击右侧「浏览」选择目录，或直接粘贴 Windows 路径。"
             persistent-hint
             class="mb-2"
             :disabled="!!submitting"
