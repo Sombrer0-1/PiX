@@ -950,6 +950,8 @@ export class PlanController {
   /** Inject the completed background task's result into the parent turn for verification. */
   private async _triggerTaskResultVerificationTurn(step: PlanStep, summary: string): Promise<void> {
     const content = [
+      serializePlanContextMessage(this._snapshot.plan!, "executing"),
+      "",
       `The background task group for plan step "${step.stepKey}" (${step.title}) completed.`,
       "",
       `Result summary:`,
@@ -1750,6 +1752,8 @@ export class PlanController {
         this._recordDeviation(deviation);
       }
       const content = [
+        serializePlanContextMessage(plan, "executing"),
+        "",
         `The subagent finished plan step "${step.stepKey}" (${step.title}).`,
         "",
         `Result: ${result.status === "result" ? "completed" : "failed"}`,

@@ -85,7 +85,8 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain("new user request");
 			expect(prompt).toContain("model-visible but UI-hidden");
 			expect(prompt).toContain("inspect_agent_task");
-			expect(prompt).toContain("inspect_team_task");
+			expect(prompt).not.toContain("inspect_team_task");
+			expect(buildSystemPrompt({ cwd: process.cwd(), customPrompt: "Custom assistant" })).not.toContain("inspect_team_task");
 			expect(prompt).toContain("<plan_generation>");
 			expect(prompt).toContain("adapt to the user's actual task");
 			expect(

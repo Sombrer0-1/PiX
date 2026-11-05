@@ -36,6 +36,7 @@ export const SEAT_TOOL_NAMES: readonly string[] = [
   "release_write_paths",
   "team_bash",
   "request_permission",
+  "read_deliverable",
   "revise_deliverable",
   "stance_on_deliverable",
   "open_item",
@@ -426,6 +427,24 @@ export function registerSeatTools(args: RegisterSeatToolsArgs): ToolDefinition[]
 
     // -------------------------------------------------------------- 交付物 --
     {
+      name: "read_deliverable",
+      label: "Read deliverable",
+      description: "Read a deliverable's id, version, current revision, Markdown and stances. Omit id to read the latest version. Use the returned id for stance_on_deliverable and id/revision for revise_deliverable.",
+      promptSnippet: "Read the current deliverable before taking a stance or revising it.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "交付物 id；省略则读取最新版。" })),
+      }),
+      executionMode: "parallel" as const,
+      execute: async (_toolCallId: string, params: { id?: string }) => {
+        const versions = host.getDeliverables();
+        const deliverable = params.id === undefined ? versions.at(-1) : versions.find((item) => item.id === params.id);
+        return toolResult(deliverable === undefined
+          ? { ok: false as const, error: params.id === undefined ? "尚无交付物。" : `交付物 ${params.id} 不存在。` }
+          : { ok: true as const, deliverable });
+      },
+    },
+
+    {
       name: "revise_deliverable",
       label: "Revise deliverable",
       description:
@@ -433,7 +452,7 @@ export function registerSeatTools(args: RegisterSeatToolsArgs): ToolDefinition[]
         "version and revision instead of overwriting: rebase on that version and submit again.",
       promptSnippet: "Use revise_deliverable to publish an updated deliverable version.",
       promptGuidelines: [
-        "On conflict, read the current version and rebase on currentRevision; never overwrite silently.",
+        "Use read_deliverable to get the current id, revision and text. On conflict, read it again and rebase before submitting.",
       ],
       parameters: Type.Object({
         id: Type.String({ description: "交付物 id。" }),
@@ -456,7 +475,7 @@ export function registerSeatTools(args: RegisterSeatToolsArgs): ToolDefinition[]
       label: "Take a stance",
       description: "Record your stance on a deliverable version: support, oppose, or conditional.",
       promptSnippet: "Use stance_on_deliverable to record agreement or objection.",
-      promptGuidelines: ["Give a reason when you oppose or attach conditions."],
+      promptGuidelines: ["Use read_deliverable when you need the deliverable id or text. Give a reason when you oppose or attach conditions."],
       parameters: Type.Object({
         id: Type.String({ description: "交付物 id。" }),
         stance: STANCE_LITERALS(),

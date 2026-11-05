@@ -4,7 +4,6 @@ import { constants } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import { getShellConfig, getShellEnv, killProcessTree, normalizeWindowsNullDeviceRedirects, trackDetachedChildPid, untrackDetachedChildPid } from "../utils/shell.ts";
 import { OutputAccumulator } from "./tools/output-accumulator.ts";
-import { truncateTail } from "./tools/truncate.ts";
 
 export interface BackgroundTask {
 	taskId: string;
@@ -122,30 +121,24 @@ export class BackgroundTaskRegistry {
 		if (!task) return { found: false };
 
 		const snapshot = task.output.snapshot({ persistIfTruncated: true });
-		let text = snapshot.content || "(no output yet)";
-
-		// If fromLine specified, return only lines from that point forward
-		if (fromLine !== undefined && fromLine > 0) {
-			const allLines = text.split("\n");
-			if (fromLine >= allLines.length) {
-				text = "";
-			} else {
-				text = allLines.slice(fromLine).join("\n");
-			}
-		}
-
-		// Add truncation footer if output was truncated
 		const truncation = snapshot.truncation;
-		if (truncation.truncated) {
-			const endLine = truncation.totalLines ?? 1;
-			text += `\n\n[Showing last ${formatSize(truncation.outputBytes ?? 0)} of ${formatSize(truncation.totalBytes ?? 0)}, lines ${endLine - (truncation.outputLines ?? 1) + 1}-${endLine} of ${truncation.totalLines ?? 1}]`;
+		const firstLine = truncation.totalLines - truncation.outputLines + 1;
+		const offset = Math.max(0, (fromLine ?? firstLine) - firstLine);
+		const lines = Math.max(0, truncation.outputLines - offset);
+		let text = offset === 0 ? snapshot.content : snapshot.content.split("\n").slice(offset).join("\n");
+		if (lines === 0) text = truncation.totalLines === 0 ? "(no output yet)" : "(no new output)";
+		if (truncation.truncated && lines > 0) {
+			const gap = fromLine !== undefined && fromLine < firstLine
+				? `Requested lines ${fromLine}-${firstLine - 1} are no longer in the retained window. `
+				: "";
+			text += `\n\n[${gap}Showing ${formatSize(Buffer.byteLength(text, "utf8"))} of ${formatSize(truncation.totalBytes)}, lines ${firstLine + offset}-${truncation.totalLines} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
 		}
 
 		return {
 			found: true,
 			text,
-			lines: text.split("\n").length,
-			totalLines: snapshot.truncation.totalLines ?? text.split("\n").length,
+			lines,
+			totalLines: truncation.totalLines,
 			running: task.status === "running",
 		};
 	}

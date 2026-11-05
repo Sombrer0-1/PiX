@@ -17,6 +17,7 @@ import type { BashOperations, ExecutionBackend } from "@earendil-works/pi-coding
 import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import {
   type KnowledgeCard,
+  type DeliverableVersion,
   type OpenItem,
   type RoundtableState,
   type TimelineItem,
@@ -64,6 +65,7 @@ export type PostSeatMessageResult =
  */
 export interface RoundtableToolHost {
   getState(): RoundtableState | null;
+  getDeliverables(): DeliverableVersion[];
   isRuntimeActive(): boolean;
   postSeatMessage(fromSeatId: string, params: SendTeamMessageParams): Promise<PostSeatMessageResult>;
   claimWritePaths(

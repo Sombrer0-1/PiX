@@ -10,7 +10,7 @@
  *   - request_permission 同步返回 submitted（H23）
  *   - health 只对真卡死发 seat_stuck 并分段续跑
  *   - stop() 退订 onApply / inbox.onChange / session
- *   - 席位工具名单 = §4.11 的 13 个，删除清单一个不注册
+ *   - 席位工具名单与 SEAT_TOOL_NAMES 一致，删除清单一个不注册
  *   - S1 x S2c 延迟集成：真实 AgentSession + shouldStopAfterTurn 消费语义
  *     （L2 在工具批次中挂起 → 批次后结束 run → 结果已保存 → flag 只生效一次）
  *   - 协议管理器：无 team-constants 依赖、无待批 Promise、ExitRequest 协商
@@ -382,6 +382,7 @@ function createFakeHost(options: FakeHostOptions = {}): { host: RoundtableToolHo
   };
   const host: RoundtableToolHost = {
     getState: () => makeState(),
+    getDeliverables: () => [],
     isRuntimeActive: () => true,
     postSeatMessage: async (_fromSeatId: string, params: SendTeamMessageParams) => {
       record.messages.push(params);
@@ -540,7 +541,7 @@ await run("§4.11：席位工具名单精确，删除清单一个不注册", asy
   const tools = registerSeatTools({ seatId: SEAT_ID, host });
   const names = tools.map((tool) => tool.name);
 
-  assertEqual(names.length, 13, "注册 13 个工具");
+  assertEqual(names.length, 14, "注册 14 个工具");
   for (const expected of SEAT_TOOL_NAMES) {
     assert(names.includes(expected), `注册了 ${expected}`);
   }
@@ -552,7 +553,7 @@ await run("§4.11：席位工具名单精确，删除清单一个不注册", asy
 
   const parallel = tools.filter((tool) => tool.executionMode === "parallel").length;
   const sequential = tools.filter((tool) => tool.executionMode === "sequential").length;
-  assertEqual(parallel + sequential, 13, "每个工具都显式声明 executionMode");
+  assertEqual(parallel + sequential, 14, "每个工具都显式声明 executionMode");
   assertEqual(sequential, 2, "只有写租约两条是协议顺序（claim/release）");
   assertEqual(
     tools.filter((tool) => tool.name === "claim_write_paths")[0]?.executionMode,

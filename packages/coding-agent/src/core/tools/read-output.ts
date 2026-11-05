@@ -4,7 +4,7 @@ import type { BackgroundTaskRegistry } from "../background-task-registry.ts";
 
 const readOutputSchema = Type.Object({
 	taskId: Type.String({ description: "Task ID returned by run_background" }),
-	fromLine: Type.Optional(Type.Number({ description: "Return only lines starting from this line number (1-based). Omit to get all output." })),
+	fromLine: Type.Optional(Type.Integer({ minimum: 1, description: "Return retained output starting at this cumulative line number (1-based). Poll with the previous total + 1. Omit to get the retained output window." })),
 });
 
 export type ReadOutputInput = Static<typeof readOutputSchema>;
@@ -16,7 +16,7 @@ export function createReadOutputToolDefinition(
 		name: "read_output",
 		label: "Read Background Output",
 		description:
-			"Read the accumulated stdout and stderr output of a running background task. Pass fromLine to get only newer lines (useful for polling). Returns (no output yet) if nothing has been printed.",
+			"Read the retained stdout and stderr output of a background task. Pass fromLine to poll using cumulative line numbers. Output is limited to the latest 2000 lines or 50KB; a truncation notice identifies the retained range and full output file. Returns (no output yet) if nothing has been printed, or (no new output) when the cursor is past the output.",
 		promptSnippet: "Read the output of a running background task",
 		parameters: readOutputSchema,
 		async execute(_toolCallId, { taskId, fromLine }: ReadOutputInput) {

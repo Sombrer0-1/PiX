@@ -36,6 +36,7 @@ import {
 import {
   USER_SEAT_ID,
   type AttentionItem,
+  type DeliverableVersion,
   type ExitRequest,
   type InboxEntry,
   type RoundtableSettings,
@@ -641,7 +642,7 @@ await run("T-4：modelCalls 覆盖 aux 整理会话（整理 prompt 计入总量
   await manager.requestWrapUp("system");
   await settle();
   assertEqual(fixture.auxes.length, 1, "系统整理创建了一个 aux session");
-  assertEqual(modelCalls(fixture) - before, 1, "整理的那次 prompt 被计入 modelCalls（退回只统计席位时这里恒为 0）");
+  assertEqual(modelCalls(fixture) - before, 1 + fixture.seats.length, "整理 prompt 与发给各席的就绪通知都计入 modelCalls");
   assertEqual(
     fixture.auxes[0]!.calls.filter((call) => call === "prompt").length,
     1,
@@ -964,6 +965,46 @@ await run("buildHandoff：payload 绑定具体交付物版本", async () => {
 });
 
 // ============================================================================
+// 交付物读取、就绪通知与修订冲突
+// ============================================================================
+
+await run("交付物：所有席位收到就绪通知，能读取、表态并在冲突后读取最新稿", async () => {
+  const { manager } = await makeFixture("deliverable-discovery");
+  try {
+    const state = await manager.createRoundtable({ topic: "交付物协议" });
+    await settle();
+    const deliverable = await manager.requestWrapUp("system");
+    const ids = seatIds(state);
+    for (const seatId of ids) {
+      assert(manager.getInbox(seatId).some((entry) => entry.text.includes(deliverable.id) && entry.text.includes("read_deliverable")), "每席都收到含 id 的就绪通知");
+      const tools = registerSeatTools({ seatId, host: manager });
+      const read = await tools.find((tool) => tool.name === "read_deliverable")!.execute("read", {}, undefined, undefined, NO_EXTENSION_CONTEXT);
+      const block = read.content.find((item) => item.type === "text");
+      const visible = JSON.parse(block?.type === "text" ? block.text : "{}") as { deliverable: DeliverableVersion };
+      assertEqual(visible.deliverable.id, deliverable.id, "模型可见结果包含真实交付物 id");
+      assertEqual(visible.deliverable.markdown, AUX_MARKDOWN, "模型可见结果包含正文");
+      const stanced = await tools.find((tool) => tool.name === "stance_on_deliverable")!.execute("stance", { id: visible.deliverable.id, stance: "support" }, undefined, undefined, NO_EXTENSION_CONTEXT);
+      assertEqual((stanced.details as { ok: boolean }).ok, true, "席位能用读取结果表态");
+    }
+    assertEqual(manager.getDeliverables().at(-1)?.stances?.length, ids.length, "所有席位的表态都已保存");
+
+    manager.reviseDeliverable(deliverable.id, "## 结论\n第一席的新稿", ids[0], deliverable.revision);
+    const peerTools = registerSeatTools({ seatId: ids[1], host: manager });
+    const revise = peerTools.find((tool) => tool.name === "revise_deliverable")!;
+    const conflict = await revise.execute("stale", { id: deliverable.id, markdown: "旧稿", expectedRevision: deliverable.revision }, undefined, undefined, NO_EXTENSION_CONTEXT);
+    assertEqual((conflict.details as { ok: boolean }).ok, false, "旧 revision 被拒绝");
+    const latest = await peerTools.find((tool) => tool.name === "read_deliverable")!.execute("reload", { id: deliverable.id }, undefined, undefined, NO_EXTENSION_CONTEXT);
+    const block = latest.content.find((item) => item.type === "text");
+    const visible = JSON.parse(block?.type === "text" ? block.text : "{}") as { deliverable: DeliverableVersion };
+    assertIncludes(visible.deliverable.markdown, "第一席的新稿", "冲突后能读到最新正文");
+    const updated = await revise.execute("retry", { id: visible.deliverable.id, markdown: visible.deliverable.markdown + "\n补充依据", expectedRevision: visible.deliverable.revision }, undefined, undefined, NO_EXTENSION_CONTEXT);
+    assertEqual((updated.details as { ok: boolean }).ok, true, "基于最新正文和 revision 修订成功");
+  } finally {
+    await manager.dispose();
+  }
+});
+
+// ============================================================================
 // 9. createAgentSession 入参（H29 / H34 / H35）+ WSL 不变量
 // ============================================================================
 
@@ -1006,7 +1047,7 @@ await run("席位 createAgentSession 入参 + WSL：backend 对象身份 / runti
     for (const tool of ["bash", "run_background", "read_output", "stop_process", "agent", "get_goal", "create_goal", "update_goal"]) {
       assert(excluded.includes(tool), `excludeTools 含 ${tool}（H29）`);
     }
-    assertEqual((options.customTools ?? []).length, 13, "席位工具 13 个（§4.11）");
+    assertEqual((options.customTools ?? []).length, 14, "席位工具包含交付物读取入口");
   }
 
   // 席位 cwd 视图（H34）：logical + backend.getCwd()。

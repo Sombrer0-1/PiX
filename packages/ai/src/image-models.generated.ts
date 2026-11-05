@@ -575,6 +575,21 @@ export const IMAGE_MODELS = {
 	  "cacheWrite": 0
 	}
 		} satisfies ImagesModel<"openrouter-images">,
+		"openrouter/auto-code": {
+			id: "openrouter/auto-code",
+			name: "Auto Code",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text","image"],
+			output: ["text","image"],
+			cost: 	{
+	  "input": -1000000,
+	  "output": -1000000,
+	  "cacheRead": 0,
+	  "cacheWrite": 0
+	}
+		} satisfies ImagesModel<"openrouter-images">,
 		"qwen/qwen-image-2.1-pro": {
 			id: "qwen/qwen-image-2.1-pro",
 			name: "Qwen: Qwen Image 2.1 Pro",

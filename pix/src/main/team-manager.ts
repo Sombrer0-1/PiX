@@ -1323,6 +1323,14 @@ export class TeamManager implements RoundtableToolHost {
       refId: deliverable.id,
       text: `交付物 v${deliverable.version} 已就绪（截止 seq=${deliverable.cutoffSeq}）：可取用、可修订、可移交。`,
     });
+    const modules = this._modules!;
+    const item = this._appendSystem(
+      `交付物 v${deliverable.version} 已就绪（id=${deliverable.id}，revision=${deliverable.revision}）。用 read_deliverable 阅读正文，再用 stance_on_deliverable 表态；修订时使用读取到的最新 revision。`,
+      "*",
+    );
+    const targets = modules.roster.activeIds();
+    modules.inbox.enqueue(item, targets);
+    this._nudge(targets, "L1", "system");
   }
 
   stanceOnDeliverable(

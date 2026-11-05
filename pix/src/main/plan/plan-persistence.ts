@@ -142,12 +142,13 @@ export function serializePlanContextMessage(plan: Plan, phase: PlanStatus): stri
   lines.push(`<plan_context plan_id="${plan.planId}" version="${plan.version}" status="${phase}">`);
   lines.push(`Title: ${plan.title}`);
   lines.push(`Summary: ${plan.summary}`);
+  lines.push(`For update_plan_step, use planId="${plan.planId}", version=${plan.version}, and the stepId listed below.`);
   lines.push("Steps:");
   for (const step of plan.steps) {
     const files = step.files.length > 0
       ? ` [files: ${step.files.map((f) => `${f.path}(${f.operation})`).join(", ")}]`
       : "";
-    lines.push(`- ${step.stepKey}: ${step.title}${files}`);
+    lines.push(`- ${step.stepKey} (stepId=${step.stepId}): ${step.title}${files}`);
   }
   lines.push("</plan_context>");
   return lines.join("\n");

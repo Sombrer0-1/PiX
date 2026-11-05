@@ -296,6 +296,8 @@ export function translateAct(
 					coordinate_frame: declaredByDriver(schema, "coordinate_frame") ? effectiveFrame(p) : undefined,
 					scope: desktopScope && declaredByDriver(schema, "scope") ? "desktop" : undefined,
 					...targetingArgs(p, schema),
+					capture_id: declaredByDriver(schema, "capture_id") ? p.capture_id : undefined,
+					from_zoom: declaredByDriver(schema, "from_zoom") ? p.from_zoom : undefined,
 					delivery_mode: p.delivery,
 				}),
 			};
@@ -325,6 +327,10 @@ export function translateAct(
 				args: definedArgs({
 					x: p.x,
 					y: p.y,
+					...targetingArgs(p, schema),
+					coordinate_frame: declaredByDriver(schema, "coordinate_frame") ? effectiveFrame(p) : undefined,
+					capture_id: declaredByDriver(schema, "capture_id") ? p.capture_id : undefined,
+					from_zoom: declaredByDriver(schema, "from_zoom") ? p.from_zoom : undefined,
 					scope: declaredByDriver(schema, "scope") ? effectiveFrame(p) : undefined,
 				}),
 			};
@@ -809,6 +815,14 @@ export class CuaDriverBackend implements ComputerBackend {
 	): Promise<BackendActionResult> {
 		let translatedParams = p;
 		const windows = this.platform === "win32-x64" || this.platform === "win32-arm64";
+		if (windows && p.action === "move_cursor"
+			&& (effectiveFrame(p) !== "desktop" || p.pid !== undefined || p.window_id !== undefined || p.element_token !== undefined)) {
+			throw new ComputerUseError("unsupported_on_platform", "Windows move_cursor requires desktop screenshot coordinates.", 'Observe view="desktop", then use frame="desktop" without pid/window_id.');
+		}
+		if ((p.action === "scroll" || p.action === "move_cursor") && p.from_zoom && (p.x !== undefined || p.y !== undefined)
+			&& !declaredByDriver(this._client.getToolInputSchema(p.action), "from_zoom")) {
+			throw new ComputerUseError("unsupported_on_platform", `${p.action} cannot use zoom coordinates with this driver.`, 'Observe the full window or desktop again, then use its coordinates without from_zoom.');
+		}
 		const clipboardText = windows && p.action === "type_text" && p.delivery === "foreground" ? p.text : undefined;
 		if (windows && p.action === "type_text" && p.delivery === "foreground") {
 			if (clipboardText === undefined) throw new ComputerUseError("invalid_params", "type_text requires text.");
@@ -844,6 +858,16 @@ export class CuaDriverBackend implements ComputerBackend {
 		if ("wait" in t) {
 			// PiX-level sleep performed by the controller (interruptible by signal); the driver is never called.
 			return { text: `Waited ${t.wait} ms.`, target: actTarget(p), driverTool: "wait" };
+		}
+		if ((p.action === "scroll" || p.action === "move_cursor") && (p.x !== undefined || p.y !== undefined) && p.capture_id !== undefined
+			&& !declaredByDriver(this._client.getToolInputSchema(t.tool), "capture_id")) {
+			const snapshot = this._snapshots.get(h.driverSession);
+			const frame = effectiveFrame(p);
+			const captureId = frame === "desktop" ? snapshot?.desktop_capture_id : p.from_zoom ? snapshot?.zoom_capture_id : snapshot?.capture_id;
+			if (captureId !== p.capture_id || (frame === "window"
+				&& (snapshot?.pid !== p.pid || (p.window_id !== undefined && snapshot?.window_id !== p.window_id)))) {
+				throw new ComputerUseError("stale_reference", "The coordinates do not belong to the latest capture of this target.", "Observe the target again and use its fresh capture_id and coordinates.");
+			}
 		}
 		if (windows) {
 			await assertWindowsBackgroundKeyboardAllowed(p, (pid) => this._client.listToolNames().has("debug_window_info")
@@ -995,7 +1019,14 @@ export class CuaDriverBackend implements ComputerBackend {
 		if (!result.isError && tool === "get_window_state" && o.session !== undefined && result.structuredContent) {
 			this._snapshots.set(o.session, {
 				pid: args.pid, window_id: args.window_id, elements: result.structuredContent.elements,
+				capture_id: result.structuredContent.capture_id,
 				screenshot_width: result.structuredContent.screenshot_width, screenshot_height: result.structuredContent.screenshot_height,
+			});
+		}
+		if (!result.isError && o.session !== undefined && (tool === "get_desktop_state" || tool === "zoom")) {
+			this._snapshots.set(o.session, {
+				...this._snapshots.get(o.session),
+				[tool === "zoom" ? "zoom_capture_id" : "desktop_capture_id"]: result.structuredContent?.capture_id,
 			});
 		}
 		if (result.isError) {

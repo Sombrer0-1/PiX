@@ -33,32 +33,30 @@ export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string 
  * - Normalize special Unicode spaces to regular space
  */
 export function normalizeForFuzzyMatch(text: string): string {
-	return (
-		text
-			.normalize("NFKC")
-			// Strip trailing whitespace per line
-			.split("\n")
-			.map((line) => line.trimEnd())
-			.join("\n")
-			// Smart single quotes → '
-			.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
-			// Smart double quotes → "
-			.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
-			// Various dashes/hyphens → -
-			// U+2010 hyphen, U+2011 non-breaking hyphen, U+2012 figure dash,
-			// U+2013 en-dash, U+2014 em-dash, U+2015 horizontal bar, U+2212 minus
-			.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
-			// Special spaces → regular space
-			// U+00A0 NBSP, U+2002-U+200A various spaces, U+202F narrow NBSP,
-			// U+205F medium math space, U+3000 ideographic space
-			.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ")
-	);
+	return normalizeFuzzyCharacters(text).split("\n").map((line) => line.trimEnd()).join("\n");
+}
+
+function normalizeFuzzyCharacters(text: string): string {
+	return text
+		.normalize("NFKC")
+		// Smart single quotes → '
+		.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+		// Smart double quotes → "
+		.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+		// Various dashes/hyphens → -
+		// U+2010 hyphen, U+2011 non-breaking hyphen, U+2012 figure dash,
+		// U+2013 en-dash, U+2014 em-dash, U+2015 horizontal bar, U+2212 minus
+		.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+		// Special spaces → regular space
+		// U+00A0 NBSP, U+2002-U+200A various spaces, U+202F narrow NBSP,
+		// U+205F medium math space, U+3000 ideographic space
+		.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
 }
 
 export interface FuzzyMatchResult {
 	/** Whether a match was found */
 	found: boolean;
-	/** The index where the match starts (in the content that should be used for replacement) */
+	/** The index where the match starts in the original content. */
 	index: number;
 	/** Length of the matched text */
 	matchLength: number;
@@ -66,7 +64,7 @@ export interface FuzzyMatchResult {
 	usedFuzzyMatch: boolean;
 	/**
 	 * The content to use for replacement operations.
-	 * When exact match: original content. When fuzzy match: normalized content.
+	 * Original content; fuzzy normalization is used only to locate a match.
 	 */
 	contentForReplacement: string;
 }
@@ -90,9 +88,8 @@ export interface AppliedEditsResult {
 
 /**
  * Find oldText in content, trying exact match first, then fuzzy match.
- * When fuzzy matching is used, the returned contentForReplacement is the
- * fuzzy-normalized version of the content (trailing whitespace stripped,
- * Unicode quotes/dashes normalized to ASCII).
+ * Fuzzy matches are mapped back to original character boundaries so unrelated
+ * whitespace and Unicode characters are preserved.
  */
 export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResult {
 	// Try exact match first
@@ -112,7 +109,10 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
 	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
 
-	if (fuzzyIndex === -1) {
+	const range = fuzzyIndex === -1 || fuzzyOldText.length === 0
+		? undefined
+		: originalFuzzyRange(content, fuzzyIndex, fuzzyOldText.length);
+	if (!range) {
 		return {
 			found: false,
 			index: -1,
@@ -122,16 +122,41 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 		};
 	}
 
-	// When fuzzy matching, we work in the normalized space for replacement.
-	// This means the output will have normalized whitespace/quotes/dashes,
-	// which is acceptable since we're fixing minor formatting differences anyway.
 	return {
 		found: true,
-		index: fuzzyIndex,
-		matchLength: fuzzyOldText.length,
+		index: range.start,
+		matchLength: range.end - range.start,
 		usedFuzzyMatch: true,
-		contentForReplacement: fuzzyContent,
+		contentForReplacement: content,
 	};
+}
+
+/** Map normalized offsets at whole Unicode grapheme boundaries back to the file. */
+function originalFuzzyRange(content: string, index: number, length: number): { start: number; end: number } | undefined {
+	const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	let originalOffset = 0;
+	let normalizedOffset = 0;
+	let start: number | undefined;
+	const lines = content.split("\n");
+	for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+		const line = lines[lineIndex];
+		for (const part of segmenter.segment(line.trimEnd())) {
+			if (normalizedOffset === index) start = originalOffset + part.index;
+			normalizedOffset += normalizeFuzzyCharacters(part.segment).length;
+			if (start !== undefined && normalizedOffset === index + length) {
+				return { start, end: originalOffset + part.index + part.segment.length };
+			}
+		}
+		if (lineIndex < lines.length - 1) {
+			if (normalizedOffset === index) start = originalOffset + line.length;
+			normalizedOffset++;
+			if (start !== undefined && normalizedOffset === index + length) {
+				return { start, end: originalOffset + line.length + 1 };
+			}
+		}
+		originalOffset += line.length + 1;
+	}
+	return undefined;
 }
 
 /** Strip UTF-8 BOM if present, return both the BOM (if any) and the text without it */
@@ -148,11 +173,11 @@ function countOccurrences(content: string, oldText: string): number {
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+			`Could not find the exact text in ${path}, including the fallback for trailing whitespace and Unicode punctuation/compatibility differences. Read the current file and provide matching oldText.`,
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+		`Could not find edits[${editIndex}] in ${path}, including the fallback for trailing whitespace and Unicode punctuation/compatibility differences. Read the current file and provide matching oldText.`,
 	);
 }
 
@@ -184,12 +209,10 @@ function getNoChangeError(path: string, totalEdits: number): Error {
 }
 
 /**
- * Apply one or more exact-text replacements to LF-normalized content.
+ * Apply one or more targeted replacements to LF-normalized content.
  *
  * All edits are matched against the same original content. Replacements are
- * then applied in reverse order so offsets remain stable. If any edit needs
- * fuzzy matching, the operation runs in fuzzy-normalized content space to
- * preserve current single-edit behavior.
+ * then applied in reverse order so offsets remain stable.
  */
 export function applyEditsToNormalizedContent(
 	normalizedContent: string,
@@ -207,10 +230,7 @@ export function applyEditsToNormalizedContent(
 		}
 	}
 
-	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
-	const baseContent = initialMatches.some((match) => match.usedFuzzyMatch)
-		? normalizeForFuzzyMatch(normalizedContent)
-		: normalizedContent;
+	const baseContent = normalizedContent;
 
 	const matchedEdits: MatchedEdit[] = [];
 	for (let i = 0; i < normalizedEdits.length; i++) {
