@@ -16,13 +16,8 @@ export function createRunBackgroundToolDefinition(
 		name: "run_background",
 		label: "Run Background",
 		description:
-			"Run a long-lived command in the background (dev servers, watchers, containers). Returns a taskId immediately without waiting for the process to exit. Use read_output to check the accumulated output, and stop_process to terminate the task.",
-		promptSnippet: "Run long-lived commands in the background (dev servers, watchers, containers)",
-		promptGuidelines: [
-			"Use run_background for dev servers, watchers, containers, and other processes that should not block the agent. Use bash for short-lived commands that return and exit.",
-			"Use read_output(taskId) to check what a background task has printed.",
-			"Use stop_process(taskId) to terminate a background task when it is no longer needed.",
-		],
+			"Start a long-lived command such as a server or watcher. Returns a taskId immediately. Use bash when you need the command to finish before continuing.",
+		promptSnippet: "Start a background command",
 		parameters: runBackgroundSchema,
 		async execute(_toolCallId, { command }: RunBackgroundInput, signal) {
 			try {
@@ -31,7 +26,7 @@ export function createRunBackgroundToolDefinition(
 					content: [
 						{
 							type: "text",
-							text: `Background task started.\nTask ID: ${taskId}\nPID: ${pid ?? "unknown"}\nCommand: ${command}\n\nUse read_output("${taskId}") to check its output, or stop_process("${taskId}") to stop it.`,
+							text: `Background task started.\nTask ID: ${taskId}\nPID: ${pid ?? "unknown"}\nCommand: ${command}\n\nUse read_output with taskId="${taskId}" to check output or status. Use stop_process with the same taskId to stop it.`,
 						},
 					],
 					details: undefined,

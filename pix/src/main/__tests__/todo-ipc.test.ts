@@ -248,7 +248,8 @@ await run("todo_write tool: fixed success text, structured failures, auto-clear"
 	const tool = createTodoWriteTool(controller);
 	assertEqual(tool.name, TODO_TOOL_NAME, "tool name todo_write");
 	assertEqual(tool.promptSnippet, "Track multi-step work with a session todo list.", "promptSnippet per SDD");
-	assert(Array.isArray(tool.promptGuidelines) && tool.promptGuidelines.length >= 3, "promptGuidelines present");
+	assert(tool.promptGuidelines?.some((line) => line.includes("before starting work")) === true, "system prompt explains when to start a todo list");
+	assert(tool.description.includes("Send the full todo list each time"), "tool description explains how to update the list");
 
 	const ok = await tool.execute("tc-1", { todos: makeItems() });
 	assertEqual(ok.content.length, 1, "success result has one content block");

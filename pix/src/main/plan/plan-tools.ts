@@ -97,9 +97,9 @@ export interface UpdatePlanStepToolDetails {
 }
 
 const SUBMIT_PLAN_DESCRIPTION = [
-  "Submit the complete plan for user approval. Called once the plan is fully formed; the host validates the draft and only accepted plans become a version.",
-  "generationId MUST be copied exactly from the <plan_generation generation_id=\"...\"> context (or the retry message). Do not invent a UUID.",
-  "Every step must be self-contained: title, description, risk (with riskReason), effort, verification and the files/commands it will touch.",
+  "Submit the complete plan for user approval. Use request_user_input first if a requirement needs clarification. The host validates the draft before creating a version. Wait for the user to approve and start execution.",
+  "Copy generationId exactly from the current <plan_generation> context or retry message.",
+  "For each step, describe the work, its risk and effort, how to verify it, and the files and commands it will touch.",
   "dependsOn lists OTHER stepKeys that must finish before this step; cycles and unknown keys are rejected.",
   "Revisions must pass basedOnVersion equal to the version the revision was requested against; first versions omit it.",
   "PlanStepFile.path is a workspace-relative logical path (no globs, no absolute paths); a trailing / declares a directory scope.",
@@ -107,10 +107,9 @@ const SUBMIT_PLAN_DESCRIPTION = [
 ].join(" ");
 
 const UPDATE_PLAN_STEP_DESCRIPTION = [
-  "Report the execution status of one plan step. Only the executing model submits statuses:",
-  "running (before executing), waiting_input (with waitingReason=user_input), completed or failed.",
-  "completed REQUIRES a non-empty completionSummary and a verificationResult that is not failed.",
-  "skipped/cancelled are produced by host commands, never by the model.",
+  "Report the status of the step you are executing. Use the planId, version, and stepId from the plan context.",
+  "Mark a parent step running before work starts. Use waiting_input with waitingReason=user_input if you need the user's answer.",
+  "Report completed with a completionSummary and a verificationResult of passed or not_run. Report failed if the step fails. The host handles skipped and cancelled.",
 ].join(" ");
 
 function textContent(text: string): TextContent {
@@ -128,11 +127,6 @@ export function createSubmitUserPlanTool(
     label: "Submit User Plan",
     description: SUBMIT_PLAN_DESCRIPTION,
     promptSnippet: "Submit a complete plan draft for user approval.",
-    promptGuidelines: [
-      "Only submit when the plan is complete; every step needs risk/effort/verification and declared file scope.",
-      "Pass generationId exactly as given in the plan_generation context; a mismatch is rejected.",
-      "Revisions must reference the version the revision was requested against via basedOnVersion.",
-    ],
     parameters: SubmitUserPlanParamsSchema,
     async execute(_toolCallId, params): Promise<AgentToolResult<SubmitPlanToolDetails>> {
       const result = await host.controller.submitPlan(params);
@@ -140,7 +134,7 @@ export function createSubmitUserPlanTool(
       let contentText: string;
       if (result.accepted) {
         const version = snapshot.plan?.version;
-        contentText = `Plan accepted${version !== undefined ? ` (version ${version})` : ""} and is waiting for user approval.`;
+        contentText = `Plan accepted${version !== undefined ? ` (version ${version})` : ""}. Wait for the user to approve it and start execution.`;
       } else {
         const details = (result.fieldErrors ?? [])
           .map((error) => `${error.path}: ${error.message}`)
@@ -170,10 +164,6 @@ export function createUpdatePlanStepTool(
     label: "Update Plan Step",
     description: UPDATE_PLAN_STEP_DESCRIPTION,
     promptSnippet: "Report the execution status of one plan step.",
-    promptGuidelines: [
-      "Call with running before executing a parent step, then completed (with completionSummary and a non-failed verificationResult) or failed afterwards.",
-      "Use waiting_input with waitingReason=user_input when the step needs user input.",
-    ],
     parameters: UpdatePlanStepParamsSchema,
     async execute(_toolCallId, params): Promise<AgentToolResult<UpdatePlanStepToolDetails>> {
       const result = await host.controller.updatePlanStep(params);

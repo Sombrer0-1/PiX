@@ -115,7 +115,8 @@ export class BackgroundTaskRegistry {
 				text: string;
 				lines: number;
 				totalLines: number;
-				running: boolean;
+				status: BackgroundTask["status"];
+				exitCode: number | null;
 		  } {
 		const task = this._tasks.get(taskId);
 		if (!task) return { found: false };
@@ -139,7 +140,8 @@ export class BackgroundTaskRegistry {
 			text,
 			lines,
 			totalLines: truncation.totalLines,
-			running: task.status === "running",
+			status: task.status,
+			exitCode: task.exitCode,
 		};
 	}
 

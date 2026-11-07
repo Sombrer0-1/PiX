@@ -23,9 +23,11 @@ import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
+const DEFAULT_TIMEOUT_SECONDS = 120;
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (default: 120). Increase for long-running builds or data processing. Set to 0 to disable." })),
+	timeout: Type.Optional(Type.Number({ description: `Timeout in seconds. Defaults to ${DEFAULT_TIMEOUT_SECONDS}. Set to 0 to disable.` })),
 });
 
 export type BashToolInput = Static<typeof bashSchema>;
@@ -94,8 +96,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 			};
 
 			try {
-				// Default timeout is 120s. Use 0 to disable.
-				const effectiveTimeout = timeout ?? 120;
+				const effectiveTimeout = timeout ?? DEFAULT_TIMEOUT_SECONDS;
 				if (effectiveTimeout > 0) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
@@ -117,7 +118,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 					throw new Error("aborted");
 				}
 				if (timedOut) {
-					throw new Error(`timeout:${timeout}`);
+					throw new Error(`timeout:${effectiveTimeout}`);
 				}
 				return { exitCode };
 			} finally {
@@ -282,8 +283,8 @@ export function createBashToolDefinition(
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Default timeout is 120s; increase for long-running builds or set to 0 to disable. When a timeout fires the output collected so far is returned.`,
-		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
+		description: `Run a shell command in the current working directory. Returns stdout and stderr. Output is limited to the last ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}, whichever limit is reached first. If truncated, the result includes a path to the full output. Set timeout for commands that need longer than the default. On timeout, the result includes the output collected so far.`,
+		promptSnippet: "Run shell commands such as Git, builds, and tests",
 		parameters: bashSchema,
 		async execute(
 			_toolCallId,

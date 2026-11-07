@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { emptyTurnDiffSummary } from "../src/core/file-change.ts";
-import { createVerificationGateState, shouldQueueVerificationContinuation } from "../src/core/verification-gate.ts";
+import {
+	createVerificationContinuationMessage,
+	createVerificationGateState,
+	shouldQueueVerificationContinuation,
+} from "../src/core/verification-gate.ts";
 
 describe("verification gate", () => {
 	it("does not queue verification continuations outside active goals", () => {
@@ -27,5 +31,8 @@ describe("verification gate", () => {
 				state,
 			}),
 		).toBe(true);
+		expect(createVerificationContinuationMessage(state.summary).content).toContain(
+			"Follow the user's and project's verification instructions",
+		);
 	});
 });

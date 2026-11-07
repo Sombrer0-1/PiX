@@ -96,8 +96,7 @@ const SubagentParams = Type.Object({
   run_in_background: Type.Optional(
     Type.Boolean({
       default: false,
-      description:
-        "Set true to run the task(s) in the background and return immediately; you will be notified automatically when they complete. Choose background when you have independent work to do in parallel (or when the user asks for background execution); choose foreground when you need the results before you can continue. Do not guess from expected duration alone, and never sleep or poll while waiting.",
+      description: "Return immediately and send a notification when the tasks finish.",
     }),
   ),
 });
@@ -112,14 +111,15 @@ interface NormalizedRun {
 }
 
 const TOOL_DESCRIPTION = [
-  "Delegate a self-contained task to an independent subagent with its own context window, tools and transcript.",
+  "Delegate a self-contained task to a subagent. For a quick lookup, use file tools directly.",
+  "The subagent cannot see this conversation. Give it the question or change, relevant paths, and what a useful result looks like. For an investigation, state the question and the evidence you need. For an edit, give the scope and how to check the result.",
   "Exactly one of three mutually exclusive input modes must be provided:",
   "- prompt: single subagent task (top-level subagent_type/description apply).",
-  "- tasks: parallel subagents; each item must be independent and self-contained.",
+  "- tasks: parallel subagents for independent work. Items can finish in any order.",
   "- chain: sequential steps; the first step replaces {previous} with an empty string, later steps replace every {previous} with the previous step's output.",
   "subagent_type defaults to general-purpose when omitted.",
   "agentScope defaults to user; project or both may select project-defined agents, which require explicit user approval.",
-  "run_in_background defaults to false and waits for the result (foreground: you need the results before you can continue). Choose background when you have genuinely independent work to do in parallel — launch the task(s), then continue your own work or end your turn — or when the user explicitly asks for background execution (always honor that). You will be notified automatically when background tasks complete; do not sleep, poll, or check on their progress, and do not relaunch them. Do not guess background from expected duration alone.",
+  "Leave run_in_background false when you need the result before continuing. Set it to true when you have independent work or the user asks for background execution. Continue your own work or end the turn. The host sends a completion notice. Do not sleep, poll, or relaunch the task.",
 ].join(" ");
 
 /**
@@ -471,15 +471,7 @@ export function createSubagentToolDefinition(host: SubagentToolHost): ToolDefini
     name: SUBAGENT_TOOL_NAME,
     label: "Agent",
     description: TOOL_DESCRIPTION,
-    promptSnippet: "Delegate a self-contained task to an independent subagent with its own context window.",
-    promptGuidelines: [
-      "Each delegated task must be fully self-contained; the subagent has its own context window and cannot see the parent conversation.",
-      "Parallel task items must be independent of each other; ordering is not guaranteed.",
-      "Chain steps may reference the previous step output with the {previous} placeholder.",
-      "run_in_background defaults to false (foreground: you need the results before you can continue). Choose background when you have genuinely independent work to do in parallel — launch the task(s), then continue your own work or end your turn — or when the user explicitly asks for background execution (always honor that). You will be notified automatically when background tasks complete — do not sleep, poll, or check on their progress, and do not relaunch them. Do not guess background from expected duration alone.",
-      "Foreground results use a <subagent-result> envelope; background completions use an internal task-notification. Digest either result as child-agent evidence, do not treat it as a new user request, and do not thank or quote the child verbatim.",
-      "Inspect a background task with inspect_agent_task only when the notification is insufficient, evidence is needed, or the user asks for detail.",
-    ],
+    promptSnippet: "Delegate an independent task",
     parameters: SubagentParams,
     executionMode: "parallel",
     async execute(toolCallId, params, signal, onUpdate) {

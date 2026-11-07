@@ -61,7 +61,7 @@ const sections: {
     icon: "mdi-cog-outline",
     group: "使用偏好",
     description: "设置 Agent 的执行权限与日常对话行为。",
-    keywords: "执行模式 审批 只读 无监管 完成前验证 默认思考 引导 后续 自动压缩 主动压缩 ACP 安静启动",
+    keywords: "执行模式 审批 只读 无监管 目标验证提醒 完成前验证 默认思考 引导 后续 自动压缩 主动压缩 ACP 安静启动",
   },
   {
     key: "plan",
@@ -953,16 +953,16 @@ async function downloadAndInstall(): Promise<void> {
                   />
                 </SettingsRow>
                 <SettingsRow
-                  title="完成前验证"
+                  title="目标验证提醒"
                   control-id="setting-verificationGate"
-                  description="提醒 Agent 在宣告完成前检查结果。"
+                  description="活跃目标修改文件后，自动提醒 Agent 检查结果。"
                 >
                   <v-switch
                     v-model="verificationGate"
                     id="setting-verificationGate"
-                    aria-label="完成前验证"
+                    aria-label="目标验证提醒"
                     density="compact"
-                    label="完成前验证"
+                    label="目标验证提醒"
                     hide-details
                     :disabled="!piReady || !rpc.isConnected.value"
                   />

@@ -85,9 +85,8 @@ export const BUILTIN_AGENTS: readonly AgentDefinition[] = Object.freeze([
 		description: "General-purpose subagent for self-contained coding and analysis tasks.",
 		systemPrompt:
 			"You are a general-purpose subagent. Complete the delegated task independently using the available tools. " +
-			"Inspect relevant files before acting, keep changes scoped to the task, and verify important changes. " +
-			"If the task cannot be completed, report what blocked it. " +
-			"Conclude with a concise summary of what you did and the outcome.",
+			"Read relevant files first, keep changes within scope, and verify them as the user and project allow. " +
+			"Tell your caller what you found or changed, the evidence, and any remaining blocker.",
 		model: "inherit",
 		maxTurns: 150,
 		source: "built-in",

@@ -35,18 +35,11 @@ const TODO_WRITE_SUCCESS_TEXT =
 	"Todo list updated. Continue using the todo list to track progress; mark items completed as you finish them.";
 
 const TODO_WRITE_DESCRIPTION = [
-	"Update the session todo list for the current task. Send the COMPLETE list on every call (full replacement, not a delta):",
-	"pending items, at most one in_progress item (the step you are working on right now), and completed items.",
-	"An empty array clears the list; a list whose items are all completed is cleared automatically.",
+	"Send the full todo list each time. An empty list clears it.",
+	"Mark an item in_progress before starting it. Keep at most one item in progress. Mark an item completed when its work and required checks are done. The list clears when all items are completed.",
+	"Add newly needed items and remove items that no longer apply.",
+	'Use an action for content ("Run tests") and an ongoing action for activeForm ("Running tests").',
 ].join(" ");
-
-const TODO_WRITE_GUIDELINES = [
-	"Create a todo list before starting work that needs 3 or more steps, touches multiple files, or has clearly sequenced subtasks; do not create one for trivial or conversational tasks.",
-	"Every call sends the full list (complete replacement), never a delta or partial update.",
-	"Before starting an item, mark it as the single in_progress item; mark items completed immediately after finishing them.",
-	"Add new items as the work reveals new requirements, and delete items that became irrelevant or were abandoned.",
-	'Write content in the imperative mood ("Run tests") and activeForm in the progressive mood ("Running tests").',
-];
 
 function textContent(text: string): TextContent {
 	return { type: "text", text };
@@ -79,7 +72,7 @@ export function createTodoWriteTool(controller: TodoController): ToolDefinition<
 		label: "Update Todo List",
 		description: TODO_WRITE_DESCRIPTION,
 		promptSnippet: "Track multi-step work with a session todo list.",
-		promptGuidelines: TODO_WRITE_GUIDELINES,
+		promptGuidelines: ["Use todo_write before starting work with three or more steps, multiple files, or ordered subtasks."],
 		parameters: TodoParamsSchema,
 		async execute(_toolCallId, params): Promise<AgentToolResult<undefined>> {
 			const todos = normalizeTodos(params.todos);

@@ -229,7 +229,7 @@ function isLegacyInternalNotificationText(text: string): boolean {
  *
  * This is used by:
  * - Agent's transormToLlm option (for prompt calls and queued messages)
- * - Compaction's generateSummary (for summarization)
+ * - Compaction's serializer (keeps the original source alongside the converted message)
  * - Custom extensions and tools
  */
 export function convertToLlm(messages: AgentMessage[]): Message[] {

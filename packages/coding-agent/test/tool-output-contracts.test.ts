@@ -1,7 +1,7 @@
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BackgroundTaskRegistry } from "../src/core/background-task-registry.ts";
 import { createEditToolDefinition } from "../src/core/tools/edit.ts";
 import { applyEditsToNormalizedContent, computeEditsDiff } from "../src/core/tools/edit-diff.ts";
@@ -60,7 +60,7 @@ describe("background output cursors", () => {
 		const registry = new BackgroundTaskRegistry();
 		const output = new OutputAccumulator({ ...options, tempFilePrefix: "pi-output-contract-test" });
 		accumulators.push(output);
-		(registry as unknown as { _tasks: Map<string, unknown> })._tasks.set("task", { output, status: "running" });
+		(registry as unknown as { _tasks: Map<string, unknown> })._tasks.set("task", { output, status: "running", exitCode: null });
 		return { registry, output };
 	}
 
@@ -88,6 +88,25 @@ describe("background output cursors", () => {
 		const { registry, output } = fixture({ maxBytes: 12 });
 		output.append(Buffer.from("first\nsecond\nthird\nfourth"));
 		expect(registry.read("task", 4)).toMatchObject({ text: expect.stringMatching(/^fourth\n/), lines: 1, totalLines: 4 });
+	});
+
+	it("reports different exit statuses for quiet successful and failed commands", async () => {
+		const registry = new BackgroundTaskRegistry();
+		const tool = createReadOutputToolDefinition(registry);
+		try {
+			const success = await registry.start("exit 0", process.cwd());
+			const failure = await registry.start("exit 7", process.cwd());
+			await vi.waitFor(() => {
+				expect(registry.getTask(success.taskId)?.exitCode).toBe(0);
+				expect(registry.getTask(failure.taskId)?.exitCode).toBe(7);
+			});
+			const successResult = await tool.execute("success", { taskId: success.taskId }, undefined, undefined, {} as never);
+			const failureResult = await tool.execute("failure", { taskId: failure.taskId }, undefined, undefined, {} as never);
+			expect(successResult.content[0]).toMatchObject({ text: expect.stringContaining("(stopped, exit code 0)") });
+			expect(failureResult.content[0]).toMatchObject({ text: expect.stringContaining("(error, exit code 7)") });
+		} finally {
+			registry.stopAll();
+		}
 	});
 });
 

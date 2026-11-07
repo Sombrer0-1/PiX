@@ -103,9 +103,8 @@ export function createRequestUserInputToolDefinitions(handler?: RequestUserInput
 			name: "request_user_input",
 			label: "Request user input",
 			description:
-				"Ask the user one to three short questions when you need clarification before continuing. Execution pauses until the user responds.",
-			promptSnippet:
-				"Use request_user_input when progress requires explicit user input. Keep questions short and provide 2-3 choices when possible.",
+				"Ask short questions when you need the user's answer before continuing. Offer concrete choices when possible. The call waits for a reply. In Plan mode, use this tool to clarify requirements and use submit_user_plan to request approval of the full plan.",
+			promptSnippet: "Ask the user for a decision or missing information",
 			parameters: requestUserInputSchema,
 			executionMode: "sequential",
 			async execute(_toolCallId, params: Static<typeof requestUserInputSchema>, signal) {

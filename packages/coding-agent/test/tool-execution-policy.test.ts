@@ -5,10 +5,10 @@ import { inspectToolExecution } from "../src/core/tool-execution-policy.ts";
 describe("tool execution policy", () => {
 	const cwd = process.platform === "win32" ? "C:\\work\\project" : "/work/project";
 
-	it("requires approval for destructive commands in approval mode", () => {
+	it.each(["bash", "run_background"])("requires approval for destructive commands through %s", (toolName) => {
 		const decision = inspectToolExecution({
 			mode: "approval",
-			toolName: "bash",
+			toolName,
 			args: { command: "rm -fr /" },
 			cwd,
 		});

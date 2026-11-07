@@ -132,7 +132,7 @@ export function inspectToolExecution(options: {
 		}
 	}
 
-	if (options.toolName !== "bash") {
+	if (options.toolName !== "bash" && options.toolName !== "run_background") {
 		return { allowed: true };
 	}
 

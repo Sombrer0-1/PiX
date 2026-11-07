@@ -575,7 +575,7 @@ export class AgentSession {
 	}
 
 	private _approvalSummary(toolName: string, args: unknown): string {
-		if (toolName === "bash") {
+		if (toolName === "bash" || toolName === "run_background") {
 			const command = this._getCommandText(args);
 			if (command) return this._truncateApprovalText(command);
 		}
@@ -596,9 +596,13 @@ export class AgentSession {
 		return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
 	}
 
-	private async _requestToolApproval(toolName: string, args: unknown, reason?: string): Promise<boolean> {
+	private async _requestToolApproval(
+		toolName: string,
+		args: unknown,
+		reason?: string,
+	): Promise<"approved" | "denied" | "cancelled" | "unavailable"> {
 		const handler = this._requestUserInput;
-		if (!handler) return false;
+		if (!handler) return "unavailable";
 		const target = this._approvalSummary(toolName, args);
 		const reasonText = reason ? ` 原因：${reason}。` : "";
 		try {
@@ -616,9 +620,12 @@ export class AgentSession {
 					},
 				],
 			});
-			return !response.cancelled && response.answers.approval === "允许执行";
+			if (response.cancelled) return "cancelled";
+			if (response.answers.approval === "允许执行") return "approved";
+			if (response.answers.approval === "拒绝") return "denied";
+			return "unavailable";
 		} catch {
-			return false;
+			return "unavailable";
 		}
 	}
 
@@ -658,11 +665,16 @@ export class AgentSession {
 			}
 			if (!policyDecision.allowed) {
 				if (policyDecision.requiresApproval) {
-					const approved = await this._requestToolApproval(toolCall.name, args, policyDecision.reason);
-					if (!approved) {
+					const approval = await this._requestToolApproval(toolCall.name, args, policyDecision.reason);
+					if (approval !== "approved") {
+						const outcome = {
+							denied: "The user denied this operation.",
+							cancelled: "The approval request was cancelled.",
+							unavailable: "No approval was received.",
+						}[approval];
 						return {
 							block: true,
-							reason: policyDecision.reason,
+							reason: [outcome, policyDecision.reason, "Continue only with actions already authorized."].filter(Boolean).join(" "),
 						};
 					}
 				} else {

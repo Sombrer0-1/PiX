@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { type CompactionPreparation, compact, generateSummary } from "../src/core/compaction/index.ts";
+import { type CompactionPreparation, compact, generateBranchSummary, generateSummary } from "../src/core/compaction/index.ts";
 
 const { completeSimpleMock } = vi.hoisted(() => ({
 	completeSimpleMock: vi.fn(),
@@ -117,10 +117,16 @@ describe("generateSummary reasoning options", () => {
 	});
 
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
+		const reminder = {
+			customType: "pi.verification_required",
+			content: "Verify the changed files.",
+			display: false,
+		};
+		const transcript: AgentMessage[] = [...messages, { role: "custom", ...reminder, timestamp: Date.now() }];
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
-			messagesToSummarize: messages,
-			turnPrefixMessages: messages,
+			messagesToSummarize: transcript,
+			turnPrefixMessages: transcript,
 			isSplitTurn: true,
 			tokensBefore: 600000,
 			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
@@ -130,5 +136,15 @@ describe("generateSummary reasoning options", () => {
 		await compact(preparation, createModel(false, 128000), "test-key");
 
 		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000, 128000]);
+		await generateBranchSummary(
+			[{ type: "custom_message", id: "notice", parentId: null, timestamp: new Date().toISOString(), ...reminder }],
+			{ model: createModel(false), apiKey: "test-key", signal: new AbortController().signal },
+		);
+		expect(completeSimpleMock).toHaveBeenCalledTimes(3);
+		for (const [, context] of completeSimpleMock.mock.calls) {
+			const prompt = context.messages[0].content[0].text;
+			expect(prompt).toContain("[Host]: Verify the changed files.");
+			expect(prompt).not.toContain("[User]: Verify the changed files.");
+		}
 	});
 });

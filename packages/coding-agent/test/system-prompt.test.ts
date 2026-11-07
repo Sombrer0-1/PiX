@@ -79,16 +79,15 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain('<instruction_hierarchy role="system" source="base"');
 			expect(prompt).toContain('<task_execution role="developer" source="base"');
 			expect(prompt).toContain('<tool_use role="developer" source="tools"');
-			expect(prompt).toContain('<context_boundaries role="developer" source="base"');
 			expect(prompt).toContain('<environment_context role="developer" source="runtime"');
 			expect(prompt).toContain('<internal_notification_policy role="developer" source="runtime"');
 			expect(prompt).toContain("new user request");
-			expect(prompt).toContain("model-visible but UI-hidden");
+			expect(prompt).toContain("The user may not see internal notices.");
 			expect(prompt).toContain("inspect_agent_task");
 			expect(prompt).not.toContain("inspect_team_task");
 			expect(buildSystemPrompt({ cwd: process.cwd(), customPrompt: "Custom assistant" })).not.toContain("inspect_team_task");
 			expect(prompt).toContain("<plan_generation>");
-			expect(prompt).toContain("adapt to the user's actual task");
+			expect(prompt).toContain("Adapt to the user's actual task");
 			expect(
 				matchesPromptFragment(
 					prompt.match(/<role_and_scope[\s\S]*?<\/role_and_scope>/)?.[0] ?? "",
@@ -179,6 +178,14 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).toContain("- Use dynamic_tool for project summaries.");
+		});
+
+		test("uses only enabled tools in file-search guidance", () => {
+			const withGrep = buildSystemPrompt({ cwd: "/workspace", selectedTools: ["bash", "grep"] });
+			expect(withGrep).toContain("Use grep for file contents. Use bash for shell commands.");
+			expect(withGrep).not.toContain("find for file names");
+			const withBashOnly = buildSystemPrompt({ cwd: "/workspace", selectedTools: ["bash"] });
+			expect(withBashOnly).toContain("Use bash for file searches when dedicated search tools are unavailable.");
 		});
 
 		test("deduplicates and trims promptGuidelines", () => {
@@ -383,11 +390,24 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain("Current working directory: C:/Users/me/project");
 			expect(prompt).toContain("Operating system: Windows (win32)");
 			expect(prompt).toContain("Execution mode: approval mode");
-			expect(prompt).toContain("Verification gate: enabled for code/configuration changes");
+			expect(prompt).toContain("Automatic verification reminders for active goals: enabled");
 			expect(prompt).toContain("Command shell for bash tool: C:\\Program Files\\Git\\bin\\bash.exe -c");
 			expect(prompt).toContain("Shell syntax for bash tool: POSIX shell/bash syntax.");
 			expect(prompt).toContain("use /dev/null to discard output");
 			expect(prompt).toContain("do not use bare NUL/nul redirection");
+		});
+
+		test("keeps project verification instructions in force when automatic reminders are disabled", () => {
+			const rule = "Run npm test or npm run build only when the user asks.";
+			const prompt = buildSystemPrompt({
+				cwd: "/workspace",
+				contextFiles: [{ path: "AGENTS.md", content: rule }],
+				runtimeEnvironment: { verificationGate: false },
+			});
+			expect(prompt).toContain(rule);
+			expect(prompt).toContain("Project instructions may override defaults for style, workflow, and verification.");
+			expect(prompt).toContain("within the user's and project's instructions");
+			expect(prompt).toContain("Automatic verification reminders for active goals: disabled");
 		});
 
 		test("describes unavailable shell instead of hiding it", () => {

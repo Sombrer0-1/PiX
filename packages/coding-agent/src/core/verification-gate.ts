@@ -53,9 +53,7 @@ export function createVerificationContinuationMessage(summary: TurnDiffSummary):
 		customType: "pi.verification_required",
 		content: `<verification_required>
 This run changed ${fileText} with +${summary.added} -${summary.removed}.
-Before giving the final answer for a code/configuration change, run the narrowest useful verification now: targeted tests, typecheck, lint, build, or packaging when the user requested a packaged deliverable.
-If verification is genuinely not applicable or cannot run in this environment, explain that clearly in the final answer instead of pretending it passed.
-Keep this engineering discipline scoped to the current code/project work; do not force it onto creative writing, analysis, translation, or other non-code tasks.
+Follow the user's and project's verification instructions for these changes. Report any important check you could not run.
 </verification_required>`,
 		display: false,
 		details: { summary },

@@ -45,14 +45,14 @@ describe("AgentSession prompt characterization", () => {
 		harnesses.push(harness);
 
 		expect(harness.session.systemPrompt).toContain("Execution mode: approval mode");
-		expect(harness.session.systemPrompt).toContain("Verification gate: enabled for code/configuration changes");
+		expect(harness.session.systemPrompt).toContain("Automatic verification reminders for active goals: enabled");
 
 		harness.settingsManager.setExecutionMode("unattended");
 		harness.settingsManager.setVerificationGateEnabled(false);
 		harness.session.refreshSystemPrompt();
 
 		expect(harness.session.systemPrompt).toContain("Execution mode: unattended mode");
-		expect(harness.session.systemPrompt).toContain("Verification gate: disabled");
+		expect(harness.session.systemPrompt).toContain("Automatic verification reminders for active goals: disabled");
 	});
 
 	it("handles a tool call turn and waits for the follow-up LLM response", async () => {

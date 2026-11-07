@@ -1244,20 +1244,12 @@ await run("tool: schema defaults run_in_background to false and the description 
   assertEqual(backgroundParam!.default, false, "run_in_background defaults to false");
   assert(tool.description.includes("run_in_background"), "description documents the parameter");
   assert(
-    tool.description.includes("notified automatically") && tool.description.includes("independent work"),
-    "description teaches background-for-parallel-work with automatic notification",
+    tool.description.includes("you need the result before continuing") && tool.description.includes("independent work"),
+    "description distinguishes work that needs a result from independent work",
   );
   assert(
-    tool.description.includes("Do not guess background from expected duration alone"),
-    "description keeps the duration warning",
-  );
-  assert(
-    tool.promptGuidelines?.some((g) => g.includes("run_in_background") && g.includes("notified automatically")) === true,
-    "prompt guidelines carry the same decision model",
-  );
-  assert(
-    tool.promptGuidelines?.some((g) => g.includes("run_in_background") && g.includes("independent work")) === true,
-    "prompt guidelines anchor background on independent parallel work",
+    tool.description.includes("sends a completion notice") && tool.description.includes("Do not sleep, poll, or relaunch"),
+    "description directs the model to wait for the completion notice",
   );
 });
 

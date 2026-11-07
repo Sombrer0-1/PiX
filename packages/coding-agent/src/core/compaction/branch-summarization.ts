@@ -9,7 +9,6 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import {
-	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
@@ -303,10 +302,7 @@ export async function generateBranchSummary(
 		return { summary: "No content to summarize" };
 	}
 
-	// Transform to LLM-compatible messages, then serialize to text
-	// Serialization prevents the model from treating it as a conversation to continue
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = serializeConversation(messages);
 
 	// Build prompt
 	let instructions: string;

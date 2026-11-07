@@ -298,15 +298,8 @@ export function createEditToolDefinition(
 		name: "edit",
 		label: "edit",
 		description:
-			"Edit a single file using targeted text replacement. Exact matching is tried first; a fallback tolerates trailing whitespace and Unicode punctuation/compatibility differences while preserving text outside the matched region. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
-		promptSnippet:
-			"Make precise file edits, including multiple disjoint edits in one call",
-		promptGuidelines: [
-			"Use edit for precise changes; copy edits[].oldText from the current file",
-			"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-		],
+			"Replace specific text in one file. Copy the smallest unique oldText from the current file. Use one call with separate edits for distant changes and combine changes that affect the same block. All edits match the original file and must be unique and non-overlapping. Exact matches take priority. Matching can also tolerate trailing whitespace and equivalent Unicode characters. Text outside the matched region is preserved.",
+		promptSnippet: "Replace specific text in a file",
 		parameters: editSchema,
 		renderShell: "self",
 		prepareArguments: prepareEditArguments,
