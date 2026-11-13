@@ -42,34 +42,33 @@ import {
   type RequestUserInputResponse,
   type TurnDiffSummary,
 } from "@earendil-works/pi-coding-agent";
-import { isSubagentDetails } from "../../shared/subagent-types.js";
-import type { SubagentDetails, SubagentUsage } from "../../shared/subagent-types.js";
+import { isSubagentDetails } from "@earendil-works/pix-runtime/shared/subagent-types";
+import type { SubagentDetails, SubagentUsage } from "@earendil-works/pix-runtime/shared/subagent-types";
 import type { ProjectLocation } from "../../shared/project-location.js";
-import type { AgentTaskActivity, AgentTaskGroupHandle, AgentTaskSpec } from "../../shared/agent-task-types.js";
-import { SettingsStore } from "../settings-store.js";
-import { isProductEvent, type ProductEvent } from "../../shared/product-events.js";
+import type { AgentTaskActivity, AgentTaskGroupHandle, AgentTaskSpec } from "@earendil-works/pix-runtime/shared/agent-task-types";
+import { isProductEvent, type ProductEvent } from "@earendil-works/pix-runtime/shared/product-events";
 import type { ProductEventCollector } from "../product-event-collector.js";
-import type { AgentTaskInputRouter } from "../agent-task/agent-task-input.js";
-import type { AgentTaskRuntime, AgentTaskRuntimeResult } from "../agent-task/agent-task-runtime.js";
-import type { ParentAnswerInfo } from "../agent-task/parent-answer.js";
+import type { AgentTaskInputRouter } from "@earendil-works/pix-runtime/agent-task/agent-task-input.js";
+import type { AgentTaskRuntime, AgentTaskRuntimeResult } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
+import type { ParentAnswerInfo } from "@earendil-works/pix-runtime/agent-task/parent-answer.js";
 import {
   AgentTaskService,
   __setAgentTaskServiceHooksForTests,
   type AgentTaskServiceTestHooks,
   type AgentTaskSubmissionContext,
-} from "../agent-task/agent-task-service.js";
-import { __setAgentTaskRuntimeContextFactoriesForTests } from "../agent-task/agent-task-runtime.js";
-import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { disposeProjectExecutionContext } from "../execution-context.js";
+} from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import { __setAgentTaskRuntimeContextFactoriesForTests } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
+import { AgentTaskStore } from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { disposeProjectExecutionContext } from "@earendil-works/pix-runtime/execution-context.js";
 import {
   MAX_DELEGATED_PROMPT_BYTES,
   MAX_PARALLEL_TASKS,
   SHELL_BACKGROUND_TOOLS,
   SubagentRunner,
   type SubagentRunOptions,
-} from "../subagent/subagent-runner.js";
-import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "../subagent/subagent-tool.js";
-import type { SubagentExecutionContext, SubagentToolHost } from "../subagent/types.js";
+} from "@earendil-works/pix-runtime/subagent/subagent-runner.js";
+import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "@earendil-works/pix-runtime/subagent/subagent-tool.js";
+import type { SubagentExecutionContext, SubagentToolHost } from "@earendil-works/pix-runtime/subagent/types.js";
 
 // ============================================================================
 // Test harness (matches the pre-migration style)
@@ -359,7 +358,7 @@ class FakeRuntime {
     });
   }
 
-  private makeItemResult(item: AgentTaskSpec["items"][number], index: number): import("../../shared/subagent-types.js").SubagentSingleResult {
+  private makeItemResult(item: AgentTaskSpec["items"][number], index: number): import("@earendil-works/pix-runtime/shared/subagent-types").SubagentSingleResult {
     return {
       id: `fake-${this.spec.taskId}-${index}`,
       index: item.index,
@@ -569,16 +568,22 @@ function makeLoadedAgents(): LoadAgentsResult {
  */
 function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): FacadeHarness {
   FakeRuntime.instances = [];
-  const cwd = mkdtempSync(join(tmpdir(), "pix-subagent-facade-"));
-  const settings = new SettingsStore({ cwd });
-  settings.set("enableProductAnalytics", true);
   const events = new FakeCollector() as unknown as ProductEventCollector;
   const approvals = makeApprovalControls();
   let resolveHostDisposed: () => void = () => {};
   const hostDisposed = new Promise<"host_disposed">((resolve) => {
     resolveHostDisposed = () => resolve("host_disposed");
   });
-  const service = new AgentTaskService({ settings, events, store: new AgentTaskStore({ rootDir: mkdtempSync(join(tmpdir(), "pix-subagent-runner-store-")), maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 }), runId: "runner-run" });
+  const service = new AgentTaskService({
+    settings: {},
+    recordProductEvent: (event) => events.record(event),
+    store: new AgentTaskStore({
+      rootDir: mkdtempSync(join(tmpdir(), "pix-subagent-runner-store-")),
+      maxTaskBytes: 25 * 1024 * 1024,
+      maxWorkspaceBytes: 500 * 1024 * 1024,
+    }),
+    runId: "runner-run",
+  });
   __setAgentTaskServiceHooksForTests({
     autoBackgroundMsOverride: 0,
     runtimeFactory: (spec, input) => {
@@ -609,14 +614,8 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): FacadeHar
   const loadedAgents = makeLoadedAgents();
 
   const ctx: SubagentExecutionContext = {
-    physicalCwd: PROJECT_CWD,
-    logicalCwd: PROJECT_CWD,
     agentDir: AGENT_DIR,
-    executionBackend: undefined,
-    runtimeEnvironmentOverride: undefined,
-    authStorage,
     modelRegistry: registry,
-    isWsl: false,
     getLoadedAgents: () => loadedAgents,
     getParentRuntime: () => parentRuntime,
     requestUserInput: (request, signal) => {
@@ -653,8 +652,6 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): FacadeHar
 function makeHost(h: FacadeHarness): SubagentToolHost {
   return {
     getRunner: () => h.runner,
-    getTaskService: () => h.service,
-    getSubmissionContext: (toolCallId: string) => h.runner.assembleSubmissionContext(toolCallId),
   };
 }
 
@@ -776,8 +773,8 @@ await run("assembleSubmissionContext forwards the parentAnswer seam (both submis
 
   // The workflow child spawner and the plan adapter submit through the same
   // assembleSubmissionContext path, so one seam covers every submission path.
-  const viaHost = makeHost(h).getSubmissionContext("wf-tool-call");
-  assert(viaHost.parentAnswer !== undefined, "the tool-host submission context carries the seam too");
+  const workflowContext = h.runner.assembleSubmissionContext("wf-tool-call");
+  assert(workflowContext.parentAnswer !== undefined, "the workflow submission context carries the seam too");
 });
 
 await run("foreground single: completes with details and records aggregated usage exactly once", async () => {
@@ -1044,11 +1041,17 @@ await run("WSL runtime isolation: explicit shell background tools fail tool_unav
 
   try {
     // The real runtime is used (no runtimeFactory hook) with a WSL project.
-    const cwd = mkdtempSync(join(tmpdir(), "pix-subagent-wsl-"));
-    const settings = new SettingsStore({ cwd });
-    settings.set("enableProductAnalytics", true);
     const events = new FakeCollector() as unknown as ProductEventCollector;
-    const service = new AgentTaskService({ settings, events, store: new AgentTaskStore({ rootDir: mkdtempSync(join(tmpdir(), "pix-subagent-runner-store-")), maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 }), runId: "runner-run" });
+    const service = new AgentTaskService({
+      settings: {},
+      recordProductEvent: (event) => events.record(event),
+      store: new AgentTaskStore({
+        rootDir: mkdtempSync(join(tmpdir(), "pix-subagent-runner-store-")),
+        maxTaskBytes: 25 * 1024 * 1024,
+        maxWorkspaceBytes: 500 * 1024 * 1024,
+      }),
+      runId: "runner-run",
+    });
     __setAgentTaskServiceHooksForTests({ autoBackgroundMsOverride: 0 });
 
     const authStorage = AuthStorage.create(join(AGENT_DIR, "auth.json"));
@@ -1056,14 +1059,8 @@ await run("WSL runtime isolation: explicit shell background tools fail tool_unav
     registry.registerProvider("faux", { api: "faux-api", streamSimple: fauxStream });
     const parentModel = registry.find("faux", "faux-model");
     const ctx: SubagentExecutionContext = {
-      physicalCwd: PROJECT_CWD,
-      logicalCwd: wslLocation.path,
       agentDir: AGENT_DIR,
-      executionBackend: undefined,
-      runtimeEnvironmentOverride: undefined,
-      authStorage,
       modelRegistry: registry,
-      isWsl: true,
       getLoadedAgents: () => makeLoadedAgents(),
       getParentRuntime: () => ({
         model: parentModel,
@@ -1145,11 +1142,17 @@ await run("WSL runtime isolation: all-tools activation excludes shell background
   });
 
   try {
-    const cwd = mkdtempSync(join(tmpdir(), "pix-subagent-wsl2-"));
-    const settings = new SettingsStore({ cwd });
-    settings.set("enableProductAnalytics", true);
     const events = new FakeCollector() as unknown as ProductEventCollector;
-    const service = new AgentTaskService({ settings, events, store: new AgentTaskStore({ rootDir: mkdtempSync(join(tmpdir(), "pix-subagent-runner-store-")), maxTaskBytes: 25 * 1024 * 1024, maxWorkspaceBytes: 500 * 1024 * 1024 }), runId: "runner-run" });
+    const service = new AgentTaskService({
+      settings: {},
+      recordProductEvent: (event) => events.record(event),
+      store: new AgentTaskStore({
+        rootDir: mkdtempSync(join(tmpdir(), "pix-subagent-runner-store-")),
+        maxTaskBytes: 25 * 1024 * 1024,
+        maxWorkspaceBytes: 500 * 1024 * 1024,
+      }),
+      runId: "runner-run",
+    });
     __setAgentTaskServiceHooksForTests({ autoBackgroundMsOverride: 0 });
 
     const authStorage = AuthStorage.create(join(AGENT_DIR, "auth.json"));
@@ -1157,14 +1160,8 @@ await run("WSL runtime isolation: all-tools activation excludes shell background
     registry.registerProvider("faux", { api: "faux-api", streamSimple: fauxStream });
     const parentModel = registry.find("faux", "faux-model");
     const ctx: SubagentExecutionContext = {
-      physicalCwd: PROJECT_CWD,
-      logicalCwd: wslLocation.path,
       agentDir: AGENT_DIR,
-      executionBackend: undefined,
-      runtimeEnvironmentOverride: undefined,
-      authStorage,
       modelRegistry: registry,
-      isWsl: true,
       getLoadedAgents: () => makeLoadedAgents(),
       getParentRuntime: () => ({
         model: parentModel,
@@ -1209,8 +1206,6 @@ await run("WSL runtime isolation: all-tools activation excludes shell background
     provider.scripts.push({ kind: "message", text: "win", stopReason: "stop" });
     const winCtx: SubagentExecutionContext = {
       ...ctx,
-      isWsl: false,
-      logicalCwd: PROJECT_CWD,
       getProjectLocation: () => PROJECT_LOCATION,
     };
     const winRunner = new SubagentRunner(winCtx);
@@ -1353,14 +1348,8 @@ await run("tool: no service available fails closed with a structured failed resu
   const authStorage = AuthStorage.create(join(AGENT_DIR, "auth.json"));
   const registry = ModelRegistry.create(authStorage, join(AGENT_DIR, "models.json"));
   const bareCtx: SubagentExecutionContext = {
-    physicalCwd: PROJECT_CWD,
-    logicalCwd: PROJECT_CWD,
     agentDir: AGENT_DIR,
-    executionBackend: undefined,
-    runtimeEnvironmentOverride: undefined,
-    authStorage,
     modelRegistry: registry,
-    isWsl: false,
     getLoadedAgents: () => makeLoadedAgents(),
     getParentRuntime: () => ({ model: undefined, thinkingLevel: "off", executionMode: "approval", verificationGate: false, acp: false }),
     requestUserInput: async (request) => ({ id: request.id, cancelled: false, answers: {} }),
@@ -1372,10 +1361,6 @@ await run("tool: no service available fails closed with a structured failed resu
   const runner = new SubagentRunner(bareCtx);
   const host: SubagentToolHost = {
     getRunner: () => runner,
-    getTaskService: () => {
-      throw new Error("no service");
-    },
-    getSubmissionContext: (toolCallId: string) => runner.assembleSubmissionContext(toolCallId),
   };
   const tool = createSubagentToolDefinition(host);
   const result = await executeTool(tool, "tc-1", { prompt: "go" });

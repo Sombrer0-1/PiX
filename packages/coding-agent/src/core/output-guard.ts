@@ -9,6 +9,11 @@ let stdoutTakeoverState: StdoutTakeoverState | undefined;
 const RAW_STDOUT_RETRY_DELAY_MS = 10;
 
 let rawStdoutWriteTail: Promise<void> = Promise.resolve();
+let onRawStdoutError: ((error: unknown) => void) | undefined;
+
+export function setRawStdoutErrorHandler(handler?: (error: unknown) => void): void {
+	onRawStdoutError = handler;
+}
 
 function getRawStdoutWrite(): StdoutTakeoverState["rawStdoutWrite"] {
 	if (stdoutTakeoverState) {
@@ -87,8 +92,9 @@ export function writeRawStdout(text: string): void {
 		return;
 	}
 	rawStdoutWriteTail = rawStdoutWriteTail.then(() => writeRawStdoutChunk(text));
-	void rawStdoutWriteTail.catch(() => {
-		process.exit(1);
+	void rawStdoutWriteTail.catch((error: unknown) => {
+		if (onRawStdoutError) onRawStdoutError(error);
+		else process.exit(1);
 	});
 }
 

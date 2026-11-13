@@ -37,7 +37,7 @@ import type {
   PlanStep,
   PixCommandResult,
 } from "@shared/types.js";
-import type { TodoEvent } from "@shared/todo-types.js";
+import type { TodoEvent } from "@earendil-works/pix-runtime/shared/todo-types";
 import CenterPanel from "../components/layout/CenterPanel.vue";
 import PlanModeToggle from "../components/plan/PlanModeToggle.vue";
 import PlanCard from "../components/plan/PlanCard.vue";

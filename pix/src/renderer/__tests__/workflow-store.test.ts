@@ -13,7 +13,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { WorkflowRunId } from "@shared/workflow-types.js";
+import { WorkflowRunId } from "@earendil-works/pix-runtime/shared/workflow-types";
 import type { PixApi } from "../../main/preload";
 import type {
   PixCommandResult,

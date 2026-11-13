@@ -23,7 +23,7 @@
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
 import type { ChatMessageAttachment, DisplayBlock, ToolWorkItem } from "@/types/session";
 import { classifyApiError } from "@/utils/api-error";
-import { isInternalCustomMessageType } from "@shared/internal-notification";
+import { isInternalCustomMessageType } from "@earendil-works/pix-runtime/shared/internal-notification";
 
 // ============================================================================
 // Public contract (Plan 4.7)

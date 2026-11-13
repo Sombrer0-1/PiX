@@ -31,7 +31,7 @@ import {
   sanitizeProductEventPayload,
   type ProductEvent,
   type ProductEventPayload,
-} from "../../shared/product-events.js";
+} from "@earendil-works/pix-runtime/shared/product-events";
 import { SettingsStore } from "../settings-store.js";
 import { ProductEventCollector } from "../product-event-collector.js";
 

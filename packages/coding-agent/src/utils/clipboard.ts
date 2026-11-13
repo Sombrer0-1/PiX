@@ -1,7 +1,9 @@
-import { execSync, spawn } from "child_process";
+import { execFile, execSync, spawn } from "child_process";
 import { platform } from "os";
+import { promisify } from "util";
 import { isWaylandSession } from "./clipboard-image.ts";
 import { clipboard } from "./clipboard-native.ts";
+import { isWSL } from "./wsl.ts";
 
 type NativeClipboardExecOptions = {
 	input: string;
@@ -18,6 +20,53 @@ function copyToX11Clipboard(options: NativeClipboardExecOptions): void {
 }
 
 const MAX_OSC52_ENCODED_LENGTH = 100_000;
+const execClipboard = promisify(execFile);
+
+async function readClipboardCommand(command: string, args: string[]): Promise<string | null> {
+	try {
+		const { stdout } = await execClipboard(command, args, {
+			cwd: "/",
+			encoding: "utf-8",
+			maxBuffer: 50 * 1024 * 1024,
+			timeout: 5000,
+			windowsHide: true,
+		});
+		return stdout || null;
+	} catch {
+		return null;
+	}
+}
+
+export async function readClipboardText(): Promise<string | null> {
+	const p = platform();
+	const commands: [string, string[]][] = [];
+	if (process.env.TERMUX_VERSION) commands.push(["termux-clipboard-get", []]);
+	if (p === "linux") {
+		if (process.env.WAYLAND_DISPLAY) commands.push(["wl-paste", ["--no-newline", "--type", "text"]]);
+		if (process.env.DISPLAY) {
+			commands.push(["xclip", ["-selection", "clipboard", "-out"]], ["xsel", ["--clipboard", "--output"]]);
+		}
+	}
+	for (const [command, args] of commands) {
+		const text = await readClipboardCommand(command, args);
+		if (text) return text;
+	}
+	try {
+		const text = await clipboard?.getText();
+		if (text) return text;
+	} catch {
+		// Windows can still read the clipboard through PowerShell.
+	}
+	if (p === "win32" || (p === "linux" && isWSL())) {
+		return readClipboardCommand("powershell.exe", [
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); [Console]::Write([string](Get-Clipboard -Raw))",
+		]);
+	}
+	return null;
+}
 
 function isRemoteSession(env: NodeJS.ProcessEnv = process.env): boolean {
 	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION);

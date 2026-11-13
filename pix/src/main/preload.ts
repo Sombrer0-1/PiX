@@ -39,7 +39,7 @@ import type {
   WslDistroListResult,
 } from "../shared/types.js";
 import type { ComputerUseCommand, ComputerUseEvent, ComputerUseSnapshot } from "../shared/computer-use-types.js";
-import type { TodoCommand, TodoEvent, TodoSnapshot } from "../shared/todo-types.js";
+import type { TodoCommand, TodoEvent, TodoSnapshot } from "@earendil-works/pix-runtime/shared/todo-types";
 
 export interface PixApi {
   // File dialogs

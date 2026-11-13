@@ -6,6 +6,7 @@ import { join } from "path";
 
 import { clipboard } from "./clipboard-native.ts";
 import { loadPhoton } from "./photon.ts";
+import { isWSL } from "./wsl.ts";
 
 export type ClipboardImage = {
 	bytes: Uint8Array;
@@ -140,19 +141,6 @@ function readClipboardImageViaWlPaste(): ClipboardImage | null {
 	return { bytes: data.stdout, mimeType: baseMimeType(selectedType) };
 }
 
-function isWSL(env: NodeJS.ProcessEnv = process.env): boolean {
-	if (env.WSL_DISTRO_NAME || env.WSLENV) {
-		return true;
-	}
-
-	try {
-		const release = readFileSync("/proc/version", "utf-8");
-		return /microsoft|wsl/i.test(release);
-	} catch {
-		return false;
-	}
-}
-
 /**
  * On WSL, the Linux clipboard (Wayland/X11) does not receive image data from
  * Windows screenshots (Win+Shift+S). PowerShell can access the Windows clipboard
@@ -215,25 +203,20 @@ function readClipboardImageViaXclip(): ClipboardImage | null {
 		timeoutMs: DEFAULT_LIST_TIMEOUT_MS,
 	});
 
-	let candidateTypes: string[] = [];
-	if (targets.ok) {
-		candidateTypes = targets.stdout
-			.toString("utf-8")
-			.split(/\r?\n/)
-			.map((t) => t.trim())
-			.filter(Boolean);
-	}
-
-	const preferred = candidateTypes.length > 0 ? selectPreferredImageMimeType(candidateTypes) : null;
-	const tryTypes = preferred ? [preferred, ...SUPPORTED_IMAGE_MIME_TYPES] : [...SUPPORTED_IMAGE_MIME_TYPES];
-
-	for (const mimeType of tryTypes) {
-		const data = runCommand("xclip", ["-selection", "clipboard", "-t", mimeType, "-o"]);
+	if (!targets.ok) return null;
+	const candidateTypes = targets.stdout
+		.toString("utf-8")
+		.split(/\r?\n/)
+		.map((type) => type.trim());
+	const preferred = selectPreferredImageMimeType(candidateTypes);
+	if (!preferred) return null;
+	const otherTypes = candidateTypes.filter((type) => type !== preferred && isSupportedImageMimeType(type));
+	for (const type of [preferred, ...otherTypes]) {
+		const data = runCommand("xclip", ["-selection", "clipboard", "-t", type, "-o"]);
 		if (data.ok && data.stdout.length > 0) {
-			return { bytes: data.stdout, mimeType: baseMimeType(mimeType) };
+			return { bytes: data.stdout, mimeType: baseMimeType(type) };
 		}
 	}
-
 	return null;
 }
 

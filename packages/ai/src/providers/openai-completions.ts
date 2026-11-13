@@ -32,8 +32,8 @@ import type {
 import { extractApiErrorInfo } from "../utils/api-error.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
@@ -160,19 +160,17 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			interface StreamingToolCallBlock extends ToolCall {
-				partialArgs?: string;
-				streamIndex?: number;
-			}
-			type StreamingBlock = TextContent | ThinkingContent | StreamingToolCallBlock;
+			type StreamingBlock = TextContent | ThinkingContent | ToolCall;
+			type StreamingToolCall = { block: ToolCall; args: ToolCallArgumentsStream; streamIndex?: number };
 			type StreamingToolCallDelta = NonNullable<ChatCompletionChunk.Choice.Delta["tool_calls"]>[number];
 
 			let textBlock: TextContent | null = null;
 			let thinkingBlock: ThinkingContent | null = null;
 			let hasFinishReason = false;
-			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
-			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
-			const blocks = output.content as StreamingBlock[];
+			const toolCallsByIndex = new Map<number, StreamingToolCall>();
+			const toolCallsById = new Map<string, StreamingToolCall>();
+			const toolArguments = new Map<ToolCall, ToolCallArgumentsStream>();
+			const blocks = output.content;
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const finishBlock = (block: StreamingBlock) => {
 				const contentIndex = getContentIndex(block);
@@ -194,11 +192,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						partial: output,
 					});
 				} else if (block.type === "toolCall") {
-					block.arguments = parseStreamingJson(block.partialArgs);
-					// Finalize in-place and strip the scratch buffers so replay only
-					// carries parsed arguments.
-					delete block.partialArgs;
-					delete block.streamIndex;
+					Object.assign(block, toolArguments.get(block)!.finish());
 					stream.push({
 						type: "toolcall_end",
 						contentIndex,
@@ -229,25 +223,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			};
 			const ensureToolCallBlock = (toolCall: StreamingToolCallDelta) => {
 				const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
-				let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
-				if (!block && toolCall.id) {
-					block = toolCallBlocksById.get(toolCall.id);
+				let call = streamIndex !== undefined ? toolCallsByIndex.get(streamIndex) : undefined;
+				if (!call && toolCall.id) {
+					call = toolCallsById.get(toolCall.id);
 				}
-				if (!block) {
-					block = {
+				if (!call) {
+					const block: ToolCall = {
 						type: "toolCall",
 						id: toolCall.id || "",
 						name: toolCall.function?.name || "",
 						arguments: {},
-						partialArgs: "",
-						streamIndex,
 					};
-					if (streamIndex !== undefined) {
-						toolCallBlocksByIndex.set(streamIndex, block);
-					}
-					if (toolCall.id) {
-						toolCallBlocksById.set(toolCall.id, block);
-					}
+					call = { block, args: new ToolCallArgumentsStream() };
+					toolArguments.set(block, call.args);
 					blocks.push(block);
 					stream.push({
 						type: "toolcall_start",
@@ -255,14 +243,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						partial: output,
 					});
 				}
-				if (streamIndex !== undefined && block.streamIndex === undefined) {
-					block.streamIndex = streamIndex;
-					toolCallBlocksByIndex.set(streamIndex, block);
+				if (streamIndex !== undefined && call.streamIndex === undefined) {
+					call.streamIndex = streamIndex;
+					toolCallsByIndex.set(streamIndex, call);
 				}
 				if (toolCall.id) {
-					toolCallBlocksById.set(toolCall.id, block);
+					toolCallsById.set(toolCall.id, call);
 				}
-				return block;
+				return call;
 			};
 
 			for await (const chunk of openaiStream) {
@@ -347,10 +335,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls) {
-							const block = ensureToolCallBlock(toolCall);
+							const { block, args } = ensureToolCallBlock(toolCall);
 							if (!block.id && toolCall.id) {
 								block.id = toolCall.id;
-								toolCallBlocksById.set(toolCall.id, block);
 							}
 							if (!block.name && toolCall.function?.name) {
 								block.name = toolCall.function.name;
@@ -359,8 +346,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 							let delta = "";
 							if (toolCall.function?.arguments) {
 								delta = toolCall.function.arguments;
-								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
-								block.arguments = parseStreamingJson(block.partialArgs);
+								block.arguments = args.append(delta);
 							}
 							stream.push({
 								type: "toolcall_delta",
@@ -407,12 +393,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
-			for (const block of output.content) {
-				delete (block as { index?: number }).index;
-				// Streaming scratch buffers are only used during parsing; never persist them.
-				delete (block as { partialArgs?: string }).partialArgs;
-				delete (block as { streamIndex?: number }).streamIndex;
-			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			output.apiError = extractApiErrorInfo(error);

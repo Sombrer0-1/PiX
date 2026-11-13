@@ -21,6 +21,7 @@ import type {
 } from "../../core/extensions/index.ts";
 import {
 	flushRawStdout,
+	setRawStdoutErrorHandler,
 	takeOverStdout,
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
@@ -28,6 +29,7 @@ import {
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import { createSyntheticSourceInfo } from "../../core/source-info.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
+import { queueHostInput } from "../host-input-queue.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
@@ -78,15 +80,44 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	};
 
 	// Pending extension UI requests waiting for response
-	const pendingExtensionRequests = new Map<
-		string,
-		{ resolve: (value: any) => void; reject: (error: Error) => void }
-	>();
+	const pendingExtensionRequests = new Map<string, { resolve: (value: RpcExtensionUIResponse) => void }>();
 
 	// Shutdown request flag
 	let shutdownRequested = false;
-	let shuttingDown = false;
+	let shuttingDown: Promise<never> | undefined;
+	const shutdownController = new AbortController();
+	let sessionDialogs = new AbortController();
 	const signalCleanupHandlers: Array<() => void> = [];
+	const requestUserInput = queueHostInput(
+		(request, signal) =>
+			new Promise((resolve) => {
+				const cancelled = { id: request.id, answers: {}, cancelled: true };
+				if (signal?.aborted) return resolve(cancelled);
+				const onAbort = () => {
+					pendingExtensionRequests.delete(request.id);
+					resolve(cancelled);
+				};
+				signal?.addEventListener("abort", onAbort, { once: true });
+				pendingExtensionRequests.set(request.id, {
+					resolve: (response) => {
+						signal?.removeEventListener("abort", onAbort);
+						const answers = "answers" in response ? response.answers : undefined;
+						if (
+							("cancelled" in response && response.cancelled) ||
+							!answers ||
+							typeof answers !== "object" ||
+							Array.isArray(answers) ||
+							Object.values(answers).some((answer) => typeof answer !== "string")
+						) {
+							resolve(cancelled);
+							return;
+						}
+						resolve({ id: request.id, answers });
+					},
+				});
+				output({ type: "extension_ui_request", method: "request_user_input", ...request });
+			}),
+	);
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -96,14 +127,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		parseResponse: (response: RpcExtensionUIResponse) => T,
 	): Promise<T> {
 		if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+		const signal = opts?.signal ? AbortSignal.any([opts.signal, sessionDialogs.signal]) : sessionDialogs.signal;
 
 		const id = crypto.randomUUID();
-		return new Promise((resolve, reject) => {
+		return new Promise((resolve) => {
 			let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
 			const cleanup = () => {
 				if (timeoutId) clearTimeout(timeoutId);
-				opts?.signal?.removeEventListener("abort", onAbort);
+				signal.removeEventListener("abort", onAbort);
 				pendingExtensionRequests.delete(id);
 			};
 
@@ -111,7 +143,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				cleanup();
 				resolve(defaultValue);
 			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) return onAbort();
+			signal.addEventListener("abort", onAbort, { once: true });
 
 			if (opts?.timeout) {
 				timeoutId = setTimeout(() => {
@@ -125,7 +158,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					cleanup();
 					resolve(parseResponse(response));
 				},
-				reject,
 			});
 			output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 		});
@@ -254,9 +286,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 		async editor(title: string, prefill?: string): Promise<string | undefined> {
 			const id = crypto.randomUUID();
-			return new Promise((resolve, reject) => {
+			const signal = sessionDialogs.signal;
+			return new Promise((resolve) => {
+				const onAbort = () => {
+					pendingExtensionRequests.delete(id);
+					resolve(undefined);
+				};
+				if (signal.aborted) return onAbort();
+				signal.addEventListener("abort", onAbort, { once: true });
 				pendingExtensionRequests.set(id, {
 					resolve: (response: RpcExtensionUIResponse) => {
+						signal.removeEventListener("abort", onAbort);
 						if ("cancelled" in response && response.cancelled) {
 							resolve(undefined);
 						} else if ("value" in response) {
@@ -265,7 +305,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 							resolve(undefined);
 						}
 					},
-					reject,
 				});
 				output({ type: "extension_ui_request", id, method: "editor", title, prefill } as RpcExtensionUIRequest);
 			});
@@ -314,10 +353,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	runtimeHost.setRebindSession(async () => {
 		await rebindSession();
 	});
+	if (runtimeHost.files) runtimeHost.setBeforeSessionClose(() => sessionDialogs.abort());
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
-		await session.bindExtensions({
+		sessionDialogs.abort();
+		sessionDialogs = new AbortController();
+		if (shutdownController.signal.aborted) sessionDialogs.abort();
+		if (runtimeHost.files) runtimeHost.setHostIO({ requestUserInput, emit: output });
+		const bindExtensions = runtimeHost.files
+			? runtimeHost.bindExtensions.bind(runtimeHost)
+			: session.bindExtensions.bind(session);
+		await bindExtensions({
 			uiContext: createExtensionUIContext(),
 			commandContextActions: {
 				waitForIdle: () => session.agent.waitForIdle(),
@@ -349,6 +396,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
 			},
 		});
+		if (shutdownController.signal.aborted) return;
 
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
@@ -358,10 +406,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
 			await waitForRawStdoutBackpressure();
 		});
+		if (runtimeHost.files) await runtimeHost.initializeSession();
 	};
 
 	const registerSignalHandlers = (): void => {
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		if (runtimeHost.files) signals.push("SIGINT");
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
@@ -369,15 +419,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+				void shutdown(signal === "SIGHUP" ? 129 : signal === "SIGINT" ? 130 : 143, signal);
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
 		}
 	};
-
-	await rebindSession();
-	registerSignalHandlers();
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
@@ -422,6 +469,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "follow_up");
 			}
 
+			case "clear_queue": {
+				return success(id, "clear_queue", session.clearQueue());
+			}
+
 			case "abort": {
 				await session.abort();
 				return success(id, "abort");
@@ -430,9 +481,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const result = await runtimeHost.newSession(options);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "new_session", result);
 			}
 
@@ -577,17 +625,31 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "switch_session": {
 				const result = await runtimeHost.switchSession(command.sessionPath);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "switch_session", result);
+			}
+
+			case "import_session": {
+				if (!runtimeHost.files) return error(id, command.type, `Unknown command: ${command.type}`);
+				const result = await runtimeHost.importFromJsonl(command.path, command.cwdOverride);
+				return success(id, command.type, result);
+			}
+
+			case "rename_session": {
+				if (!runtimeHost.files) return error(id, command.type, `Unknown command: ${command.type}`);
+				const name = command.name.trim();
+				if (!name) return error(id, command.type, "Session name cannot be empty");
+				await runtimeHost.renameSessionFile(command.path, name);
+				return success(id, command.type);
+			}
+
+			case "delete_session": {
+				if (!runtimeHost.files) return error(id, command.type, `Unknown command: ${command.type}`);
+				await runtimeHost.deleteSessionFile(command.path);
+				return success(id, command.type);
 			}
 
 			case "fork": {
 				const result = await runtimeHost.fork(command.entryId);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
@@ -597,15 +659,28 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					return error(id, "clone", "Cannot clone session: no current entry selected");
 				}
 				const result = await runtimeHost.fork(leafId, { position: "at" });
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "clone", { cancelled: result.cancelled });
 			}
 
 			case "get_fork_messages": {
 				const messages = session.getUserMessagesForForking();
 				return success(id, "get_fork_messages", { messages });
+			}
+
+			case "get_entries": {
+				const sessionManager = session.sessionManager;
+				let entries = sessionManager.getEntries();
+				if (command.since !== undefined) {
+					const index = entries.findIndex((entry) => entry.id === command.since);
+					if (index === -1) return error(id, "get_entries", `Entry not found: ${command.since}`);
+					entries = entries.slice(index + 1);
+				}
+				return success(id, "get_entries", { entries, leafId: sessionManager.getLeafId() });
+			}
+
+			case "get_tree": {
+				const sessionManager = session.sessionManager;
+				return success(id, "get_tree", { tree: sessionManager.getTree(), leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_last_assistant_text": {
@@ -643,6 +718,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 						description: command.description,
 						source: "builtin",
 						sourceInfo: createSyntheticSourceInfo("<builtin:slash>", { source: "builtin" }),
+					});
+				}
+				for (const command of runtimeHost.files ? runtimeHost.hostCommands : []) {
+					commands.push({
+						name: command.name,
+						description: command.description,
+						source: "builtin",
+						sourceInfo: createSyntheticSourceInfo("<host:slash>", { source: "builtin" }),
 					});
 				}
 
@@ -689,23 +772,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 */
 	let detachInput = () => {};
 
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
-		if (shuttingDown) {
+	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+		shuttingDown ??= (async () => {
+			shutdownController.abort();
+			sessionDialogs.abort();
+			detachInput();
+			process.stdin.pause();
+			unsubscribe?.();
+			unsubscribeBackpressure?.();
+			try {
+				await runtimeHost.dispose();
+				if (signal !== "SIGTERM") await flushRawStdout();
+			} catch (error) {
+				console.error(error);
+				exitCode ||= 1;
+			} finally {
+				for (const cleanup of signalCleanupHandlers) cleanup();
+			}
 			process.exit(exitCode);
-		}
-		shuttingDown = true;
-		for (const cleanup of signalCleanupHandlers) {
-			cleanup();
-		}
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
-		await runtimeHost.dispose();
-		detachInput();
-		process.stdin.pause();
-		if (signal !== "SIGTERM") {
-			await flushRawStdout();
-		}
-		process.exit(exitCode);
+		})();
+		return shuttingDown;
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
@@ -714,6 +800,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	}
 
 	const handleInputLine = async (line: string) => {
+		if (shuttingDown) return;
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(line);
@@ -745,9 +832,28 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return;
 		}
 
+		if (!parsed || typeof parsed !== "object" || !("type" in parsed) || typeof parsed.type !== "string") {
+			output(error(undefined, "parse", "Expected a command object with a type"));
+			return;
+		}
 		const command = parsed as RpcCommand;
 		try {
-			const response = await handleCommand(command);
+			await ready;
+			if (shuttingDown) return;
+			const hostCommand =
+				runtimeHost.files &&
+				runtimeHost.hostCommands.find(({ rpc }) =>
+					typeof rpc === "string" ? rpc === command.type : rpc?.includes(command.type),
+				);
+			const response = hostCommand
+				? {
+						id: command.id,
+						type: "response",
+						command: command.type,
+						success: true,
+						data: await hostCommand.execute(parsed as Record<string, unknown>),
+					}
+				: await handleCommand(command);
 			if (response) {
 				output(response);
 				await waitForRawStdoutBackpressure();
@@ -768,17 +874,33 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	const onInputEnd = () => {
 		void shutdown();
 	};
-	process.stdin.on("end", onInputEnd);
+	registerSignalHandlers();
+	if (runtimeHost.files)
+		setRawStdoutErrorHandler(() => {
+			void shutdown(1);
+		});
+	const ready = rebindSession();
 
 	detachInput = (() => {
 		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
 			void handleInputLine(line);
 		});
+		process.stdin.on("end", onInputEnd);
 		return () => {
 			detachJsonl();
 			process.stdin.off("end", onInputEnd);
 		};
 	})();
+	try {
+		await ready;
+	} catch (error) {
+		detachInput();
+		process.stdin.pause();
+		for (const cleanup of signalCleanupHandlers) cleanup();
+		if (runtimeHost.files) setRawStdoutErrorHandler();
+		throw error;
+	}
+	if (process.stdin.readableEnded) return shutdown();
 
 	// Keep process alive forever
 	return new Promise(() => {});

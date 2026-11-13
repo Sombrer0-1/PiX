@@ -256,6 +256,8 @@ export interface ToolCall {
 	id: string;
 	name: string;
 	arguments: Record<string, any>;
+	/** Error parsing the finished arguments, reported by tool validation. */
+	argumentsError?: string;
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 }
 

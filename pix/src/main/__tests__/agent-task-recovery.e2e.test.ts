@@ -70,19 +70,19 @@ import {
   getAgentDir,
   type RequestUserInputResponse,
 } from "@earendil-works/pi-coding-agent";
-import type { AgentTaskInfo, AgentTaskInputRequest } from "../../shared/agent-task-types.js";
+import type { AgentTaskInfo, AgentTaskInputRequest } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { ProjectLocation } from "../../shared/project-location.js";
-import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
-import { RESUME_INTERRUPTED_TOOL_RESULT_TEXT, RESUME_NOTE_CUSTOM_TYPE } from "../agent-task/agent-task-resumer.js";
-import { RESUME_TURN_MESSAGE } from "../agent-task/agent-task-runtime.js";
+import { AgentTaskStore } from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { workspaceIdOf } from "@earendil-works/pix-runtime/agent-task/agent-task-identity.js";
+import { RESUME_INTERRUPTED_TOOL_RESULT_TEXT, RESUME_NOTE_CUSTOM_TYPE } from "@earendil-works/pix-runtime/agent-task/agent-task-resumer.js";
+import { RESUME_TURN_MESSAGE } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
 import {
   AgentTaskService,
   __setAgentTaskServiceHooksForTests,
   type AgentTaskServiceEvent,
   type AgentTaskSubmissionContext,
-} from "../agent-task/agent-task-service.js";
-import type { SubagentTaskItem } from "../subagent/types.js";
+} from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import type { SubagentTaskItem } from "@earendil-works/pix-runtime/subagent/types.js";
 import { ProductEventCollector } from "../product-event-collector.js";
 import { SettingsStore } from "../settings-store.js";
 
@@ -357,7 +357,15 @@ async function runChild(model: Model<Api>): Promise<void> {
     maxTaskBytes: 25 * 1024 * 1024,
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
-  const service = new AgentTaskService({ settings, events, store, runId });
+  const service = new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId,
+  });
 
   const location: ProjectLocation = {
     path: projectDir,
@@ -607,7 +615,15 @@ async function crashHarness(
     maxTaskBytes: 25 * 1024 * 1024,
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
-  const service = new AgentTaskService({ settings, events, store, runId: `restore-${timepoint}` });
+  const service = new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId: `restore-${timepoint}`,
+  });
   // 1.5 (P1): the crash scenarios verify the manual hydration/resume flows -
   // disable the automatic post-restoreAll recovery pass by default; the
   // dedicated auto-recovery scenario opts back in.

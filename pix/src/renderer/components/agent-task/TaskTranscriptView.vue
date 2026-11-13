@@ -19,7 +19,7 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
 import SessionView from "../session/SessionView.vue";
 import { createDisplayBlockAssembler } from "../../utils/display-blocks";
-import type { AgentTaskInfo, AgentTaskStatus } from "@shared/agent-task-types.js";
+import type { AgentTaskInfo, AgentTaskStatus } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { DisplayBlock } from "@/types/session";
 
 const TERMINAL_STATUSES: ReadonlySet<AgentTaskStatus> = new Set(["completed", "failed", "cancelled"]);

@@ -17,8 +17,8 @@
 import { computed, ref } from "vue";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
 import { useLiveNow } from "../../composables/useLiveNow";
-import { AGENT_TASK_MAX_ACTIVITIES } from "@shared/agent-task-types.js";
-import type { AgentTaskDiagnosticExport, AgentTaskInfo, AgentTaskRecoveryIssue } from "@shared/agent-task-types.js";
+import { AGENT_TASK_MAX_ACTIVITIES } from "@earendil-works/pix-runtime/shared/agent-task-types";
+import type { AgentTaskDiagnosticExport, AgentTaskInfo, AgentTaskRecoveryIssue } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import { thinkingLevelLabel } from "../../utils/thinking-labels";
 
 const props = defineProps<{

@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { applyPatch } from "diff";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BackgroundTaskRegistry } from "../src/core/background-task-registry.ts";
 import { createEditToolDefinition } from "../src/core/tools/edit.ts";
@@ -38,6 +39,27 @@ describe("targeted fuzzy edits", () => {
 		], "unicode.md");
 		expect(result.baseContent).toBe(original);
 		expect(result.newContent).toBe("keep: ⑩ ﬃ cafe\u0301  \nchanged\nEXACT\n");
+	});
+
+	it("preserves mixed line endings and builds a patch for distant edits", async () => {
+		const original = Array.from({ length: 100 }, (_, i) => `line ${i + 1}${i % 2 === 0 ? "\r\n" : "\n"}`).join("");
+		let written = "";
+		const operations = {
+			access: async () => {},
+			readFile: async () => Buffer.from(original),
+			writeFile: async (_path: string, text: string) => { written = text; },
+		};
+		const edits = [
+			{ oldText: "line 5\n", newText: "changed\nextra\n" },
+			{ oldText: "line 96\n", newText: "last change\n" },
+		];
+		const result = await createEditToolDefinition(process.cwd(), { operations }).execute(
+			"edit", { path: "mixed.txt", edits }, undefined, undefined, {} as never,
+		);
+		expect(written).toBe(original.replace("line 5\r\n", "changed\r\nextra\r\n").replace("line 96\n", "last change\n"));
+		expect(result.details?.firstChangedLine).toBe(5);
+		expect(result.details?.diff).toMatch(/\+\s*97 last change/);
+		expect(applyPatch(original.replaceAll("\r\n", "\n"), result.details!.patch)).toBe(written.replaceAll("\r\n", "\n"));
 	});
 
 	it("does not replace half of a compatibility-expanded character", () => {
@@ -122,6 +144,21 @@ it("grep respects hierarchical .gitignore files outside Git repositories", async
 		await writeFile(join(root, "src", "main.txt"), "needle");
 		const result = await createGrepToolDefinition(root).execute("grep", { pattern: "needle" }, undefined, undefined, {} as never);
 		expect(result.content).toEqual([{ type: "text", text: "src/main.txt:1: needle" }]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+it("roots grep globs at the search directory and preserves relative paths", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-grep-glob-test-"));
+	try {
+		await mkdir(join(root, "repo", "..visible"), { recursive: true });
+		await writeFile(join(root, "repo", "..visible", "test.txt"), "needle\n");
+		await writeFile(join(root, "repo", "ignored.txt"), "needle\n");
+		const result = await createGrepToolDefinition(root).execute(
+			"grep", { path: "repo", pattern: "needle", glob: "./..visible/*.txt" }, undefined, undefined, {} as never,
+		);
+		expect(result.content).toEqual([{ type: "text", text: "..visible/test.txt:1: needle" }]);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

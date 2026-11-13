@@ -86,7 +86,7 @@ import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.ts";
-import { copyToClipboard } from "../../utils/clipboard.ts";
+import { copyToClipboard, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { getCwdRelativePath } from "../../utils/paths.ts";
@@ -94,6 +94,7 @@ import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
+import { queueHostInput } from "../host-input-queue.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
@@ -202,13 +203,14 @@ function quoteIfNeeded(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function formatResumeCommand(sessionManager: SessionManager): string | undefined {
+export function formatResumeCommand(sessionManager: SessionManager, hostName?: string): string | undefined {
 	if (!process.stdout.isTTY) return undefined;
 	if (!sessionManager.isPersisted()) return undefined;
 
 	const sessionFile = sessionManager.getSessionFile();
 	if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
 
+	if (hostName) return `${hostName} --session ${quoteIfNeeded(sessionFile)}`;
 	const args = [APP_NAME];
 	if (!sessionManager.usesDefaultSessionDir()) {
 		args.push("--session-dir", quoteIfNeeded(sessionManager.getSessionDir()));
@@ -255,6 +257,7 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
+	identity?: { name: string; version: string };
 }
 
 export class InteractiveMode {
@@ -344,6 +347,7 @@ export class InteractiveMode {
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
+	private extensionDialogs?: AbortController;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
 
 	// Extension widgets (components rendered above/below the editor)
@@ -386,10 +390,11 @@ export class InteractiveMode {
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			this.resetExtensionUI();
 		});
+		this.runtimeHost.setBeforeSessionClose(() => this.extensionDialogs?.abort());
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession();
 		});
-		this.version = VERSION;
+		this.version = options.identity?.version ?? VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
@@ -475,6 +480,9 @@ export class InteractiveMode {
 			name: command.name,
 			description: command.description,
 		}));
+		for (const command of this.runtimeHost.hostCommands) {
+			slashCommands.push({ name: command.name, description: command.description });
+		}
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
 		if (modelCommand) {
@@ -622,7 +630,9 @@ export class InteractiveMode {
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
+			const logo =
+				theme.bold(theme.fg("accent", this.options.identity?.name ?? APP_NAME)) +
+				theme.fg("dim", ` v${this.version}`);
 
 			// Build startup instructions using keybinding hint helpers
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
@@ -645,7 +655,7 @@ export class InteractiveMode {
 				rawKeyHint("!!", "to run bash (no context)"),
 				hint("app.message.followUp", "to queue follow-up"),
 				hint("app.message.dequeue", "to edit all queued messages"),
-				hint("app.clipboard.pasteImage", "to paste image"),
+				hint("app.clipboard.pasteImage", "to paste image or text"),
 				rawKeyHint("drop files", "to attach"),
 			].join("\n");
 			const compactInstructions = [
@@ -724,12 +734,13 @@ export class InteractiveMode {
 	 * Update terminal title with session name and cwd.
 	 */
 	private updateTerminalTitle(): void {
+		const title = this.options.identity?.name ?? APP_TITLE;
 		const cwdBasename = path.basename(this.sessionManager.getCwd());
 		const sessionName = this.sessionManager.getSessionName();
 		if (sessionName) {
-			this.ui.terminal.setTitle(`${APP_TITLE} - ${sessionName} - ${cwdBasename}`);
+			this.ui.terminal.setTitle(`${title} - ${sessionName} - ${cwdBasename}`);
 		} else {
-			this.ui.terminal.setTitle(`${APP_TITLE} - ${cwdBasename}`);
+			this.ui.terminal.setTitle(`${title} - ${cwdBasename}`);
 		}
 	}
 
@@ -740,19 +751,14 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 
-		// Start version check asynchronously
-		checkForNewPiVersion(this.version).then((newRelease) => {
-			if (newRelease) {
-				this.showNewVersionNotification(newRelease);
-			}
-		});
-
-		// Start package update check asynchronously
-		this.checkForPackageUpdates().then((updates) => {
-			if (updates.length > 0) {
-				this.showPackageUpdateNotification(updates);
-			}
-		});
+		if (!this.options.identity) {
+			checkForNewPiVersion(this.version).then((newRelease) => {
+				if (newRelease) this.showNewVersionNotification(newRelease);
+			});
+			this.checkForPackageUpdates().then((updates) => {
+				if (updates.length > 0) this.showPackageUpdateNotification(updates);
+			});
+		}
 
 		// Check tmux keyboard setup asynchronously
 		this.checkTmuxKeyboardSetup().then((warning) => {
@@ -882,6 +888,7 @@ export class InteractiveMode {
 	 * Only shows new entries since last seen version, skips for resumed sessions.
 	 */
 	private getChangelogForDisplay(): string | undefined {
+		if (this.options.identity) return undefined;
 		// Skip changelog for resumed/continued sessions (already have messages)
 		if (this.session.state.messages.length > 0) {
 			return undefined;
@@ -1505,8 +1512,15 @@ export class InteractiveMode {
 	 * Initialize the extension system with TUI-based UI context.
 	 */
 	private async bindCurrentSessionExtensions(): Promise<void> {
+		if (this.options.identity) this.extensionDialogs = new AbortController();
 		const uiContext = this.createExtensionUIContext();
-		await this.session.bindExtensions({
+		this.runtimeHost.setHostIO({
+			requestUserInput: this.requestHostInput,
+			emit: (_event, text) => {
+				if (text) this.showStatus(text);
+			},
+		});
+		await this.runtimeHost.bindExtensions({
 			uiContext,
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
@@ -1613,18 +1627,25 @@ export class InteractiveMode {
 		this.unsubscribe = undefined;
 		this.applyRuntimeSettings();
 		await this.bindCurrentSessionExtensions();
+		if (this.isShuttingDown) return;
 		this.subscribeToAgent();
+		await this.runtimeHost.initializeSession();
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
 	}
 
-	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
+	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<{ cancelled: true }> {
 		const message = error instanceof Error ? error.message : String(error);
 		this.showError(`${prefix}: ${message}`);
+		if (this.runtimeHost.files && this.runtimeHost.hasOpenSession) return { cancelled: true };
 		stopThemeWatcher();
 		this.stop();
-		process.exit(1);
+		try {
+			await this.runtimeHost.dispose();
+		} finally {
+			process.exit(1);
+		}
 	}
 
 	private renderCurrentSessionState(): void {
@@ -1986,10 +2007,13 @@ export class InteractiveMode {
 	 * Create the ExtensionUIContext for extensions.
 	 */
 	private createExtensionUIContext(): ExtensionUIContext {
+		const lifetime = this.extensionDialogs?.signal;
+		const bindDialog = (opts?: ExtensionUIDialogOptions): ExtensionUIDialogOptions | undefined =>
+			lifetime ? { ...opts, signal: opts?.signal ? AbortSignal.any([opts.signal, lifetime]) : lifetime } : opts;
 		return {
-			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
-			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
-			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
+			select: (title, options, opts) => this.showExtensionSelector(title, options, bindDialog(opts)),
+			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, bindDialog(opts)),
+			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, bindDialog(opts)),
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
@@ -2010,7 +2034,7 @@ export class InteractiveMode {
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
-			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
+			editor: (title, prefill) => this.showExtensionEditor(title, prefill, lifetime),
 			addAutocompleteProvider: (factory) => {
 				this.autocompleteProviderWrappers.push(factory);
 				this.setupAutocompleteProvider();
@@ -2041,6 +2065,43 @@ export class InteractiveMode {
 			setToolsExpanded: (expanded) => this.setToolsExpanded(expanded),
 		};
 	}
+
+	private requestHostInput = queueHostInput(async (request, signal) => {
+		const controller = new AbortController();
+		const inputSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+		const stop = this.ui.addInputListener((key) => {
+			if (matchesKey(key, "ctrl+c")) {
+				controller.abort();
+				return { consume: true };
+			}
+		});
+		try {
+			const answers: Record<string, string> = {};
+			const cancelled = { id: request.id, answers: {}, cancelled: true };
+			if (inputSignal.aborted) return cancelled;
+			for (const question of request.questions) {
+				const title = `${question.header}\n${question.question}`;
+				const allowCustom = !request.purpose;
+				const custom = "Enter a different answer";
+				let answer: string | undefined;
+				if (question.options?.length) {
+					const labels = question.options.map(({ label }) => label);
+					answer = await this.showExtensionSelector(title, allowCustom ? [...labels, custom] : labels, {
+						signal: inputSignal,
+					});
+					if (allowCustom && answer === custom)
+						answer = await this.showExtensionInput(title, undefined, { signal: inputSignal });
+				} else {
+					answer = await this.showExtensionInput(title, undefined, { signal: inputSignal });
+				}
+				if (answer === undefined) return cancelled;
+				answers[question.id] = answer;
+			}
+			return { id: request.id, answers };
+		} finally {
+			stop();
+		}
+	});
 
 	/**
 	 * Show a selector for extensions.
@@ -2175,21 +2236,23 @@ export class InteractiveMode {
 	/**
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
-	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
+	private showExtensionEditor(title: string, prefill?: string, signal?: AbortSignal): Promise<string | undefined> {
 		return new Promise((resolve) => {
+			if (signal?.aborted) return resolve(undefined);
+			const finish = (value?: string) => {
+				signal?.removeEventListener("abort", onAbort);
+				this.hideExtensionEditor();
+				resolve(value);
+			};
+			const onAbort = () => finish();
+			signal?.addEventListener("abort", onAbort, { once: true });
 			this.extensionEditor = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
 				title,
 				prefill,
-				(value) => {
-					this.hideExtensionEditor();
-					resolve(value);
-				},
-				() => {
-					this.hideExtensionEditor();
-					resolve(undefined);
-				},
+				finish,
+				onAbort,
 			);
 
 			this.editorContainer.clear();
@@ -2218,7 +2281,7 @@ export class InteractiveMode {
 		this.editorComponentFactory = factory;
 
 		// Save text from current editor before switching
-		const currentText = this.editor.getText();
+		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
 
 		this.editorContainer.clear();
 
@@ -2307,7 +2370,7 @@ export class InteractiveMode {
 			onHandle?: (handle: OverlayHandle) => void;
 		},
 	): Promise<T> {
-		const savedText = this.editor.getText();
+		const savedText = this.editor.getExpandedText?.() ?? this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
 
 		const restoreEditor = () => {
@@ -2457,29 +2520,28 @@ export class InteractiveMode {
 			}
 		};
 
-		// Handle clipboard image paste (triggered on Ctrl+V)
 		this.defaultEditor.onPasteImage = () => {
-			this.handleClipboardImagePaste();
+			void this.handleClipboardPaste();
 		};
 	}
 
-	private async handleClipboardImagePaste(): Promise<void> {
+	private async handleClipboardPaste(): Promise<void> {
 		try {
 			const image = await readClipboardImage();
-			if (!image) {
+			if (image) {
+				const ext = extensionForImageMimeType(image.mimeType) ?? "png";
+				const filePath = path.join(os.tmpdir(), `pi-clipboard-${crypto.randomUUID()}.${ext}`);
+				fs.writeFileSync(filePath, image.bytes);
+				this.editor.insertTextAtCursor?.(filePath);
+				this.ui.requestRender();
 				return;
 			}
 
-			// Write to temp file
-			const tmpDir = os.tmpdir();
-			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-			const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
-			const filePath = path.join(tmpDir, fileName);
-			fs.writeFileSync(filePath, Buffer.from(image.bytes));
-
-			// Insert file path directly
-			this.editor.insertTextAtCursor?.(filePath);
-			this.ui.requestRender();
+			const text = await readClipboardText();
+			if (text) {
+				this.editor.insertTextAtCursor?.(text);
+				this.ui.requestRender();
+			}
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
 		}
@@ -2487,6 +2549,7 @@ export class InteractiveMode {
 
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
+			if (this.isShuttingDown) return;
 			text = text.trim();
 			if (!text) return;
 
@@ -2614,6 +2677,23 @@ export class InteractiveMode {
 				return;
 			}
 
+			if (text.startsWith("/")) {
+				const name = text.slice(1).split(/\s/, 1)[0];
+				const hostCommand = this.runtimeHost.hostCommands.find((command) => command.name === name);
+				if (hostCommand) {
+					this.editor.addToHistory?.(text);
+					this.editor.setText("");
+					try {
+						const result = await hostCommand.execute(text.slice(name.length + 1).trim());
+						if (result !== undefined)
+							this.showStatus(typeof result === "string" ? result : JSON.stringify(result));
+					} catch (error) {
+						this.showError(error instanceof Error ? error.message : String(error));
+					}
+					return;
+				}
+			}
+
 			// Handle bash command (! for normal, !! for excluded from context)
 			if (text.startsWith("!")) {
 				const isExcluded = text.startsWith("!!");
@@ -2675,6 +2755,7 @@ export class InteractiveMode {
 	}
 
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {
+		if (this.isShuttingDown) return;
 		if (!this.isInitialized) {
 			await this.init();
 		}
@@ -3282,6 +3363,20 @@ export class InteractiveMode {
 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
+		if (this.options.identity) {
+			let exitCode = 0;
+			try {
+				await this.runtimeHost.dispose();
+				await this.ui.terminal.drainInput(1000);
+			} catch (error) {
+				console.error(error);
+				exitCode = 1;
+			} finally {
+				this.stop();
+			}
+			if (!options?.fromSignal) this.printResumeCommand();
+			process.exit(exitCode);
+		}
 		this.unregisterSignalHandlers();
 
 		if (options?.fromSignal) {
@@ -3308,21 +3403,32 @@ export class InteractiveMode {
 		this.stop();
 		await this.runtimeHost.dispose();
 
-		const resumeCommand = formatResumeCommand(this.sessionManager);
-		if (resumeCommand) {
-			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
-		}
-
+		this.printResumeCommand();
 		process.exit(0);
 	}
 
-	private emergencyTerminalExit(): never {
+	private printResumeCommand(): void {
+		const resumeCommand = formatResumeCommand(this.sessionManager, this.options.identity?.name);
+		if (resumeCommand) {
+			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+		}
+	}
+
+	private emergencyTerminalExit(): void {
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 		killTrackedDetachedChildren();
 		// The terminal is gone. Do not run normal shutdown because TUI and
 		// extension cleanup can write restore sequences and re-trigger EIO.
-		process.exit(129);
+		if (this.options.identity) this.exitAfterDispose(129);
+		else process.exit(129);
+	}
+
+	private exitAfterDispose(code: number): void {
+		void this.runtimeHost.dispose().then(
+			() => process.exit(code),
+			() => process.exit(code),
+		);
 	}
 
 	/**
@@ -3336,8 +3442,9 @@ export class InteractiveMode {
 	 * call ui.stop() to restore cooked mode, the cursor, and disable bracketed
 	 * paste / Kitty / modifyOtherKeys sequences.
 	 */
-	private uncaughtCrash(error: Error): never {
+	private uncaughtCrash(error: Error): void {
 		if (this.isShuttingDown) {
+			if (this.options.identity) return;
 			process.exit(1);
 		}
 		this.isShuttingDown = true;
@@ -3350,9 +3457,10 @@ export class InteractiveMode {
 		try {
 			this.ui.stop();
 		} catch {}
-		console.error("pi exiting due to uncaughtException:");
+		console.error(`${this.options.identity?.name ?? APP_NAME} exiting due to uncaughtException:`);
 		console.error(error);
-		process.exit(1);
+		if (this.options.identity) this.exitAfterDispose(1);
+		else process.exit(1);
 	}
 
 	/**
@@ -3367,6 +3475,7 @@ export class InteractiveMode {
 		this.unregisterSignalHandlers();
 
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		if (this.options.identity) signals.push("SIGINT");
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
@@ -3387,6 +3496,7 @@ export class InteractiveMode {
 		const terminalErrorHandler = (error: Error) => {
 			if (isDeadTerminalError(error)) {
 				this.emergencyTerminalExit();
+				return;
 			}
 			throw error;
 		};
@@ -3755,7 +3865,7 @@ export class InteractiveMode {
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
-		const currentText = options?.currentText ?? this.editor.getText();
+		const currentText = options?.currentText ?? this.editor.getExpandedText?.() ?? this.editor.getText();
 		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
@@ -4435,13 +4545,14 @@ export class InteractiveMode {
 
 	private showSessionSelector(): void {
 		this.showSelector((done) => {
+			const selectedSessionFile = this.sessionManager.getSessionFile();
+			const sessionDir = this.runtimeHost.sessionDir || undefined;
 			const selector = new SessionSelectorComponent(
+				(onProgress) => SessionManager.list(this.sessionManager.getCwd(), sessionDir, onProgress),
 				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
-				(onProgress) =>
-					this.sessionManager.usesDefaultSessionDir()
+					!this.runtimeHost.files && this.sessionManager.usesDefaultSessionDir()
 						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
+						: SessionManager.listAll(sessionDir, onProgress),
 				async (sessionPath) => {
 					done();
 					await this.handleResumeSession(sessionPath);
@@ -4458,14 +4569,23 @@ export class InteractiveMode {
 					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
 						const next = (nextName ?? "").trim();
 						if (!next) return;
-						const mgr = SessionManager.open(sessionFilePath);
-						mgr.appendSessionInfo(next);
+						await this.runtimeHost.renameSessionFile(sessionFilePath, next);
 					},
+					deleteSession:
+						this.runtimeHost.files &&
+						(async (sessionPath) => {
+							await this.runtimeHost.deleteSessionFile(sessionPath);
+							if (this.session.sessionFile !== selectedSessionFile) {
+								done();
+								this.renderCurrentSessionState();
+							}
+						}),
+					allowDeleteCurrent: !!this.runtimeHost.files,
 					showRenameHint: true,
 					keybindings: this.keybindings,
 				},
 
-				this.sessionManager.getSessionFile(),
+				selectedSessionFile,
 			);
 			return { component: selector, focus: selector };
 		});
@@ -4497,10 +4617,15 @@ export class InteractiveMode {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
-					cwdOverride: selectedCwd,
-					withSession: options?.withSession,
-				});
+				let result: { cancelled: boolean };
+				try {
+					result = await this.runtimeHost.switchSession(sessionPath, {
+						cwdOverride: selectedCwd,
+						withSession: options?.withSession,
+					});
+				} catch (retryError) {
+					return this.handleFatalRuntimeError("Failed to resume session", retryError);
+				}
 				if (result.cancelled) {
 					return result;
 				}
@@ -5382,7 +5507,7 @@ export class InteractiveMode {
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${followUp}\` | Queue follow-up message |
 | \`${dequeue}\` | Restore queued messages |
-| \`${pasteImage}\` | Paste image from clipboard |
+| \`${pasteImage}\` | Paste image or text from clipboard |
 | \`/\` | Slash commands |
 | \`!\` | Run bash command |
 | \`!!\` | Run bash command (excluded from context) |

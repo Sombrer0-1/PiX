@@ -1,4 +1,5 @@
 import { parse as partialParse } from "partial-json";
+import type { ToolCall } from "../types.ts";
 
 const VALID_JSON_ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
 
@@ -91,6 +92,23 @@ export function parseJsonWithRepair<T>(json: string): T {
 			return JSON.parse(repairedJson) as T;
 		}
 		throw error;
+	}
+}
+
+/** Parse the finished arguments, preserving string repairs but rejecting incomplete JSON. */
+export function parseToolCallArguments(json: string | undefined): Pick<ToolCall, "arguments" | "argumentsError"> {
+	if (!json?.trim()) return { arguments: {} };
+	try {
+		const parsed = parseJsonWithRepair<unknown>(json);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			throw new Error("Tool arguments must be a JSON object");
+		}
+		return { arguments: parsed as ToolCall["arguments"] };
+	} catch (error) {
+		return {
+			arguments: {},
+			argumentsError: `${error instanceof Error ? error.message : String(error)}\n\nReceived arguments:\n${json}`,
+		};
 	}
 }
 

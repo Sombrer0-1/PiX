@@ -26,7 +26,7 @@ import type {
   LoadAgentsResult,
   TurnDiffSummary,
 } from "@earendil-works/pi-coding-agent";
-import { isProductEvent, PRODUCT_EVENT_NAMES_V141, type ProductEvent } from "../../shared/product-events.js";
+import { isProductEvent, PRODUCT_EVENT_NAMES_V141, type ProductEvent } from "@earendil-works/pix-runtime/shared/product-events";
 import {
   AGENT_TASK_MAX_RECENT_ACTIVITIES,
   isAgentTaskInfo,
@@ -37,17 +37,17 @@ import {
   type AgentTaskPlanLink,
   type AgentTaskSpec,
   type AgentTaskUsage,
-} from "../../shared/agent-task-types.js";
-import type { SubagentDetails, SubagentSingleResult } from "../../shared/subagent-types.js";
+} from "@earendil-works/pix-runtime/shared/agent-task-types";
+import type { SubagentDetails, SubagentSingleResult } from "@earendil-works/pix-runtime/shared/subagent-types";
 import type { RequestUserInputRequest, RequestUserInputResponse } from "../../shared/types.js";
 import type { ProjectLocation } from "../../shared/project-location.js";
 import { SettingsStore } from "../settings-store.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
-import type { SubagentParentRuntimeSnapshot, SubagentTaskItem } from "../subagent/types.js";
-import type { AgentTaskInputRouter } from "../agent-task/agent-task-input.js";
-import type { AgentTaskRuntime, AgentTaskRuntimeResult } from "../agent-task/agent-task-runtime.js";
-import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
+import type { SubagentParentRuntimeSnapshot, SubagentTaskItem } from "@earendil-works/pix-runtime/subagent/types.js";
+import type { AgentTaskInputRouter } from "@earendil-works/pix-runtime/agent-task/agent-task-input.js";
+import type { AgentTaskRuntime, AgentTaskRuntimeResult } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
+import { AgentTaskStore } from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { workspaceIdOf } from "@earendil-works/pix-runtime/agent-task/agent-task-identity.js";
 import {
   AgentTaskService,
   __setAgentTaskServiceHooksForTests,
@@ -56,8 +56,8 @@ import {
   type AgentTaskServiceTestHooks,
   type AgentTaskSubmissionContext,
   type CreateTaskParams,
-} from "../agent-task/agent-task-service.js";
-import { isSubagentDetails } from "../../shared/subagent-types.js";
+} from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import { isSubagentDetails } from "@earendil-works/pix-runtime/shared/subagent-types";
 
 // ============================================================================
 // Test harness (matches subagent-runner.test.ts style)
@@ -412,7 +412,15 @@ function makeHarness(extraHooks?: Partial<AgentTaskServiceTestHooks>): Harness {
     maxTaskBytes: 25 * 1024 * 1024,
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
-  const service = new AgentTaskService({ settings, events, store, runId: "test-run-1" });
+  const service = new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId: "test-run-1",
+  });
   __setAgentTaskServiceHooksForTests({
     autoBackgroundMsOverride: 0,
     runtimeFactory: (spec, input) => {

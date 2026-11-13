@@ -43,6 +43,8 @@ export interface SessionHeader {
 
 export interface NewSessionOptions {
 	id?: string;
+	/** Explicit file path, for hosts that acquire the target lock before creating a session. */
+	targetPath?: string;
 	parentSession?: string;
 	/** Written to header.acp; omitted by default (equivalent to false). */
 	acp?: boolean;
@@ -1058,14 +1060,16 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
-		this.sessionFile = resolvePath(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			this.fileEntries = loadEntriesFromFile(this.sessionFile);
+		const explicitPath = resolvePath(sessionFile);
+		if (existsSync(explicitPath)) {
+			const entries = loadEntriesFromFile(explicitPath);
+			if (entries.length === 0 && statSync(explicitPath).size > 0) {
+				throw new Error(`Session file is not a valid pi session and was not modified: ${explicitPath}`);
+			}
+			this.sessionFile = explicitPath;
+			this.fileEntries = entries;
 
-			// If file was empty or corrupted (no valid header), truncate and start fresh
-			// to avoid appending messages without a session header (which breaks the session)
-			if (this.fileEntries.length === 0) {
-				const explicitPath = this.sessionFile;
+			if (entries.length === 0) {
 				this.newSession();
 				this.sessionFile = explicitPath;
 				this._rewriteFile();
@@ -1083,7 +1087,6 @@ export class SessionManager {
 			this._buildIndex();
 			this.flushed = true;
 		} else {
-			const explicitPath = this.sessionFile;
 			this.newSession();
 			this.sessionFile = explicitPath; // preserve explicit path from --session flag
 		}
@@ -1112,7 +1115,9 @@ export class SessionManager {
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
+			this.sessionFile = options?.targetPath
+				? resolvePath(options.targetPath)
+				: join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
 		}
 		return this.sessionFile;
 	}
@@ -1598,7 +1603,7 @@ export class SessionManager {
 	 * Useful for extracting a single conversation path from a branched session.
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
-	createBranchedSession(leafId: string): string | undefined {
+	createBranchedSession(leafId: string, options?: Pick<NewSessionOptions, "id" | "targetPath">): string | undefined {
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -1608,10 +1613,13 @@ export class SessionManager {
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map
 		const pathWithoutLabels = path.filter((e) => e.type !== "label");
 
-		const newSessionId = createSessionId();
+		if (options?.id !== undefined) assertValidSessionId(options.id);
+		const newSessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		const newSessionFile = join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
+		const newSessionFile = options?.targetPath
+			? resolvePath(options.targetPath)
+			: join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
 		const acp = this.getAcp();
 
 		const header: SessionHeader = {
@@ -1691,6 +1699,16 @@ export class SessionManager {
 		this.sessionId = newSessionId;
 		this._buildIndex();
 		return undefined;
+	}
+
+	/** Branch the current in-memory history without changing the source manager. */
+	forkBranch(leafId: string, options: Pick<NewSessionOptions, "id" | "targetPath"> = {}): SessionManager {
+		const target = new SessionManager(this.cwd, this.sessionDir, undefined, this.persist);
+		target.sessionFile = this.sessionFile;
+		target.fileEntries = structuredClone(this.fileEntries);
+		target._buildIndex();
+		target.createBranchedSession(leafId, options);
+		return target;
 	}
 
 	/**
@@ -1777,7 +1795,10 @@ export class SessionManager {
 		const newSessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		const newSessionFile = join(dir, `${fileTimestamp}_${newSessionId}.jsonl`);
+		const newSessionFile = options?.targetPath
+			? resolvePath(options.targetPath)
+			: join(dir, `${fileTimestamp}_${newSessionId}.jsonl`);
+		migrateToCurrentVersion(sourceEntries);
 
 		// Write new header pointing to source as parent, with updated cwd
 		const newHeader: SessionHeader = {

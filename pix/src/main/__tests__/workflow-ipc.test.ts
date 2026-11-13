@@ -28,9 +28,9 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import type { PixCommandResult } from "../../shared/types.js";
-import { WorkflowRunId, type PixWorkflowRecord, type WorkflowViewState } from "../../shared/workflow-types.js";
-import { WorkflowEngine } from "../workflow/engine/engine.js";
-import { createWorkflowRecorder, type WorkflowRecorder } from "../workflow/recorder.js";
+import { WorkflowRunId, type PixWorkflowRecord, type WorkflowViewState } from "@earendil-works/pix-runtime/shared/workflow-types";
+import { WorkflowEngine } from "@earendil-works/pix-runtime/workflow/engine/engine.js";
+import { createWorkflowRecorder, type WorkflowRecorder } from "@earendil-works/pix-runtime/workflow/recorder.js";
 import {
   registerWorkflowIpcHandlers,
   resyncWorkflowEventForwarding,

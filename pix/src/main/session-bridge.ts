@@ -32,59 +32,31 @@ import {
 	DefaultResourceLoader,
 	ModelRegistry,
 	getAgentDir,
-	createActiveCompressionExtension,
 } from "@earendil-works/pi-coding-agent";
-import { McpAdapter } from "pi-mcp-adapter";
-import { aggregateSubagentUsage, isSubagentDetails } from "../shared/subagent-types.js";
+import { aggregateSubagentUsage, isSubagentDetails } from "@earendil-works/pix-runtime/shared/subagent-types";
 import { btwValidateQuestion, type BtwAskResult } from "../shared/types.js";
 import { createSideQuestionCoordinator, type SideQuestionCoordinator } from "./btw/side-question.js";
-import type { SubagentExecutionContext, SubagentToolHost } from "./subagent/types.js";
-import { SHELL_BACKGROUND_TOOLS, SubagentRunner } from "./subagent/subagent-runner.js";
-import { createSubagentToolDefinition, SUBAGENT_TOOL_NAME } from "./subagent/subagent-tool.js";
-import { createInspectAgentTaskTool } from "./subagent/inspect-agent-task.js";
-import { isPlanRestrictedPhase, PlanController } from "./plan/plan-controller.js";
-import type {
-  PlanControllerContext,
-  PlanDisposeReason,
-  PlanLinkedTaskFileChangeEvent,
-  PlanStepExecutionLink,
-  PlanTaskLinkHydration,
-  PlanUserRequest,
-  StepDelegateResult,
-} from "./plan/plan-controller.js";
-import { detectFileDeviation, type PlanPathContext } from "./plan/plan-deviation.js";
-import { createSubmitUserPlanTool, createUpdatePlanStepTool } from "./plan/plan-tools.js";
-import { TodoController } from "./todo/todo-controller.js";
-import { createTodoWriteTool } from "./todo/todo-tool.js";
-import { WorkflowChildCache } from "./workflow/child-cache.js";
-import { createAgentTaskChildSpawner } from "./workflow/child-spawner.js";
-import { WorkerThreadWorkflowEngine } from "./workflow/engine/index.js";
 import {
-	createWorkflowRecorder,
-	type WorkflowLifecycleEvent,
-	type WorkflowLifecyclePayload,
-	type WorkflowRecorder,
-} from "./workflow/recorder.js";
-import { createRalphToolDefinition } from "./workflow/tool-ralph.js";
-import { createWorkflowToolDefinition, type WorkflowToolHost } from "./workflow/tool-workflow.js";
-import type { AgentTaskDeliveryContent, AgentTaskService, AgentTaskSubmissionContext } from "./agent-task/agent-task-service.js";
-import { runParentAnswer } from "./agent-task/parent-answer.js";
-import { workspaceIdOf } from "./agent-task/agent-task-identity.js";
-import type { AgentTaskPlanLink } from "../shared/agent-task-types.js";
-import {
-  formatInternalNotification,
-  INTERNAL_CUSTOM_MESSAGE_TYPES,
-} from "../shared/internal-notification.js";
-import type { PlanDeviation, PlanStep } from "../shared/plan-types.js";
-import { PRODUCT_EVENT_SCHEMA_VERSION, type ProductEvent, type ProductEventName } from "../shared/product-events.js";
-import { WORKFLOW_RECORD_CUSTOM_TYPE } from "../shared/workflow-types.js";
+	createSoloExtensionFactories,
+	createSoloSession,
+	McpAdapter,
+	setSessionAcp,
+	type SoloSession,
+} from "@earendil-works/pix-runtime";
+import { SHELL_BACKGROUND_TOOLS } from "@earendil-works/pix-runtime/subagent/subagent-runner.js";
+import { SUBAGENT_TOOL_NAME } from "@earendil-works/pix-runtime/subagent/subagent-tool.js";
+import type { AgentTaskService } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import type { PlanController, PlanTaskLinkHydration } from "@earendil-works/pix-runtime/plan/plan-controller.js";
+import type { TodoController } from "@earendil-works/pix-runtime/todo/todo-controller.js";
+import type { WorkerThreadWorkflowEngine } from "@earendil-works/pix-runtime/workflow/engine/index.js";
+import type { WorkflowRecorder } from "@earendil-works/pix-runtime/workflow/recorder.js";
 import type { ProductEventCollector } from "./product-event-collector.js";
 import type { TeamManager } from "./team-manager.js";
 import {
 	createProjectExecutionContext,
 	disposeProjectExecutionContext,
 	type ProjectExecutionContext,
-} from "./execution-context.js";
+} from "@earendil-works/pix-runtime/execution-context.js";
 import type {
 	AgentSessionEvent,
 	ClipboardImage,
@@ -161,6 +133,7 @@ export interface SessionBridgeOptions {
 	productEventCollector?: ProductEventCollector;
 	/** App-level agent task service (1.4.1); injected by index.ts. */
 	agentTaskService?: AgentTaskService;
+	workflowCacheDir?: string;
 	/** App-level computer-use service (PiX 1.5.0); injected by index.ts for the solo bridge only (team-leader ignores it). */
 	computerUseService?: ComputerUseService;
 }
@@ -184,21 +157,6 @@ interface AuxiliaryUsageTotals {
 	cacheWrite: number;
 	cost: number;
 }
-
-/**
- * 1.4.3 (S8) workflow lifecycle product events (V143). S12 lands the shared
- * PRODUCT_EVENT_NAMES_V143 union in product-events.ts with these EXACT names;
- * until that lands, the collector's name union does not include them, so this
- * binding projects the literal into ProductEventName at the call site and the
- * collector guard drops the event (silent no-op) instead of failing. record()
- * is called ONLY from the recorder's onLifecycle binding.
- */
-const WORKFLOW_PRODUCT_EVENT_NAMES = {
-	started: "workflow_started",
-	completed: "workflow_completed",
-	failed: "workflow_failed",
-	cancelled: "workflow_cancelled",
-} as const;
 
 /**
  * One queued/active/terminal user-input request in the bridge FIFO. Only the
@@ -248,8 +206,6 @@ interface BackgroundLiveSession {
 	readonly sessionManager: SessionManager;
 	readonly generation: RuntimeGeneration;
 	readonly mcpAdapter: McpAdapter | null;
-	/** Delivery-sink unsubscribe kept alive across the detach (D2.3). */
-	deliverySinkUnsubscribe: (() => void) | null;
 	/** D5 state-tracking subscription (never forwards to _eventListeners). */
 	unsubscribe: () => void;
 	state: BackgroundSessionState;
@@ -262,35 +218,11 @@ interface BackgroundLiveSession {
 	validSoloSessionRecorded: boolean;
 }
 
-/**
- * Solo-only runtime candidate generation. Created before the parent session,
- * owned by the bridge, never shared with extensions. `agentDir` is resolved
- * exactly once per generation and used uniformly for auth storage, the model
- * registry, the parent loader/session and the runner context; a replaced old
- * generation never reads a new value (design plan section 4.9).
- */
-interface RuntimeGeneration {
-	/** Non-reusable generation id; parent and runner closures both capture it. */
+interface RuntimeGeneration extends SoloSession {
 	readonly genId: number;
 	readonly agentDir: string;
-	readonly authStorage: AuthStorage;
-	readonly modelRegistry: ModelRegistry;
-	/** Generation-bound auxiliary accumulator (history rebuild + live usage). */
 	readonly auxiliaryUsage: AuxiliaryUsageTotals;
-	/** Parent session of this generation; closed over by getParentRuntime. */
-	session: AgentSession | null;
-	readonly runner: SubagentRunner;
-	readonly mcpAdapter: McpAdapter;
-	/** Solo Plan state machine of this generation (PiX 1.4.0). */
-	readonly planController: PlanController;
-	/** Session todo list of this generation (R3); in-memory, model-written via todo_write. */
-	readonly todoController: TodoController;
-	/** Computer-use controller of this generation (PiX 1.5.0); null when the service is absent/disabled or the global switch is off. */
 	readonly computerUse: ComputerUseSessionController | null;
-	/** Workflow engine of this generation (PiX 1.4.3): children spawn through the generation's AgentTaskService via the injected spawner (host/engine never import AgentTaskService). */
-	readonly workflowEngine: WorkerThreadWorkflowEngine;
-	/** Durable projection + V143 lifecycle binding of this generation's workflow runs. */
-	readonly workflowRecorder: WorkflowRecorder;
 }
 
 function globPatternToRegExp(pattern: string): RegExp {
@@ -611,7 +543,8 @@ export class SessionBridge {
 	private readonly _role: SessionBridgeRole;
 	private _productEventCollector: ProductEventCollector | undefined;
 	/** App-level agent task service (1.4.1); owned by index.ts, borrowed. */
-	private _agentTaskService: AgentTaskService | undefined;
+	private readonly _agentTaskService: AgentTaskService | undefined;
+	private readonly _workflowCacheDir: string | undefined;
 	/** App-level computer-use service (PiX 1.5.0); owned by index.ts, solo bridge only. */
 	private _computerUseService: ComputerUseService | undefined;
 	/** First activate in this process is app_restart; later session switches are session_reopen. */
@@ -671,8 +604,6 @@ export class SessionBridge {
 	 * level task service keeps running them.
 	 */
 	private _appShuttingDown = false;
-	/** Unsubscribe of the active Solo session's delivery sink (1.4.2). */
-	private _deliverySinkUnsubscribe: (() => void) | null = null;
 	/**
 	 * In-flight side-question (/btw, 1.5.0) coordinator, created lazily on the
 	 * first askSideQuestion. Holds the single AbortController implementing
@@ -684,6 +615,7 @@ export class SessionBridge {
 	 * session JSONL path. Invariant I1: never contains the active session.
 	 */
 	private _backgroundSessions = new Map<string, BackgroundLiveSession>();
+	private readonly _closingBackgroundSessions = new Set<Promise<void>>();
 	/** Stage B D7: renderer-side sessions-state broadcast listeners. */
 	private _sessionsStateListeners: Array<(payload: SessionsStatePayload) => void> = [];
 
@@ -692,6 +624,7 @@ export class SessionBridge {
 		this._teamManager = this._role === "team-leader" ? options.teamManager ?? null : null;
 		this._productEventCollector = options.productEventCollector;
 		this._agentTaskService = options.agentTaskService;
+		this._workflowCacheDir = options.workflowCacheDir;
 		// Computer use is solo-only: the team-leader bridge ignores the
 		// injection; subagent / workflow / AgentTask sessions never mount the tools.
 		this._computerUseService = this._role === "single" ? options.computerUseService : undefined;
@@ -725,19 +658,16 @@ export class SessionBridge {
 		this._logicalCwd = candidateContext.logicalCwd;
 		this._guiSettings = guiSettings;
 
-		const agentDir = getAgentDir();
-		this._authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-
-		const settingsManager = this._createSettingsManager(this._physicalCwd);
-		const sessionDir = this._getSessionDir(this._physicalCwd, settingsManager.getSessionDir());
-		this._sessionManager = SessionManager.continueRecent(this._physicalCwd, sessionDir);
-		// continueRecent with no recent file internally newSession() without acp.
-		// Unflushed empty sessions take GuiSettings.defaultAcp; flushed files use header only.
-		if (!this._sessionManager.isFlushed()) {
-			this._sessionManager.setAcp(guiDefaultAcp(this._guiSettings));
-		}
-
 		try {
+			if (this._role === "team-leader") {
+				this._authStorage = AuthStorage.create(join(getAgentDir(), "auth.json"));
+			}
+			const settingsManager = this._createSettingsManager(this._physicalCwd);
+			const sessionDir = this._getSessionDir(this._physicalCwd, settingsManager.getSessionDir());
+			this._sessionManager = SessionManager.continueRecent(this._physicalCwd, sessionDir);
+			if (!this._sessionManager.isFlushed()) {
+				this._sessionManager.setAcp(guiDefaultAcp(this._guiSettings));
+			}
 			const result = await this._createSession(
 				this._physicalCwd,
 				this._sessionManager,
@@ -754,6 +684,7 @@ export class SessionBridge {
 			this._executionContext = null;
 			this._sessionManager = null;
 			this._mcpAdapter = null;
+			this._authStorage = null;
 			this._physicalCwd = "";
 			this._logicalCwd = "";
 			await disposeProjectExecutionContext(candidateContext);
@@ -894,11 +825,13 @@ export class SessionBridge {
 	}
 
 	async prompt(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		const session = this._getSession();
 		if (typeof text === "string" && text.trim() !== "") {
 			this._recordValidSoloSessionOnce();
 		}
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
-		await this._getSession().prompt(prepared.text, {
+		this._assertLiveSession(session);
+		await session.prompt(prepared.text, {
 			images: prepared.images,
 			displayText: prepared.displayText,
 			attachments: prepared.attachments,
@@ -906,8 +839,10 @@ export class SessionBridge {
 	}
 
 	async steer(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		const session = this._getSession();
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
-		await this._getSession().steer(prepared.text, {
+		this._assertLiveSession(session);
+		await session.steer(prepared.text, {
 			images: prepared.images,
 			displayText: prepared.displayText,
 			attachments: prepared.attachments,
@@ -915,8 +850,10 @@ export class SessionBridge {
 	}
 
 	async followUp(text: string, filePaths?: string[], clipboardImages?: ClipboardImage[]): Promise<void> {
+		const session = this._getSession();
 		const prepared = await this._preparePromptInput(text, filePaths, clipboardImages);
-		await this._getSession().followUp(prepared.text, {
+		this._assertLiveSession(session);
+		await session.followUp(prepared.text, {
 			images: prepared.images,
 			displayText: prepared.displayText,
 			attachments: prepared.attachments,
@@ -1702,12 +1639,7 @@ export class SessionBridge {
 	}
 
 	async setAcp(enabled: boolean): Promise<void> {
-		const session = this._getSession();
-		if (session.isAcpLocked()) {
-			throw new Error("ACP_LOCKED");
-		}
-		session.sessionManager.setAcp(enabled);
-		await session.reload();
+		await setSessionAcp(this._getSession(), enabled);
 	}
 
 	setSessionName(name: string): void {
@@ -2279,6 +2211,8 @@ export class SessionBridge {
 		attachments?: ChatMessageAttachment[];
 	}> {
 		const session = this._getSession();
+		const auxiliaryUsage = this._auxiliaryUsage;
+		const eyeUsage = this._eyeUsage;
 		const allImages: ImageContent[] = [];
 		const allAttachments: ChatMessageAttachment[] = [];
 		const parts: string[] = [];
@@ -2324,7 +2258,7 @@ export class SessionBridge {
 			};
 		}
 
-		const visualContext = await this._tryTakeHerEyes(text, allImages, allAttachments);
+		const visualContext = await this._tryTakeHerEyes(session, text, allImages, allAttachments, auxiliaryUsage, eyeUsage);
 		if (visualContext) {
 			parts.push(visualContext);
 			return {
@@ -2344,13 +2278,15 @@ export class SessionBridge {
 	}
 
 	private async _tryTakeHerEyes(
+		session: AgentSession,
 		userText: string,
 		images: ImageContent[],
 		attachments: ChatMessageAttachment[],
+		auxiliaryUsage: AuxiliaryUsageTotals,
+		eyeUsage: AuxiliaryUsageTotals,
 	): Promise<string | null> {
 		if (images.length === 0) return null;
 
-		const session = this._getSession();
 		if (session.settingsManager.getBlockImages()) return null;
 		const mainModel = session.model;
 		if (!mainModel) return null;
@@ -2366,7 +2302,7 @@ export class SessionBridge {
 		const operationId = `eye_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 		let emittedStart = false;
 		const emitEnd = (success: boolean, errorMessage?: string): void => {
-			if (!emittedStart) return;
+			if (!emittedStart || this._session !== session) return;
 			this._emitSessionEvent({
 				type: "eye_model_end",
 				id: operationId,
@@ -2386,14 +2322,16 @@ export class SessionBridge {
 				return null;
 			}
 
-			this._emitSessionEvent({
-				type: "eye_model_start",
-				id: operationId,
-				provider: eyeModel.provider,
-				modelId: eyeModel.id,
-				imageCount: images.length,
-			});
-			emittedStart = true;
+			if (this._session === session) {
+				this._emitSessionEvent({
+					type: "eye_model_start",
+					id: operationId,
+					provider: eyeModel.provider,
+					modelId: eyeModel.id,
+					imageCount: images.length,
+				});
+				emittedStart = true;
+			}
 
 			const response = await completeSimple(eyeModel, this._createEyeContext(userText, images, attachments), {
 				apiKey: auth.apiKey,
@@ -2402,7 +2340,14 @@ export class SessionBridge {
 				timeoutMs: TAKE_HER_EYES_TIMEOUT_MS,
 				maxRetries: 0,
 			});
-			this._recordAuxiliaryUsage(response.usage);
+			const usage = response.usage;
+			for (const total of [auxiliaryUsage, eyeUsage]) {
+				total.input += usage.input;
+				total.output += usage.output;
+				total.cacheRead += usage.cacheRead;
+				total.cacheWrite += usage.cacheWrite;
+				total.cost += usage.cost.total;
+			}
 
 			if (response.stopReason === "error") {
 				const errorMessage = response.errorMessage ?? "unknown error";
@@ -2474,25 +2419,6 @@ export class SessionBridge {
 			"</visual_context>",
 			"",
 		].join("\n");
-	}
-
-	private _recordAuxiliaryUsage(usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: { total: number };
-	}): void {
-		this._auxiliaryUsage.input += usage.input;
-		this._auxiliaryUsage.output += usage.output;
-		this._auxiliaryUsage.cacheRead += usage.cacheRead;
-		this._auxiliaryUsage.cacheWrite += usage.cacheWrite;
-		this._auxiliaryUsage.cost += usage.cost.total;
-		this._eyeUsage.input += usage.input;
-		this._eyeUsage.output += usage.output;
-		this._eyeUsage.cacheRead += usage.cacheRead;
-		this._eyeUsage.cacheWrite += usage.cacheWrite;
-		this._eyeUsage.cost += usage.cost.total;
 	}
 
 	private _lifetimeAuxiliaryTokens(): AuxiliaryUsageTotals {
@@ -2607,32 +2533,10 @@ export class SessionBridge {
 		cwd: string,
 		sessionManager: SessionManager,
 		sessionStartEvent: SessionStartEvent,
-		settingsManagerOverride?: SettingsManager,
+		settingsManager = this._createSettingsManager(cwd),
 	): Promise<CreateAgentSessionResult> {
-		// S8: start() already built this generation's settings manager (for
-		// sessionDir resolution); reuse it instead of re-parsing settings.json
-		// for the same generation. Other entry points create their own.
-		const settingsManager = settingsManagerOverride ?? this._createSettingsManager(cwd);
-		const context = this._executionContext;
-		const isSolo = this._role === "single";
-		// Resolved exactly once per candidate generation and used uniformly for
-		// auth storage, model registry, loader, parent session and runner
-		// context; a replaced old generation never reads a new value (4.9).
+		const context = this._executionContext!;
 		const agentDir = getAgentDir();
-		// WSL mode disables Windows-side stdio MCP (decided by context.isWsl, not
-		// by backend existence). HTTP/SSE remain configurable (wsl_plan.md §4.10).
-		const mcpAdapter = new McpAdapter({
-			allowStdio: context?.isWsl ? false : true,
-		});
-		this._mcpAdapter = mcpAdapter;
-
-		// Each candidate parent session gets a non-reusable generation. The
-		// user-input FIFO is session-scoped (Stage B §4.3): the parent
-		// createAgentSession closure, the runner's closure and the Plan
-		// controller's closure all capture THIS state object, so a session
-		// backgrounded while busy keeps its own (suspended) queue and a stale
-		// callback against a closed state is rejected by the closing guard. The
-		// new generation reopens with a fresh state.
 		const genId = ++this._userInputGenerationSeed;
 		const userInputState: UserInputSessionState = {
 			queue: [],
@@ -2641,493 +2545,133 @@ export class SessionBridge {
 			generation: genId,
 		};
 		this._userInputState = userInputState;
-
-		let parentSessionRef: AgentSession | null = null;
-		// Computer-use controller for this candidate solo generation. Declared
-		// outside the try because createController registers it in the service
-		// registry the moment it is built: until the generation record at
-		// the bottom takes ownership, ANY failure in between must dispose it here
-		// or it leaks in the registry forever (ownership is handed over by
-		// nulling this local right after the generation is assigned).
-		let computerUseController: ComputerUseSessionController | null = null;
+		const requestUserInput = (request: RequestUserInputRequest, signal?: AbortSignal) =>
+			this._requestUserInputForGeneration(userInputState, request, signal);
+		const sessionOptions = { cwd, agentDir, sessionManager, settingsManager, sessionStartEvent, requestUserInput };
+		let computerUse: ComputerUseSessionController | null = null;
+		let session: AgentSession | undefined;
 		try {
-			if (isSolo) {
-				// Solo runtime: the generation owns its auth storage and model
-				// registry; the SAME registry identity is later handed to the
-				// parent createAgentSession and the runner (the parent must
-				// never get an SDK-created second registry).
-				const generationAuthStorage = AuthStorage.create(join(agentDir, "auth.json"));
-				this._authStorage = generationAuthStorage;
-				const generationModelRegistry = ModelRegistry.create(generationAuthStorage, join(agentDir, "models.json"));
-
-				// Computer use (PiX 1.5.0): one controller per solo
-				// generation, created BEFORE the resource loader because the
-				// extensionFactories array literal is evaluated immediately by the
-				// DefaultResourceLoader constructor while planController and the
-				// generation literal are declared below - the isPlanRestricted
-				// closure only runs on tool execution / hook firing, by which time
-				// those block bindings are initialized (a deferred closure never
-				// trips TS2448). getSession resolves lazily: session_start fires
-				// inside bindExtensions, after parentSessionRef is assigned.
-				computerUseController = this._computerUseService?.isGloballyEnabled()
-					? this._computerUseService.createController({
-						genId,
-						getSession: () => parentSessionRef,
-						getSessionManager: () => sessionManager,
-						isForeground: () => this._generation?.genId === genId,
-						requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
-						isPlanRestricted: () => isPlanRestrictedPhase(planController.getSnapshot().phase),
-					})
-					: null;
-
-				const resourceLoader = new DefaultResourceLoader({
-					cwd,
-					agentDir,
-					settingsManager,
-					extensionFactories: [
-						(pi) => { mcpAdapter.register(pi); },
-						createActiveCompressionExtension(() => sessionManager),
-						// Appended AFTER the compression extension: context handlers
-						// chain in registration order, so screenshot
-						// retention sees the compressed message list. The keep-count
-						// is read from the service's resolved settings on EVERY call
-						// so a settings change takes effect without a session rebuild.
-						...(computerUseController
-							? [createComputerUseExtension(computerUseController, () => ({
-								keepRecent: this._computerUseService!.getResolvedSettings().keepRecentScreenshots,
-								chunk: SCREENSHOT_RETENTION_CHUNK,
-							}))]
-							: []),
-					],
-				});
-				await resourceLoader.reload();
-
-				// Construct the runner/host BEFORE creating the parent session;
-				// the SDK custom tool is mounted as one entry of customTools.
-				// SDK custom tools are written after extension tools in
-				// AgentSession._refreshToolRegistry(), so the effective parent
-				// agent is deterministically <sdk:agent> (design plan 4.8).
-				const auxiliaryAccumulator = createEmptyAuxiliaryUsage();
-				const runnerContext: SubagentExecutionContext = {
-					physicalCwd: cwd,
-					logicalCwd: this._logicalCwd || cwd,
-					agentDir,
-					executionBackend: context?.executionBackend,
-					runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
-					authStorage: generationAuthStorage,
-					modelRegistry: generationModelRegistry,
-					isWsl: context?.isWsl ?? false,
-					getLoadedAgents: () => resourceLoader.getAgents?.(),
-					getParentRuntime: () => {
-						// Closes over this candidate generation's own parent
-						// session; a stale runner's late calls must never
-						// inherit a replacement session's state.
-						const parent = parentSessionRef;
-						return {
-							model: parent?.model,
-							thinkingLevel: parent?.thinkingLevel ?? "off",
-							executionMode: parent?.settingsManager.getExecutionMode() ?? "approval",
-							verificationGate: parent?.settingsManager.getVerificationGateEnabled() ?? false,
-							acp: parent?.sessionManager.getAcp() === true,
-						};
+			if (this._role === "single") {
+				const auxiliaryUsage = createEmptyAuxiliaryUsage();
+				const solo = await createSoloSession({
+					runtime: {
+						taskService: this._agentTaskService,
+						workflowCacheDir: this._workflowCacheDir ?? join(agentDir, "workflow-cache"),
 					},
-					requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
-					// Parent-agent answering for nested request_user_input (PiX):
-					// the subagent's questions are answered out of band by the
-					// generation's own parent session (the agent blocked in the
-					// agent tool call). Generation-bound like getParentRuntime -
-					// a stale runner's late questions never reach a replacement
-					// parent session. After the session is disposed the closure
-					// keeps its last reference and answers from the frozen
-					// read-only context (better than bouncing a backgrounded
-					// task's question to the human panel). undefined (session
-					// not yet created / no model / no auth) degrades to the
-					// human task_input route.
-					parentAnswer: (info, request, signal) => {
-						const parent = parentSessionRef;
-						if (parent === null) {
-							return Promise.resolve(undefined);
-						}
-						return runParentAnswer(parent, info, request, signal);
+					context,
+					sessionOptions,
+					preparePlanningPrompt: async (request) => {
+						const session = this._getSession();
+						this._recordValidSoloSessionOnce();
+						const { text, ...options } = await this._preparePromptInput(request.text, request.filePaths, request.images);
+						this._assertLiveSession(session);
+						return { text, options };
 					},
-					recordAuxiliaryUsage: (usage) => {
-						// Generation-bound accumulator: old generations never
-						// write usage into a replacement session through the
-						// replaceable _auxiliaryUsage field.
-						auxiliaryAccumulator.input += usage.input;
-						auxiliaryAccumulator.output += usage.output;
-						auxiliaryAccumulator.cacheRead += usage.cacheRead;
-						auxiliaryAccumulator.cacheWrite += usage.cacheWrite;
-						auxiliaryAccumulator.cost += usage.cost;
-					},
-					// 1.4.1 service facade surface: the app-level service and the
-					// synchronous submission-context pieces (lazy session id so a
-					// stale runner's late calls never read a replacement parent).
-					getTaskService: () => this._agentTaskService,
-					getSessionId: () => parentSessionRef?.sessionId ?? "",
-					getProjectLocation: () => this._planExecutionContext().location,
-				};
-				const runner = new SubagentRunner(runnerContext);
-				const host: SubagentToolHost = {
-					getRunner: () => runner,
-					getTaskService: () => this._agentTaskService!,
-					getSubmissionContext: (toolCallId: string) => runner.assembleSubmissionContext(toolCallId),
-				};
-				const inspectAgentTaskTool = this._agentTaskService
-					? createInspectAgentTaskTool({
-						service: this._agentTaskService,
-						workspaceId: workspaceIdOf(cwd),
-						getParentSessionId: () => parentSessionRef?.sessionId ?? "",
-					})
-					: undefined;
-
-				// Solo workflow engine + recorder (PiX 1.4.3): the engine borrows
-				// this generation's app-level AgentTaskService through the
-				// injected spawner seam - the host and the engine never import
-				// AgentTaskService (plan 2.6). The recorder's append sink is the
-				// generation's sessionManager (a no-op when none is bound), and
-				// its lifecycle callback is the ONLY productEventCollector.record
-				// call for workflow runs.
-				const workflowEngine = new WorkerThreadWorkflowEngine(
-					createAgentTaskChildSpawner(this._agentTaskService!),
-					{
-						getRunningSlotCap: () => this._agentTaskService!.getMaxConcurrentSlots(),
-						cache: new WorkflowChildCache({ rootDir: join(getAgentDir(), "workflow-cache") }),
-					},
-				);
-				const workflowRecorder = createWorkflowRecorder({
-					// Generation-bound append sink (R4 review fix): capture the
-					// _createSession sessionManager parameter, NOT the mutable
-					// this._sessionManager — a backgrounded run of an old
-					// generation finishing late must never write its run-end
-					// record into the replacement session's JSONL.
-					append: (data) => {
-						sessionManager.appendCustomEntry(WORKFLOW_RECORD_CUSTOM_TYPE, data);
-					},
-					engine: workflowEngine,
-					onLifecycle: (event, payload) => this._recordWorkflowLifecycle(event, payload),
-				});
-				// Borrow-and-use parent ref per tool call: getSubmissionContext is
-				// called once per child-start and only valid during createTaskGroup.
-				const workflowHost: WorkflowToolHost = {
-					engine: workflowEngine,
-					recorder: workflowRecorder,
-					// Contract (plan §4.7 step 1): throws when no session is active.
-					// A null parentSessionRef must never silently publish a run into
-					// an empty-sessionId group that would escape per-session
-					// detach-cancel.
-					getParentRef: (toolCallId: string) => {
-						if (parentSessionRef === null) {
-							throw new Error("workflow tool called without an active parent session");
-						}
-						return {
-							sessionId: parentSessionRef.sessionId,
-							toolCallId,
-							workspaceId: workspaceIdOf(cwd),
-							getSubmissionContext: () => runner.assembleSubmissionContext(toolCallId),
-						};
-					},
-					// R4: deliver a background run's completion notification to
-					// the parent session. The liveness check is bridge-level
-					// (_isSessionLive, Stage B D2.3 semantics: active OR
-					// backgrounded): AgentSession.sendCustomMessage has no
-					// disposed guard, so a plain parentSessionRef null check is
-					// not enough — delivering on a zombie session would start a
-					// real LLM turn instead of throwing.
-					deliverNotification: async (notification) => {
-						const session = parentSessionRef;
-						if (session === null || !this._isSessionLive(session)) {
-							throw new Error("target_session_not_open");
-						}
-						const streaming = session.isStreaming;
-						await session.sendCustomMessage(
-							{
-								customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TASK_RESULT,
-								content: formatInternalNotification(notification),
-								display: false,
-								details: notification,
-								context: "internal",
-							},
-							streaming ? { deliverAs: "followUp" } : { triggerTurn: true },
-						);
-					},
-				};
-
-				// Solo Plan state machine (PiX 1.4.0). Created before the parent
-				// session so its tools can be mounted; the session reference is
-				// resolved lazily via parentSessionRef (set right after
-				// createAgentSession). The planning-model resolution reads the
-				// configured planModel setting and falls back to the current
-				// session model; useSessionModelAndRetry uses the controller's
-				// frozen first-enter snapshot instead.
-				const planController = new PlanController({
-					getSession: () => parentSessionRef!,
-					getSessionManager: () => this._sessionManager!,
-					getProjectLocation: () => this._planExecutionContext().location,
-					getExecutionContext: () => this._planExecutionContext(),
-					getExecutionMode: () => parentSessionRef?.settingsManager.getExecutionMode() ?? "approval",
-					resolvePlanningModel: () => {
+					resolvePlanningModel: (parent) => {
 						const cfg = this._guiSettings?.planModel;
-						const session = parentSessionRef;
 						if (cfg) {
-							if (!session) return { error: "no active session" };
-							const model = session.modelRegistry.find(cfg.provider, cfg.modelId);
-							if (!model) {
-								return { error: `plan model not found: ${cfg.provider}/${cfg.modelId}` };
-							}
-							if (!session.modelRegistry.hasConfiguredAuth(model)) {
+							const model = parent.modelRegistry.find(cfg.provider, cfg.modelId);
+							if (!model) return { error: `plan model not found: ${cfg.provider}/${cfg.modelId}` };
+							if (!parent.modelRegistry.hasConfiguredAuth(model)) {
 								return { error: `no configured credentials for ${cfg.provider}/${cfg.modelId}` };
 							}
-							return { model, thinkingLevel: this._guiSettings?.planThinkingLevel ?? session.thinkingLevel };
+							return { model, thinkingLevel: this._guiSettings?.planThinkingLevel ?? parent.thinkingLevel };
 						}
-						if (!session) return { error: "no active session" };
-						const model = session.model;
-						if (!model) return { error: "the session has no active model" };
-						return { model, thinkingLevel: session.thinkingLevel };
+						if (!parent.model) return { error: "the session has no active model" };
+						return { model: parent.model, thinkingLevel: parent.thinkingLevel };
 					},
-					promptPlanningRequest: async (request: PlanUserRequest) => {
-						this._recordValidSoloSessionOnce();
-						const prepared = await this._preparePromptInput(request.text, request.filePaths, request.images);
-						const session = parentSessionRef;
-						if (!session) throw new Error("No active session.");
-						await session.prompt(prepared.text, {
-							images: prepared.images,
-							displayText: prepared.displayText,
-							attachments: prepared.attachments,
+					recordAuxiliaryUsage: (usage) => {
+						auxiliaryUsage.input += usage.input;
+						auxiliaryUsage.output += usage.output;
+						auxiliaryUsage.cacheRead += usage.cacheRead;
+						auxiliaryUsage.cacheWrite += usage.cacheWrite;
+						auxiliaryUsage.cost += usage.cost;
+					},
+					recordProductEvent: (event) => this._productEventCollector?.record(event),
+					hostTools: ({ getSession, isPlanRestricted }) => {
+						const service = this._computerUseService;
+						if (!service?.isGloballyEnabled()) return {};
+						const controller = service.createController({
+							genId,
+							getSession,
+							getSessionManager: () => sessionManager,
+							isForeground: () => this._generation?.genId === genId,
+							requestUserInput,
+							isPlanRestricted,
 						});
-					},
-					requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
-					recordProductEvent: (e: ProductEvent) => {
-						this._productEventCollector?.record(e);
-					},
-					delegateSubagentStep: (step, link, presentation) => this._delegatePlanStep(step, link, presentation),
-					// 1.4.1 Plan-linked background task surface (SessionBridge adapter).
-					subscribePlanLinkedTaskEvents: (listener) => this._subscribePlanLinkedTaskEvents(listener),
-					getPlanTaskGroupResult: async (groupId, link) => {
-						const service = this._agentTaskService;
-						if (!service) {
-							return { ok: false, reason: "task_service_unavailable" };
-						}
-						return service.getPlanTaskGroupResult(groupId, link);
-					},
-					confirmPlanTaskGroupConsumed: async (groupId, link) => {
-						const service = this._agentTaskService;
-						if (!service) {
-							return;
-						}
-						await service.confirmPlanTaskGroupConsumed(groupId, link);
-					},
-					releasePlanTaskGroup: async (groupId, link, reason) => {
-						const service = this._agentTaskService;
-						if (!service) {
-							return;
-						}
-						await service.releasePlanTaskGroup(groupId, link, reason);
+						computerUse = controller;
+						return {
+							extensionFactories: [createComputerUseExtension(controller, () => ({
+								keepRecent: service.getResolvedSettings().keepRecentScreenshots,
+								chunk: SCREENSHOT_RETENTION_CHUNK,
+							}))],
+							customTools: [
+								createComputerObserveTool(controller) as ToolDefinition,
+								createComputerActTool(controller) as ToolDefinition,
+							],
+						};
 					},
 				});
-				// Session todo list (R3). Created next to the PlanController so the
-				// todo_write tool can be mounted on the same session; the session
-				// id is resolved lazily via parentSessionRef (set right after
-				// createAgentSession), same deferred pattern as the controller
-				// context getters above. In-memory only: a generation switch
-				// starts from an empty list.
-				const todoController = new TodoController(() => parentSessionRef?.sessionId ?? "");
-				const generation: RuntimeGeneration = {
-					genId,
-					agentDir,
-					authStorage: generationAuthStorage,
-					modelRegistry: generationModelRegistry,
-					auxiliaryUsage: auxiliaryAccumulator,
-					session: null,
-					runner,
-					mcpAdapter,
-					planController,
-					todoController,
-					computerUse: computerUseController,
-					workflowEngine,
-					workflowRecorder,
-				};
-				this._generation = generation;
-
-				const result = await createAgentSession({
-					cwd,
-					// bootstrap uses physical cwd (above); the Agent runtime uses the
-					// logical cwd via runtimeCwd. When no context is injected these are
-					// equal and Windows behavior is byte-identical (wsl_plan.md §4.1).
-					runtimeCwd: this._logicalCwd || cwd,
-					agentDir,
-					executionBackend: context?.executionBackend,
-					runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
-					sessionManager,
-					settingsManager,
-					resourceLoader,
-					authStorage: generationAuthStorage,
-					modelRegistry: generationModelRegistry,
-					// 1.4.1 WSL Shell tool isolation: the parent SessionBridge
-					// denylists run_background/read_output/stop_process under WSL
-					// (Windows keeps them available); WSL AgentTaskRuntime nested
-					// sessions apply the same denylist.
-					excludeTools: context?.isWsl === true ? [...SHELL_BACKGROUND_TOOLS] : undefined,
-					// The typed cast only widens the generic parameters; the tool
-					// definition itself is a full ToolDefinition.
-					customTools: [
-						createSubagentToolDefinition(host) as ToolDefinition,
-						...(inspectAgentTaskTool ? [inspectAgentTaskTool as ToolDefinition] : []),
-						createSubmitUserPlanTool({ controller: planController }) as ToolDefinition,
-						createUpdatePlanStepTool({ controller: planController }) as ToolDefinition,
-						createWorkflowToolDefinition(workflowHost) as ToolDefinition,
-						createRalphToolDefinition(workflowHost) as ToolDefinition,
-						createTodoWriteTool(todoController) as ToolDefinition,
-						// Computer-use tools (PiX 1.5.0). Mounted only when the global
-						// switch is on at generation creation; the controller's
-						// reconcileTools decides per-turn visibility.
-						...(computerUseController
-							? [
-								createComputerObserveTool(computerUseController) as ToolDefinition,
-								createComputerActTool(computerUseController) as ToolDefinition,
-							]
-							: []),
-					],
-					// Authoritative host tool policy during planning/revising;
-					// survives extension reloads (PiX 1.4.0 F1).
-					hostToolPolicyOverride: (input) => planController.decideToolPolicy(input),
-					sessionStartEvent,
-					requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
-				});
-				parentSessionRef = result.session;
-				generation.session = result.session;
-				// Ownership of the controller fully transferred to the live
-				// generation: later failures go through the normal generation
-				// teardown. Nulling here keeps the catch-side leak guard from
-				// disposing an already-owned controller (dispose is idempotent, so
-				// even a createAgentSession failure between the two lines is safe).
-				computerUseController = null;
-				this._applyEnabledModelScope(result.session);
-				return result;
+				this._generation = { ...solo, genId, agentDir, auxiliaryUsage, computerUse };
+				this._authStorage = solo.authStorage;
+				this._mcpAdapter = solo.mcpAdapter;
+				this._applyEnabledModelScope(solo.session);
+				return solo;
 			}
 
-			// Team-leader: no subagent ModelRegistry/runner/custom tool and no
-			// leader tool registration - the host bridge only supplies the
-			// ProjectExecutionContext / AuthStorage / WSL backend, discussion is
-			// driven by TeamCommand (plan §3.4 / §4.12).
+			// The Team leader session supplies project services to the roundtable.
+			const mcpAdapter = new McpAdapter({ allowStdio: !context.isWsl });
+			this._mcpAdapter = mcpAdapter;
 			const resourceLoader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
 				settingsManager,
-				extensionFactories: [
-					(pi) => { mcpAdapter.register(pi); },
-					createActiveCompressionExtension(() => sessionManager),
-				],
+				extensionFactories: createSoloExtensionFactories(mcpAdapter, () => sessionManager),
 			});
 			await resourceLoader.reload();
-
 			const result = await createAgentSession({
-				cwd,
-				runtimeCwd: this._logicalCwd || cwd,
-				executionBackend: context?.executionBackend,
-				runtimeEnvironmentOverride: context?.runtimeEnvironmentOverride,
-				sessionManager,
-				settingsManager,
+				...sessionOptions,
+				runtimeCwd: context.logicalCwd,
+				executionBackend: context.executionBackend,
+				runtimeEnvironmentOverride: context.runtimeEnvironmentOverride,
 				resourceLoader,
 				authStorage: this._authStorage ?? undefined,
-				// 1.4.1 WSL Shell tool isolation applies to the leader session too.
-				excludeTools: context?.isWsl === true ? [...SHELL_BACKGROUND_TOOLS] : undefined,
-				sessionStartEvent,
-				requestUserInput: (request, signal) => this._requestUserInputForGeneration(userInputState, request, signal),
+				excludeTools: context.isWsl ? [...SHELL_BACKGROUND_TOOLS] : undefined,
 			});
-			// Team-leader keeps no generation record; retain the created session
-			// in the candidate ref so a later bind/activate failure still
-			// disposes it (design plan 4.9).
-			parentSessionRef = result.session;
-			this._applyEnabledModelScope(result.session);
+			session = result.session;
+			this._applyEnabledModelScope(session);
 			return result;
-		} catch (err) {
-			// Candidate create failure: dispose the created runner/session/MCP,
-			// close this generation's input queue and clear bridge fields -
-			// not just null the references (design plan 4.9).
-			await this._disposeCandidateRuntime(parentSessionRef);
-			// A controller built before the generation record exists is not
-			// covered by _disposeCandidateRuntime (which only disposes generation.
-			// computerUse) but is already registered in the service registry -
-			// dispose it here or it leaks there forever (its dispose is wrapped
-			// by the service to unregister itself; also idempotent, so the brief
-			// window where the generation owns it is double-dispose safe).
-			await this._disposeComputerUseController(computerUseController);
-			throw err;
+		} catch (error) {
+			if (!this._generation) await this._disposeComputerUseController(computerUse);
+			await this._disposeCandidateRuntime(session);
+			throw error;
 		}
 	}
 
-	/**
-	 * Dispose the candidate runtime after a create/bind/activate failure: close
-	 * this generation's input queue first (marks closing + invalidates the
-	 * generation), then dispose runner, session and MCP, and clear the bridge
-	 * fields. candidateSession is the team-leader candidate, which keeps no
-	 * generation record; it is skipped when identical to the generation's own
-	 * session so solo behavior is unchanged.
-	 */
-	private async _disposeCandidateRuntime(candidateSession?: AgentSession | null): Promise<void> {
+	private async _disposeCandidateRuntime(candidateSession?: AgentSession): Promise<void> {
 		const generation = this._generation;
 		this._generation = null;
-		this._markUserInputStateClosing(this._userInputState);
-		this._settleClosedUserInputState(this._userInputState);
-		if (generation) {
-			// 1.4.3 (S8): candidate create/bind/activate failure shares the
-			// close-path prefix - dispose every live workflow run FIRST, then
-			// detach this session's still-foreground groups so they continue in
-			// the app service as backgrounded, then dispose plan/runner/session.
-			try {
-				await generation.workflowEngine?.disposeAll(this._appShuttingDown);
-			} catch (err) {
-				console.warn("[SessionBridge] Error during workflow engine dispose:", err);
-			}
-			if (this._agentTaskService && generation.session) {
-				try {
-					this._agentTaskService.detachForegroundGroupsForSession(generation.session.sessionId);
-				} catch (err) {
-					console.warn("[SessionBridge] Error during foreground group detach:", err);
-				}
-			}
-			try {
-				await generation.planController.dispose("host_disposed");
-			} catch (err) {
-				console.error("[SessionBridge] Error during plan controller dispose:", err);
-			}
-			// R3: generation-bound todo listeners (in-memory items die with the instance).
-			generation.todoController.dispose();
-			// Computer use (PiX 1.5.0): dispose the generation's controller
-			// (end_session on the backend, release the lease); a dispose failure
-			// is logged and never blocks the remaining teardown.
-			void this._disposeComputerUseController(generation.computerUse);
-			try {
-				await generation.runner.dispose();
-			} catch (err) {
-				console.error("[SessionBridge] Error during subagent runner dispose:", err);
-			}
-			if (generation.session) {
-				try {
-					await generation.session.dispose();
-				} catch (err) {
-					console.error("[SessionBridge] Error during candidate session dispose:", err);
-				}
-			}
-		}
-		if (candidateSession && candidateSession !== generation?.session) {
-			try {
-				await candidateSession.dispose();
-			} catch (err) {
-				console.error("[SessionBridge] Error during candidate session dispose:", err);
-			}
-		}
-		const mcpAdapter = generation?.mcpAdapter ?? this._mcpAdapter;
-		if (mcpAdapter) {
-			try {
-				await mcpAdapter.dispose();
-			} catch (err) {
-				console.error("[SessionBridge] Error during candidate MCP adapter dispose:", err);
-			}
-		}
+		const userInput = this._userInputState;
+		const mcpAdapter = this._mcpAdapter;
 		this._mcpAdapter = null;
 		this._authStorage = null;
+		if (generation) {
+			await generation.close({
+				planReason: "host_disposed",
+				appShuttingDown: this._appShuttingDown,
+				markInputClosing: () => this._markUserInputStateClosing(userInput),
+				closeInput: () => this._settleClosedUserInputState(userInput),
+				disposeHostTools: () => this._disposeComputerUseController(generation.computerUse),
+			}).catch((error: unknown) => console.error("[SessionBridge] Error closing candidate session:", error));
+			return;
+		}
+		this._markUserInputStateClosing(userInput);
+		this._settleClosedUserInputState(userInput);
+		try {
+			await candidateSession?.dispose();
+		} finally {
+			await mcpAdapter?.dispose();
+		}
 	}
 
 	private async _disposeComputerUseController(
@@ -3145,303 +2689,29 @@ export class SessionBridge {
 		this._setupEventSubscription(session);
 		try {
 			await this._bindExtensions();
+			this._auxiliaryUsage = this._generation?.auxiliaryUsage ?? createEmptyAuxiliaryUsage();
+			this._eyeUsage = createEmptyAuxiliaryUsage();
+			this._rebuildAuxiliaryUsageFromHistory(session);
+			if (this._generation) {
+				await this._generation.initialize({ taskLinkHydration: this._planTaskLinkHydration });
+				this._planTaskLinkHydration = "session_reopen";
+			}
 		} catch (err) {
-			// Activation (bind) failure: dispose the created runner/session/MCP,
-			// close this generation's input queue and clear bridge fields.
-			this._deliverySinkUnsubscribe?.();
-			this._deliverySinkUnsubscribe = null;
 			this._session = null;
 			this._unsubscribe?.();
 			this._unsubscribe = null;
 			await this._disposeCandidateRuntime(session);
 			throw err;
 		}
-		// The host session is not a roundtable participant: TeamManager never
-		// receives it, and hostSessionId stays a plain persisted state field of
-		// the roundtable. Discussion is driven by TeamCommand and
-		// `team-leader-sessions` is only the runtime attach identity (§6.3).
-		// The stats reference points at this generation's accumulator so history
-		// rebuild and live usage of the same generation write the same object.
-		this._auxiliaryUsage = this._generation?.auxiliaryUsage ?? createEmptyAuxiliaryUsage();
-		this._eyeUsage = createEmptyAuxiliaryUsage();
-		this._rebuildAuxiliaryUsageFromHistory(session);
-		// Plan rebuild: the controller hydrates the persisted snapshot of the
-		// current branch (dormant planning/revising + A8 executing normalization
-		// + 1.4.1 task-link intent replay/confirm).
-		if (this._generation) {
-			await this._generation.planController.restoreFromHistory(session.sessionManager.getEntries(), {
-				taskLinkHydration: this._planTaskLinkHydration,
-			});
-			this._planTaskLinkHydration = "session_reopen";
-		}
-		// Workflow rebuild (plan §2.3): fold the persisted pix-workflow-v1
-		// CustomEntries of the current branch into this generation's recorder so
-		// interrupted-prefix runs survive session switches/restarts. restore
-		// merges into the in-memory mirror (dedup), so later same-instance
-		// resync re-pushes keep the restored runs instead of wiping them.
-		this._generation?.workflowRecorder.restore(session.sessionManager.getEntries());
-		// 1.4.2 (R4): register only after the session, extensions, Plan state,
-		// and workflow state are restored. Catch-up delivery can trigger a
-		// parent turn, so it must not race activation.
-		this._registerDeliverySink(session);
 		this._emitLifecycle("ready");
 	}
 
-	/**
-	 * Plan delegation adapter (PiX 1.4.1): the subagent step's self-contained
-	 * prompt is built from the step contract and submitted to the app-level
-	 * AgentTaskService with the explicit PlanStepExecutionLink (never a guessed
-	 * project agent, never a second model call, never inferred from the
-	 * prompt). The adapter forces runInBackground from the controller's
-	 * executionTarget; the parent model never assembles the parameter itself.
-	 * Observable nested file changes run through detectFileDeviation bound to
-	 * the current link; deviations travel with the StepDelegateResult back to
-	 * the controller.
-	 */
-	private async _delegatePlanStep(
-		step: PlanStep,
-		link: PlanStepExecutionLink,
-		presentation: "foreground" | "background",
-	): Promise<StepDelegateResult> {
-		const service = this._agentTaskService;
-		const generation = this._generation;
-		if (!service || !generation) {
-			return {
-				stepId: step.stepId,
-				status: "failed",
-				summary: "The agent task service is not available; the step cannot be delegated.",
-			};
-		}
-		const execution = this._planExecutionContext();
-		const pathContext: PlanPathContext = {
-			logicalCwd: execution.logicalCwd,
-			isWsl: execution.isWsl,
-			executionBackend: execution.executionBackend,
-		};
-		const planLink: AgentTaskPlanLink = { planId: link.planId, version: link.version, stepId: link.stepId };
-		const prompt = this._buildPlanStepPrompt(step, link);
-		const context = generation.runner.assembleSubmissionContext(`plan-step-${link.planId}-${link.stepId}`);
-		const group = await service.createTaskGroup(
-			{
-				mode: "single",
-				agentScope: "user",
-				tasks: [{ subagent_type: "general-purpose", prompt, description: step.title }],
-				runInBackground: presentation === "background",
-				planLink,
-			},
-			context,
-			presentation,
-			undefined,
-		);
-		if (presentation === "background") {
-			// Minimal link only: the Plan layer never depends on AgentTask UI types.
-			return {
-				stepId: step.stepId,
-				status: "backgrounded",
-				groupId: group.groupId,
-				taskIds: group.tasks.map((task) => task.taskId),
-			};
-		}
-		const deviations: PlanDeviation[] = [];
-		const detectionPromises: Array<Promise<void>> = [];
-		const taskIds = new Set(group.tasks.map((task) => task.taskId));
-		const unsubscribe = service.onEvent((event) => {
-			if (event.type !== "task_file_change" || !taskIds.has(event.taskId)) {
-				return;
-			}
-			detectionPromises.push(
-				detectFileDeviation(event.change, step, pathContext)
-					.then((deviation) => {
-						if (deviation) {
-							deviations.push(deviation);
-						}
-					})
-					.catch(() => {
-						// Deviation detection is best-effort; a failed probe never
-						// fails the delegation.
-					}),
-			);
-		});
-		try {
-			const awaited = await service.awaitGroup(group.groupId);
-			if (awaited.kind === "backgrounded") {
-				// The foreground group detached while awaiting (manual/auto
-				// background): surface the group handle to the controller.
-				return {
-					stepId: step.stepId,
-					status: "backgrounded",
-					groupId: awaited.handle.groupId,
-					taskIds: awaited.handle.tasks.map((task) => task.taskId),
-				};
-			}
-			await Promise.allSettled(detectionPromises);
-			const result = awaited.details.results[0];
-			if (result?.status === "completed") {
-				return {
-					stepId: step.stepId,
-					status: "result",
-					summary: result.finalOutput !== "" ? result.finalOutput : "The subagent completed without producing text.",
-					deviations,
-					groupId: group.groupId,
-				};
-			}
-			return {
-				stepId: step.stepId,
-				status: "failed",
-				summary: result?.errorMessage ?? result?.finalOutput ?? "The subagent failed.",
-				deviations,
-				groupId: group.groupId,
-			};
-		} finally {
-			unsubscribe();
-		}
-	}
-
-	/**
-	 * 1.4.1 Plan-linked task file-change subscription adapter: forwards the
-	 * service's main-only task_file_change events carrying a planLink to the
-	 * PlanController for background-step deviation detection.
-	 */
-	private _subscribePlanLinkedTaskEvents(listener: (event: PlanLinkedTaskFileChangeEvent) => void): () => void {
-		const service = this._agentTaskService;
-		if (!service) {
-			return () => {};
-		}
-		return service.onEvent((event) => {
-			if (event.type !== "task_file_change" || !event.planLink) {
-				return;
-			}
-			listener({
-				taskId: event.taskId,
-				planId: event.planLink.planId,
-				version: event.planLink.version,
-				stepId: event.planLink.stepId,
-				change: event.change,
-				aggregate: event.aggregate,
-			});
-		});
-	}
-
-	/**
-	 * 1.4.2 (R4): register the active Solo session as the result delivery sink
-	 * (design plan §4.5: "当前打开的 Solo SessionBridge 按 sessionId+workspaceId
-	 * 注册 sink"). Background completions inject a custom message: followUp
-	 * while the parent is streaming (consumed after the current turn would
-	 * stop), or triggerTurn when idle so the parent actually sees the report.
-	 */
-	private _registerDeliverySink(session: AgentSession): void {
-		const service = this._agentTaskService;
-		if (!service || this._role !== "single") {
-			return;
-		}
-		this._deliverySinkUnsubscribe?.();
-		this._deliverySinkUnsubscribe = null;
-		// Stage B D2.3: the sink stays registered across a background detach,
-		// so the liveness check is bound to the captured session object (active
-		// OR backgrounded) instead of this._session identity - otherwise every
-		// delivery to a backgrounded session would misreport
-		// target_session_not_open. The sink is unregistered when its session is
-		// really closed (active close / background finalize / bridge dispose).
-		const sinkSession = session;
-		const sessionId = session.sessionId;
-		const workspaceId = workspaceIdOf(this._planExecutionContext().location.physicalPath);
-		this._deliverySinkUnsubscribe = service.registerSessionDeliverySink(
-			sessionId,
-			workspaceId,
-			async (content) => {
-				if (!this._isSessionLive(sinkSession)) {
-					throw new Error("target_session_not_open");
-				}
-				const streaming = sinkSession.isStreaming;
-				await sinkSession.sendCustomMessage(
-					{
-						customType: INTERNAL_CUSTOM_MESSAGE_TYPES.TASK_RESULT,
-						content: this._formatDeliveryContent(content),
-						display: false,
-						details: content,
-						context: "internal",
-					},
-					streaming ? { deliverAs: "followUp" } : { triggerTurn: true },
-				);
-			},
-		);
-	}
-
-	/** Stage B D2.3: a session is live while active or backgrounded. */
-	private _isSessionLive(session: AgentSession): boolean {
-		if (this._session === session) {
-			return true;
-		}
+	private _assertLiveSession(session: AgentSession): void {
+		if (this._session === session) return;
 		for (const record of this._backgroundSessions.values()) {
-			if (record.session === session) {
-				return true;
-			}
+			if (record.session === session) return;
 		}
-		return false;
-	}
-
-	/** Bounded model-facing envelope for one delivered task result. */
-	private _formatDeliveryContent(content: AgentTaskDeliveryContent): string {
-		return formatInternalNotification({
-			notificationId: `task-result:${content.taskId}:${content.groupId}`,
-			source: "agent-task",
-			kind: "task-result",
-			taskId: content.taskId,
-			groupId: content.groupId,
-			status: content.status,
-			requiresAction: content.status !== "completed" || Boolean(content.errorMessage),
-			result: content.finalOutput || content.summary,
-			error: content.errorMessage,
-			usage: content.usage,
-			planLink: content.planLink,
-			items: content.items.map((item) => ({
-				id: item.id,
-				index: item.index,
-				step: item.step,
-				agentName: item.agentName,
-				agentSource: item.agentSource,
-				status: item.status,
-				...(content.items.length > 1 ? { result: item.finalOutput } : {}),
-				error: item.errorMessage,
-				usage: item.usage,
-			})),
-		});
-	}
-
-	/** Self-contained single-task prompt for a delegated plan step. */
-	private _buildPlanStepPrompt(step: PlanStep, link: PlanStepExecutionLink): string {
-		const lines: string[] = [];
-		lines.push(`<plan_step_execution plan_id="${link.planId}" version="${link.version}" step_id="${link.stepId}">`);
-		lines.push(`Title: ${step.title}`);
-		lines.push(`Description: ${step.description}`);
-		if (step.scopeNote) {
-			lines.push(`Scope note: ${step.scopeNote}`);
-		}
-		if (step.files.length > 0) {
-			lines.push(
-				`Declared files (workspace-relative; work only inside this scope): ${step.files
-					.map((file) => `${file.path} (${file.operation})`)
-					.join(", ")}`,
-			);
-		}
-		if (step.expectedCommands && step.expectedCommands.length > 0) {
-			lines.push(`Expected commands: ${step.expectedCommands.join(" | ")}`);
-		}
-		lines.push(`Verification required: ${step.verification}`);
-		lines.push(`Risk: ${step.risk} - ${step.riskReason}`);
-		lines.push("Work only within the declared scope. Report what you changed and how it was verified.");
-		lines.push("</plan_step_execution>");
-		return lines.join("\n");
-	}
-
-	/** Execution context with a defensive fallback for the Plan validation surface. */
-	private _planExecutionContext(): ProjectExecutionContext {
-		return this._executionContext ?? {
-			location: this._coerceLocation(this._physicalCwd),
-			logicalCwd: this._logicalCwd || this._physicalCwd,
-			physicalCwd: this._physicalCwd,
-			isWsl: false,
-		};
+		throw new Error("Session closed while preparing the prompt.");
 	}
 
 	/** Count each Solo session once for the valid-sessions baseline (content never recorded). */
@@ -3451,28 +2721,6 @@ export class SessionBridge {
 		}
 		this._validSoloSessionRecorded = true;
 		this._productEventCollector?.recordValidSoloSession();
-	}
-
-	/**
-	 * 1.4.3 (S8): the ONLY productEventCollector.record call for workflow runs,
-	 * bound as the recorder's onLifecycle callback. The payload carries only
-	 * existing ProductEventPayload fields (status / durationMs / counts) -
-	 * never script, prompt or value.
-	 */
-	private _recordWorkflowLifecycle(event: WorkflowLifecycleEvent, payload: WorkflowLifecyclePayload): void {
-		const collector = this._productEventCollector;
-		if (!collector) return;
-		const name = WORKFLOW_PRODUCT_EVENT_NAMES[event];
-		if (name === undefined) return;
-		collector.record({
-			schemaVersion: PRODUCT_EVENT_SCHEMA_VERSION,
-			name: name as unknown as ProductEventName,
-			payload: {
-				...(payload.status !== undefined ? { status: payload.status } : {}),
-				...(payload.durationMs !== undefined ? { durationMs: payload.durationMs } : {}),
-				...(payload.counts !== undefined ? { counts: payload.counts } : {}),
-			},
-		});
 	}
 
 	/**
@@ -3517,14 +2765,7 @@ export class SessionBridge {
 			console.warn("[SessionBridge] Failed to flush unpersisted user messages:", err);
 		}
 		this._generation = null;
-		// 1.4.2 (R4): unregister the delivery sink FIRST so an in-flight
-		// send_to_session never injects into a closing session; the result
-		// stays in the panel (design plan §5.4).
-		this._deliverySinkUnsubscribe?.();
-		this._deliverySinkUnsubscribe = null;
-		// Stage B §4.5: the active close delegates to the shared "real close"
-		// sequence; its teardown callback clears the bridge's active fields at
-		// the exact historical point in the order below.
+		generation?.suspendDelivery();
 		return this._closeTarget(
 			{ session, mcpAdapter, generation, userInput },
 			reason,
@@ -3539,6 +2780,7 @@ export class SessionBridge {
 				this._mcpAdapter = null;
 				this._auxiliaryUsage = createEmptyAuxiliaryUsage();
 				this._eyeUsage = createEmptyAuxiliaryUsage();
+				this._validSoloSessionRecorded = false;
 			},
 		);
 	}
@@ -3562,106 +2804,27 @@ export class SessionBridge {
 		teardownActiveFields: () => void,
 	): Promise<boolean> {
 		const { session, mcpAdapter, generation, userInput } = target;
-		// 1.4.3 (S8): workflow children are foreground AgentTask groups of this
-		// session; cancel + bounded-dispose every live workflow run BEFORE the
-		// detach below - a detached group cannot be killed by cancelGroup
-		// anymore, so the parent run's children must never keep running in the
-		// task panel after the parent dies (locked close order, plan 2.6).
-		// disposeAll cancels each live run and awaits every registered child's
-		// by-taskId cancel (or disposeGraceMs); it never touches ordinary
-		// foreground agent groups or Plan delegation groups.
-		if (generation?.workflowEngine) {
+		if (generation) {
 			try {
-				await generation.workflowEngine.disposeAll(this._appShuttingDown);
+				await generation.close({
+					reason,
+					targetSessionFile,
+					appShuttingDown: this._appShuttingDown,
+					markInputClosing: () => this._markUserInputStateClosing(userInput),
+					closeInput: () => this._settleClosedUserInputState(userInput),
+					onBeforeParentClose: teardownActiveFields,
+					disposeHostTools: () => this._disposeComputerUseController(generation.computerUse),
+				});
 			} catch (err) {
-				console.warn("[SessionBridge] Error during workflow engine dispose:", err);
+				console.error("[SessionBridge] Error during Solo session close:", err);
 			}
+			return true;
 		}
-		// 1.4.1 session switch/close: detach this session's still-foreground
-		// groups AFTER the workflow disposeAll (they continue in the app
-		// service as backgrounded and the facade's parent-signal listeners are
-		// removed), so the parent signal below never misclassifies a session
-		// switch as user_cancel.
-		if (this._agentTaskService && session) {
-			try {
-				this._agentTaskService.detachForegroundGroupsForSession(session.sessionId);
-			} catch (err) {
-				console.warn("[SessionBridge] Error during foreground group detach:", err);
-			}
-		}
-		// 1.4.2 (R4): yield one macrotask after the detach and BEFORE the plan
-		// dispose so the awaitGroup continuations (delegation adapter ->
-		// controller _delegateStep) flush first. A foreground Plan delegation
-		// then persists waiting_input(agent_task) + Plan paused before the
-		// session_close dispose, instead of being caught mid-delegation and
-		// written failed; the detached facade also removes its parent-signal
-		// listener in that same continuation, so the dispose abort never fires
-		// onAbort -> cancelGroup against a just-backgrounded group.
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
-		// Plan close matrix: session/app semantics map to PlanDisposeReason;
-		// dispose runs BEFORE the session manager is nulled so the final
-		// snapshot can still be persisted. Never auto-approves/executes.
-		// 1.4.2 (R4): "quit" alone is not an app shutdown - stop-pi, project
-		// switch (start) and team-mode switch all close with "quit" while the
-		// app and the app-level task service keep running; only index.ts
-		// cleanup marks _appShuttingDown.
-		const planDisposeReason: PlanDisposeReason = this._appShuttingDown ? "app_shutdown" : "session_close";
-		const planDisposePromise = generation?.planController
-			? generation.planController.dispose(planDisposeReason)
-			: undefined;
-		// R3: dispose the generation's todo listeners alongside the plan dispose
-		// (the background-session close path routes through this same teardown,
-		// so all three conceptual close sites are covered by the two blocks).
-		generation?.todoController.dispose();
-		// Computer use (PiX 1.5.0): same placement as the todo dispose - the active
-		// close and every background-close site route through here; dispose
-		// errors are logged, never blocking.
-		void this._disposeComputerUseController(generation?.computerUse);
 		teardownActiveFields();
-
-		// Mark the input queue closing and invalidate the generation FIRST.
-		// Bridge-level request/dismissal listeners must stay so IPC can still
-		// receive the close events (design plan section 4.9).
 		this._markUserInputStateClosing(userInput);
-		// Call but do not await runner.dispose(): its synchronous prefix writes
-		// host_disposed and aborts queued/active tasks. Any abort it triggers on
-		// the displayed request now emits "session_closed" exactly once, never
-		// "aborted" - a close-driven approval rejection is never misjudged as a
-		// user denial.
-		const runnerPromise = generation ? generation.runner.dispose() : undefined;
-		// The bridge then dismisses the displayed request and rejects the
-		// remaining user-input; queued items were never displayed so they get
-		// no dismissal. Never pump afterwards.
 		this._settleClosedUserInputState(userInput);
-
-		const awaitCleanups = async (): Promise<void> => {
-			if (planDisposePromise) {
-				try {
-					await planDisposePromise;
-				} catch (err) {
-					console.error("[SessionBridge] Error during plan controller dispose:", err);
-				}
-			}
-			if (runnerPromise) {
-				try {
-					await runnerPromise;
-				} catch (err) {
-					console.error("[SessionBridge] Error during subagent runner dispose:", err);
-				}
-			}
-		};
-
-		if (!session) {
-			await awaitCleanups();
-			return false;
-		}
-
-		// Finally await the plan/runner cleanup, then dispose the parent
-		// session and the parent MCP IN THAT ORDER. The UI never waits up to
-		// 5s for the runner to settle before the session closes.
-		await awaitCleanups();
 		try {
-			await session.dispose({ reason, targetSessionFile });
+			await session?.dispose({ reason, targetSessionFile });
 		} catch (err) {
 			console.error("[SessionBridge] Error during session dispose:", err);
 		}
@@ -3670,7 +2833,7 @@ export class SessionBridge {
 		} catch (err) {
 			console.error("[SessionBridge] Error during MCP adapter dispose:", err);
 		}
-		return true;
+		return session !== null;
 	}
 
 	// =========================================================================
@@ -3749,7 +2912,6 @@ export class SessionBridge {
 			sessionManager,
 			generation,
 			mcpAdapter: this._mcpAdapter,
-			deliverySinkUnsubscribe: this._deliverySinkUnsubscribe,
 			unsubscribe: () => {},
 			state: suspended ? "waiting_input" : "running",
 			pendingCount: this._pendingMessageCount,
@@ -3767,7 +2929,6 @@ export class SessionBridge {
 		this._sessionManager = null;
 		this._generation = null;
 		this._mcpAdapter = null;
-		this._deliverySinkUnsubscribe = null;
 		this._auxiliaryUsage = createEmptyAuxiliaryUsage();
 		this._eyeUsage = createEmptyAuxiliaryUsage();
 		this._isCompacting = false;
@@ -3810,11 +2971,6 @@ export class SessionBridge {
 		this._sessionManager = record.sessionManager;
 		this._generation = record.generation;
 		this._mcpAdapter = record.mcpAdapter;
-		// The delivery sink itself stayed registered across the detach (D2.3);
-		// only the bridge-held unsubscribe moves back so the next real close
-		// unregisters it.
-		this._deliverySinkUnsubscribe = record.deliverySinkUnsubscribe;
-		record.deliverySinkUnsubscribe = null;
 		// D3.2: re-mount the forwarding subscription. _setupEventSubscription
 		// resets the compaction/queue counters, so the record's values are
 		// restored after it (D3.1).
@@ -3931,7 +3087,17 @@ export class SessionBridge {
 	 * eviction / D8 bridge-level close). The caller has already removed the
 	 * record from the map; this runs the _closeCurrentSession order against it.
 	 */
-	private async _closeBackgroundSession(
+	private _closeBackgroundSession(
+		record: BackgroundLiveSession,
+		reason: SessionShutdownEvent["reason"],
+		options: { abort?: boolean } = {},
+	): Promise<void> {
+		const closing = this._disposeBackgroundSession(record, reason, options);
+		this._closingBackgroundSessions.add(closing);
+		return closing.finally(() => this._closingBackgroundSessions.delete(closing));
+	}
+
+	private async _disposeBackgroundSession(
 		record: BackgroundLiveSession,
 		reason: SessionShutdownEvent["reason"],
 		options: { abort?: boolean } = {},
@@ -3944,9 +3110,7 @@ export class SessionBridge {
 		} catch (err) {
 			console.warn("[SessionBridge] Failed to flush unpersisted user messages:", err);
 		}
-		// Unregister the delivery sink kept alive across the detach (D2.3).
-		record.deliverySinkUnsubscribe?.();
-		record.deliverySinkUnsubscribe = null;
+		record.generation.suspendDelivery();
 		// Eviction/bridge-level close abort the running loop first so the turn
 		// lands on disk with stopReason "aborted" before the dispose.
 		if (options.abort) {
@@ -3988,15 +3152,13 @@ export class SessionBridge {
 
 	/** Stage B D8: close every backgrounded live session (abort included). */
 	private async _closeAllBackgroundSessions(abort: boolean): Promise<void> {
-		if (this._backgroundSessions.size === 0) {
-			return;
-		}
 		const records = [...this._backgroundSessions.values()];
 		this._backgroundSessions.clear();
 		for (const record of records) {
 			await this._closeBackgroundSession(record, "quit", { abort });
 		}
-		this._broadcastSessionsState();
+		await Promise.all(this._closingBackgroundSessions);
+		if (records.length > 0) this._broadcastSessionsState();
 	}
 
 	/**

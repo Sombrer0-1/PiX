@@ -1,0 +1,10 @@
+export { McpAdapter, closeAllMcpConnections } from "pi-mcp-adapter";
+export * from "./process-runtime.js";
+export * from "./solo-session.js";
+export * from "./execution-context.js";
+export { parseWslUnc } from "./wsl/wsl-paths.js";
+export { workspaceIdOf } from "./agent-task/agent-task-identity.js";
+export { AgentTaskService } from "./agent-task/agent-task-service.js";
+export type { AgentTaskServiceEvent, AgentTaskSettings } from "./agent-task/agent-task-service.js";
+export { AgentTaskStore } from "./agent-task/agent-task-store.js";
+export { executePlanCommand, isPlanCommand } from "./plan/plan-command.js";

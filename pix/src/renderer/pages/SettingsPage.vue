@@ -13,7 +13,7 @@ import { useWorkspaceRpc } from "../composables/useWorkspaceRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 import { thinkingLevelItems } from "../utils/thinking-labels";
 import { toPlain } from "../utils/plain";
-import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, AGENT_TASK_MAX_RUNNING_SLOTS } from "@shared/agent-task-types.js";
+import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, AGENT_TASK_MAX_RUNNING_SLOTS } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import { isAbsoluteComputerUseDriverPath, type ComputerUseSettings } from "@shared/computer-use-types.js";
 import SettingsGroup from "../components/settings/SettingsGroup.vue";
 import SettingsRow from "../components/settings/SettingsRow.vue";

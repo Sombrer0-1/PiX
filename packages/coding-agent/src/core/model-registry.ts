@@ -932,6 +932,14 @@ export class ModelRegistry {
 		this.upsertRegisteredProvider(providerName, migratedConfig);
 	}
 
+	/** Add extension provider configuration to a registry with its own disk and auth settings. */
+	copyRuntimeProvidersTo(target: ModelRegistry): void {
+		for (const [provider, config] of this.registeredProviders) {
+			target.applyProviderConfig(provider, config);
+			target.registeredProviders.set(provider, { ...config });
+		}
+	}
+
 	/**
 	 * Unregister a previously registered provider.
 	 *

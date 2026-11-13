@@ -30,7 +30,7 @@ import {
   type ProductEvent,
   type ProductEventName,
   type ProductEventPayload,
-} from "../shared/product-events.js";
+} from "@earendil-works/pix-runtime/shared/product-events";
 import type { SettingsStore } from "./settings-store.js";
 
 const PRODUCT_EVENTS_LOG_NAME = "product-events.log";

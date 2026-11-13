@@ -24,13 +24,13 @@
  * misfire on an in-flight run.
  */
 import { computed, ref } from "vue";
-import { isWorkflowToolDetails, workflowPhaseKey } from "@shared/workflow-types.js";
+import { isWorkflowToolDetails, workflowPhaseKey } from "@earendil-works/pix-runtime/shared/workflow-types";
 import type {
   WorkflowMemberState,
   WorkflowRunStatus,
   WorkflowToolDetails,
   WorkflowViewState,
-} from "@shared/workflow-types.js";
+} from "@earendil-works/pix-runtime/shared/workflow-types";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
 import { useWorkflowStore } from "../../stores/workflow-store";
 

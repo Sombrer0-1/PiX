@@ -4,7 +4,6 @@
 
 import { access, readFile, stat } from "node:fs/promises";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import chalk from "chalk";
 import { resolve } from "path";
 import { resolveReadPath } from "../core/tools/path-utils.ts";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize.ts";
@@ -16,6 +15,7 @@ export interface ProcessedFiles {
 }
 
 export interface ProcessFileOptions {
+	cwd?: string;
 	/** Whether to auto-resize images to 2000x2000 max. Default: true */
 	autoResizeImages?: boolean;
 }
@@ -28,14 +28,13 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 
 	for (const fileArg of fileArgs) {
 		// Expand and resolve path (handles ~ expansion and macOS screenshot Unicode spaces)
-		const absolutePath = resolve(resolveReadPath(fileArg, process.cwd()));
+		const absolutePath = resolve(resolveReadPath(fileArg, options?.cwd ?? process.cwd()));
 
 		// Check if file exists
 		try {
 			await access(absolutePath);
 		} catch {
-			console.error(chalk.red(`Error: File not found: ${absolutePath}`));
-			process.exit(1);
+			throw new Error(`File not found: ${absolutePath}`);
 		}
 
 		// Check if file is empty
@@ -89,8 +88,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 				text += `<file name="${absolutePath}">\n${content}\n</file>\n`;
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
-				console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
-				process.exit(1);
+				throw new Error(`Could not read file ${absolutePath}: ${message}`, { cause: error });
 			}
 		}
 	}

@@ -17,9 +17,10 @@
  * loading the Electron runtime (same rule as the plan adapters).
  */
 
-import { isFiniteNonNegativeNumber, type IpcMainLike, type WebContentsLike } from "./ipc-plan-adapters.js";
-import type { AgentTaskService } from "./agent-task/agent-task-service.js";
-import type { AgentTaskInfo } from "../shared/agent-task-types.js";
+import { isFiniteNonNegativeNumber } from "@earendil-works/pix-runtime/plan/plan-command.js";
+import type { IpcMainLike, WebContentsLike } from "./ipc-plan-adapters.js";
+import type { AgentTaskService } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import type { AgentTaskInfo } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { AgentTaskCommand, AgentTaskCommandDataV15, AgentTaskEvent, PixCommandResult } from "../shared/types.js";
 
 const LIST_OUTPUT_PREVIEW_CHARS = 240;

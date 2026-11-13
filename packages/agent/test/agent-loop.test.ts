@@ -4,6 +4,7 @@ import {
 	EventStream,
 	type Message,
 	type Model,
+	parseToolCallArguments,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -367,6 +368,62 @@ describe("agentLoop with AgentMessage", () => {
 		}
 
 		expect(executed).toEqual([123]);
+	});
+
+	it("reports malformed finished arguments without preparing or executing the tool", async () => {
+		const parameters = Type.Object({ value: Type.String() });
+		const tool: AgentTool<typeof parameters> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters,
+			prepareArguments() {
+				throw new Error("prepareArguments must not run");
+			},
+			async execute() {
+				throw new Error("execute must not run");
+			},
+		};
+		const message = createAssistantMessage(
+			[
+				{
+					type: "toolCall",
+					id: "tool-1",
+					name: "echo",
+					...parseToolCallArguments('{"value":"valid prefix",'),
+				},
+			],
+			"toolUse",
+		);
+		const finished = createAssistantMessage([{ type: "text", text: "done" }]);
+		let firstRequest = true;
+		const run = agentLoop(
+			[createUserMessage("echo")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			undefined,
+			() => {
+				const stream = new MockAssistantStream();
+				const response = firstRequest ? message : finished;
+				firstRequest = false;
+				queueMicrotask(() =>
+					stream.push({ type: "done", reason: response === message ? "toolUse" : "stop", message: response }),
+				);
+				return stream;
+			},
+		);
+		const results: AgentEvent[] = [];
+		for await (const event of run) {
+			if (event.type === "tool_execution_end") results.push(event);
+		}
+		expect(results).toEqual([
+			expect.objectContaining({
+				isError: true,
+				result: expect.objectContaining({
+					content: [{ type: "text", text: expect.stringContaining('Invalid arguments for tool "echo"') }],
+				}),
+			}),
+		]);
 	});
 
 	it("should prepare tool arguments for validation", async () => {

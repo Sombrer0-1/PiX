@@ -17,13 +17,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
-import { WORKFLOW_RECORD_SCHEMA_VERSION, WorkflowRunId } from "@shared/workflow-types.js";
+import { WORKFLOW_RECORD_SCHEMA_VERSION, WorkflowRunId } from "@earendil-works/pix-runtime/shared/workflow-types";
 import type {
   WorkflowEvent,
   WorkflowMemberState,
   WorkflowToolDetails,
   WorkflowViewState,
-} from "@shared/workflow-types.js";
+} from "@earendil-works/pix-runtime/shared/workflow-types";
 import type { AgentMessage } from "@/types/rpc";
 import type { PixApi } from "../../main/preload";
 import type { AgentTaskEvent, AgentTaskInfo } from "@shared/types.js";

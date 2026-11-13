@@ -52,19 +52,19 @@ import {
   getAgentDir,
   type RequestUserInputResponse,
 } from "@earendil-works/pi-coding-agent";
-import type { AgentTaskGroupHandle, AgentTaskInfo, AgentTaskInputRequest } from "../../shared/agent-task-types.js";
+import type { AgentTaskGroupHandle, AgentTaskInfo, AgentTaskInputRequest } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { ProjectLocation } from "../../shared/project-location.js";
-import { isSubagentDetails, type SubagentDetails } from "../../shared/subagent-types.js";
-import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { AgentTaskService, __setAgentTaskServiceHooksForTests, type AgentTaskServiceEvent } from "../agent-task/agent-task-service.js";
-import type { ProjectExecutionContext } from "../execution-context.js";
-import { createProjectExecutionContext, disposeProjectExecutionContext, resolveProjectLocation } from "../execution-context.js";
+import { isSubagentDetails, type SubagentDetails } from "@earendil-works/pix-runtime/shared/subagent-types";
+import { AgentTaskStore } from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { AgentTaskService, __setAgentTaskServiceHooksForTests, type AgentTaskServiceEvent } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import type { ProjectExecutionContext } from "@earendil-works/pix-runtime/execution-context.js";
+import { createProjectExecutionContext, disposeProjectExecutionContext, resolveProjectLocation } from "@earendil-works/pix-runtime/execution-context.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
 import { SettingsStore } from "../settings-store.js";
 import { SessionBridge } from "../session-bridge.js";
-import type { SubagentRunner } from "../subagent/subagent-runner.js";
-import { WslDistroResolver, type WslDistroInfo } from "../wsl/wsl-distro.js";
-import { createWslRuntime, type WslRuntime } from "../wsl/wsl-runtime.js";
+import type { SubagentRunner } from "@earendil-works/pix-runtime/subagent/subagent-runner.js";
+import { WslDistroResolver, type WslDistroInfo } from "@earendil-works/pix-runtime/wsl/wsl-distro.js";
+import { createWslRuntime, type WslRuntime } from "@earendil-works/pix-runtime/wsl/wsl-runtime.js";
 
 // ============================================================================
 // CLI flags: --windows / --wsl2 select the legs; no flags run both.
@@ -269,7 +269,15 @@ function makeService(): AgentTaskService {
     maxTaskBytes: 25 * 1024 * 1024,
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
-  return new AgentTaskService({ settings, events, store, runId: "e2e-run" });
+  return new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId: "e2e-run",
+  });
 }
 
 interface BridgeAccess {

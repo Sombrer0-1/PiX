@@ -25,6 +25,7 @@ export interface RequestUserInputQuestion {
 
 export interface RequestUserInputRequest {
 	id: string;
+	purpose?: "tool_approval" | "project_agent_trust";
 	questions: RequestUserInputQuestion[];
 }
 

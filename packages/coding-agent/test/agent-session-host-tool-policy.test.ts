@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
+import type { RequestUserInputHandler, RequestUserInputRequest } from "../src/core/request-user-input-tool.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { HostToolPolicyInput, HostToolPolicyOverride } from "../src/core/tool-execution-policy.ts";
@@ -65,6 +66,7 @@ function makeSession(options: {
 	runtimeCwd?: string;
 	responses?: FauxResponseInput[];
 	tools?: Record<string, AgentTool>;
+	requestUserInput?: RequestUserInputHandler;
 }): AgentSession {
 	const { streamFn } = createFauxStreamFn(options.responses ?? ["ok"]);
 	const agent = new Agent({
@@ -85,6 +87,7 @@ function makeSession(options: {
 		runtimeCwd: options.runtimeCwd,
 		executionBackend: options.executionBackend,
 		hostToolPolicyOverride: options.hostToolPolicyOverride,
+		requestUserInput: options.requestUserInput,
 		modelRegistry,
 		resourceLoader: createTestResourceLoader(),
 		baseToolsOverride: options.tools,
@@ -92,9 +95,7 @@ function makeSession(options: {
 }
 
 function toolResultTexts(session: AgentSession): string[] {
-	return session.messages
-		.filter((m) => m.role === "toolResult")
-		.map((m) => JSON.stringify(m.content));
+	return session.messages.filter((m) => m.role === "toolResult").map((m) => JSON.stringify(m.content));
 }
 
 describe("AgentSession host tool policy override", () => {
@@ -155,6 +156,38 @@ describe("AgentSession host tool policy override", () => {
 
 			expect(executed).toEqual([]);
 			expect(toolResultTexts(session)).toEqual([expect.stringContaining("blocked by host policy")]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("passes the tool approval purpose and abort signal to the host", async () => {
+		const { tools, executed } = recordingTools(["bash"]);
+		const waiting = Promise.withResolvers<{ request: RequestUserInputRequest; signal?: AbortSignal }>();
+		const session = makeSession({
+			tempDir,
+			hostToolPolicyOverride: () => ({ allowed: false, requiresApproval: true }),
+			responses: [{ toolCalls: [{ name: "bash", args: { command: "pwd" } }] }, "done"],
+			tools,
+			requestUserInput: (request, signal) => {
+				waiting.resolve({ request, signal });
+				if (!signal) return Promise.resolve({ id: request.id, answers: {}, cancelled: true });
+				return new Promise((resolve) => {
+					signal.addEventListener("abort", () => resolve({ id: request.id, answers: { approval: "允许执行" } }), {
+						once: true,
+					});
+				});
+			},
+		});
+		try {
+			const prompt = session.prompt("run a command");
+			const { request, signal } = await waiting.promise;
+			expect(request.purpose).toBe("tool_approval");
+			expect(signal).toBeInstanceOf(AbortSignal);
+			await session.abort();
+			await prompt;
+			expect(signal?.aborted).toBe(true);
+			expect(executed).toEqual([]);
 		} finally {
 			await session.dispose();
 		}

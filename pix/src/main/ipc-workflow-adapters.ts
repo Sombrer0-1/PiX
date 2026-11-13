@@ -10,7 +10,7 @@
  * adapter.
  *
  * The IpcMainLike / WebContentsLike adapter types and the shared
- * isFiniteNonNegativeNumber helper live in ipc-plan-adapters.ts and are
+ * adapter types live in ipc-plan-adapters.ts and are
  * reused by the agent-task adapters and here. The adapter never imports
  * SessionBridge: the recorder instance and the parent-session entry stream
  * (getEntries) are injected by ipc-handlers.
@@ -23,9 +23,9 @@ import {
   type WorkflowCommand,
   type WorkflowEvent,
   type WorkflowViewState,
-} from "../shared/workflow-types.js";
-import type { WorkflowEngine } from "./workflow/engine/engine.js";
-import type { WorkflowRecorder } from "./workflow/recorder.js";
+} from "@earendil-works/pix-runtime/shared/workflow-types";
+import type { WorkflowEngine } from "@earendil-works/pix-runtime/workflow/engine/engine.js";
+import type { WorkflowRecorder } from "@earendil-works/pix-runtime/workflow/recorder.js";
 import type { IpcMainLike, WebContentsLike } from "./ipc-plan-adapters.js";
 
 /**

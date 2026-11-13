@@ -23,19 +23,19 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { AgentSession, getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { ProductEvent } from "../../shared/product-events.js";
+import type { ProductEvent } from "@earendil-works/pix-runtime/shared/product-events";
 import type { ProjectLocation } from "../../shared/types.js";
-import { WorkflowRunId } from "../../shared/workflow-types.js";
-import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { AgentTaskService } from "../agent-task/agent-task-service.js";
-import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
+import { WorkflowRunId } from "@earendil-works/pix-runtime/shared/workflow-types";
+import { AgentTaskStore } from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { AgentTaskService } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import { workspaceIdOf } from "@earendil-works/pix-runtime/agent-task/agent-task-identity.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
 import { SettingsStore } from "../settings-store.js";
-import type { PlanController } from "../plan/plan-controller.js";
-import type { WorkflowRecorder } from "../workflow/recorder.js";
-import { WorkflowChildCache } from "../workflow/child-cache.js";
-import type { WorkflowStartRequest } from "../workflow/engine/index.js";
-import { WorkerThreadWorkflowEngine } from "../workflow/engine/index.js";
+import type { PlanController } from "@earendil-works/pix-runtime/plan/plan-controller.js";
+import type { WorkflowRecorder } from "@earendil-works/pix-runtime/workflow/recorder.js";
+import { WorkflowChildCache } from "@earendil-works/pix-runtime/workflow/child-cache.js";
+import type { WorkflowStartRequest } from "@earendil-works/pix-runtime/workflow/engine/index.js";
+import { WorkerThreadWorkflowEngine } from "@earendil-works/pix-runtime/workflow/engine/index.js";
 import { SessionBridge } from "../session-bridge.js";
 
 // ============================================================================
@@ -155,7 +155,15 @@ function makeTaskService(): AgentTaskService {
     maxTaskBytes: 25 * 1024 * 1024,
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
-  return new AgentTaskService({ settings, events, store, runId: "wf-bridge-run" });
+  return new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId: "wf-bridge-run",
+  });
 }
 
 // ============================================================================

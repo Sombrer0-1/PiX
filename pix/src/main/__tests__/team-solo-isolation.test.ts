@@ -36,19 +36,19 @@ import {
 import {
   AGENT_TASK_DEFAULT_RUNNING_SLOTS,
   DEFAULT_MAX_TURNS,
-} from "../../shared/agent-task-types.js";
+} from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { AgentSessionEvent } from "../../shared/types.js";
 import type { SeatConfig } from "../../shared/team-types.js";
-import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
-import { DEFAULT_MAX_TURNS as RUNTIME_DEFAULT_MAX_TURNS } from "../agent-task/agent-task-runtime.js";
-import { AgentTaskScheduler } from "../agent-task/agent-task-scheduler.js";
-import { DEFAULT_MAX_TURNS as SERVICE_DEFAULT_MAX_TURNS } from "../agent-task/agent-task-service.js";
+import { workspaceIdOf } from "@earendil-works/pix-runtime/agent-task/agent-task-identity.js";
+import { DEFAULT_MAX_TURNS as RUNTIME_DEFAULT_MAX_TURNS } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
+import { AgentTaskScheduler } from "@earendil-works/pix-runtime/agent-task/agent-task-scheduler.js";
+import { DEFAULT_MAX_TURNS as SERVICE_DEFAULT_MAX_TURNS } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
 import {
   AGENT_TASK_DEFAULT_MAX_TASK_BYTES,
   AGENT_TASK_DEFAULT_MAX_WORKSPACE_BYTES,
   AgentTaskStore,
-} from "../agent-task/agent-task-store.js";
-import type { ProjectExecutionContext } from "../execution-context.js";
+} from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import type { ProjectExecutionContext } from "@earendil-works/pix-runtime/execution-context.js";
 import { DEFAULT_COALESCE_INTERVAL_MS, MessageUpdateCoalescer } from "../message-update-coalescer.js";
 import { TeamManager } from "../team-manager.js";
 import { TeamCapacityPool } from "../team/capacity-pool.js";

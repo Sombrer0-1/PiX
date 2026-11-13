@@ -1,6 +1,7 @@
 import type { SpawnSyncReturns } from "child_process";
 import { writeFileSync } from "fs";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { readClipboardImage } from "../src/utils/clipboard-image.ts";
 
 const mocks = vi.hoisted(() => {
 	return {
@@ -49,7 +50,6 @@ function spawnError(error: Error): SpawnSyncReturns<Buffer> {
 
 describe("readClipboardImage", () => {
 	beforeEach(() => {
-		vi.resetModules();
 		mocks.spawnSync.mockReset();
 		mocks.clipboard.hasImage.mockReset();
 		mocks.clipboard.getImageBinary.mockReset();
@@ -70,7 +70,6 @@ describe("readClipboardImage", () => {
 			throw new Error(`Unexpected spawnSync call: ${command} ${args.join(" ")}`);
 		});
 
-		const { readClipboardImage } = await import("../src/utils/clipboard-image.ts");
 		const result = await readClipboardImage({ platform: "linux", env: { WAYLAND_DISPLAY: "1" } });
 		expect(result).not.toBeNull();
 		expect(result?.mimeType).toBe("image/png");
@@ -101,7 +100,6 @@ describe("readClipboardImage", () => {
 			return spawnOk(Buffer.alloc(0));
 		});
 
-		const { readClipboardImage } = await import("../src/utils/clipboard-image.ts");
 		const result = await readClipboardImage({ platform: "linux", env: { XDG_SESSION_TYPE: "wayland" } });
 		expect(result).not.toBeNull();
 		expect(result?.mimeType).toBe("image/png");
@@ -138,7 +136,6 @@ describe("readClipboardImage", () => {
 			throw new Error(`Unexpected spawnSync call: ${command} ${args.join(" ")}`);
 		});
 
-		const { readClipboardImage } = await import("../src/utils/clipboard-image.ts");
 		const result = await readClipboardImage({ platform: "linux", env: { WSL_DISTRO_NAME: "Ubuntu" } });
 		expect(result).not.toBeNull();
 		expect(result?.mimeType).toBe("image/png");
@@ -153,7 +150,6 @@ describe("readClipboardImage", () => {
 		mocks.clipboard.hasImage.mockReturnValue(true);
 		mocks.clipboard.getImageBinary.mockResolvedValue(new Uint8Array([7]));
 
-		const { readClipboardImage } = await import("../src/utils/clipboard-image.ts");
 		const result = await readClipboardImage({ platform: "linux", env: {} });
 		expect(result).not.toBeNull();
 		expect(result?.mimeType).toBe("image/png");
@@ -167,8 +163,36 @@ describe("readClipboardImage", () => {
 
 		mocks.clipboard.hasImage.mockReturnValue(false);
 
-		const { readClipboardImage } = await import("../src/utils/clipboard-image.ts");
 		const result = await readClipboardImage({ platform: "linux", env: {} });
 		expect(result).toBeNull();
+	});
+
+	test("does not request an X11 image from a text-only clipboard", async () => {
+		mocks.spawnSync.mockImplementation((command, args) => {
+			if (command === "xclip" && args.includes("TARGETS")) {
+				return spawnOk(Buffer.from("TARGETS\nUTF8_STRING\n"));
+			}
+			return command === "xclip" ? spawnOk(Buffer.from("plain text")) : spawnError(new Error("unavailable"));
+		});
+
+		await expect(readClipboardImage({ platform: "linux", env: { WAYLAND_DISPLAY: "1" } })).resolves.toBeNull();
+		expect(mocks.spawnSync).not.toHaveBeenCalledWith(
+			"xclip",
+			expect.arrayContaining(["image/png"]),
+			expect.anything(),
+		);
+	});
+
+	test("tries another advertised image type if the preferred image cannot be read", async () => {
+		mocks.spawnSync.mockImplementation((command, args) => {
+			if (command === "xclip" && args.includes("TARGETS")) {
+				return spawnOk(Buffer.from("image/png\nimage/jpeg\n"));
+			}
+			if (command === "xclip" && args.includes("image/jpeg")) return spawnOk(Buffer.from([9, 8]));
+			return spawnError(new Error("unavailable"));
+		});
+
+		const result = await readClipboardImage({ platform: "linux", env: { WAYLAND_DISPLAY: "1" } });
+		expect(result).toEqual({ bytes: Buffer.from([9, 8]), mimeType: "image/jpeg" });
 	});
 });

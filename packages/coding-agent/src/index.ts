@@ -6,6 +6,7 @@ export {
 	type AcpToolName,
 	createActiveCompressionExtension,
 } from "./core/active-compression/index.ts";
+export { sidecarPathForSessionFile } from "./core/active-compression/state.ts";
 
 // Config paths
 export { getAgentDir, VERSION } from "./config.ts";
@@ -241,6 +242,7 @@ export {
 	type PromptTemplate,
 } from "./core/sdk.ts";
 export {
+	assertValidSessionId,
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
@@ -250,6 +252,7 @@ export {
 	type FileEntry,
 	getLatestCompactionEntry,
 	invalidateSessionListCache,
+	loadEntriesFromFile,
 	type ListSessionsOptions,
 	type ModelChangeEntry,
 	migrateSessionEntries,
@@ -265,8 +268,18 @@ export {
 	type SessionInfoEntry,
 	SessionManager,
 	type SessionMessageEntry,
+	type SessionTreeNode,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
+export type { SessionFileHost } from "./core/session-file-host.ts";
+export type {
+	AppMode,
+	MainHost,
+	MainHostProcess,
+	MainHostSession,
+	SessionHostCommand,
+	SessionHostIO,
+} from "./core/session-host.ts";
 export {
 	type CompactionSettings,
 	type ExecutionSettings,

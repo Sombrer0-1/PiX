@@ -24,7 +24,7 @@ import AgentTaskDetail from "./AgentTaskDetail.vue";
 import AgentTaskInputCard from "./AgentTaskInputCard.vue";
 import TaskFileChanges from "./TaskFileChanges.vue";
 import TaskTranscriptView from "./TaskTranscriptView.vue";
-import type { AgentTaskInfo, AgentTaskStatus } from "@shared/agent-task-types.js";
+import type { AgentTaskInfo, AgentTaskStatus } from "@earendil-works/pix-runtime/shared/agent-task-types";
 
 const TERMINAL_STATUSES: ReadonlySet<AgentTaskStatus> = new Set(["completed", "failed", "cancelled"]);
 

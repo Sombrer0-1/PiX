@@ -36,7 +36,7 @@ import { basename, posix as pathPosix, join } from "node:path";
 import type { AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream, type Api } from "@earendil-works/pi-ai";
 import { AuthStorage, ModelRegistry, SessionManager, type ExecutionBackend } from "@earendil-works/pi-coding-agent";
-import { isProductEvent, type ProductEvent } from "../../shared/product-events.js";
+import { isProductEvent, type ProductEvent } from "@earendil-works/pix-runtime/shared/product-events";
 import {
   isAgentTaskInfo,
   type AgentTaskActivity,
@@ -45,17 +45,17 @@ import {
   type AgentTaskSpec,
   type AgentTaskUsage,
   type ResumeDecision,
-} from "../../shared/agent-task-types.js";
-import type { SubagentSingleResult } from "../../shared/subagent-types.js";
+} from "@earendil-works/pix-runtime/shared/agent-task-types";
+import type { SubagentSingleResult } from "@earendil-works/pix-runtime/shared/subagent-types";
 import type { RequestUserInputRequest, RequestUserInputResponse } from "../../shared/types.js";
 import type { ProjectLocation } from "../../shared/project-location.js";
 import { SettingsStore } from "../settings-store.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
-import type { SubagentParentRuntimeSnapshot, SubagentTaskItem } from "../subagent/types.js";
-import type { AgentTaskInputRouter } from "../agent-task/agent-task-input.js";
-import type { AgentTaskRuntimeResult } from "../agent-task/agent-task-runtime.js";
-import { AgentTaskRuntime, RESUME_TURN_MESSAGE, __setAgentTaskRuntimeContextFactoriesForTests } from "../agent-task/agent-task-runtime.js";
-import { AgentTaskResumer, RESUME_NOTE_CUSTOM_TYPE, __setAgentTaskResumerContextFactoriesForTests } from "../agent-task/agent-task-resumer.js";
+import type { SubagentParentRuntimeSnapshot, SubagentTaskItem } from "@earendil-works/pix-runtime/subagent/types.js";
+import type { AgentTaskInputRouter } from "@earendil-works/pix-runtime/agent-task/agent-task-input.js";
+import type { AgentTaskRuntimeResult } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
+import { AgentTaskRuntime, RESUME_TURN_MESSAGE, __setAgentTaskRuntimeContextFactoriesForTests } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
+import { AgentTaskResumer, RESUME_NOTE_CUSTOM_TYPE, __setAgentTaskResumerContextFactoriesForTests } from "@earendil-works/pix-runtime/agent-task/agent-task-resumer.js";
 import {
   AgentTaskStore,
   TaskStorageLimitError,
@@ -66,8 +66,8 @@ import {
   type TaskIndexProbe,
   type TaskLogEvent,
   type TaskLogEventPayload,
-} from "../agent-task/agent-task-store.js";
-import { workspaceIdOf } from "../agent-task/agent-task-identity.js";
+} from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { workspaceIdOf } from "@earendil-works/pix-runtime/agent-task/agent-task-identity.js";
 import {
   AgentTaskService,
   RESTORE_WORKSPACE_CONCURRENCY,
@@ -75,7 +75,7 @@ import {
   type AgentTaskServiceTestHooks,
   type AgentTaskSubmissionContext,
   type CreateTaskParams,
-} from "../agent-task/agent-task-service.js";
+} from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
 
 // ============================================================================
 // Test harness (matches agent-task-service.test.ts / agent-task-runtime.test.ts)
@@ -661,7 +661,15 @@ function makeRecoveryHarness(
       maxTaskBytes: opts.maxTaskBytes ?? 25 * 1024 * 1024,
       maxWorkspaceBytes: opts.maxWorkspaceBytes ?? 500 * 1024 * 1024,
     });
-  const service = new AgentTaskService({ settings, events, store, runId: "recovery-run" });
+  const service = new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId: "recovery-run",
+  });
   const hooks: Partial<AgentTaskServiceTestHooks> = {
     autoBackgroundMsOverride: 0,
     flushIndexWrites: true,

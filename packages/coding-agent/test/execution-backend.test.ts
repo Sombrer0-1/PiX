@@ -431,9 +431,9 @@ describe("execution backend: Windows fallback unchanged", () => {
 		};
 	}
 
-	function matchEvent(filePath: string, lineNumber: number, lineText: string): string {
+	function rgEvent(type: "match" | "context", filePath: string, lineNumber: number, lineText: string): string {
 		return JSON.stringify({
-			type: "match",
+			type,
 			data: { path: { text: filePath }, line_number: lineNumber, lines: { text: `${lineText}\n` } },
 		});
 	}
@@ -443,10 +443,9 @@ describe("execution backend: Windows fallback unchanged", () => {
 		const grepDef = createGrepToolDefinition(tempDir, {
 			operations: {
 				isDirectory: async () => true,
-				readFile: async () => "apple\napricot\nbanana\n",
 				spawnRipgrep: fakeRipgrep([
-					matchEvent(aTxt, 1, "apple"),
-					matchEvent(aTxt, 2, "apricot"),
+					rgEvent("match", aTxt, 1, "apple"),
+					rgEvent("match", aTxt, 2, "apricot"),
 				]),
 			},
 		});
@@ -456,24 +455,34 @@ describe("execution backend: Windows fallback unchanged", () => {
 		expect(text).toContain("1 matches limit");
 	});
 
-	it("grep context lines are emitted when context > 0 (local fallback)", async () => {
-		const aTxt = `${tempDir}/a.txt`.replace(/\\/g, "/");
-		const grepDef = createGrepToolDefinition(tempDir, {
+	it("requests context from ripgrep in the backend's search directory", async () => {
+		const spawnRipgrep = vi.fn(fakeRipgrep([
+			rgEvent("context", "./a.txt", 1, "apple"),
+			rgEvent("match", "./a.txt", 2, "apricot"),
+			rgEvent("context", "./a.txt", 3, "banana"),
+			rgEvent("match", "./a.txt", 4, "apricot again"),
+		]));
+		const grepDef = createGrepToolDefinition("/home/user/project", {
 			operations: {
 				isDirectory: async () => true,
-				readFile: async () => "apple\napricot\nbanana\n",
-				spawnRipgrep: fakeRipgrep([matchEvent(aTxt, 3, "banana")]),
+				spawnRipgrep,
 			},
+			pathContext: makePosixPathContext(),
 		});
 		const result = await grepDef.execute(
 			"tc",
-			{ pattern: "banana", path: ".", context: 1 },
+			{ pattern: "apricot", path: "sub", glob: "./nested/*.txt", context: 1, limit: 1 },
 			undefined,
 		);
 		const text = result.content.map((c) => (c.type === "text" ? c.text : "")).join("");
-		// Context separator line before the match.
-		expect(text).toContain("a.txt-2- apricot");
-		expect(text).toContain("a.txt:3: banana");
+		expect(spawnRipgrep).toHaveBeenCalledWith(
+			expect.arrayContaining(["--glob", "nested/*.txt", "--context", "1", "--", "apricot", "."]),
+			"/home/user/project/sub",
+			process.env,
+		);
+		expect(text).toContain("a.txt-1- apple\na.txt:2: apricot\na.txt-3- banana");
+		expect(text).not.toContain("apricot again");
+		expect(result.details?.matchLimitReached).toBe(1);
 	});
 
 	it("ls stat fallback marks directories with '/' (no readdirWithTypes)", async () => {

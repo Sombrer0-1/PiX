@@ -59,7 +59,7 @@ import { createPinia, setActivePinia } from "pinia";
 // files, which a Node-side externalized import cannot load in happy-dom.
 import { components as vuetifyComponents, createVuetify, directives as vuetifyDirectives } from "vuetify/dist/vuetify.js";
 import type { PixApi } from "../../main/preload";
-import { AGENT_TASK_MAX_ACTIVITIES } from "@shared/agent-task-types.js";
+import { AGENT_TASK_MAX_ACTIVITIES } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type {
   AgentTaskActivity,
   AgentTaskGroupHandle,
@@ -68,10 +68,10 @@ import type {
   AgentTaskLogEvent,
   AgentTaskRecoveryIssue,
   AgentTaskStorageStatus,
-} from "@shared/agent-task-types.js";
+} from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { FileChangeSummary, SessionInfo } from "@shared/types.js";
 import type { AgentMessage, AgentTaskEvent } from "@shared/types.js";
-import type { SubagentDetails } from "@shared/subagent-types.js";
+import type { SubagentDetails } from "@earendil-works/pix-runtime/shared/subagent-types";
 import { useAgentTaskStore } from "../stores/agent-task-store";
 import AgentTaskLauncher from "../components/agent-task/AgentTaskLauncher.vue";
 import AgentTaskDetail from "../components/agent-task/AgentTaskDetail.vue";

@@ -12,7 +12,7 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
-import type { AgentTaskInfo } from "@shared/agent-task-types.js";
+import type { AgentTaskInfo } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { FileChangeSummary } from "@shared/types.js";
 
 const props = defineProps<{

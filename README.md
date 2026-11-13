@@ -1,6 +1,6 @@
 # PiX
 
-PiX 是一个基于 Electron 的桌面 GUI 应用，为 Pi AI 编码代理提供图形化界面。
+PiX 是一个基于 Pi 的编码代理，提供终端命令 `pix` 和 Electron 桌面应用。两端的 Solo 会话共用模型配置、文件与 Shell 工具、MCP、原生子代理、workflow、Ralph、Plan 和 Todo。Team 圆桌和 Computer Use 由桌面应用提供。
 
 ## 技术栈
 
@@ -29,7 +29,7 @@ PiX 支持将项目在 WSL2 发行版内执行：Agent 会话获得 Linux 语义
 - **rg 和 fd 由用户在发行版内自行安装**（v1 不自动下载二进制）：
   - ripgrep：`sudo apt install ripgrep`
   - fd：Debian/Ubuntu 包名为 `fd-find`，安装后命令是 `fdfind`；其它发行版（Fedora/Arch 等）命令名为 `fd`。backend 依次探测 `fd`、`fdfind`，缺失时报含发行版名与安装提示的错误，不会回退到 Windows 侧二进制。
-- **配置入口**：设置 → WSL 分区（启用开关、默认发行版、默认 Linux 项目目录）；打开项目时选择 Windows/WSL 环境与发行版。WSL 不可用或未探测到发行版时相关控件禁用并显示诊断。
+- **配置入口**：桌面在打开项目时选择 WSL 发行版和目录。终端使用 `pix --wsl-distro Ubuntu-22.04 --wsl-path /home/user/project`。
 
 ### 使用限制（v1）
 
@@ -42,56 +42,48 @@ PiX 支持将项目在 WSL2 发行版内执行：Agent 会话获得 Linux 语义
 
 ## 项目结构
 
-```
-pix/
-├── src/
-│   ├── main/           # Electron 主进程
-│   │   ├── index.ts    # 应用入口
-│   │   ├── session-bridge.ts  # 会话管理桥接
-│   │   ├── settings-store.ts  # 设置持久化
-│   │   └── ipc-handlers.ts    # IPC 通信处理
-│   ├── renderer/       # Vue 渲染进程
-│   │   ├── components/ # UI 组件
-│   │   ├── pages/      # 页面视图
-│   │   ├── stores/     # Pinia 状态管理
-│   │   └── composables/# 组合式函数
-│   └── shared/         # 共享类型定义
-├── package.json
-└── tsconfig.json
+```text
+packages/agent          Agent loop 和工具调用
+packages/ai             模型目录、认证协议和流式模型调用
+packages/coding-agent   Pi SDK、AgentSession、扩展、会话文件及终端模式
+packages/pix-runtime    PiX Solo 会话工厂、任务服务、workflow worker、Plan、Todo 和 WSL
+packages/pix-cli        pix 终端入口、会话文件锁与宿主命令
+pix/                    Electron 主进程、IPC、preload 和 Vue
 ```
 
-## 开发
+## 终端
+
+在仓库根目录安装工作区依赖并构建 CLI。需要 Node.js 22.19 或以上。
 
 ```bash
-# 安装依赖
 npm install --ignore-scripts
-
-# 开发模式（同时启动 Vite 和 Electron）
-npm run dev
-
-# 仅启动渲染进程开发服务器
-npm run dev:renderer
-
-# 构建
-npm run build
-
-# 打包为可执行文件
-npm run package
+npm run build:cli
+npx --no-install pix --help
+npx --no-install pix -p "检查这个项目"
+npx --no-install pix --mode json -p "用子代理梳理测试目录"
+npx --no-install pix --mode rpc
 ```
 
-## 构建打包
+交互模式使用 `/plan` 查看计划命令，使用 `/tasks` 查询任务，用 `/cancel-task <id>` 取消任务。新会话默认关闭 ACP，可用 `--acp` 启用，空会话可用 `/acp on` 或 `/acp off` 调整。终端会话保存在 `<agentDir>/pix-cli-sessions`，`--session-dir` 选择其中的子目录。模型、凭据和扩展仍从原 `agentDir` 读取。
+
+开发时运行 `npm run dev:cli` 和 `npm run watch:pix-runtime`，分别监听 CLI 和共享运行时。
+
+## 桌面开发与打包
+
+在仓库根目录安装工作区依赖后，单独安装桌面依赖。开发环境需要已安装的 Electron 二进制。
 
 ```bash
-# 构建并打包为安装程序
-npm run package
+npm --prefix pix install --ignore-scripts
+npm --prefix pix run build
+npm --prefix pix run dev
+npm --prefix pix run package
 ```
 
 打包前确认 `packages/ai/src/models.generated.ts`（以及 `image-models.generated.ts`）的改动已提交并推送。这两份文件是 `@earendil-works/pi-ai` 的模型目录源码，不是 `dist/` 产物；未进仓库则安装包里的模型列表、定价和上下文窗口仍是上一份已提交内容。
 
-打包产物位于 `release/` 目录，包含：
-- Windows: `PiX Setup x.x.x.exe`
-- macOS: `PiX-x.x.x.dmg`
-- Linux: `PiX-x.x.x.AppImage`
+打包产物位于 `pix/release/`。发版时在仓库根目录运行 `npm run version:pix -- <version>`，同步三个 PiX 包的产品版本和两个锁文件。
+
+运行 `npm run test:pix-runtime` 验证 CLI、共享运行时和桌面主进程。设置 `PIX_WSL_TEST_DISTRO` 可运行真实 WSL 用例，设置 `PIX_PACKAGED_EXE` 可验证打包后的桌面应用。另用 `-- --live` 运行需要真实模型凭据的任务用例。
 
 ## 依赖包
 

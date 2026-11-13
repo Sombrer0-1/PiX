@@ -209,26 +209,11 @@ describe("SessionManager active compression header", () => {
 		expect(forkedOff.getHeader()?.acp).toBeUndefined();
 	});
 
-	it("empty or corrupt session file starts a new session with ACP off", () => {
+	it("starts an empty session file with ACP off", () => {
 		const emptyFile = join(tempDir, "empty.jsonl");
 		writeFileSync(emptyFile, "");
 		const emptySession = SessionManager.open(emptyFile, tempDir);
 		expect(emptySession.getAcp()).toBe(false);
 		expect(emptySession.getHeader()?.acp).toBeUndefined();
-
-		const badFile = join(tempDir, "bad.jsonl");
-		writeFileSync(badFile, "not json\n");
-		const badSession = SessionManager.open(badFile, tempDir);
-		expect(badSession.getAcp()).toBe(false);
-		expect(badSession.getHeader()?.acp).toBeUndefined();
-
-		const noHeaderFile = join(tempDir, "no-header.jsonl");
-		writeFileSync(
-			noHeaderFile,
-			'{"type":"message","id":"abc","parentId":null,"timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"hi"}}\n',
-		);
-		const recovered = SessionManager.open(noHeaderFile, tempDir);
-		expect(recovered.getAcp()).toBe(false);
-		expect(recovered.getHeader()?.acp).toBeUndefined();
 	});
 });

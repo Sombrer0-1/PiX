@@ -42,18 +42,18 @@ import {
   type RequestUserInputResponse,
 } from "@earendil-works/pi-coding-agent";
 import type { CustomProviderConfig } from "../../shared/custom-providers.js";
-import type { SubagentDetails } from "../../shared/subagent-types.js";
+import type { SubagentDetails } from "@earendil-works/pix-runtime/shared/subagent-types";
 import type { ProjectLocation, RequestUserInputDismissal } from "../../shared/types.js";
 import { McpAdapter } from "pi-mcp-adapter";
-import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { AgentTaskService, __setAgentTaskServiceHooksForTests } from "../agent-task/agent-task-service.js";
-import type { AgentTaskRuntime } from "../agent-task/agent-task-runtime.js";
+import { AgentTaskStore } from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { AgentTaskService, __setAgentTaskServiceHooksForTests } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import type { AgentTaskRuntime } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
 import { SettingsStore } from "../settings-store.js";
-import type { SubagentExecutionContext } from "../subagent/types.js";
-import type { SubagentRunner } from "../subagent/subagent-runner.js";
-import type { PlanController, PlanDisposeReason } from "../plan/plan-controller.js";
-import type { PlanRuntimeSnapshot } from "../../shared/plan-types.js";
+import type { SubagentExecutionContext } from "@earendil-works/pix-runtime/subagent/types.js";
+import type { SubagentRunner } from "@earendil-works/pix-runtime/subagent/subagent-runner.js";
+import type { PlanController, PlanDisposeReason } from "@earendil-works/pix-runtime/plan/plan-controller.js";
+import type { PlanRuntimeSnapshot } from "@earendil-works/pix-runtime/shared/plan-types";
 import { SessionBridge } from "../session-bridge.js";
 
 // ============================================================================
@@ -337,7 +337,15 @@ function makeTaskService(): AgentTaskService {
     maxTaskBytes: 25 * 1024 * 1024,
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
-  return new AgentTaskService({ settings, events, store, runId: "bridge-run" });
+  return new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId: "bridge-run",
+  });
 }
 
 /**
@@ -466,7 +474,6 @@ await run("parent/nested registry identity and agentDir are same-source", async 
       "runner context borrows the same registry identity as the parent session",
     );
     assertEqual(runnerCtx.agentDir, generation.agentDir, "runner context agentDir === generation agentDir");
-    assert(runnerCtx.authStorage === generation.authStorage, "runner context borrows the generation auth storage");
   } finally {
     await bridge.dispose();
   }

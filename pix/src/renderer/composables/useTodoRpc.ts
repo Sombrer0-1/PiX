@@ -10,7 +10,7 @@
 
 import type { PixApi } from "../../main/preload";
 import type { PixCommandResult } from "@shared/types.js";
-import type { TodoCommand, TodoEvent, TodoSnapshot } from "@shared/todo-types.js";
+import type { TodoCommand, TodoEvent, TodoSnapshot } from "@earendil-works/pix-runtime/shared/todo-types";
 
 /** Minimal todo IPC surface the todo store needs over the preload pixApi. */
 export interface TodoTransport {

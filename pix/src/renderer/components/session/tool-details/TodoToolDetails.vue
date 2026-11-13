@@ -10,7 +10,7 @@
  */
 import { computed } from "vue";
 import type { ToolWorkItem } from "@/types/session";
-import { isTodoItem, type TodoItem } from "@shared/todo-types.js";
+import { isTodoItem, type TodoItem } from "@earendil-works/pix-runtime/shared/todo-types";
 
 const props = defineProps<{
   tool: ToolWorkItem;

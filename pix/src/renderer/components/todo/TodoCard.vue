@@ -14,7 +14,7 @@
  */
 import { computed, ref } from "vue";
 import { useTodoStore } from "../../stores/todo-store";
-import type { TodoItem } from "@shared/todo-types.js";
+import type { TodoItem } from "@earendil-works/pix-runtime/shared/todo-types";
 
 const todoStore = useTodoStore();
 

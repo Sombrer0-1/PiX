@@ -7,7 +7,7 @@
 
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, DEFAULT_AUTO_BACKGROUND_MS } from "@shared/agent-task-types.js";
+import { AGENT_TASK_DEFAULT_RUNNING_SLOTS, DEFAULT_AUTO_BACKGROUND_MS } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { GuiSettings, WslDistroInfo, WslSettings } from "@/types/session";
 import type { PixApi } from "../../main/preload";
 import { DESKTOP_API_UNAVAILABLE, mapDesktopApiError, sanitizeUserDiagnostic } from "../utils/desktop-api";

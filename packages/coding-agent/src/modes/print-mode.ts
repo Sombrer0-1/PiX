@@ -8,7 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
-import { flushRawStdout, writeRawStdout } from "../core/output-guard.ts";
+import { flushRawStdout, setRawStdoutErrorHandler, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 
 /**
@@ -34,18 +34,17 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	let exitCode = 0;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
-	let disposed = false;
+	let disposed: Promise<void> | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
-	const disposeRuntime = async (): Promise<void> => {
-		if (disposed) return;
-		disposed = true;
-		unsubscribe?.();
-		await runtimeHost.dispose();
+	const disposeRuntime = (): Promise<void> => {
+		disposed ??= runtimeHost.dispose().finally(() => unsubscribe?.());
+		return disposed;
 	};
 
 	const registerSignalHandlers = (): void => {
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		if (runtimeHost.files) signals.push("SIGINT");
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
@@ -53,9 +52,10 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void disposeRuntime().finally(() => {
-					process.exit(signal === "SIGHUP" ? 129 : 143);
-				});
+				const code = signal === "SIGHUP" ? 129 : signal === "SIGINT" ? 130 : 143;
+				void disposeRuntime()
+					.then(flushRawStdout)
+					.finally(() => process.exit(code));
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -63,6 +63,10 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	};
 
 	registerSignalHandlers();
+	if (runtimeHost.files)
+		setRawStdoutErrorHandler(() => {
+			void disposeRuntime().finally(() => process.exit(1));
+		});
 
 	runtimeHost.setRebindSession(async () => {
 		await rebindSession();
@@ -70,7 +74,14 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
-		await session.bindExtensions({
+		runtimeHost.setHostIO({
+			requestUserInput: async (request) => ({ id: request.id, answers: {}, cancelled: true }),
+			emit: (event, text) => {
+				if (mode === "json") writeRawStdout(`${JSON.stringify(event)}\n`);
+				else if (text) console.error(text);
+			},
+		});
+		await runtimeHost.bindExtensions({
 			commandContextActions: {
 				waitForIdle: () => session.agent.waitForIdle(),
 				newSession: async (newSessionOptions) => runtimeHost.newSession(newSessionOptions),
@@ -105,6 +116,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				writeRawStdout(`${JSON.stringify(event)}\n`);
 			}
 		});
+		await runtimeHost.initializeSession();
 	};
 
 	try {
@@ -116,6 +128,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		}
 
 		await rebindSession();
+		if (disposed) return 1;
 
 		if (initialMessage) {
 			await session.prompt(initialMessage, { images: initialImages });
@@ -152,7 +165,11 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		for (const cleanup of signalCleanupHandlers) {
 			cleanup();
 		}
-		await disposeRuntime();
-		await flushRawStdout();
+		try {
+			await disposeRuntime();
+			await flushRawStdout();
+		} finally {
+			if (runtimeHost.files) setRawStdoutErrorHandler();
+		}
 	}
 }

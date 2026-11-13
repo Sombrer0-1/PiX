@@ -21,14 +21,14 @@ import { basename, join, resolve } from "node:path";
 import { AgentSession, SessionManager, type RequestUserInputRequest } from "@earendil-works/pi-coding-agent";
 import type { ProjectLocation, RequestUserInputDismissal } from "../../shared/types.js";
 import type { AgentSessionEvent, SessionsStatePayload } from "../../shared/types.js";
-import { AgentTaskStore } from "../agent-task/agent-task-store.js";
-import { AgentTaskService, __setAgentTaskServiceHooksForTests } from "../agent-task/agent-task-service.js";
-import type { AgentTaskRuntime } from "../agent-task/agent-task-runtime.js";
+import { AgentTaskStore } from "@earendil-works/pix-runtime/agent-task/agent-task-store.js";
+import { AgentTaskService, __setAgentTaskServiceHooksForTests } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import type { AgentTaskRuntime } from "@earendil-works/pix-runtime/agent-task/agent-task-runtime.js";
 import type { ProductEventCollector } from "../product-event-collector.js";
 import { SettingsStore } from "../settings-store.js";
-import type { SubagentExecutionContext } from "../subagent/types.js";
-import type { SubagentRunner } from "../subagent/subagent-runner.js";
-import type { PlanController } from "../plan/plan-controller.js";
+import type { SubagentExecutionContext } from "@earendil-works/pix-runtime/subagent/types.js";
+import type { SubagentRunner } from "@earendil-works/pix-runtime/subagent/subagent-runner.js";
+import type { PlanController } from "@earendil-works/pix-runtime/plan/plan-controller.js";
 import { SessionBridge } from "../session-bridge.js";
 
 // ============================================================================
@@ -279,7 +279,15 @@ function makeTaskService(): AgentTaskService {
     maxTaskBytes: 25 * 1024 * 1024,
     maxWorkspaceBytes: 500 * 1024 * 1024,
   });
-  return new AgentTaskService({ settings, events, store, runId: "bg-run" });
+  return new AgentTaskService({
+    settings: {
+      getAgentTaskMaxConcurrent: () => settings.get("agentTaskMaxConcurrent"),
+      getAgentTaskAutoBackgroundMs: () => settings.get("autoBackgroundMs"),
+    },
+    recordProductEvent: (event) => events.record(event),
+    store,
+    runId: "bg-run",
+  });
 }
 
 /** Never-settling runtime so a foreground task keeps its delivery alive. */

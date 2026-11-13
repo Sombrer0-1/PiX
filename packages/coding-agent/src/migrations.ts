@@ -405,8 +405,8 @@ function migrateExtensionSystem(cwd: string): string[] {
 /**
  * Print deprecation warnings and wait for keypress.
  */
-export async function showDeprecationWarnings(warnings: string[]): Promise<void> {
-	if (warnings.length === 0) return;
+export async function showDeprecationWarnings(warnings: string[], signal?: AbortSignal): Promise<void> {
+	if (warnings.length === 0 || signal?.aborted) return;
 
 	for (const warning of warnings) {
 		console.log(chalk.yellow(`Warning: ${warning}`));
@@ -417,13 +417,17 @@ export async function showDeprecationWarnings(warnings: string[]): Promise<void>
 	console.log(chalk.dim(`\nPress any key to continue...`));
 
 	await new Promise<void>((resolve) => {
-		process.stdin.setRawMode?.(true);
-		process.stdin.resume();
-		process.stdin.once("data", () => {
+		const finish = () => {
+			process.stdin.off("data", finish);
+			signal?.removeEventListener("abort", finish);
 			process.stdin.setRawMode?.(false);
 			process.stdin.pause();
 			resolve();
-		});
+		};
+		process.stdin.setRawMode?.(true);
+		process.stdin.resume();
+		process.stdin.once("data", finish);
+		signal?.addEventListener("abort", finish, { once: true });
 	});
 	console.log();
 }
@@ -433,13 +437,16 @@ export async function showDeprecationWarnings(warnings: string[]): Promise<void>
  *
  * @returns Object with migration results and deprecation warnings
  */
-export function runMigrations(cwd: string): {
+export function runMigrations(
+	cwd: string,
+	options?: { externalSessionFiles?: boolean },
+): {
 	migratedAuthProviders: string[];
 	deprecationWarnings: string[];
 } {
 	const migratedAuthProviders = migrateAuthToAuthJson();
 	migrateExplicitEnvVarConfigValues();
-	migrateSessionsFromAgentRoot();
+	if (!options?.externalSessionFiles) migrateSessionsFromAgentRoot();
 	migrateToolsToBin();
 	migrateKeybindingsConfigFile();
 	const deprecationWarnings = migrateExtensionSystem(cwd);

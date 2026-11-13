@@ -42,9 +42,9 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
 import { createHttpProxyAgentsForTarget } from "../utils/node-http-proxy.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -84,7 +84,7 @@ export interface BedrockOptions extends StreamOptions {
 	bearerToken?: string;
 }
 
-type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number; partialJson?: string };
+type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number };
 
 export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOptions> = (
 	model: Model<"bedrock-converse-stream">,
@@ -113,6 +113,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 		};
 
 		const blocks = output.content as Block[];
+		const toolArguments = new Map<ToolCall, ToolCallArgumentsStream>();
 
 		const config: BedrockRuntimeClientConfig = {
 			profile: options.profile,
@@ -221,11 +222,11 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 					}
 					stream.push({ type: "start", partial: output });
 				} else if (item.contentBlockStart) {
-					handleContentBlockStart(item.contentBlockStart, blocks, output, stream);
+					handleContentBlockStart(item.contentBlockStart, blocks, output, stream, toolArguments);
 				} else if (item.contentBlockDelta) {
-					handleContentBlockDelta(item.contentBlockDelta, blocks, output, stream);
+					handleContentBlockDelta(item.contentBlockDelta, blocks, output, stream, toolArguments);
 				} else if (item.contentBlockStop) {
-					handleContentBlockStop(item.contentBlockStop, blocks, output, stream);
+					handleContentBlockStop(item.contentBlockStop, blocks, output, stream, toolArguments);
 				} else if (item.messageStop) {
 					output.stopReason = mapStopReason(item.messageStop.stopReason);
 				} else if (item.metadata) {
@@ -251,13 +252,12 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 				throw new Error("An unknown error occurred");
 			}
 
+			for (const [block, args] of toolArguments) Object.assign(block, args.finish());
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
 				delete (block as Block).index;
-				// partialJson is only a streaming scratch buffer; never persist it.
-				delete (block as Block).partialJson;
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatBedrockError(error);
@@ -386,6 +386,7 @@ function handleContentBlockStart(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	toolArguments: Map<ToolCall, ToolCallArgumentsStream>,
 ): void {
 	const index = event.contentBlockIndex!;
 	const start = event.start;
@@ -396,9 +397,9 @@ function handleContentBlockStart(
 			id: start.toolUse.toolUseId || "",
 			name: start.toolUse.name || "",
 			arguments: {},
-			partialJson: "",
 			index,
 		};
+		toolArguments.set(block, new ToolCallArgumentsStream());
 		output.content.push(block);
 		stream.push({ type: "toolcall_start", contentIndex: blocks.length - 1, partial: output });
 	}
@@ -409,6 +410,7 @@ function handleContentBlockDelta(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	toolArguments: Map<ToolCall, ToolCallArgumentsStream>,
 ): void {
 	const contentBlockIndex = event.contentBlockIndex!;
 	const delta = event.delta;
@@ -429,9 +431,9 @@ function handleContentBlockDelta(
 			stream.push({ type: "text_delta", contentIndex: index, delta: delta.text, partial: output });
 		}
 	} else if (delta?.toolUse && block?.type === "toolCall") {
-		block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
-		block.arguments = parseStreamingJson(block.partialJson);
-		stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
+		const input = delta.toolUse.input ?? "";
+		block.arguments = toolArguments.get(block)!.append(input);
+		stream.push({ type: "toolcall_delta", contentIndex: index, delta: input, partial: output });
 	} else if (delta?.reasoningContent) {
 		let thinkingBlock = block;
 		let thinkingIndex = index;
@@ -482,11 +484,12 @@ function handleContentBlockStop(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	toolArguments: Map<ToolCall, ToolCallArgumentsStream>,
 ): void {
 	const index = blocks.findIndex((b) => b.index === event.contentBlockIndex);
 	const block = blocks[index];
 	if (!block) return;
-	delete (block as Block).index;
+	delete block.index;
 
 	switch (block.type) {
 		case "text":
@@ -496,10 +499,8 @@ function handleContentBlockStop(
 			stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
 			break;
 		case "toolCall":
-			block.arguments = parseStreamingJson(block.partialJson);
-			// Finalize in-place and strip the scratch buffer so replay only
-			// carries parsed arguments.
-			delete (block as Block).partialJson;
+			Object.assign(block, toolArguments.get(block)!.finish());
+			toolArguments.delete(block);
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;
 	}

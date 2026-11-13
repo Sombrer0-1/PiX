@@ -9,6 +9,7 @@ import {
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { getAgentDir } from "../config.ts";
+import { isWSL } from "../utils/wsl.ts";
 
 export interface AppKeybindings {
 	"app.interrupt": true;
@@ -104,8 +105,9 @@ export const KEYBINDINGS = {
 		description: "Restore queued messages",
 	},
 	"app.clipboard.pasteImage": {
-		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
-		description: "Paste image from clipboard",
+		defaultKeys:
+			process.platform === "win32" || (process.platform === "linux" && isWSL()) ? ["alt+v", "ctrl+v"] : "ctrl+v",
+		description: "Paste image or text from clipboard",
 	},
 	"app.session.new": { defaultKeys: [], description: "Start a new session" },
 	"app.session.tree": { defaultKeys: [], description: "Open session tree" },

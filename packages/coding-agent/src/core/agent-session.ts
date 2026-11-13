@@ -600,27 +600,33 @@ export class AgentSession {
 		toolName: string,
 		args: unknown,
 		reason?: string,
+		signal?: AbortSignal,
 	): Promise<"approved" | "denied" | "cancelled" | "unavailable"> {
 		const handler = this._requestUserInput;
 		if (!handler) return "unavailable";
+		if (signal?.aborted) return "cancelled";
 		const target = this._approvalSummary(toolName, args);
 		const reasonText = reason ? ` 原因：${reason}。` : "";
 		try {
-			const response = await handler({
-				id: randomUUID(),
-				questions: [
-					{
-						id: "approval",
-						header: "工具审批",
-						question: `${toolName} 想执行：${target}.${reasonText}是否允许本次执行？`,
-						options: [
-							{ label: "允许执行", description: "仅允许这一次工具调用继续。" },
-							{ label: "拒绝", description: "阻止这一次工具调用。" },
-						],
-					},
-				],
-			});
-			if (response.cancelled) return "cancelled";
+			const response = await handler(
+				{
+					id: randomUUID(),
+					purpose: "tool_approval",
+					questions: [
+						{
+							id: "approval",
+							header: "工具审批",
+							question: `${toolName} 想执行：${target}.${reasonText}是否允许本次执行？`,
+							options: [
+								{ label: "允许执行", description: "仅允许这一次工具调用继续。" },
+								{ label: "拒绝", description: "阻止这一次工具调用。" },
+							],
+						},
+					],
+				},
+				signal,
+			);
+			if (response.cancelled || signal?.aborted) return "cancelled";
 			if (response.answers.approval === "允许执行") return "approved";
 			if (response.answers.approval === "拒绝") return "denied";
 			return "unavailable";
@@ -638,7 +644,7 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+		this.agent.beforeToolCall = async ({ toolCall, args }, signal) => {
 			// Host override first, then the built-in execution-mode policy. The
 			// input carries the runtime cwd and the active backend path context.
 			// A throwing override fails closed: it must never fall back to allow.
@@ -665,7 +671,7 @@ export class AgentSession {
 			}
 			if (!policyDecision.allowed) {
 				if (policyDecision.requiresApproval) {
-					const approval = await this._requestToolApproval(toolCall.name, args, policyDecision.reason);
+					const approval = await this._requestToolApproval(toolCall.name, args, policyDecision.reason, signal);
 					if (approval !== "approved") {
 						const outcome = {
 							denied: "The user denied this operation.",
@@ -674,7 +680,9 @@ export class AgentSession {
 						}[approval];
 						return {
 							block: true,
-							reason: [outcome, policyDecision.reason, "Continue only with actions already authorized."].filter(Boolean).join(" "),
+							reason: [outcome, policyDecision.reason, "Continue only with actions already authorized."]
+								.filter(Boolean)
+								.join(" "),
 						};
 					}
 				} else {

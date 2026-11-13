@@ -59,7 +59,7 @@ import {
   type TimelineItem,
   type ToolAuthTier,
 } from "../shared/team-types.js";
-import type { ProjectExecutionContext } from "./execution-context.js";
+import type { ProjectExecutionContext } from "@earendil-works/pix-runtime/execution-context.js";
 import { TeamProtocolManager } from "./team-protocol-manager.js";
 import { AttentionBus } from "./team/attention-bus.js";
 import { TeamCapacityPool } from "./team/capacity-pool.js";

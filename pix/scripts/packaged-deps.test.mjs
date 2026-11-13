@@ -9,9 +9,9 @@ import { fileURLToPath } from "node:url";
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const pixPackage = JSON.parse(readFileSync(join(scriptsDir, "../package.json"), "utf8"));
 const preparation = pixPackage.scripts.package
-  .replace("npm run build", pixPackage.scripts.build)
   .split(" && ")
   .filter((command) => /^node scripts\/(materialize-workspace-deps|sync-nested-deps)\.mjs$/.test(command));
+assert.equal(preparation.length, 2);
 
 function writePackage(directory, manifest, files = {}) {
   mkdirSync(directory, { recursive: true });
@@ -29,10 +29,29 @@ for (const layout of ["npm junction", "previously materialized package"]) {
     const workspace = join(root, "packages/runtime");
     const installed = join(pix, "node_modules/test-workspace");
     try {
-      writePackage(pix, { dependencies: { "test-workspace": "file:../packages/runtime" } });
+      writePackage(pix, {
+        dependencies: {
+          "test-workspace": "file:../packages/runtime",
+          "pi-mcp-adapter": "file:../packages/mcp-adapter",
+        },
+      });
       writePackage(workspace, {
-        name: "test-workspace", version: "1.0.0", type: "module", dependencies: { glob: "13.0.6" },
-      }, { "dist/index.mjs": 'import { globSync } from "glob"; console.log(globSync());' });
+        name: "test-workspace", version: "1.0.0", type: "module",
+        dependencies: { glob: "13.0.6", "pi-mcp-adapter": "1.0.0", "@earendil-works/pi-tui": "1.0.0" },
+      }, { "dist/index.mjs": 'import { globSync } from "glob"; import "pi-mcp-adapter"; import "@earendil-works/pi-tui"; console.log(globSync());' });
+      writePackage(join(root, "packages/mcp-adapter"), {
+        name: "pi-mcp-adapter", version: "1.0.0", type: "module", exports: "./dist/index.js",
+      }, { "dist/index.js": "export {}" });
+      writePackage(join(workspace, "node_modules/pi-mcp-adapter"), {
+        name: "pi-mcp-adapter", version: "1.0.0", type: "module", exports: "./dist/index.js",
+      }, { "dist/index.js": 'throw new Error("stale nested adapter")' });
+      const tui = join(root, "packages/tui");
+      writePackage(tui, {
+        name: "@earendil-works/pi-tui", version: "1.0.0", type: "module", exports: "./dist/index.js",
+      }, { "dist/index.js": "export {}" });
+      const rootScope = join(root, "node_modules/@earendil-works");
+      mkdirSync(rootScope, { recursive: true });
+      symlinkSync(tui, join(rootScope, "pi-tui"), "junction");
       writePackage(join(root, "node_modules/glob"), {
         name: "glob", version: "13.0.6", type: "module", exports: "./index.js",
         dependencies: { "test-transitive": "2.0.0" },
@@ -60,6 +79,8 @@ for (const layout of ["npm junction", "previously materialized package"]) {
       assert.equal(result.status, 0, result.stderr);
       assert.equal(result.stdout.trim(), "correct ESM dependency");
       assert.equal(JSON.parse(readFileSync(join(installed, "node_modules/glob/package.json"), "utf8")).version, "13.0.6");
+      assert.equal(readFileSync(join(pix, "node_modules/@earendil-works/pi-tui/dist/index.js"), "utf8"), "export {}");
+      assert.throws(() => readFileSync(join(installed, "node_modules/pi-mcp-adapter/package.json")), { code: "ENOENT" });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

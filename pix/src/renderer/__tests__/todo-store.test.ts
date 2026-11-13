@@ -13,7 +13,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import type { PixApi } from "../../main/preload";
 import type { PixCommandResult } from "@shared/types.js";
-import type { TodoEvent, TodoItem, TodoSnapshot } from "@shared/todo-types.js";
+import type { TodoEvent, TodoItem, TodoSnapshot } from "@earendil-works/pix-runtime/shared/todo-types";
 import { useTodoStore } from "../stores/todo-store";
 
 // ============================================================================

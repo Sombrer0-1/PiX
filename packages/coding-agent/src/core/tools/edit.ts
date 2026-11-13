@@ -9,15 +9,13 @@ import type { ToolDefinition } from "../extensions/types.ts";
 import type { ToolPathContext } from "./execution-backend.ts";
 import {
 	applyEditsToNormalizedContent,
+	applyReplacementsToOriginal,
 	computeEditsDiff,
-	detectLineEnding,
 	type Edit,
 	type EditDiffError,
 	type EditDiffResult,
-	generateDiffString,
-	generateUnifiedPatch,
+	generateEditDiff,
 	normalizeToLF,
-	restoreLineEndings,
 	stripBom,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
@@ -336,17 +334,15 @@ export function createEditToolDefinition(
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = stripBom(rawContent);
-				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const details = generateEditDiff(path, baseContent, newContent, replacements);
 				throwIfAborted();
 
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+				const finalContent = bom + applyReplacementsToOriginal(content, replacements);
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 
-				const diffResult = generateDiffString(baseContent, newContent);
-				const patch = generateUnifiedPatch(path, baseContent, newContent);
 				return {
 					content: [
 						{
@@ -354,7 +350,7 @@ export function createEditToolDefinition(
 							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details,
 				};
 			}, { getKey: pathContext?.getMutationKey });
 		},

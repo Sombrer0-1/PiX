@@ -1,13 +1,15 @@
 import { execSync, spawn } from "child_process";
 import { platform } from "os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { copyToClipboard } from "../src/utils/clipboard.ts";
+import { copyToClipboard, readClipboardText } from "../src/utils/clipboard.ts";
 
 const mocks = vi.hoisted(() => {
 	return {
 		clipboard: {
+			getText: vi.fn<() => Promise<string>>(),
 			setText: vi.fn<(text: string) => Promise<void>>(),
 		},
+		execClipboard: vi.fn<() => Promise<{ stdout: string }>>(),
 		execSync: vi.fn(),
 		spawn: vi.fn(),
 		platform: vi.fn<() => NodeJS.Platform>(),
@@ -23,6 +25,7 @@ vi.mock("../src/utils/clipboard-native.js", () => {
 
 vi.mock("child_process", () => {
 	return {
+		execFile: Object.assign(() => {}, { [Symbol.for("nodejs.util.promisify.custom")]: mocks.execClipboard }),
 		execSync: mocks.execSync,
 		spawn: mocks.spawn,
 	};
@@ -57,9 +60,14 @@ beforeEach(() => {
 	vi.stubEnv("SSH_CONNECTION", "");
 	vi.stubEnv("SSH_CLIENT", "");
 	vi.stubEnv("MOSH_CONNECTION", "");
+	vi.stubEnv("TERMUX_VERSION", "");
+	vi.stubEnv("WAYLAND_DISPLAY", "");
+	vi.stubEnv("DISPLAY", "");
 	stdoutWrites = [];
 	nativeResolved = false;
+	mocks.clipboard.getText.mockReset();
 	mocks.clipboard.setText.mockReset();
+	mocks.execClipboard.mockReset();
 	mocks.execSync.mockReset();
 	mocks.spawn.mockReset();
 	mocks.platform.mockReset();
@@ -144,5 +152,28 @@ describe("copyToClipboard", () => {
 
 		await expect(copyToClipboard("x".repeat(80_000))).rejects.toThrow("Failed to copy to clipboard");
 		expect(osc52Writes()).toHaveLength(0);
+	});
+});
+
+describe("readClipboardText", () => {
+	test("reads native Windows clipboard text", async () => {
+		mockedPlatform.mockReturnValue("win32");
+		mocks.clipboard.getText.mockResolvedValue("first\r\n第二行\r\n");
+
+		await expect(readClipboardText()).resolves.toBe("first\r\n第二行\r\n");
+		expect(mocks.execClipboard).not.toHaveBeenCalled();
+	});
+
+	test("uses PowerShell to read the Windows clipboard from headless WSL", async () => {
+		mockedPlatform.mockReturnValue("linux");
+		vi.stubEnv("WSL_DISTRO_NAME", "Ubuntu");
+		mocks.execClipboard.mockResolvedValue({ stdout: "第二行\r\n" });
+
+		await expect(readClipboardText()).resolves.toBe("第二行\r\n");
+		expect(mocks.execClipboard).toHaveBeenCalledWith(
+			"powershell.exe",
+			expect.arrayContaining([expect.stringContaining("Get-Clipboard -Raw")]),
+			expect.objectContaining({ encoding: "utf-8" }),
+		);
 	});
 });

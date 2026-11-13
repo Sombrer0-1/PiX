@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { getModel } from "@earendil-works/pi-ai";
-import { PlanController, type PlanControllerContext } from "../plan/plan-controller.js";
-import { createSubmitUserPlanTool, createUpdatePlanStepTool } from "../plan/plan-tools.js";
-import type { PlanStepExecutionTarget } from "../../shared/plan-types.js";
+import { PlanController, type PlanControllerContext } from "@earendil-works/pix-runtime/plan/plan-controller.js";
+import { createSubmitUserPlanTool, createUpdatePlanStepTool } from "@earendil-works/pix-runtime/plan/plan-tools.js";
+import type { PlanStepExecutionTarget } from "@earendil-works/pix-runtime/shared/plan-types";
 import { CuaDriverBackend, translateAct } from "../computer-use/cua-backend.js";
 import { ComputerUseError, type DriverClient, type DriverToolInputSchema } from "../computer-use/contracts.js";
 

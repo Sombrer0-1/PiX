@@ -18,7 +18,7 @@ import type {
   AgentTaskInfo,
   AgentTaskInputRequest,
   AgentTaskRecoveryIssue,
-} from "@shared/agent-task-types.js";
+} from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type {
   AgentTaskEvent,
   PixCommandResult,

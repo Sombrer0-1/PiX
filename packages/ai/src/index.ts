@@ -29,6 +29,7 @@ export * from "./types.ts";
 export * from "./utils/diagnostics.ts";
 export * from "./utils/event-stream.ts";
 export * from "./utils/json-parse.ts";
+export { ToolCallArgumentsStream } from "./utils/streaming-json.ts";
 export type {
 	OAuthAuthInfo,
 	OAuthCredentials,

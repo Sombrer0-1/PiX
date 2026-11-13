@@ -12,8 +12,9 @@
 
 import type { IpcMainLike, WebContentsLike } from "./ipc-plan-adapters.js";
 import type { PixCommandResult } from "../shared/types.js";
-import { isTodoCommand, type TodoCommand, type TodoSnapshot } from "../shared/todo-types.js";
-import type { TodoController, TodoControllerEvent } from "./todo/todo-controller.js";
+import { isTodoCommand, type TodoCommand, type TodoSnapshot } from "@earendil-works/pix-runtime/shared/todo-types";
+import type { TodoController } from "@earendil-works/pix-runtime/todo/todo-controller.js";
+import type { TodoEvent } from "@earendil-works/pix-runtime/shared/todo-types";
 
 // 结构守卫已在 todo-types（叶子模块）导出，这里 re-export 保持与 plan/workflow
 // 适配器“isXxxCommand 就近可得”的导入习惯。
@@ -110,7 +111,7 @@ export function subscribeTodoEventForwarding(
 		}
 	}
 
-	function forward(event: TodoControllerEvent): void {
+	function forward(event: TodoEvent): void {
 		const webContents = getWebContents();
 		if (webContents) {
 			webContents.send("todo-event", event);

@@ -282,6 +282,7 @@ class SessionList implements Component, Focusable {
 	private showPath = false;
 	private confirmingDeletePath: string | null = null;
 	private currentSessionCanonicalPath?: string;
+	private readonly allowDeleteCurrent: boolean;
 	public onSelect?: (sessionPath: string) => void;
 	public onCancel?: () => void;
 	public onExit: () => void = () => {};
@@ -312,6 +313,7 @@ class SessionList implements Component, Focusable {
 		nameFilter: NameFilter,
 		keybindings: KeybindingsManager,
 		currentSessionFilePath?: string,
+		allowDeleteCurrent = false,
 	) {
 		this.allSessions = sessions;
 		this.filteredSessions = [];
@@ -321,6 +323,7 @@ class SessionList implements Component, Focusable {
 		this.nameFilter = nameFilter;
 		this.keybindings = keybindings;
 		this.currentSessionCanonicalPath = canonicalizePath(currentSessionFilePath);
+		this.allowDeleteCurrent = allowDeleteCurrent;
 		this.filterSessions("");
 
 		// Handle Enter in search input - select current item
@@ -382,7 +385,7 @@ class SessionList implements Component, Focusable {
 		if (!selected) return;
 
 		// Prevent deleting current session
-		if (this.isCurrentSessionPath(selected.session.path)) {
+		if (!this.allowDeleteCurrent && this.isCurrentSessionPath(selected.session.path)) {
 			this.onError?.("Cannot delete the currently active session");
 			return;
 		}
@@ -742,6 +745,8 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		requestRender: () => void,
 		options?: {
 			renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+			deleteSession?: (sessionPath: string) => Promise<void>;
+			allowDeleteCurrent?: boolean;
 			showRenameHint?: boolean;
 			keybindings?: KeybindingsManager;
 		},
@@ -767,6 +772,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.nameFilter,
 			this.keybindings,
 			currentSessionFilePath,
+			options?.allowDeleteCurrent,
 		);
 
 		this.buildBaseLayout(this.sessionList);
@@ -818,7 +824,17 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
-			const result = await deleteSessionFile(sessionPath);
+			let result: Awaited<ReturnType<typeof deleteSessionFile>>;
+			if (options?.deleteSession) {
+				try {
+					await options.deleteSession(sessionPath);
+					result = { ok: true, method: "unlink" };
+				} catch (error) {
+					result = { ok: false, method: "unlink", error: error instanceof Error ? error.message : String(error) };
+				}
+			} else {
+				result = await deleteSessionFile(sessionPath);
+			}
 
 			if (result.ok) {
 				if (this.currentSessions) {

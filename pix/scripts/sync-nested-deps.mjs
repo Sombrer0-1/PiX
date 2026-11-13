@@ -18,8 +18,7 @@
 //   from the packaged context, copy the build-context version into the
 //   packaged package's nested node_modules. Transitive mismatches are followed.
 //
-// Runs during `npm run build`, and again during packaging AFTER workspace
-// materialization so the final copies retain their nested runtime versions.
+// Runs after workspace materialization during packaging.
 
 import { readFileSync, existsSync, lstatSync, rmSync, mkdirSync, cpSync, readdirSync } from "fs";
 import { join, dirname } from "path";
@@ -87,10 +86,6 @@ function resolveBuildPackage(baseDir, name, localPackages) {
   return resolvePackage(baseDir, name);
 }
 
-function normalizePathForCompare(value) {
-  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-}
-
 function readDeps(pkgDir) {
   try {
     const json = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8"));
@@ -119,15 +114,13 @@ function syncPackage(name, buildDir, installedDir, localPackages) {
     const { name: dep, buildBase, pkgBase } = queue.shift();
     const fromBuild = resolveBuildPackage(buildBase, dep, localPackages);
     if (!fromBuild) continue; // optional/absent dependency
-    const fromPkg = resolvePackage(pkgBase, dep);
+    const fromPkg = localPackages.has(dep)
+      ? readPackageInfo(join(PIX_MODULES, ...dep.split("/")))
+      : resolvePackage(pkgBase, dep);
 
-    const isLocalWorkspaceDependency = localPackages.has(dep);
-    const resolvesDifferentLocalPackage =
-      isLocalWorkspaceDependency &&
-      fromPkg &&
-      normalizePathForCompare(fromPkg.dir) !== normalizePathForCompare(fromBuild.dir);
-
-    if (!fromPkg || fromPkg.version !== fromBuild.version || resolvesDifferentLocalPackage) {
+    // All consumers must share the materialized Pi packages. In particular,
+    // duplicate pi-ai and MCP adapters split the provider registry and pool.
+    if (!fromPkg || fromPkg.version !== fromBuild.version) {
       toNest.push({ name: dep, srcDir: fromBuild.dir, version: fromBuild.version });
       // After nesting, this dep's own deps resolve from the nested location,
       // walking up through nestedRoot. Follow them from the build version.

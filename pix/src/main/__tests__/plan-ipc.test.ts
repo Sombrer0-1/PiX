@@ -34,15 +34,15 @@ import type {
   ProjectLocation,
   ThinkingLevel,
 } from "../../shared/types.js";
-import { PLAN_SCHEMA_VERSION, isPlanRuntimeSnapshot, type PlanDeviation, type PlanStep } from "../../shared/plan-types.js";
-import type { ProjectExecutionContext } from "../execution-context.js";
-import { PlanController } from "../plan/plan-controller.js";
+import { PLAN_SCHEMA_VERSION, isPlanRuntimeSnapshot, type PlanDeviation, type PlanStep } from "@earendil-works/pix-runtime/shared/plan-types";
+import type { ProjectExecutionContext } from "@earendil-works/pix-runtime/execution-context.js";
+import { PlanController } from "@earendil-works/pix-runtime/plan/plan-controller.js";
 import type {
   PlanControllerContext,
   PlanStepExecutionLink,
   StepDelegateResult,
-} from "../plan/plan-controller.js";
-import type { SubmitUserPlanParams, UpdatePlanStepParams } from "../plan/plan-deviation.js";
+} from "@earendil-works/pix-runtime/plan/plan-controller.js";
+import type { SubmitUserPlanParams, UpdatePlanStepParams } from "@earendil-works/pix-runtime/plan/plan-deviation.js";
 import {
   registerPlanIpcHandlers,
   resyncPlanEventForwarding,

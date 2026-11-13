@@ -14,7 +14,7 @@ import { BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from "electron
 import { getAgentDir, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import electronUpdater from "electron-updater";
 import { selectChatFiles, selectProjectDirectory, selectSessionFile } from "./file-dialogs.js";
-import { resolveProjectLocation } from "./execution-context.js";
+import { resolveProjectLocation } from "@earendil-works/pix-runtime/execution-context.js";
 import { createGitStatusService } from "./git/git-status-service.js";
 import { MessageUpdateCoalescer } from "./message-update-coalescer.js";
 import type { SessionBridge } from "./session-bridge.js";
@@ -31,8 +31,8 @@ import type {
   WslSettings,
 } from "../shared/types.js";
 import { USER_SEAT_ID } from "../shared/team-types.js";
-import type { AgentTaskService } from "./agent-task/agent-task-service.js";
-import { parseAgentTaskMaxConcurrent } from "../shared/agent-task-types.js";
+import type { AgentTaskService } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
+import { parseAgentTaskMaxConcurrent } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import { sanitizeComputerUseSettings } from "../shared/computer-use-types.js";
 import type { ComputerUseService } from "./computer-use/computer-use-service.js";
 // Plan/agent-task command registration and dispatch live in pure modules that
@@ -69,7 +69,7 @@ import { readWorkspaceMode, writeWorkspaceMode } from "./team-persistence.js";
 import { ROUNDTABLE_FILES, roundtableFilePath } from "./team/constants.js";
 import { detectLegacyTeamSnapshot } from "./team/legacy-snapshot.js";
 import { RoundtablePersistence, SNAPSHOT_DEBOUNCE_MS } from "./team/persistence.js";
-import { WslDistroResolver } from "./wsl/wsl-distro.js";
+import { WslDistroResolver } from "@earendil-works/pix-runtime/wsl/wsl-distro.js";
 
 const { autoUpdater } = electronUpdater;
 
@@ -1795,14 +1795,14 @@ async function executeTeamCommand(teamManager: TeamManager, cmd: TeamCommand): P
 // functions, event-forwarding subscriptions or adapter types from
 // ipc-handlers keep working.
 export {
-  executePlanCommand,
-  isPlanCommand,
   registerPlanIpcHandlers,
   resyncPlanEventForwarding,
   subscribePlanEventForwarding,
   type IpcMainLike,
   type WebContentsLike,
 } from "./ipc-plan-adapters.js";
+
+export { executePlanCommand, isPlanCommand } from "@earendil-works/pix-runtime/plan/plan-command.js";
 
 export {
   executeAgentTaskCommand,

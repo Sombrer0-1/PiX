@@ -16,7 +16,7 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { useTodoRpc } from "../composables/useTodoRpc";
-import type { TodoEvent, TodoItem, TodoSnapshot } from "@shared/todo-types.js";
+import type { TodoEvent, TodoItem, TodoSnapshot } from "@earendil-works/pix-runtime/shared/todo-types";
 
 export const useTodoStore = defineStore("todo", () => {
 	const todoRpc = useTodoRpc();

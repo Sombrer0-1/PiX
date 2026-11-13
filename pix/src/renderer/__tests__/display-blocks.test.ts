@@ -17,7 +17,7 @@
 import { describe, expect, it } from "vitest";
 import { reactive, watch } from "vue";
 import type { AgentMessage, AgentSessionEvent } from "@shared/types.js";
-import { INTERNAL_CUSTOM_MESSAGE_TYPES, formatInternalNotification } from "@shared/internal-notification";
+import { INTERNAL_CUSTOM_MESSAGE_TYPES, formatInternalNotification } from "@earendil-works/pix-runtime/shared/internal-notification";
 // Imported from the coding-agent source (its only top-level imports are
 // type-only) rather than the package name: the dist barrel may be stale, and
 // the drift check must compare live sources on both sides.

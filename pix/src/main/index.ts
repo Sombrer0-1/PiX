@@ -5,23 +5,17 @@
  * No more subprocess spawning; the coding agent runs in-process.
  */
 
-import { randomUUID } from "crypto";
 import { BrowserWindow, Menu, app, globalShortcut, shell } from "electron";
 import { dirname, join } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { closeAllMcpConnections } from "pi-mcp-adapter";
+import { createPixProcessRuntime, type PixProcessRuntime } from "@earendil-works/pix-runtime";
 import { registerIpcHandlers, setupEventForwarding, teardownEventForwarding } from "./ipc-handlers.js";
 import { SessionBridge } from "./session-bridge.js";
 import { SettingsStore } from "./settings-store.js";
 import { TeamManager } from "./team-manager.js";
 import { ProductEventCollector } from "./product-event-collector.js";
-import {
-  AGENT_TASK_DEFAULT_MAX_TASK_BYTES,
-  AGENT_TASK_DEFAULT_MAX_WORKSPACE_BYTES,
-  AgentTaskStore,
-} from "./agent-task/agent-task-store.js";
-import { AgentTaskService } from "./agent-task/agent-task-service.js";
+import type { AgentTaskService } from "@earendil-works/pix-runtime/agent-task/agent-task-service.js";
 import { setRestoreGate } from "./ipc-agent-task-adapters.js";
 import { ComputerUseService } from "./computer-use/computer-use-service.js";
 
@@ -37,11 +31,9 @@ let teamLeaderSessionBridge: SessionBridge | null = null;
 let settingsStore: SettingsStore;
 let teamManager: TeamManager | null = null;
 let productEventCollector: ProductEventCollector | null = null;
-let agentTaskStore: AgentTaskStore | null = null;
+let runtime: PixProcessRuntime | null = null;
 let agentTaskService: AgentTaskService | null = null;
 let computerUseService: ComputerUseService | null = null;
-/** Frozen at service construction; prepareShutdown writes matching close markers with it. */
-let agentTaskRunId = "";
 
 function isSafeExternalUrl(url: string): boolean {
   try {
@@ -183,7 +175,7 @@ async function cleanup(): Promise<void> {
   // connection. Close the pool here, after every owner has released, so
   // HTTP/SSE transports are torn down and stdio children are killed.
   try {
-    await closeAllMcpConnections();
+    await runtime?.close({ desktop: true });
   } catch (err) {
     console.error("[main] Error during MCP connection cleanup:", err);
   }
@@ -227,18 +219,17 @@ app.whenReady().then(async () => {
   // still sees the fully hydrated task set (design plan §3, §5.5).
   let restorePromise: Promise<unknown>;
   try {
-    agentTaskStore = new AgentTaskStore({
-      rootDir: join(getAgentDir(), "agent-tasks"),
-      maxTaskBytes: AGENT_TASK_DEFAULT_MAX_TASK_BYTES,
-      maxWorkspaceBytes: AGENT_TASK_DEFAULT_MAX_WORKSPACE_BYTES,
+    const agentDir = getAgentDir();
+    runtime = createPixProcessRuntime({
+      taskDir: join(agentDir, "agent-tasks"),
+      workflowCacheDir: join(agentDir, "workflow-cache"),
+      settings: {
+        getAgentTaskMaxConcurrent: () => settingsStore.get("agentTaskMaxConcurrent"),
+        getAgentTaskAutoBackgroundMs: () => settingsStore.get("autoBackgroundMs"),
+      },
+      recordProductEvent: (event) => productEventCollector?.record(event),
     });
-    agentTaskRunId = randomUUID();
-    agentTaskService = new AgentTaskService({
-      settings: settingsStore,
-      events: productEventCollector!,
-      store: agentTaskStore,
-      runId: agentTaskRunId,
-    });
+    agentTaskService = runtime.taskService;
     restorePromise = agentTaskService.restoreAll();
   } catch (err) {
     console.error("[main] AgentTaskService FAILED:", err);
@@ -289,6 +280,7 @@ app.whenReady().then(async () => {
       role: "single",
       productEventCollector: productEventCollector ?? undefined,
       agentTaskService: agentTaskService ?? undefined,
+      workflowCacheDir: runtime.workflowCacheDir,
       computerUseService: computerUseService ?? undefined,
     });
   } catch (err) {
@@ -354,6 +346,11 @@ app.whenReady().then(async () => {
       }
     }
   });
+}).catch(async (error: unknown) => {
+  console.error("[main] Startup failed:", error);
+  quitting = true;
+  await cleanup();
+  app.exit(1);
 });
 
 let quitting = false;

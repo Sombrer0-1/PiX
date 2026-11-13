@@ -58,7 +58,7 @@ import type {
   AgentTaskStatus,
   AgentTaskStorageStatus,
   AgentTaskTranscriptPage,
-} from "@shared/agent-task-types.js";
+} from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type {
   AgentTaskCommandDataV15,
   AgentTaskCommandV15,
@@ -68,7 +68,7 @@ import type {
   PixCommandResult,
   RequestUserInputResponse,
 } from "@shared/types.js";
-import type { AgentTaskLogSnapshot } from "@shared/agent-task-types.js";
+import type { AgentTaskLogSnapshot } from "@earendil-works/pix-runtime/shared/agent-task-types";
 
 /** Shared auto-background deadline of one foreground task group. */
 export interface GroupAutoBackground {

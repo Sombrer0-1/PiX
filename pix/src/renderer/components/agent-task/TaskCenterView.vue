@@ -38,7 +38,7 @@ import type {
   AgentTaskInfo,
   AgentTaskRecoveryIssue,
   AgentTaskStatus,
-} from "@shared/agent-task-types.js";
+} from "@earendil-works/pix-runtime/shared/agent-task-types";
 
 const props = defineProps<{
   /** 当前 workspace 的 sessionId -> 会话名，用于展示来源会话。 */

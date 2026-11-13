@@ -567,7 +567,7 @@ function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): b
 }
 
 function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
-	if (!tool.prepareArguments) {
+	if (toolCall.argumentsError || !tool.prepareArguments) {
 		return toolCall;
 	}
 	const preparedArguments = tool.prepareArguments(toolCall.arguments);

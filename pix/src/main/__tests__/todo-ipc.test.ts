@@ -22,9 +22,9 @@
  */
 
 import type { PixCommandResult } from "../../shared/types.js";
-import { TODO_MAX_ITEMS, type TodoSnapshot } from "../../shared/todo-types.js";
-import { TodoController } from "../todo/todo-controller.js";
-import { TODO_TOOL_NAME, createTodoWriteTool } from "../todo/todo-tool.js";
+import { TODO_MAX_ITEMS, type TodoSnapshot } from "@earendil-works/pix-runtime/shared/todo-types";
+import { TodoController } from "@earendil-works/pix-runtime/todo/todo-controller.js";
+import { TODO_TOOL_NAME, createTodoWriteTool } from "@earendil-works/pix-runtime/todo/todo-tool.js";
 import {
 	registerTodoIpcHandlers,
 	resyncTodoEventForwarding,

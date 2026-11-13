@@ -5,23 +5,28 @@
   "type": "module",
   "main": "dist/main/main/index.js",
   "scripts": {
-    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev": "npm run build:runtime && node scripts/link-workspace-deps.mjs && concurrently \"vite\" \"npm --prefix .. run watch:pix-runtime\" \"npm run dev:main\" \"wait-on http://localhost:5173 dist/main/main/index.js dist/main/main/preload.cjs && node scripts/watch-electron.mjs\"",
+    "dev:main": "npm run build:preload && tsc -p tsconfig.main.json --watch",
     "dev:renderer": "vite",
     "dev:electron": "electron .",
     "build:renderer": "vite build",
-    "build:main": "tsc src/main/preload.ts --outDir dist/main --module CommonJS --target ES2022 --esModuleInterop --skipLibCheck --rootDir src && tsc -p tsconfig.main.json && shx mv dist/main/main/preload.js dist/main/main/preload.cjs && shx cp src/main/workflow/engine/package.json dist/main/main/workflow/engine/package.json",
-    "build:pi": "npm --prefix .. run build",
-    "build": "npm run build:pi && node scripts/sync-nested-deps.mjs && npm run build:main && npm run build:renderer",
+    "build:preload": "tsc src/main/preload.ts --outDir dist/main --module CommonJS --target ES2022 --esModuleInterop --skipLibCheck --rootDir src && shx mv -f dist/main/main/preload.js dist/main/main/preload.cjs",
+    "build:main": "npm run build:preload && tsc -p tsconfig.main.json",
+    "build:runtime": "npm --prefix .. run build:pix-runtime",
+    "build:desktop": "npm run build:main && npm run build:renderer",
+    "build": "npm run build:runtime && node scripts/link-workspace-deps.mjs && npm run build:desktop",
     "start": "electron .",
     "test": "npm run test:renderer && npm run test:packaging",
     "test:renderer": "vitest run",
     "test:packaging": "node --test scripts/packaged-deps.test.mjs",
-    "package": "npm run build && node scripts/materialize-workspace-deps.mjs && node scripts/sync-nested-deps.mjs && node scripts/stop-unpacked-app.mjs && electron-builder"
+    "test:packaged-workflow": "node --test scripts/packaged-workflow.test.mjs",
+    "package": "npm run build:runtime && node scripts/materialize-workspace-deps.mjs && node scripts/sync-nested-deps.mjs && npm run build:desktop && node scripts/stop-unpacked-app.mjs && electron-builder"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "file:../packages/agent",
     "@earendil-works/pi-ai": "file:../packages/ai",
     "@earendil-works/pi-coding-agent": "file:../packages/coding-agent",
+    "@earendil-works/pix-runtime": "file:../packages/pix-runtime",
     "@mdi/font": "^7.4.47",
     "@modelcontextprotocol/sdk": "1.29.0",
     "electron-store": "^8.1.0",
@@ -69,7 +74,9 @@
       "index.html"
     ],
     "asarUnpack": [
-      "dist/main/main/workflow/engine/**/*"
+      "node_modules/@earendil-works/pix-runtime/package.json",
+      "node_modules/@earendil-works/pix-runtime/dist/workflow/engine/**/*",
+      "node_modules/@earendil-works/pix-runtime/dist/shared/workflow-types.js"
     ],
     "nsis": {
       "oneClick": false,

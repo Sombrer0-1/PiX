@@ -19,16 +19,16 @@
  * motion is disabled under prefers-reduced-motion.
  */
 import { computed, ref } from "vue";
-import { aggregateSubagentUsage, isSubagentDetails } from "@shared/subagent-types.js";
-import { isAgentTaskGroupHandle } from "@shared/agent-task-types.js";
-import type { AgentTaskGroupHandle } from "@shared/agent-task-types.js";
+import { aggregateSubagentUsage, isSubagentDetails } from "@earendil-works/pix-runtime/shared/subagent-types";
+import { isAgentTaskGroupHandle } from "@earendil-works/pix-runtime/shared/agent-task-types";
+import type { AgentTaskGroupHandle } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type {
   SubagentActivity,
   SubagentDetails,
   SubagentMode,
   SubagentSingleResult,
   SubagentStatus,
-} from "@shared/subagent-types.js";
+} from "@earendil-works/pix-runtime/shared/subagent-types";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
 import { useLiveNow } from "../../composables/useLiveNow";
 import { renderMarkdown } from "@/utils/markdown";

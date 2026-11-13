@@ -5,11 +5,13 @@ import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-a
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
+	type CreateAgentSessionRuntimeResult,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { SessionFileHost } from "../src/core/session-file-host.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type {
 	ExtensionFactory,
@@ -34,7 +36,14 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		}
 	});
 
-	async function createRuntimeHost(extensionFactory: ExtensionFactory) {
+	async function createRuntimeHost(
+		extensionFactory: ExtensionFactory,
+		host?: {
+			files: SessionFileHost;
+			attach(result: CreateAgentSessionRuntimeResult): CreateAgentSessionRuntimeResult["hostSession"];
+			onExit(): Promise<void>;
+		},
+	) {
 		const tempDir = join(tmpdir(), `pi-runtime-events-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 
@@ -60,7 +69,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				...runtimeOptions,
 				cwd,
 			});
-			return {
+			const result: CreateAgentSessionRuntimeResult = {
 				...(await createAgentSessionFromServices({
 					services,
 					sessionManager,
@@ -70,13 +79,15 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				services,
 				diagnostics: services.diagnostics,
 			};
+			result.hostSession = host?.attach(result);
+			return result;
 		};
-		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
-		});
-		await runtimeHost.session.bindExtensions({});
+		const runtimeHost = await createAgentSessionRuntime(
+			createRuntime,
+			{ cwd: tempDir, agentDir: tempDir, sessionManager: SessionManager.create(tempDir) },
+			host,
+		);
+		await runtimeHost.bindExtensions({});
 
 		cleanups.push(async () => {
 			await runtimeHost.dispose();
@@ -88,6 +99,59 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		return { runtimeHost, faux };
 	}
+
+	it("retains the current session on an open failure and releases a failed replacement after closing it", async () => {
+		const events: string[] = [];
+		const unexpected = async () => {
+			throw new Error("Unexpected file operation");
+		};
+		const files: SessionFileHost = {
+			resolveSessionDir: () => "unused",
+			open: async () => {
+				throw new Error("Session is in use");
+			},
+			create: async ({ cwd, sessionDir }) => SessionManager.create(cwd, sessionDir, { id: "replacement" }),
+			fork: unexpected,
+			branch: unexpected,
+			import: unexpected,
+			rename: unexpected,
+			delete: unexpected,
+			async release(manager) {
+				events.push(`release:${manager.getSessionId()}`);
+			},
+		};
+		const { runtimeHost } = await createRuntimeHost(() => {}, {
+			files,
+			attach({ session }) {
+				return {
+					createSession: unexpected,
+					async close() {
+						events.push(`close:${session.sessionId}`);
+					},
+				};
+			},
+			async onExit() {
+				events.push("process-close");
+			},
+		});
+		const current = runtimeHost.session;
+		await expect(runtimeHost.switchSession("occupied.jsonl")).rejects.toThrow("Session is in use");
+		expect(runtimeHost.session).toBe(current);
+		expect(events).toEqual([]);
+
+		runtimeHost.setRebindSession(async () => {
+			throw new Error("Binding failed");
+		});
+		await expect(runtimeHost.newSession()).rejects.toThrow("Binding failed");
+		await Promise.all([runtimeHost.dispose(), runtimeHost.dispose()]);
+		expect(events).toEqual([
+			`close:${current.sessionId}`,
+			`release:${current.sessionId}`,
+			"close:replacement",
+			"release:replacement",
+			"process-close",
+		]);
+	});
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];

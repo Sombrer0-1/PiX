@@ -121,6 +121,14 @@ Response:
 
 See [set_follow_up_mode](#set_follow_up_mode) for controlling how follow-up messages are processed.
 
+#### clear_queue
+
+Remove queued steering and follow-up messages. The response's `data` contains the removed messages in `steering` and `followUp` arrays.
+
+```json
+{"type": "clear_queue"}
+```
+
 #### abort
 
 Abort the current agent operation.
@@ -656,6 +664,22 @@ Response:
     ]
   }
 }
+```
+
+#### get_entries
+
+Get session entries in append order, excluding the file header. Pass `since` to return entries after a known entry ID. An unknown ID returns an error. The response's `data` contains `entries` and the active `leafId`.
+
+```json
+{"type": "get_entries", "since": "abc123"}
+```
+
+#### get_tree
+
+Get the session tree with all branches. The response's `data` contains `tree` and the active `leafId`. Each tree node contains an `entry` and its `children`.
+
+```json
+{"type": "get_tree"}
 ```
 
 #### get_last_assistant_text

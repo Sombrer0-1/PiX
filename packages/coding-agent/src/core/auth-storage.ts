@@ -228,6 +228,13 @@ export class AuthStorage {
 		this.runtimeOverrides.set(provider, apiKey);
 	}
 
+	/** Copy process-local overrides into a separate auth store. */
+	copyRuntimeApiKeysTo(target: AuthStorage): void {
+		for (const [provider, apiKey] of this.runtimeOverrides) {
+			target.setRuntimeApiKey(provider, apiKey);
+		}
+	}
+
 	/**
 	 * Remove a runtime API key override.
 	 */

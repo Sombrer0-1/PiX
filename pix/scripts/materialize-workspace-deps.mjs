@@ -18,7 +18,7 @@
 //   file lives under pix/node_modules and both asar packing and asarUnpack work.
 //
 // Runs as part of `npm run package` (and therefore package-with-proxy.bat),
-// after `npm run build` so fresh dist output is included, and BEFORE
+// after the shared runtime build so fresh dist output is included, and BEFORE
 // sync-nested-deps.mjs so replacing these directories does not discard the
 // synchronized dependencies. A re-run replaces links or previous copies.
 
@@ -60,7 +60,7 @@ function copyPackage(name, src) {
   mkdirSync(dirname(dest), { recursive: true });
   cpSync(src, dest, {
     recursive: true,
-    // Never carry the copied package's OWN nested @earendil-works copies
+    // Never carry a workspace package's nested copies of shared Pi dependencies
     // into the app: npm/sync leftovers inside packages/*/node_modules would
     // shadow the fresh top-level copies materialized in this pass and freeze
     // the runtime at stale content (e.g. an old @earendil-works/pi-ai model
@@ -68,7 +68,8 @@ function copyPackage(name, src) {
     // workspace source in this same pass, so any nested copy is redundant.
     filter: (filePath) => {
       const rel = filePath.slice(src.length).replace(/^[\\/]+/, "").replace(/\\/g, "/");
-      return !rel.startsWith("node_modules/@earendil-works/");
+      return !rel.startsWith("node_modules/@earendil-works/") &&
+        !/^node_modules\/pi-mcp-adapter(?:\/|$)/.test(rel);
     },
   });
   console.log(`[materialize-workspace-deps] ${name} -> ${dest}${wasLink ? " (replaced symlink)" : ""}`);
@@ -120,16 +121,14 @@ for (const [name, spec] of Object.entries(pkg.dependencies ?? {})) {
   if (!copyPackage(name, src)) continue;
   materialized++;
   seen.add(name);
-  pending.push(name);
+  pending.push(src);
 }
 
 while (pending.length) {
-  const name = pending.shift();
-  const installed = destFor(name);
-  if (!existsSync(installed)) continue;
-  for (const dep of readProdDeps(installed)) {
+  const source = pending.shift();
+  for (const dep of readProdDeps(source)) {
     if (seen.has(dep)) continue;
-    const found = findInstalledPackage(installed, dep);
+    const found = findInstalledPackage(source, dep);
     if (!found) continue;
     if (!isAsarUnsafeOutsidePix(found)) {
       seen.add(dep);
@@ -138,7 +137,7 @@ while (pending.length) {
     if (!copyPackage(dep, realpathSync(found))) continue;
     materialized++;
     seen.add(dep);
-    pending.push(dep);
+    pending.push(realpathSync(found));
   }
 }
 

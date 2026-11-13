@@ -1,0 +1,28 @@
+{
+	"name": "@earendil-works/pix-cli",
+	"version": "1.5.0",
+	"description": "PiX terminal coding agent",
+	"type": "module",
+	"bin": {
+		"pix": "./dist/cli.js"
+	},
+	"files": ["dist"],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
+		"start": "node dist/cli.js",
+		"dev": "node --watch --import tsx src/cli.ts"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "0.78.0",
+		"@earendil-works/pix-runtime": "1.5.0",
+		"proper-lockfile": "4.1.2"
+	},
+	"devDependencies": {
+		"@modelcontextprotocol/sdk": "1.29.0",
+		"@types/proper-lockfile": "4.1.4"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

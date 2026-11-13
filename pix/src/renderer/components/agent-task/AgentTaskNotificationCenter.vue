@@ -19,7 +19,7 @@
  */
 import { computed, ref, watch } from "vue";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
-import type { AgentTaskInfo, AgentTaskStatus } from "@shared/agent-task-types.js";
+import type { AgentTaskInfo, AgentTaskStatus } from "@earendil-works/pix-runtime/shared/agent-task-types";
 
 /** 通知堆叠最大条数（增量渲染 + 封顶，不做虚拟滚动库）。 */
 const MAX_NOTIFICATIONS = 10;

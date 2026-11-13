@@ -27,14 +27,14 @@ import {
   disposeProjectExecutionContext,
   resolveProjectLocation,
   type ProjectExecutionContextHooks,
-} from "../execution-context.js";
+} from "@earendil-works/pix-runtime/execution-context.js";
 import {
   WslDistroResolver,
   type WslAutomountConfig,
   type WslDistroInfo,
-} from "../wsl/wsl-distro.js";
-import { WslPathConverter } from "../wsl/wsl-paths.js";
-import { createWslExecutionBackend } from "../wsl/wsl-execution-backend.js";
+} from "@earendil-works/pix-runtime/wsl/wsl-distro.js";
+import { WslPathConverter } from "@earendil-works/pix-runtime/wsl/wsl-paths.js";
+import { createWslExecutionBackend } from "@earendil-works/pix-runtime/wsl/wsl-execution-backend.js";
 import { SettingsStore } from "../settings-store.js";
 import {
   teamSnapshotPath,
@@ -511,7 +511,7 @@ await run("SettingsStore: old { path } -> Windows migration", async () => {
   const store = new SettingsStore({ cwd });
   const all = store.getAll();
 
-  assertEqual(all.schemaVersion, 2, "migrated schemaVersion === 2");
+  assertEqual(all.schemaVersion, 4, "migrated schemaVersion === 4");
   assert(all.wsl !== undefined, "wsl defaults populated");
   assertEqual(all.wsl?.enabled, false, "migrated wsl.enabled === false");
   assertEqual(all.wsl?.defaultCwd, "/home", "migrated wsl.defaultCwd === /home");
@@ -567,7 +567,7 @@ await run("SettingsStore: schemaVersion=2 JSON with physicalPath round-trips", a
   // proves projectPathExists checks physicalPath (UNC), not the logical path.
   const all = store.getAll();
 
-  assertEqual(all.schemaVersion, 2, "v2 file keeps schemaVersion === 2");
+  assertEqual(all.schemaVersion, 4, "v2 file migrates to schemaVersion 4");
   assertEqual(all.theme, "dark", "v2 file theme preserved");
   assertEqual(all.wsl?.enabled, true, "v2 wsl.enabled preserved");
   assertEqual(all.wsl?.distro, "Ubuntu-22.04", "v2 wsl.distro preserved");

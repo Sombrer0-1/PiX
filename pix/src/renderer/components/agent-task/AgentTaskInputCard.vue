@@ -9,7 +9,7 @@
  */
 import { computed, ref } from "vue";
 import { useAgentTaskStore } from "../../stores/agent-task-store";
-import type { AgentTaskInputRequest } from "@shared/agent-task-types.js";
+import type { AgentTaskInputRequest } from "@earendil-works/pix-runtime/shared/agent-task-types";
 import type { RequestUserInputResponse } from "@shared/types.js";
 
 const props = defineProps<{

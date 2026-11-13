@@ -1,0 +1,48 @@
+{
+	"name": "@earendil-works/pix-runtime",
+	"version": "1.5.0",
+	"description": "Shared PiX Solo session runtime",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./shared": {
+			"types": "./dist/shared/index.d.ts",
+			"import": "./dist/shared/index.js"
+		},
+		"./shared/*": {
+			"types": "./dist/shared/*.d.ts",
+			"import": "./dist/shared/*.js"
+		},
+		"./*.js": {
+			"types": "./dist/*.d.ts",
+			"import": "./dist/*.js"
+		}
+	},
+	"typesVersions": {
+		"*": {
+			"shared": ["dist/shared/index.d.ts"],
+			"shared/*": ["dist/shared/*"]
+		}
+	},
+	"files": ["dist"],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && shx cp src/workflow/engine/package.json dist/workflow/engine/package.json",
+		"watch": "shx mkdir -p dist/workflow/engine && shx cp src/workflow/engine/package.json dist/workflow/engine/package.json && tsc -p tsconfig.build.json --watch"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "0.78.0",
+		"@earendil-works/pi-ai": "0.78.0",
+		"@earendil-works/pi-coding-agent": "0.78.0",
+		"pi-mcp-adapter": "0.1.0",
+		"typebox": "1.1.38"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

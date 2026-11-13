@@ -46,7 +46,7 @@ import {
 } from "../../shared/team-types.js";
 import type { AgentSessionEvent } from "../../shared/types.js";
 import { TeamManager } from "../team-manager.js";
-import type { ProjectExecutionContext } from "../execution-context.js";
+import type { ProjectExecutionContext } from "@earendil-works/pix-runtime/execution-context.js";
 import { archiveNotice } from "../team/export.js";
 import { buildPlanHandoffRequest, buildSoloHandoffPrompt } from "../team/handoff.js";
 import { RoundtableHealth } from "../team/health.js";

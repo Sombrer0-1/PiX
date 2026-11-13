@@ -9,20 +9,63 @@ import { access, readFile } from "fs/promises";
 import type { ToolPathContext } from "./execution-backend.ts";
 import { resolveToCwd } from "./path-utils.ts";
 
-export function detectLineEnding(content: string): "\r\n" | "\n" {
-	const crlfIdx = content.indexOf("\r\n");
-	const lfIdx = content.indexOf("\n");
-	if (lfIdx === -1) return "\n";
-	if (crlfIdx === -1) return "\n";
-	return crlfIdx < lfIdx ? "\r\n" : "\n";
-}
-
 export function normalizeToLF(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
-export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
-	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
+/**
+ * Apply replacements matched in `normalizeToLF(originalContent)` to `originalContent` itself.
+ * Text outside the replaced ranges keeps its bytes, including its line endings. Line breaks in
+ * the new text get the line ending of the line where the replaced range starts. The result,
+ * normalized to LF, equals the replacements applied to the normalized content.
+ */
+export function applyReplacementsToOriginal(originalContent: string, replacements: TextReplacement[]): string {
+	// Only CRLF changes length when normalizing: the LF of the n-th CRLF (at original offset p) is at
+	// p - n in the normalized text. Adding the number of CRLFs before a normalized offset gives the
+	// original offset, and a range that covers that LF covers the whole CRLF.
+	let crlfBefore = 0;
+	let nextCrlf = originalContent.indexOf("\r\n");
+	const toOriginal = (offset: number): number => {
+		while (nextCrlf !== -1 && nextCrlf - crlfBefore < offset) {
+			crlfBefore++;
+			nextCrlf = originalContent.indexOf("\r\n", nextCrlf + 2);
+		}
+		return offset + crlfBefore;
+	};
+
+	const parts: string[] = [];
+	let endsWithCr = false;
+	const push = (part: string): void => {
+		if (part.length === 0) return;
+		// A CR before a seam and an LF after it would merge into one CRLF line break, for example a kept
+		// lone CR followed by inserted text that starts with LF, or both sides of a deleted range. Adding
+		// an LF turns the CR into a CRLF of its own, so the written file has the line breaks the diff shows.
+		if (endsWithCr && part[0] === "\n") parts.push("\n");
+		parts.push(part);
+		endsWithCr = part[part.length - 1] === "\r";
+	};
+	let position = 0;
+	for (const replacement of replacements) {
+		const start = toOriginal(replacement.matchIndex);
+		push(originalContent.slice(position, start));
+		const ending = getLineEndingAt(originalContent, start);
+		push(ending === "\n" ? replacement.newText : replacement.newText.replaceAll("\n", ending));
+		position = toOriginal(replacement.matchIndex + replacement.matchLength);
+	}
+	push(originalContent.slice(position));
+	return parts.join("");
+}
+
+/**
+ * Line ending of the line containing `offset`: its own LF or CRLF, or that of the line before
+ * for an unterminated last line. A lone CR only counts in files without any LF (classic Mac
+ * line endings); elsewhere it is more likely a control character inside a line.
+ */
+function getLineEndingAt(content: string, offset: number): "\r\n" | "\n" | "\r" {
+	let lineFeed = content.indexOf("\n", offset);
+	if (lineFeed === -1) lineFeed = content.lastIndexOf("\n", offset);
+	if (lineFeed === -1) return content.includes("\r") ? "\r" : "\n";
+	return content[lineFeed - 1] === "\r" ? "\r\n" : "\n";
 }
 
 /**
@@ -74,16 +117,20 @@ export interface Edit {
 	newText: string;
 }
 
-interface MatchedEdit {
-	editIndex: number;
+interface TextReplacement {
 	matchIndex: number;
 	matchLength: number;
 	newText: string;
 }
 
+interface MatchedEdit extends TextReplacement {
+	editIndex: number;
+}
+
 export interface AppliedEditsResult {
 	baseContent: string;
 	newContent: string;
+	replacements: TextReplacement[];
 }
 
 /**
@@ -277,7 +324,7 @@ export function applyEditsToNormalizedContent(
 		throw getNoChangeError(path, normalizedEdits.length);
 	}
 
-	return { baseContent, newContent };
+	return { baseContent, newContent, replacements: matchedEdits };
 }
 
 /** Generate a standard unified patch. */
@@ -309,13 +356,20 @@ export function generateDiffString(
 	const oldLines = splitDisplayLines(oldContent);
 	const newLines = splitDisplayLines(newContent);
 	const parts = Diff.diffArrays(oldLines, newLines);
-	const output: string[] = [];
-
 	const maxLineNum = Math.max(1, oldLines.length, newLines.length);
 	const lineNumWidth = String(maxLineNum).length;
+	const { output, firstChangedLine } = formatDisplayDiff(parts, 1, 1, lineNumWidth, contextLines);
+	return { diff: output.join("\n"), firstChangedLine };
+}
 
-	let oldLineNum = 1;
-	let newLineNum = 1;
+function formatDisplayDiff(
+	parts: Diff.ArrayChange<string>[],
+	oldLineNum: number,
+	newLineNum: number,
+	lineNumWidth: number,
+	contextLines: number,
+): { output: string[]; firstChangedLine: number | undefined } {
+	const output: string[] = [];
 	let lastWasChange = false;
 	let firstChangedLine: number | undefined;
 
@@ -420,7 +474,144 @@ export function generateDiffString(
 		}
 	}
 
-	return { diff: output.join("\n"), firstChangedLine };
+	return { output, firstChangedLine };
+}
+
+/** Count display lines without allocating an array for the whole file. */
+function countLines(text: string): number {
+	return countLineFeeds(text, 0, text.length) + (text.length > 0 && !text.endsWith("\n") ? 1 : 0);
+}
+
+function countLineFeeds(text: string, start: number, end: number): number {
+	let count = 0;
+	for (let index = text.indexOf("\n", start); index !== -1 && index < end; index = text.indexOf("\n", index + 1)) {
+		count++;
+	}
+	return count;
+}
+
+/** Display diff and unified patch of an edit, as returned in the edit tool's details. */
+export interface EditDiff {
+	diff: string;
+	patch: string;
+	firstChangedLine: number | undefined;
+}
+
+/**
+ * Unchanged lines diffed on each side of a replacement. Well above the 4 context lines shown, so jsdiff
+ * aligns a change within its window as it would over the whole file.
+ */
+const DIFF_WINDOW_MARGIN_LINES = 32;
+
+/**
+ * Diff an edit only around its replacements, so time and memory follow the size of the change instead of
+ * the file. jsdiff may align repeated lines differently within a window.
+ */
+export function generateEditDiff(
+	path: string,
+	baseContent: string,
+	newContent: string,
+	replacements: TextReplacement[],
+	contextLines = 4,
+): EditDiff {
+	const lineNumWidth = String(Math.max(1, countLines(baseContent), countLines(newContent))).length;
+	const skipMarker = ` ${"".padStart(lineNumWidth, " ")} ...`;
+	const output: string[] = [];
+	const hunks: Diff.StructuredPatchHunk[] = [];
+	let firstChangedLine: number | undefined;
+	for (const window of getDiffWindows(baseContent, replacements)) {
+		const oldText = baseContent.slice(window.oldStart, window.oldEnd);
+		const newText = newContent.slice(window.newStart, window.newEnd);
+		const shown = formatDisplayDiff(
+			Diff.diffArrays(splitDisplayLines(oldText), splitDisplayLines(newText)),
+			window.oldLine + 1,
+			window.newLine + 1,
+			lineNumWidth,
+			contextLines,
+		);
+		firstChangedLine ??= shown.firstChangedLine;
+		if (shown.output.length > 0) {
+			if (window.oldStart > 0 && output.at(-1) !== skipMarker && shown.output[0] !== skipMarker) {
+				output.push(skipMarker);
+			}
+			if (output.at(-1) === skipMarker && shown.output[0] === skipMarker) shown.output.shift();
+		}
+		// A loop, not push(...lines): spreading a replacement of many lines overflows the call stack.
+		for (const line of shown.output) output.push(line);
+		if (shown.output.length > 0 && window.oldEnd < baseContent.length && output.at(-1) !== skipMarker) {
+			output.push(skipMarker);
+		}
+		const patch = Diff.structuredPatch(path, path, oldText, newText, undefined, undefined, { context: contextLines });
+		for (const hunk of patch.hunks) {
+			hunks.push({ ...hunk, oldStart: hunk.oldStart + window.oldLine, newStart: hunk.newStart + window.newLine });
+		}
+	}
+	const patch = Diff.formatPatch(
+		{ oldFileName: path, newFileName: path, oldHeader: undefined, newHeader: undefined, hunks },
+		Diff.FILE_HEADERS_ONLY,
+	);
+	return { diff: output.join("\n"), patch, firstChangedLine };
+}
+
+/** Matching ranges of the old and new contents around one or more replacements: offsets and 0-based first lines. */
+interface DiffWindow {
+	oldStart: number;
+	oldEnd: number;
+	oldLine: number;
+	newStart: number;
+	newEnd: number;
+	newLine: number;
+}
+
+/** Start of the line that contains `offset`. */
+function lineStartBefore(text: string, offset: number): number {
+	// lastIndexOf treats a negative position as 0 and would find a line feed at offset 0.
+	return offset === 0 ? 0 : text.lastIndexOf("\n", offset - 1) + 1;
+}
+
+/** Whole-line windows with margin around the replacements, which are sorted and disjoint; overlapping windows merge. */
+function getDiffWindows(baseContent: string, replacements: TextReplacement[]): DiffWindow[] {
+	const windows: DiffWindow[] = [];
+	// Offset and line deltas of the replacements before the current one, and a line-counting cursor.
+	let offsetDelta = 0;
+	let lineDelta = 0;
+	let cursorOffset = 0;
+	let cursorLine = 0;
+	for (const replacement of replacements) {
+		const matchEnd = replacement.matchIndex + replacement.matchLength;
+		let start = lineStartBefore(baseContent, replacement.matchIndex);
+		for (let i = 0; i < DIFF_WINDOW_MARGIN_LINES && start > 0; i++) {
+			start = lineStartBefore(baseContent, start - 1);
+		}
+		let end = matchEnd;
+		for (let i = 0; i <= DIFF_WINDOW_MARGIN_LINES && end < baseContent.length; i++) {
+			const lineFeed = baseContent.indexOf("\n", i === 0 ? Math.max(matchEnd - 1, replacement.matchIndex) : end);
+			end = lineFeed === -1 ? baseContent.length : lineFeed + 1;
+		}
+		const replacementOffsetDelta = replacement.newText.length - replacement.matchLength;
+		const replacementLineDelta =
+			countLineFeeds(replacement.newText, 0, replacement.newText.length) -
+			countLineFeeds(baseContent, replacement.matchIndex, matchEnd);
+		const previous = windows.at(-1);
+		if (previous && start <= previous.oldEnd) {
+			previous.oldEnd = Math.max(previous.oldEnd, end);
+			previous.newEnd = previous.oldEnd + offsetDelta + replacementOffsetDelta;
+		} else {
+			cursorLine += countLineFeeds(baseContent, cursorOffset, start);
+			cursorOffset = start;
+			windows.push({
+				oldStart: start,
+				oldEnd: end,
+				oldLine: cursorLine,
+				newStart: start + offsetDelta,
+				newEnd: end + offsetDelta + replacementOffsetDelta,
+				newLine: cursorLine + lineDelta,
+			});
+		}
+		offsetDelta += replacementOffsetDelta;
+		lineDelta += replacementLineDelta;
+	}
+	return windows;
 }
 
 export interface EditDiffResult {
@@ -489,10 +680,11 @@ export async function computeEditsDiff(
 		// Strip BOM before matching (LLM won't include invisible BOM in oldText)
 		const { text: content } = stripBom(rawContent);
 		const normalizedContent = normalizeToLF(content);
-		const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+		const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(normalizedContent, edits, path);
 
 		// Generate the diff
-		return generateDiffString(baseContent, newContent);
+		const { diff, firstChangedLine } = generateEditDiff(path, baseContent, newContent, replacements);
+		return { diff, firstChangedLine };
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
 	}
