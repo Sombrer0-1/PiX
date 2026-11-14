@@ -1,10 +1,12 @@
 import { join, resolve } from "node:path";
-import { Text, type TUI } from "@earendil-works/pi-tui";
+import { Text, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import { getReadmePath } from "../src/config.ts";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
+import { createEditToolDefinition } from "../src/core/tools/edit.ts";
+import { createGrepToolDefinition } from "../src/core/tools/grep.ts";
 import { createReadTool, createReadToolDefinition } from "../src/core/tools/read.ts";
 import { createWriteToolDefinition } from "../src/core/tools/write.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
@@ -477,4 +479,464 @@ describe("ToolExecutionComponent parity", () => {
 			expect(collapsed.indexOf(":120-329")).toBeLessThan(collapsed.indexOf("to expand"));
 		});
 	}
+});
+
+describe("ToolExecutionComponent compact presentation", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	function renderText(component: ToolExecutionComponent, width = 100): string {
+		return stripAnsi(component.render(width).join("\n"));
+	}
+
+	test("keeps the legacy read rendering when describe is absent", () => {
+		const component = new ToolExecutionComponent(
+			"read",
+			"legacy-read",
+			{ path: "notes.txt" },
+			{},
+			createReadToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		const rendered = renderText(component);
+		expect(rendered).toContain("read");
+		expect(rendered).toContain("notes.txt");
+		expect(rendered).not.toContain("Done");
+	});
+
+	test("shows a compact read line and the full output after expand", () => {
+		const component = new ToolExecutionComponent(
+			"read",
+			"compact-read",
+			{ path: "test/setup.ts", offset: 1, limit: 80 },
+			{ describe: () => undefined },
+			createReadToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.setArgsComplete();
+		component.markExecutionStarted();
+		let rendered = renderText(component);
+		expect(rendered).toContain("Processing");
+		expect(rendered).toContain("read");
+		expect(rendered).toContain("test/setup.ts");
+		expect(rendered).toContain("lines 1–80");
+
+		component.updateResult(
+			{ content: [{ type: "text", text: "hidden content" }], details: undefined, isError: false },
+			false,
+		);
+		rendered = renderText(component);
+		expect(rendered).toContain("Done");
+		expect(rendered).not.toContain("hidden content");
+		expect(rendered.split("\n").filter((line) => line.trim()).length).toBe(1);
+
+		const item = component.getHistoryItem("read-history");
+		expect(item.id).toBe("read-history");
+		expect(item.kind).toBe("tool");
+		expect(item.label).toContain("Done");
+		expect(item.label).not.toContain("\n");
+		expect(item.detail?.()).toContain("path: test/setup.ts");
+		expect(item.detail?.()).toContain("hidden content");
+
+		component.setExpanded(true);
+		expect(renderText(component)).toContain("hidden content");
+	});
+
+	test("uses a historical file_path for read", () => {
+		const component = new ToolExecutionComponent(
+			"read",
+			"compact-file-path",
+			{ file_path: "历史/说明.ts" },
+			{ describe: () => undefined },
+			createReadToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.setArgsComplete();
+		expect(renderText(component)).toContain("历史/说明.ts");
+	});
+
+	test("keeps a failed bash reason while collapsing the rest", () => {
+		const command = `npm run test:unit\n--watch ${"项目模块".repeat(12)}`;
+		const component = new ToolExecutionComponent(
+			"bash",
+			"compact-bash",
+			{ command },
+			{ describe: () => undefined },
+			createBashToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.markExecutionStarted();
+		component.updateResult(
+			{
+				content: [
+					{
+						type: "text",
+						text: "Missing script: test:unit\nsecond reason\nthird reason\nFOURTH-UNIQUE",
+					},
+				],
+				details: {
+					fullOutputPath: "/tmp/bash-full.txt",
+					truncation: { truncated: true, truncatedBy: "lines", outputLines: 2, totalLines: 9 },
+				},
+				isError: true,
+			},
+			false,
+		);
+
+		const wide = component.render(100);
+		for (const line of wide) expect(visibleWidth(line)).toBeLessThanOrEqual(100);
+		const rendered = stripAnsi(wide.join("\n"));
+		expect(rendered).toContain("Failed");
+		expect(rendered).toContain("bash");
+		expect(rendered).toContain("npm run test:unit");
+		expect(rendered).toContain("Missing script: test:unit");
+		expect(rendered).not.toContain("FOURTH-UNIQUE");
+		expect(wide.length).toBeLessThanOrEqual(4);
+		const narrow = component.render(36);
+		for (const line of narrow) expect(visibleWidth(line)).toBeLessThanOrEqual(36);
+
+		const detail = component.getHistoryItem("bash-history").detail?.() ?? "";
+		expect(detail).toContain("FOURTH-UNIQUE");
+		expect(detail).toContain("Full output: /tmp/bash-full.txt");
+		expect(detail).toContain("Truncated: showing 2 of 9 lines");
+		expect(detail).toContain("--watch");
+
+		component.setExpanded(true);
+		expect(renderText(component, 80)).toContain("FOURTH-UNIQUE");
+	});
+
+	test("restores an edit diff from the saved result", async () => {
+		const diff = "  context\n-old\n+UNIQUE_DIFF_LINE\n";
+		const component = new ToolExecutionComponent(
+			"edit",
+			"compact-edit",
+			{
+				path: "src/项目.ts",
+				edits: [
+					{ oldText: "a", newText: "b" },
+					{ oldText: "c", newText: "d" },
+				],
+			},
+			{ describe: () => undefined },
+			createEditToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.setArgsComplete();
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "Successfully replaced 2 block(s) in src/项目.ts." }],
+				details: { diff, firstChangedLine: 3 },
+				isError: false,
+			},
+			false,
+		);
+
+		const collapsed = renderText(component, 80);
+		expect(collapsed).toContain("Done");
+		expect(collapsed).toContain("edit");
+		expect(collapsed).toContain("src/项目.ts");
+		expect(collapsed).toContain("2 replacements");
+		expect(collapsed).toContain("line 3");
+		expect(collapsed).not.toContain("UNIQUE_DIFF_LINE");
+
+		const detail = component.getHistoryItem("edit-history").detail?.() ?? "";
+		expect(detail).toContain("  context");
+		expect(detail).toContain("+UNIQUE_DIFF_LINE");
+
+		component.setExpanded(true);
+		expect(renderText(component, 100)).toContain("UNIQUE_DIFF_LINE");
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		const later = renderText(component, 100);
+		expect(later).toContain("UNIQUE_DIFF_LINE");
+		expect(later).not.toContain("ENOENT");
+	});
+
+	test("summarizes grep without treating output lines as hits", () => {
+		const component = new ToolExecutionComponent(
+			"grep",
+			"compact-grep",
+			{ pattern: "createSession", path: "test/", limit: 20 },
+			{ describe: () => undefined },
+			createGrepToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "a\ncontext around the match\nb\ncontext around the match\n" }],
+				details: undefined,
+				isError: false,
+			},
+			false,
+		);
+		const rendered = renderText(component);
+		expect(rendered).toContain("Done");
+		expect(rendered).toContain("grep");
+		expect(rendered).toContain('"createSession"');
+		expect(rendered).toContain("test/");
+		expect(rendered).toContain("limit 20");
+		expect(rendered).not.toContain("context around");
+		expect(rendered).not.toMatch(/\d+ matches/);
+
+		component.setExpanded(true);
+		expect(renderText(component)).toContain("context around the match");
+	});
+
+	test("keeps an unknown extension name and its arguments", () => {
+		const code = "function f() {\n  return 1;\n}\n";
+		const component = new ToolExecutionComponent(
+			"mcp__docs__search",
+			"compact-mcp",
+			{ query: "会话历史", snippet: code },
+			{ describe: () => undefined },
+			undefined,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{
+				content: [
+					{ type: "text", text: code },
+					{ type: "image", data: "aaaa", mimeType: "image/png" },
+				],
+				details: undefined,
+				isError: false,
+			},
+			false,
+		);
+		const rendered = renderText(component, 48);
+		expect(rendered).toContain("mcp__docs__search");
+		expect(rendered).toContain("会话历史");
+		expect(rendered).not.toContain("return 1");
+		for (const line of component.render(28)) expect(visibleWidth(line)).toBeLessThanOrEqual(28);
+
+		const detail = component.getHistoryItem("mcp-history").detail?.() ?? "";
+		expect(detail).toContain("会话历史");
+		expect(detail).toContain("  return 1;");
+		expect(detail).toContain("[Image:");
+
+		component.setExpanded(true);
+		const expanded = renderText(component, 80);
+		expect(expanded).toContain("return 1");
+		expect(expanded).toContain("会话历史");
+	});
+
+	test("shows a cancelled request_user_input result", () => {
+		const component = new ToolExecutionComponent(
+			"request_user_input",
+			"ask-1",
+			{ questions: [{ id: "go", header: "Proceed", question: "Continue?" }] },
+			{ describe: () => undefined },
+			undefined,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "User cancelled the input request." }],
+				details: { response: { id: "1", answers: {}, cancelled: true } },
+				isError: false,
+			},
+			false,
+		);
+		const rendered = renderText(component);
+		expect(rendered).toContain("Cancelled");
+		expect(rendered).toContain("Proceed");
+		expect(rendered).toContain("User cancelled the input request.");
+	});
+
+	test("prefers describe status and still shows the tool error", () => {
+		let status: "running" | "interrupted" | "failed" | "waiting-input" = "running";
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"describe-1",
+			{ name: "child" },
+			{
+				describe: () => ({
+					status,
+					subject: "child",
+					diagnostic: "adapter note",
+				}),
+			},
+			createBaseToolDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.markExecutionStarted();
+		expect(renderText(component)).toContain("Processing");
+
+		status = "waiting-input";
+		component.refreshPresentation();
+		expect(renderText(component)).toContain("Waiting");
+		expect(renderText(component)).toContain("child");
+
+		status = "interrupted";
+		component.updateResult(
+			{ content: [{ type: "text", text: "tool broke badly" }], details: {}, isError: true },
+			false,
+		);
+		const rendered = renderText(component);
+		expect(rendered).toContain("Interrupted");
+		expect(rendered).toContain("tool broke badly");
+		expect(rendered).not.toContain("adapter note");
+	});
+
+	test("uses a describe diagnostic when the tool result is not an error", () => {
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"describe-failed",
+			{ name: "child" },
+			{ describe: () => ({ status: "failed", diagnostic: "child task failed" }) },
+			createBaseToolDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{ content: [{ type: "text", text: "still running" }], details: {}, isError: false },
+			false,
+		);
+		const rendered = renderText(component);
+		expect(rendered).toContain("Failed");
+		expect(rendered).toContain("child task failed");
+	});
+
+	test("keeps partial text when a call finishes without a result", () => {
+		const component = new ToolExecutionComponent(
+			"read",
+			"finish-read",
+			{ path: "src/项目.ts", offset: 10, limit: 5 },
+			{ describe: () => undefined },
+			createReadToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.markExecutionStarted();
+		component.updateResult(
+			{ content: [{ type: "text", text: "partial output kept" }], details: undefined, isError: false },
+			true,
+		);
+		component.finishWithoutResult("cancelled", "User cancelled");
+		const rendered = renderText(component);
+		expect(rendered).toContain("Cancelled");
+		expect(rendered).toContain("User cancelled");
+		expect(rendered).not.toContain("Successfully");
+		expect(component.getHistoryItem("finish-read").detail?.()).toContain("partial output kept");
+	});
+
+	test("uses registered renderers and shared state when expanded", () => {
+		type RenderState = { token?: string };
+		const toolDefinition: ToolDefinition<any, unknown, RenderState> = {
+			...createBaseToolDefinition("ext.workspace.search"),
+			renderCall: (_args, _theme, context) => {
+				context.state.token ??= "shared-token";
+				return new Text(`custom call ${context.state.token}`, 0, 0);
+			},
+			renderResult: () => new Text("custom result shared-token", 0, 0),
+		};
+		const component = new ToolExecutionComponent(
+			"ext.workspace.search",
+			"renderer-1",
+			{ query: "会话历史" },
+			{ describe: () => undefined },
+			toolDefinition,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult({ content: [{ type: "text", text: "done" }], details: {}, isError: false }, false);
+		const collapsed = renderText(component);
+		expect(collapsed).toContain("ext.workspace.search");
+		expect(collapsed).not.toContain("custom call");
+
+		component.setExpanded(true);
+		const expanded = renderText(component);
+		expect(expanded).toContain("custom call shared-token");
+		expect(expanded).toContain("custom result shared-token");
+
+		component.setExpanded(false);
+		component.refreshPresentation();
+		component.setExpanded(true);
+		expect(renderText(component)).toContain("custom call shared-token");
+	});
+
+	test("clears a bash detail timer after the row collapses", () => {
+		vi.useFakeTimers();
+		try {
+			const output = Array.from({ length: 20 }, (_, index) => `output-line-${index}`).join("\n");
+			const component = new ToolExecutionComponent(
+				"bash",
+				"bash-timer",
+				{ command: "echo hi" },
+				{ describe: () => undefined },
+				createBashToolDefinition(process.cwd()),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.setExpanded(true);
+			component.markExecutionStarted();
+			component.updateResult(
+				{ content: [{ type: "text", text: "output-line-0" }], details: undefined, isError: false },
+				true,
+			);
+			expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+			component.setExpanded(false);
+			component.updateResult(
+				{ content: [{ type: "text", text: output }], details: undefined, isError: false },
+				false,
+			);
+			expect(vi.getTimerCount()).toBe(0);
+			expect(renderText(component, 80)).not.toContain("output-line-19");
+
+			component.setExpanded(true);
+			expect(renderText(component, 80)).toContain("output-line-19");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("fits a long Chinese command and a multiline error to the column width", () => {
+		const command = `npm test -- ${"非常长的中文测试名称".repeat(8)}`;
+		const component = new ToolExecutionComponent(
+			"bash",
+			"bash-width",
+			{ command },
+			{ describe: () => undefined },
+			createBashToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.markExecutionStarted();
+		component.updateResult(
+			{
+				content: [
+					{
+						type: "text",
+						text: [
+							"无法执行这段命令",
+							"  at 项目/模块.ts:12",
+							"    const value = 1;",
+							"第四行不应该留在折叠行里",
+						].join("\n"),
+					},
+				],
+				details: undefined,
+				isError: true,
+			},
+			false,
+		);
+		const lines = component.render(24);
+		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(24);
+		const rendered = stripAnsi(lines.join("\n"));
+		expect(rendered).toContain("Failed");
+		expect(rendered).toContain("bash");
+		expect(rendered).not.toContain("第四行不应该留在折叠行里");
+		expect(component.getHistoryItem("bash-width").detail?.()).toContain("    const value = 1;");
+	});
 });

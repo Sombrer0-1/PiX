@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +13,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { CliSessionFiles } from "../dist/session-files.js";
 
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = process.env.PIX_TEST_CLI ?? fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const extension = fileURLToPath(new URL("../../pix-runtime/test/fixtures/faux-extension.mjs", import.meta.url));
 
 async function fixture(t) {
@@ -24,7 +24,9 @@ async function fixture(t) {
 	const tmp = join(root, "tmp");
 	await Promise.all([mkdir(cwd), mkdir(agentDir), mkdir(tmp)]);
 	const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, TEMP: tmp, TMP: tmp, TMPDIR: tmp };
-	const args = [cli, "--offline", "-e", extension, "--model", "pix-test/test", "--api-key", "test-cli-key"];
+	const fixtureExtension = join(cwd, "faux-extension.mjs");
+	await copyFile(extension, fixtureExtension);
+	const args = [cli, "--offline", "-e", fixtureExtension, "--model", "pix-test/test", "--api-key", "test-cli-key"];
 	return { root, cwd, agentDir, tmp, env, args };
 }
 
@@ -428,4 +430,18 @@ test("WSL startup adopts explicit mounted project settings and /new carries them
 	assert.equal((await local.call("new_session")).success, true);
 	assert.equal((await local.call("bash", probe)).data.output.trim(), `linux-cwd=${logicalPath}`);
 	await local.close();
+});
+
+test("piped stdin selects print output without TUI controls", async (t) => {
+	const f = await fixture(t);
+	const result = spawnSync(process.execPath, f.args, {
+		cwd: f.cwd,
+		env: f.env,
+		encoding: "utf8",
+		input: "hello\n",
+		timeout: 15000,
+	});
+	assert.equal(result.status, 0, result.stderr || result.error?.message);
+	assert.equal(result.stdout, "PiX test response\n");
+	assert.equal(result.stdout.includes("\u001b"), false);
 });

@@ -2,12 +2,15 @@ import chalk from "chalk";
 import { type SpawnSyncReturns, spawnSync } from "child_process";
 import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
 import { arch, platform } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
+import { fileURLToPath } from "url";
 import { APP_NAME, getBinDir } from "../config.ts";
 
 const TOOLS_DIR = getBinDir();
+const bundledDir = join(dirname(fileURLToPath(import.meta.url)), "..", "vendor", "tools", `${platform()}-${arch()}`);
+export const bundledToolDir = existsSync(bundledDir) ? bundledDir : undefined;
 const NETWORK_TIMEOUT_MS = 10_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 
@@ -86,10 +89,15 @@ export function getToolPath(tool: "fd" | "rg"): string | null {
 	const config = TOOLS[tool];
 	if (!config) return null;
 
+	const binaryName = config.binaryName + (platform() === "win32" ? ".exe" : "");
 	// Check our tools directory first
-	const localPath = join(TOOLS_DIR, config.binaryName + (platform() === "win32" ? ".exe" : ""));
+	const localPath = join(TOOLS_DIR, binaryName);
 	if (existsSync(localPath)) {
 		return localPath;
+	}
+	if (bundledToolDir) {
+		const bundledPath = join(bundledToolDir, binaryName);
+		if (existsSync(bundledPath)) return bundledPath;
 	}
 
 	// Check system PATH - if found, just return the command name (it's in PATH)

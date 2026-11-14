@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pix-cli",
-	"version": "1.5.0",
+	"version": "1.5.1",
 	"description": "PiX terminal coding agent",
 	"type": "module",
 	"bin": {
@@ -15,7 +15,7 @@
 	},
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "0.78.0",
-		"@earendil-works/pix-runtime": "1.5.0",
+		"@earendil-works/pix-runtime": "1.5.1",
 		"proper-lockfile": "4.1.2"
 	},
 	"devDependencies": {

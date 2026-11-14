@@ -1,4 +1,4 @@
-import { fauxAssistantMessage, fauxToolCall, getApiProvider, registerFauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall, getApiProvider, registerFauxProvider } from "@earendil-works/pi-ai";
 
 const response = (name, args) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 
@@ -8,8 +8,31 @@ function messageText(message) {
 	return text.replace(/<acp\b[^>]*>.*?<\/acp>/gs, "").trim();
 }
 
+function tuiDemo(last) {
+	if (last?.role === "toolResult" && last.toolName === "read") {
+		if (last.isError) {
+			return fauxAssistantMessage([
+				fauxThinking("第二个文件不存在，可以给出结论。"),
+				fauxText("项目说明已读取。请求的另一个文件不存在。"),
+			]);
+		}
+		return fauxAssistantMessage([
+			fauxThinking("项目说明已经读到，接下来读取一个不存在的文件。"),
+			fauxToolCall("read", { path: "不存在的文件.txt" }),
+		], { stopReason: "toolUse" });
+	}
+	return fauxAssistantMessage([
+		fauxThinking("先读取项目说明，再确认一个不存在的文件。"),
+		fauxToolCall("read", { path: "项目说明.txt" }),
+	], { stopReason: "toolUse" });
+}
+
 export default function extension(pi) {
-	const faux = registerFauxProvider({ provider: "pix-test", models: [{ id: "test" }] });
+	const faux = registerFauxProvider({
+		provider: "pix-test",
+		models: [{ id: "test" }],
+		...(process.env.PIX_TEST_TUI_STREAM === "1" ? { tokensPerSecond: 2 } : {}),
+	});
 	const model = faux.getModel();
 	pi.registerProvider(model.provider, {
 		baseUrl: model.baseUrl,
@@ -24,9 +47,14 @@ export default function extension(pi) {
 	});
 	const generate = () => (context, options) => {
 		const last = context.messages.at(-1);
-		if (last?.role === "toolResult") return fauxAssistantMessage(`Result from ${last.toolName}`);
 		const text = messageText(last);
+		const sawTuiDemo = context.messages.some((message) => messageText(message) === "tui demo");
+		if (last?.role === "toolResult") {
+			if (sawTuiDemo && last.toolName === "read") return tuiDemo(last);
+			return fauxAssistantMessage(`Result from ${last.toolName}`);
+		}
 		if (options?.apiKey !== "test-cli-key") throw new Error("Test runtime credential is missing");
+		if (text === "tui demo") return tuiDemo(last);
 		if (text.includes("Run the worker child") || text.includes("Run the delegated child") || text.includes("Verify a change")) {
 			return fauxAssistantMessage("child completed");
 		}

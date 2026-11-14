@@ -50,6 +50,7 @@ import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.ts";
+import type { InteractivePresentationFactory } from "./modes/interactive/presentation.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
@@ -109,14 +110,14 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
-function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
+function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean, requireStdoutTty: boolean): AppMode {
 	if (parsed.mode === "rpc") {
 		return "rpc";
 	}
 	if (parsed.mode === "json") {
 		return "json";
 	}
-	if (parsed.print || !stdinIsTTY) {
+	if (parsed.print || !stdinIsTTY || (requireStdoutTty && !stdoutIsTTY)) {
 		return "print";
 	}
 	return "interactive";
@@ -498,6 +499,7 @@ async function promptForMissingSessionCwd(
 export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
 	host?: MainHost;
+	interactivePresentation?: InteractivePresentationFactory;
 }
 
 export async function main(args: string[], options?: MainOptions) {
@@ -546,7 +548,12 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exitCode = 1;
 		return;
 	}
-	const appMode = resolveAppMode(parsed, process.stdin.isTTY);
+	const appMode = resolveAppMode(
+		parsed,
+		process.stdin.isTTY === true,
+		process.stdout.isTTY === true,
+		options?.interactivePresentation !== undefined,
+	);
 	const shouldTakeOverStdout = appMode !== "interactive";
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -877,6 +884,7 @@ export async function main(args: string[], options?: MainOptions) {
 				initialMessages: parsed.messages,
 				verbose: parsed.verbose,
 				identity: host,
+				interactivePresentation: options?.interactivePresentation,
 			});
 			if (startupBenchmark) {
 				try {

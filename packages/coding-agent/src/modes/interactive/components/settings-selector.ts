@@ -47,6 +47,8 @@ export interface SettingsConfig {
 	currentTheme: string;
 	availableThemes: string[];
 	hideThinkingBlock: boolean;
+	/** PiX: this switch only hides thinking previews on the main screen. */
+	progressiveThinking?: boolean;
 	collapseChangelog: boolean;
 	enableInstallTelemetry: boolean;
 	doubleEscapeAction: "fork" | "tree" | "none";
@@ -251,8 +253,10 @@ export class SettingsSelectorComponent extends Container {
 			},
 			{
 				id: "hide-thinking",
-				label: "Hide thinking",
-				description: "Hide thinking blocks in assistant responses",
+				label: config.progressiveThinking ? "Hide thinking previews" : "Hide thinking",
+				description: config.progressiveThinking
+					? "Hide thinking previews on the main screen. History can still show them."
+					: "Hide thinking blocks in assistant responses",
 				currentValue: config.hideThinkingBlock ? "true" : "false",
 				values: ["true", "false"],
 			},

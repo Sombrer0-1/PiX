@@ -53,7 +53,15 @@ pix/                    Electron 主进程、IPC、preload 和 Vue
 
 ## 终端
 
-在仓库根目录安装工作区依赖并构建 CLI。需要 Node.js 22.19 或以上。
+使用 Node.js 22.19 或以上，通过 npm 全局安装。Windows 下运行 Bash 工具需要 Git Bash 或配置好的 Bash。
+
+```bash
+npm install -g @sombrer0/pix
+pix --help
+pix -p "检查这个项目"
+```
+
+从源码开发时，在仓库根目录安装依赖并构建 CLI。
 
 ```bash
 npm install --ignore-scripts
@@ -66,7 +74,13 @@ npx --no-install pix --mode rpc
 
 交互模式使用 `/plan` 查看计划命令，使用 `/tasks` 查询任务，用 `/cancel-task <id>` 取消任务。新会话默认关闭 ACP，可用 `--acp` 启用，空会话可用 `/acp on` 或 `/acp off` 调整。终端会话保存在 `<agentDir>/pix-cli-sessions`，`--session-dir` 选择其中的子目录。模型、凭据和扩展仍从原 `agentDir` 读取。
 
+交互会话里，Ctrl+R 或 `/pix:history` 打开当前会话历史。列表用方向键、翻页、Home 和 End 移动，Enter 查看正文，Esc 或再按一次历史键关闭。Ctrl+O 批量展开主屏上的工具输出。Ctrl+T 切换主屏思考预览，设置里的对应项是 Hide thinking previews。这两项只影响主屏，历史里仍可查看思考和工具正文。会话选择器里的 Ctrl+R 仍是改名。
+
+只重定向 stdout，或 stdin 不是终端时，走非交互输出。显式指定 JSON、RPC 或 `-p` 时，这些模式仍然优先。
+
 开发时运行 `npm run dev:cli` 和 `npm run watch:pix-runtime`，分别监听 CLI 和共享运行时。
+
+在 Linux、macOS 或 WSL 的 Linux 文件系统中运行 `npm ci --ignore-scripts` 和 `npm run pack:cli`，可生成包含运行依赖的 `dist/npm/sombrer0-pix-<version>.tgz`。
 
 ## 桌面开发与打包
 

@@ -15,6 +15,7 @@
 		"build:pi": "npm run build -w packages/tui && npm run build:compile -w packages/ai && npm run build -w packages/agent && npm run build -w packages/coding-agent && npm run build -w packages/mcp-adapter",
 		"build:pix-runtime": "npm run version:pix -- --check && npm run build:pi && npm run build -w packages/pix-runtime",
 		"build:cli": "npm run build:pix-runtime && npm run build -w packages/pix-cli && npm rebuild @earendil-works/pix-cli --ignore-scripts",
+		"pack:cli": "npm run build:cli && node scripts/pack-pix-cli.mjs",
 		"dev:cli": "npm run build:pix-runtime && npm run dev -w packages/pix-cli --",
 		"watch:pix-runtime": "npm run watch -w packages/pix-runtime",
 		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:ts-imports && npm run check:shrinkwrap && tsgo --noEmit && npm run check:browser-smoke",

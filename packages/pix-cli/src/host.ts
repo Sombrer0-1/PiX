@@ -85,8 +85,19 @@ export function createCliHost(version: string, options: CliOptions): MainHost {
 						const unsubscribe: (() => void)[] = [];
 						const taskStatuses = new Map<string, string>();
 						const workflowProgress = new Map<string, string>();
+						const observedWorkflowStarts = new Set<string>();
+						let observingWorkflowStarts = false;
 						let solo: SoloSession | undefined;
 						let io: SessionHostIO | undefined;
+						const observeWorkflowStarts = () => {
+							if (observingWorkflowStarts || mode !== "interactive" || !solo) return;
+							observingWorkflowStarts = true;
+							unsubscribe.push(
+								solo.workflowEngine.on("workflow/start", (info) => {
+									observedWorkflowStarts.add(info.id);
+								}),
+							);
+						};
 						let closing: Promise<void> | undefined;
 						const requestUserInput: RequestUserInputHandler = (request, signal) =>
 							io?.requestUserInput(request, signal) ??
@@ -140,6 +151,7 @@ export function createCliHost(version: string, options: CliOptions): MainHost {
 							},
 							setIO(nextIO) {
 								io = nextIO;
+								observeWorkflowStarts();
 							},
 							async initialize() {
 								const { planController, todoController, workflowRecorder } = getSolo();
@@ -162,7 +174,17 @@ export function createCliHost(version: string, options: CliOptions): MainHost {
 										const progress = `[${run.toolName}] ${run.name} ${run.runId}: ${run.status}${phase}${children}`;
 										const text = workflowProgress.get(run.runId) === progress ? undefined : progress;
 										workflowProgress.set(run.runId, progress);
-										io?.emit({ type: "workflow_event", sessionId, event: { type: "upsert", run } }, text);
+										io?.emit(
+											mode === "interactive"
+												? {
+														type: "workflow_event",
+														sessionId,
+														event: { type: "upsert", run },
+														observedStart: observedWorkflowStarts.has(run.runId),
+													}
+												: { type: "workflow_event", sessionId, event: { type: "upsert", run } },
+											text,
+										);
 									}),
 									runtime.taskService.onEvent((event) => {
 										if (event.type === "task_removed") {
@@ -199,6 +221,19 @@ export function createCliHost(version: string, options: CliOptions): MainHost {
 									}
 								}
 								await getSolo().initialize();
+								if (mode !== "interactive") return;
+								const tasks = runtime.taskService
+									.getAll(workspaceId)
+									.tasks.filter(
+										(task) => task.parentSessionId === sessionId && task.workspaceId === workspaceId,
+									);
+								for (const task of tasks) taskStatuses.set(task.taskId, task.status);
+								io?.emit({
+									type: "pix_tui_snapshot",
+									sessionId,
+									tasks,
+									plan: getSolo().planController.getSnapshot(),
+								});
 							},
 							close(shutdown) {
 								closing ??= (async () => {

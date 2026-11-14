@@ -233,6 +233,12 @@ export class Container implements Component {
 	}
 }
 
+interface ScreenSession {
+	component: Component;
+	previousLines: string[];
+	active: boolean;
+}
+
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
@@ -259,6 +265,8 @@ export class TUI extends Container {
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private fullRedrawCount = 0;
 	private stopped = false;
+	private screenSession: ScreenSession | null = null;
+	private screenForceMain = false;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -309,6 +317,10 @@ export class TUI extends Container {
 	}
 
 	setFocus(component: Component | null): void {
+		if (this.screenSession?.active) {
+			this.dismissScreen(this.screenSession, true);
+		}
+
 		// Clear focused flag on old component
 		if (isFocusable(this.focusedComponent)) {
 			this.focusedComponent.focused = false;
@@ -320,6 +332,42 @@ export class TUI extends Container {
 		if (isFocusable(component)) {
 			component.focused = true;
 		}
+	}
+
+	/**
+	 * Show a temporary alternate-screen component.
+	 * Returns a close function, or undefined if one cannot be shown.
+	 * The main screen keeps its differential state until this screen closes.
+	 */
+	showScreen(component: Component): (() => void) | undefined {
+		if (this.stopped || this.screenSession?.active || this.getTopmostVisibleOverlay()) {
+			return undefined;
+		}
+
+		const session: ScreenSession = {
+			component,
+			previousLines: [],
+			active: true,
+		};
+		this.screenSession = session;
+		this.screenForceMain = false;
+		this.terminal.write("\x1b[?1049h");
+		this.requestRender();
+		return () => {
+			this.dismissScreen(session, true);
+		};
+	}
+
+	private dismissScreen(session: ScreenSession, restoreMain: boolean): void {
+		if (!session.active) return;
+		session.active = false;
+		if (this.screenSession !== session) return;
+		this.screenSession = null;
+		this.terminal.write("\x1b[?1049l");
+		const force = this.screenForceMain;
+		this.screenForceMain = false;
+		if (!restoreMain || this.stopped) return;
+		this.requestRender(force);
 	}
 
 	/**
@@ -436,6 +484,7 @@ export class TUI extends Container {
 	override invalidate(): void {
 		super.invalidate();
 		for (const overlay of this.overlayStack) overlay.component.invalidate?.();
+		if (this.screenSession?.active) this.screenSession.component.invalidate();
 	}
 
 	start(): void {
@@ -471,6 +520,9 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		if (this.screenSession?.active) {
+			this.dismissScreen(this.screenSession, false);
+		}
 		this.stopped = true;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
@@ -493,6 +545,11 @@ export class TUI extends Container {
 	}
 
 	requestRender(force = false): void {
+		// A full refresh requested while the alternate screen is up must not wipe the main differential state.
+		if (force && this.screenSession?.active) {
+			this.screenForceMain = true;
+			force = false;
+		}
 		if (force) {
 			this.previousLines = [];
 			this.previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
@@ -567,6 +624,15 @@ export class TUI extends Container {
 		// Global debug key handler (Shift+Ctrl+D)
 		if (matchesKey(data, "shift+ctrl+d") && this.onDebug) {
 			this.onDebug();
+			return;
+		}
+
+		if (this.screenSession?.active) {
+			const component = this.screenSession.component;
+			if (!component.handleInput) return;
+			if (isKeyRelease(data) && !component.wantsKeyRelease) return;
+			component.handleInput(data);
+			this.requestRender();
 			return;
 		}
 
@@ -950,8 +1016,35 @@ export class TUI extends Container {
 		return null;
 	}
 
+	private renderScreen(): void {
+		const session = this.screenSession;
+		if (!session?.active) return;
+		const width = this.terminal.columns;
+		const height = this.terminal.rows;
+		const lines = session.component.render(width).slice(0, height);
+		if (!session.active) return;
+
+		const previous = session.previousLines;
+		const limit = Math.min(Math.max(lines.length, previous.length), height);
+		let buffer = "";
+		for (let i = 0; i < limit; i++) {
+			const oldLine = i < previous.length ? previous[i] : "";
+			const newLine = i < lines.length ? lines[i] : "";
+			if (oldLine === newLine) continue;
+			buffer += `\x1b[${i + 1};1H\x1b[2K${newLine}`;
+		}
+		if (buffer.length > 0) {
+			this.terminal.write(`\x1b[?2026h${buffer}\x1b[?2026l`);
+		}
+		session.previousLines = lines;
+	}
+
 	private doRender(): void {
 		if (this.stopped) return;
+		if (this.screenSession?.active) {
+			this.renderScreen();
+			return;
+		}
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;

@@ -1,15 +1,14 @@
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";
+// Config paths
+export { getAgentDir, VERSION } from "./config.ts";
 export {
 	ACP_TOOL_NAMES,
 	type AcpToolName,
 	createActiveCompressionExtension,
 } from "./core/active-compression/index.ts";
 export { sidecarPathForSessionFile } from "./core/active-compression/state.ts";
-
-// Config paths
-export { getAgentDir, VERSION } from "./config.ts";
 export {
 	AgentSession,
 	type AgentSessionConfig,
@@ -187,7 +186,7 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { CreateGoalOptions, ThreadGoal, ThreadGoalStatus, UpdateGoalOptions } from "./core/goal-runtime.ts";
-export { convertToLlm, LEGACY_INTERNAL_CUSTOM_TYPES, isInternalCustomMessage } from "./core/messages.ts";
+export { convertToLlm, isInternalCustomMessage, LEGACY_INTERNAL_CUSTOM_TYPES } from "./core/messages.ts";
 export {
 	createReadonlyModelRegistry,
 	ModelRegistry,
@@ -241,6 +240,15 @@ export {
 	createWriteTool,
 	type PromptTemplate,
 } from "./core/sdk.ts";
+export type { SessionFileHost } from "./core/session-file-host.ts";
+export type {
+	AppMode,
+	MainHost,
+	MainHostProcess,
+	MainHostSession,
+	SessionHostCommand,
+	SessionHostIO,
+} from "./core/session-host.ts";
 export {
 	assertValidSessionId,
 	type BranchSummaryEntry,
@@ -252,14 +260,14 @@ export {
 	type FileEntry,
 	getLatestCompactionEntry,
 	invalidateSessionListCache,
-	loadEntriesFromFile,
 	type ListSessionsOptions,
+	loadEntriesFromFile,
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	type NewSessionOptions,
 	parseSessionEntries,
-	readSessionInfo,
 	type ReadSessionInfoOptions,
+	readSessionInfo,
 	type SessionContext,
 	type SessionEntry,
 	type SessionEntryBase,
@@ -271,15 +279,6 @@ export {
 	type SessionTreeNode,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
-export type { SessionFileHost } from "./core/session-file-host.ts";
-export type {
-	AppMode,
-	MainHost,
-	MainHostProcess,
-	MainHostSession,
-	SessionHostCommand,
-	SessionHostIO,
-} from "./core/session-host.ts";
 export {
 	type CompactionSettings,
 	type ExecutionSettings,
@@ -418,6 +417,16 @@ export {
 	UserMessageSelectorComponent,
 	type VisualTruncateResult,
 } from "./modes/interactive/components/index.ts";
+export type {
+	HistoryItem,
+	InteractivePresentation,
+	InteractivePresentationFactory,
+	InteractivePresentationUpdate,
+	InteractiveToolDescription,
+	InteractiveToolSnapshot,
+	ToolDisplayStatus,
+	ToolPhase,
+} from "./modes/interactive/presentation.ts";
 // Theme utilities for custom tools and extensions
 export {
 	getLanguageFromPath,

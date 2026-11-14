@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { delimiter } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.ts";
+import { bundledToolDir } from "./tools-manager.ts";
 
 export interface ShellConfig {
 	shell: string;
@@ -193,16 +194,14 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 }
 
 export function getShellEnv(): NodeJS.ProcessEnv {
-	const binDir = getBinDir();
 	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
 	const currentPath = process.env[pathKey] ?? "";
-	const pathEntries = currentPath.split(delimiter).filter(Boolean);
-	const hasBinDir = pathEntries.includes(binDir);
-	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
+	const pathEntries = currentPath.split(delimiter);
+	const toolDirs = [getBinDir(), bundledToolDir].filter((dir) => dir && !pathEntries.includes(dir));
 
 	return {
 		...process.env,
-		[pathKey]: updatedPath,
+		[pathKey]: [...toolDirs, currentPath].filter(Boolean).join(delimiter),
 	};
 }
 

@@ -78,6 +78,7 @@ import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.ts";
+import type { RequestUserInputRequest, RequestUserInputResponse } from "../../core/request-user-input-tool.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionContext, SessionManager } from "../../core/session-manager.ts";
@@ -116,6 +117,7 @@ import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
 import { type AuthSelectorProvider, OAuthSelectorComponent } from "./components/oauth-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
+import { SessionHistory } from "./components/session-history.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
@@ -123,6 +125,7 @@ import { ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
+import type { HistoryItem, InteractivePresentation, InteractivePresentationFactory } from "./presentation.ts";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -174,6 +177,56 @@ type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
 };
+
+interface PixToolMeta {
+	historyId: string;
+	toolCallId: string;
+	assistantId: string;
+}
+
+interface PixState {
+	assistantIdentity: WeakMap<AssistantMessage, string>;
+	assistantComponentId: WeakMap<AssistantMessageComponent, string>;
+	userIdentity: WeakMap<object, string>;
+	userEntries: WeakMap<Component, HistoryItem>;
+	errorEntries: WeakMap<Component, HistoryItem>;
+	toolMeta: WeakMap<ToolExecutionComponent, PixToolMeta>;
+	settledTools: WeakSet<ToolExecutionComponent>;
+	settledKeys: Set<string>;
+	mountedTools: Map<string, ToolExecutionComponent>;
+	nextId: number;
+	currentAssistantId?: string;
+	history?: SessionHistory;
+	historyClose?: () => void;
+	pendingNotice: string | null;
+	savedNotice: string | null;
+	inputActive: boolean;
+	historyHint: string;
+}
+
+function createPixState(): PixState {
+	return {
+		assistantIdentity: new WeakMap(),
+		assistantComponentId: new WeakMap(),
+		userIdentity: new WeakMap(),
+		userEntries: new WeakMap(),
+		errorEntries: new WeakMap(),
+		toolMeta: new WeakMap(),
+		settledTools: new WeakSet(),
+		settledKeys: new Set(),
+		mountedTools: new Map(),
+		nextId: 0,
+		pendingNotice: null,
+		savedNotice: null,
+		inputActive: false,
+		historyHint: "",
+	};
+}
+
+function firstHistoryLine(text: string): string {
+	const line = text.split("\n").find((part) => part.trim());
+	return line?.trim() ?? "";
+}
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
@@ -258,6 +311,8 @@ export interface InteractiveModeOptions {
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
 	identity?: { name: string; version: string };
+	/** PiX presentation. Absent callers keep the existing interactive behavior. */
+	interactivePresentation?: InteractivePresentationFactory;
 }
 
 export class InteractiveMode {
@@ -305,6 +360,10 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+	private presentationFactory?: InteractivePresentationFactory;
+	private presentation?: InteractivePresentation;
+	private pix?: PixState;
+	private noticeContainer?: Container;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -395,6 +454,7 @@ export class InteractiveMode {
 			await this.rebindCurrentSession();
 		});
 		this.version = options.identity?.version ?? VERSION;
+		this.presentationFactory = options.interactivePresentation;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
@@ -403,7 +463,9 @@ export class InteractiveMode {
 		this.statusContainer = new Container();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
-		this.keybindings = KeybindingsManager.create();
+		this.keybindings = this.presentationFactory
+			? KeybindingsManager.create(getAgentDir(), { history: true })
+			: KeybindingsManager.create();
 		setKeybindings(this.keybindings);
 		const editorPaddingX = this.settingsManager.getEditorPaddingX();
 		const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();
@@ -482,6 +544,9 @@ export class InteractiveMode {
 		}));
 		for (const command of this.runtimeHost.hostCommands) {
 			slashCommands.push({ name: command.name, description: command.description });
+		}
+		if (this.presentationFactory && !slashCommands.some((command) => command.name === "pix:history")) {
+			slashCommands.push({ name: "pix:history", description: "Open session history" });
 		}
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
@@ -648,7 +713,10 @@ export class InteractiveMode {
 				rawKeyHint(`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`, "to cycle models"),
 				hint("app.model.select", "to select model"),
 				hint("app.tools.expand", "to expand tools"),
-				hint("app.thinking.toggle", "to expand thinking"),
+				hint(
+					"app.thinking.toggle",
+					this.presentationFactory ? "to toggle main screen thinking previews" : "to expand thinking",
+				),
 				hint("app.editor.external", "for external editor"),
 				rawKeyHint("/", "for commands"),
 				rawKeyHint("!", "to run bash"),
@@ -696,6 +764,13 @@ export class InteractiveMode {
 		this.ui.addChild(this.statusContainer);
 		this.renderWidgets(); // Initialize with default spacer
 		this.ui.addChild(this.widgetContainerAbove);
+		if (this.presentationFactory) {
+			this.noticeContainer = new Container();
+			this.ui.addChild(this.noticeContainer);
+			const pix = this.ensurePix();
+			pix.historyHint = this.historyHintLabel();
+			this.paintNotices();
+		}
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.widgetContainerBelow);
 		this.ui.addChild(this.footer);
@@ -1516,7 +1591,15 @@ export class InteractiveMode {
 		const uiContext = this.createExtensionUIContext();
 		this.runtimeHost.setHostIO({
 			requestUserInput: this.requestHostInput,
-			emit: (_event, text) => {
+			emit: (event, text) => {
+				if (this.presentation) {
+					const update = this.presentation.acceptHostEvent(event);
+					if (update) {
+						if (update.toolCallIds) this.refreshMountedTools(update.toolCallIds);
+						if (update.pendingNotice !== undefined) this.setPendingNotice(update.pendingNotice);
+						if (update.consumeText) return;
+					}
+				}
 				if (text) this.showStatus(text);
 			},
 		});
@@ -1625,6 +1708,10 @@ export class InteractiveMode {
 	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		if (this.presentationFactory) {
+			this.presentation = this.presentationFactory();
+			this.resetPixSession();
+		}
 		this.applyRuntimeSettings();
 		await this.bindCurrentSessionExtensions();
 		if (this.isShuttingDown) return;
@@ -1670,6 +1757,11 @@ export class InteractiveMode {
 	 */
 	private setupExtensionShortcuts(extensionRunner: ExtensionRunner): void {
 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
+		if (this.presentationFactory) {
+			const pix = this.ensurePix();
+			pix.historyHint = this.historyHintLabel(shortcuts);
+			this.paintNotices();
+		}
 		if (shortcuts.size === 0) return;
 
 		// Create a context for shortcut handlers
@@ -2066,7 +2158,19 @@ export class InteractiveMode {
 		};
 	}
 
-	private requestHostInput = queueHostInput(async (request, signal) => {
+	private requestHostInput = queueHostInput((request, signal) => this.presentHostInput(request, signal));
+
+	private async presentHostInput(
+		request: RequestUserInputRequest,
+		signal?: AbortSignal,
+	): Promise<RequestUserInputResponse> {
+		const pix = this.presentation ? this.ensurePix() : undefined;
+		if (pix) {
+			if (!pix.inputActive) pix.savedNotice = pix.pendingNotice;
+			pix.inputActive = true;
+			pix.pendingNotice = request.purpose === "tool_approval" ? "Waiting for approval" : "Waiting for input";
+			this.paintNotices();
+		}
 		const controller = new AbortController();
 		const inputSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 		const stop = this.ui.addInputListener((key) => {
@@ -2100,8 +2204,14 @@ export class InteractiveMode {
 			return { id: request.id, answers };
 		} finally {
 			stop();
+			if (pix) {
+				pix.inputActive = false;
+				pix.pendingNotice = pix.savedNotice;
+				pix.savedNotice = null;
+				this.paintNotices();
+			}
 		}
-	});
+	}
 
 	/**
 	 * Show a selector for extensions.
@@ -2511,6 +2621,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
+		if (this.presentationFactory) {
+			this.defaultEditor.onAction("app.history.open", () => this.openSessionHistory());
+		}
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
@@ -2608,6 +2721,11 @@ export class InteractiveMode {
 			if (text === "/hotkeys") {
 				this.handleHotkeysCommand();
 				this.editor.setText("");
+				return;
+			}
+			if (this.presentationFactory && text === "/pix:history") {
+				this.editor.setText("");
+				this.openSessionHistory();
 				return;
 			}
 			if (text === "/fork") {
@@ -2748,6 +2866,329 @@ export class InteractiveMode {
 		};
 	}
 
+	private ensurePix(): PixState {
+		if (!this.pix) this.pix = createPixState();
+		return this.pix;
+	}
+
+	private allocateId(pix: PixState): string {
+		pix.nextId += 1;
+		return `m${pix.nextId}`;
+	}
+
+	private identityForAssistant(message: AssistantMessage): string {
+		const pix = this.ensurePix();
+		const existing = pix.assistantIdentity.get(message);
+		if (existing) return existing;
+		const id = this.allocateId(pix);
+		pix.assistantIdentity.set(message, id);
+		return id;
+	}
+
+	private resetPixSession(): void {
+		const hint = this.pix?.historyHint ?? "";
+		this.discardHistory();
+		this.pix = createPixState();
+		this.pix.historyHint = hint;
+		this.paintNotices();
+	}
+
+	private discardHistory(): void {
+		const pix = this.pix;
+		if (!pix) return;
+		pix.historyClose?.();
+		pix.historyClose = undefined;
+		pix.history = undefined;
+	}
+
+	private historyHintLabel(shortcuts?: ReadonlyMap<string, unknown>): string {
+		const keys = this.keybindings.getKeys("app.history.open");
+		const free = keys.find((key) => !shortcuts?.has(key));
+		return free ? `${formatKeyText(free, { capitalize: true })} history` : "Use /pix:history";
+	}
+
+	private paintNotices(): void {
+		if (!this.noticeContainer || !this.pix) return;
+		this.noticeContainer.clear();
+		if (this.pix.historyHint) {
+			this.noticeContainer.addChild(new Text(theme.fg("dim", this.pix.historyHint), 1, 0));
+		}
+		if (this.pix.pendingNotice) {
+			this.noticeContainer.addChild(new Text(theme.fg("warning", this.pix.pendingNotice), 1, 0));
+		}
+		this.ui.requestRender();
+	}
+
+	private setPendingNotice(notice: string | null): void {
+		if (!this.presentation) return;
+		const pix = this.ensurePix();
+		if (pix.inputActive) pix.savedNotice = notice;
+		else pix.pendingNotice = notice;
+		this.paintNotices();
+	}
+
+	private refreshMountedTools(toolCallIds: readonly string[]): void {
+		const pix = this.pix;
+		if (!pix) return;
+		for (const id of toolCallIds) {
+			const component = pix.mountedTools.get(id);
+			if (!component) continue;
+			if (!this.chatContainer.children.includes(component)) {
+				pix.mountedTools.delete(id);
+				continue;
+			}
+			component.refreshPresentation();
+		}
+		this.ui.requestRender();
+	}
+
+	private openSessionHistory(): void {
+		if (!this.presentation) return;
+		if (this.extensionSelector || this.extensionInput || this.extensionEditor) return;
+		const pix = this.ensurePix();
+		if (!pix.history) {
+			pix.history = new SessionHistory({
+				getItems: () => this.collectHistoryItems(),
+				getRows: () => this.ui.terminal.rows,
+				keybindings: this.keybindings,
+				onClose: () => {
+					pix.historyClose?.();
+					pix.historyClose = undefined;
+				},
+			});
+		}
+		pix.historyClose?.();
+		pix.historyClose = undefined;
+		const close = this.ui.showScreen(pix.history);
+		if (!close) {
+			this.showStatus("Session history is unavailable");
+			return;
+		}
+		pix.historyClose = close;
+	}
+
+	private collectHistoryItems(): HistoryItem[] {
+		const pix = this.pix;
+		if (!pix) return [];
+		const items: HistoryItem[] = [];
+		for (const child of this.chatContainer.children) {
+			if (child instanceof AssistantMessageComponent) {
+				const id = pix.assistantComponentId.get(child);
+				if (id) items.push(...child.getHistoryItems(id));
+			} else if (child instanceof ToolExecutionComponent) {
+				const meta = pix.toolMeta.get(child);
+				if (meta && pix.mountedTools.get(meta.toolCallId) === child)
+					items.push(child.getHistoryItem(meta.historyId));
+			} else {
+				const user = pix.userEntries.get(child);
+				if (user) items.push(user);
+				const error = pix.errorEntries.get(child);
+				if (error) items.push(error);
+			}
+		}
+		return items;
+	}
+
+	private attachUserMessage(message: object, component: Component, text: string): void {
+		if (!this.presentation) return;
+		const pix = this.ensurePix();
+		let id = pix.userIdentity.get(message);
+		if (!id) {
+			id = this.allocateId(pix);
+			pix.userIdentity.set(message, id);
+		}
+		const label = firstHistoryLine(text) || "You";
+		this.chatContainer.addChild(new Text(theme.fg("accent", "You"), 1, 0));
+		pix.userEntries.set(component, { id, kind: "user", label, detail: () => text });
+	}
+
+	private createPresentedTool(name: string, toolCallId: string, args: unknown): ToolExecutionComponent {
+		const presentation = this.presentation;
+		return new ToolExecutionComponent(
+			name,
+			toolCallId,
+			args,
+			{
+				showImages: this.settingsManager.getShowImages(),
+				imageWidthCells: this.settingsManager.getImageWidthCells(),
+				describe: (tool) => presentation?.describeTool(tool),
+			},
+			this.getRegisteredToolDefinition(name),
+			this.ui,
+			this.sessionManager.getCwd(),
+		);
+	}
+
+	private rememberTool(
+		component: ToolExecutionComponent,
+		assistantId: string,
+		toolCallId: string,
+		mounted: boolean,
+	): void {
+		const pix = this.ensurePix();
+		pix.toolMeta.set(component, { historyId: `${assistantId}:${toolCallId}`, toolCallId, assistantId });
+		if (mounted) pix.mountedTools.set(toolCallId, component);
+	}
+
+	private mountLiveTool(assistantId: string, name: string, toolCallId: string, args: unknown): ToolExecutionComponent {
+		const component = this.createPresentedTool(name, toolCallId, args);
+		component.setExpanded(this.toolOutputExpanded);
+		this.chatContainer.addChild(component);
+		this.pendingTools.set(toolCallId, component);
+		this.rememberTool(component, assistantId, toolCallId, true);
+		return component;
+	}
+
+	private syncLiveToolRows(message: AssistantMessage): void {
+		if (!this.presentation) return;
+		const pix = this.ensurePix();
+		const assistantId = this.identityForAssistant(message);
+		pix.currentAssistantId = assistantId;
+		for (const block of message.content) {
+			if (block.type !== "toolCall" || !block.id) continue;
+			if (pix.settledKeys.has(`${assistantId}:${block.id}`)) continue;
+			const existing = this.pendingTools.get(block.id);
+			const meta = existing ? pix.toolMeta.get(existing) : undefined;
+			if (existing && meta?.assistantId === assistantId) {
+				existing.updateArgs(block.arguments);
+				continue;
+			}
+			if (existing) continue;
+			this.mountLiveTool(assistantId, block.name, block.id, block.arguments);
+		}
+	}
+
+	private beginPresentedTool(toolName: string, toolCallId: string, args: unknown): void {
+		const pix = this.ensurePix();
+		const assistantId = pix.currentAssistantId ?? this.allocateId(pix);
+		pix.currentAssistantId = assistantId;
+		if (pix.settledKeys.has(`${assistantId}:${toolCallId}`)) return;
+		let component = this.pendingTools.get(toolCallId);
+		const meta = component ? pix.toolMeta.get(component) : undefined;
+		if (!component || meta?.assistantId !== assistantId) {
+			component = this.mountLiveTool(assistantId, toolName, toolCallId, args);
+		}
+		component.updateArgs(args);
+		component.markExecutionStarted();
+	}
+
+	private noteSettled(component: ToolExecutionComponent): void {
+		const pix = this.pix;
+		if (!pix) return;
+		pix.settledTools.add(component);
+		const meta = pix.toolMeta.get(component);
+		if (meta) pix.settledKeys.add(meta.historyId);
+	}
+
+	private finishAssistantTools(
+		message: AssistantMessage,
+		phase: "failed" | "cancelled" | "no-result",
+		diagnostic?: string,
+	): void {
+		for (const block of message.content) {
+			if (block.type !== "toolCall" || !block.id) continue;
+			const component = this.pendingTools.get(block.id);
+			if (!component) continue;
+			component.finishWithoutResult(phase, diagnostic);
+			this.noteSettled(component);
+			this.pendingTools.delete(block.id);
+		}
+	}
+
+	private finishDanglingTools(phase: "failed" | "cancelled" | "no-result", diagnostic?: string): void {
+		for (const [id, component] of [...this.pendingTools.entries()]) {
+			component.finishWithoutResult(phase, diagnostic);
+			this.noteSettled(component);
+			this.pendingTools.delete(id);
+		}
+	}
+
+	private applyThinkingVisibility(): void {
+		for (const child of this.chatContainer.children) {
+			if (child instanceof AssistantMessageComponent) child.setHideThinkingBlock(this.hideThinkingBlock);
+		}
+		for (const component of this.pendingTools.values()) component.refreshPresentation();
+		this.ui.requestRender();
+	}
+
+	private renderPresentedSessionContext(
+		sessionContext: SessionContext,
+		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
+	): void {
+		const pix = this.ensurePix();
+		const live = new Map(this.pendingTools);
+		const remounted = new Set<string>();
+		pix.mountedTools.clear();
+		this.pendingTools.clear();
+		if (options.updateFooter) {
+			this.footer.invalidate();
+			this.updateEditorBorderColor();
+		}
+
+		interface BatchEntry {
+			component: ToolExecutionComponent;
+			live: boolean;
+			matched: boolean;
+			missing: "failed" | "cancelled" | "no-result";
+			diagnostic?: string;
+		}
+		let batch = new Map<string, BatchEntry>();
+		const flush = () => {
+			for (const entry of batch.values()) {
+				if (!entry.matched && !entry.live) entry.component.finishWithoutResult(entry.missing, entry.diagnostic);
+			}
+			batch = new Map();
+		};
+
+		for (const message of sessionContext.messages) {
+			if (message.role === "assistant") {
+				flush();
+				this.addMessageToChat(message, options);
+				const assistantId = this.identityForAssistant(message);
+				const missing = message.stopReason === "aborted" ? "cancelled" : "no-result";
+				const diagnostic =
+					message.stopReason === "aborted" || message.stopReason === "error"
+						? message.errorMessage || undefined
+						: undefined;
+				for (const content of message.content) {
+					if (content.type !== "toolCall" || !content.id) continue;
+					const liveComponent = live.get(content.id);
+					const meta = liveComponent ? pix.toolMeta.get(liveComponent) : undefined;
+					const reuse = liveComponent !== undefined && meta?.assistantId === assistantId;
+					const component = reuse
+						? liveComponent
+						: this.createPresentedTool(content.name, content.id, content.arguments);
+					component.setExpanded(this.toolOutputExpanded);
+					if (!this.chatContainer.children.includes(component)) this.chatContainer.addChild(component);
+					this.rememberTool(component, assistantId, content.id, true);
+					if (reuse) {
+						this.pendingTools.set(content.id, component);
+						remounted.add(content.id);
+					}
+					batch.set(content.id, { component, live: reuse, matched: false, missing, diagnostic });
+				}
+			} else if (message.role === "toolResult") {
+				const entry = batch.get(message.toolCallId);
+				if (!entry) continue;
+				entry.component.updateResult(message);
+				entry.matched = true;
+				if (entry.live) {
+					this.noteSettled(entry.component);
+					this.pendingTools.delete(message.toolCallId);
+					entry.live = false;
+				}
+			} else {
+				this.addMessageToChat(message, options);
+			}
+		}
+		flush();
+
+		for (const [id, component] of live) {
+			if (!remounted.has(id) && !pix.settledTools.has(component)) this.pendingTools.set(id, component);
+		}
+		this.ui.requestRender();
+	}
+
 	private subscribeToAgent(): void {
 		this.unsubscribe = this.session.subscribe(async (event) => {
 			await this.handleEvent(event);
@@ -2815,6 +3256,24 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					if (this.presentation) {
+						const pix = this.ensurePix();
+						const id = this.identityForAssistant(event.message);
+						pix.currentAssistantId = id;
+						this.streamingComponent = new AssistantMessageComponent(
+							undefined,
+							this.hideThinkingBlock,
+							this.getMarkdownThemeWithSettings(),
+							this.hiddenThinkingLabel,
+							{ progressive: true },
+						);
+						pix.assistantComponentId.set(this.streamingComponent, id);
+						this.streamingMessage = event.message;
+						this.chatContainer.addChild(this.streamingComponent);
+						this.streamingComponent.updateContent(this.streamingMessage, { type: "start" });
+						this.ui.requestRender();
+						break;
+					}
 					this.streamingComponent = new AssistantMessageComponent(
 						undefined,
 						this.hideThinkingBlock,
@@ -2831,6 +3290,14 @@ export class InteractiveMode {
 			case "message_update":
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
+					if (this.presentation) {
+						const frame = event.assistantMessageEvent
+							? { type: "update" as const, event: event.assistantMessageEvent }
+							: undefined;
+						this.streamingComponent.updateContent(this.streamingMessage, frame);
+						this.ui.requestRender();
+						break;
+					}
 					this.streamingComponent.updateContent(this.streamingMessage);
 
 					for (const content of this.streamingMessage.content) {
@@ -2874,7 +3341,32 @@ export class InteractiveMode {
 							retryAttempt > 0
 								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
 								: "Operation aborted";
-						this.streamingMessage.errorMessage = errorMessage;
+						if (!this.presentation) this.streamingMessage.errorMessage = errorMessage;
+					}
+					if (this.presentation) {
+						const pix = this.ensurePix();
+						const id = pix.currentAssistantId ?? this.identityForAssistant(this.streamingMessage);
+						pix.currentAssistantId = id;
+						pix.assistantIdentity.set(this.streamingMessage, id);
+						pix.assistantComponentId.set(this.streamingComponent, id);
+						const localError =
+							errorMessage ??
+							(this.streamingMessage.stopReason === "error" ? this.streamingMessage.errorMessage : undefined);
+						this.streamingComponent.updateContent(this.streamingMessage, {
+							type: "end",
+							errorMessage: localError,
+						});
+						this.syncLiveToolRows(this.streamingMessage);
+						if (this.streamingMessage.stopReason !== "aborted" && this.streamingMessage.stopReason !== "error") {
+							for (const component of this.pendingTools.values()) {
+								component.setArgsComplete();
+							}
+						}
+						this.streamingComponent = undefined;
+						this.streamingMessage = undefined;
+						this.footer.invalidate();
+						this.ui.requestRender();
+						break;
 					}
 					this.streamingComponent.updateContent(this.streamingMessage);
 
@@ -2902,7 +3394,25 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				break;
 
+			case "turn_end":
+				if (this.presentation && event.message.role === "assistant") {
+					const aborted = event.message.stopReason === "aborted";
+					const errored = event.message.stopReason === "error";
+					this.finishAssistantTools(
+						event.message,
+						aborted ? "cancelled" : "no-result",
+						aborted || errored ? event.message.errorMessage : undefined,
+					);
+					this.ui.requestRender();
+				}
+				break;
+
 			case "tool_execution_start": {
+				if (this.presentation) {
+					this.beginPresentedTool(event.toolName, event.toolCallId, event.args);
+					this.ui.requestRender();
+					break;
+				}
 				let component = this.pendingTools.get(event.toolCallId);
 				if (!component) {
 					component = new ToolExecutionComponent(
@@ -2927,6 +3437,14 @@ export class InteractiveMode {
 			}
 
 			case "tool_execution_update": {
+				if (this.presentation) {
+					const component = this.pendingTools.get(event.toolCallId);
+					if (component && !this.pix?.settledTools.has(component)) {
+						component.updateResult({ ...event.partialResult, isError: false }, true);
+						this.ui.requestRender();
+					}
+					break;
+				}
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
 					component.updateResult({ ...event.partialResult, isError: false }, true);
@@ -2936,6 +3454,16 @@ export class InteractiveMode {
 			}
 
 			case "tool_execution_end": {
+				if (this.presentation) {
+					const component = this.pendingTools.get(event.toolCallId);
+					if (component) {
+						component.updateResult({ ...event.result, isError: event.isError });
+						this.noteSettled(component);
+						this.pendingTools.delete(event.toolCallId);
+						this.ui.requestRender();
+					}
+					break;
+				}
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
 					component.updateResult({ ...event.result, isError: event.isError });
@@ -2959,7 +3487,8 @@ export class InteractiveMode {
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 				}
-				this.pendingTools.clear();
+				if (this.presentation) this.finishDanglingTools("no-result");
+				else this.pendingTools.clear();
 
 				await this.checkShutdownRequested();
 
@@ -3012,22 +3541,48 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
-					this.chatContainer.clear();
-					this.rebuildChatFromMessages();
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-						),
-					);
-					this.footer.invalidate();
+					if (this.presentation) {
+						const summary = event.result.summary;
+						const existing = this.sessionManager
+							.buildSessionContext()
+							.messages.some((message) => message.role === "compactionSummary" && message.summary === summary);
+						this.chatContainer.clear();
+						this.rebuildChatFromMessages();
+						if (!existing) {
+							this.addMessageToChat(
+								createCompactionSummaryMessage(summary, event.result.tokensBefore, new Date().toISOString()),
+							);
+						}
+						this.footer.invalidate();
+					} else {
+						this.chatContainer.clear();
+						this.rebuildChatFromMessages();
+						this.addMessageToChat(
+							createCompactionSummaryMessage(
+								event.result.summary,
+								event.result.tokensBefore,
+								new Date().toISOString(),
+							),
+						);
+						this.footer.invalidate();
+					}
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
 						this.showError(event.errorMessage);
 					} else {
 						this.chatContainer.addChild(new Spacer(1));
-						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
+						const text = new Text(theme.fg("error", event.errorMessage), 1, 0);
+						this.chatContainer.addChild(text);
+						if (this.presentation) {
+							const pix = this.ensurePix();
+							const label = event.errorMessage;
+							pix.errorEntries.set(text, {
+								id: this.allocateId(pix),
+								kind: "error",
+								label,
+								detail: () => label,
+							});
+						}
 					}
 				}
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
@@ -3189,10 +3744,12 @@ export class InteractiveMode {
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
 							);
+							this.attachUserMessage(message, userComponent, skillBlock.userMessage);
 							this.chatContainer.addChild(userComponent);
 						}
 					} else {
 						const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings());
+						this.attachUserMessage(message, userComponent, textContent);
 						this.chatContainer.addChild(userComponent);
 					}
 					if (options?.populateHistory) {
@@ -3202,6 +3759,20 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
+				if (this.presentation) {
+					const pix = this.ensurePix();
+					const id = this.identityForAssistant(message);
+					const assistantComponent = new AssistantMessageComponent(
+						message,
+						this.hideThinkingBlock,
+						this.getMarkdownThemeWithSettings(),
+						this.hiddenThinkingLabel,
+						{ progressive: true },
+					);
+					pix.assistantComponentId.set(assistantComponent, id);
+					this.chatContainer.addChild(assistantComponent);
+					break;
+				}
 				const assistantComponent = new AssistantMessageComponent(
 					message,
 					this.hideThinkingBlock,
@@ -3231,6 +3802,10 @@ export class InteractiveMode {
 		sessionContext: SessionContext,
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
+		if (this.presentation) {
+			this.renderPresentedSessionContext(sessionContext, options);
+			return;
+		}
 		this.pendingTools.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 
@@ -3659,6 +4234,11 @@ export class InteractiveMode {
 	private toggleThinkingBlockVisibility(): void {
 		this.hideThinkingBlock = !this.hideThinkingBlock;
 		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
+		if (this.presentation) {
+			this.applyThinkingVisibility();
+			this.showStatus(`Main screen thinking previews: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
+			return;
+		}
 
 		// Rebuild chat from session messages
 		this.chatContainer.clear();
@@ -3741,7 +4321,18 @@ export class InteractiveMode {
 
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		const label = `Error: ${errorMessage}`;
+		const text = new Text(theme.fg("error", label), 1, 0);
+		this.chatContainer.addChild(text);
+		if (this.presentation) {
+			const pix = this.ensurePix();
+			pix.errorEntries.set(text, {
+				id: this.allocateId(pix),
+				kind: "error",
+				label,
+				detail: () => label,
+			});
+		}
 		this.chatContainer.addChild(new Spacer(1));
 		this.ui.requestRender();
 	}
@@ -4019,6 +4610,7 @@ export class InteractiveMode {
 					currentTheme: this.settingsManager.getTheme() || "dark",
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
+					...(this.presentation ? { progressiveThinking: true as const } : {}),
 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
 					enableInstallTelemetry: this.settingsManager.getEnableInstallTelemetry(),
 					doubleEscapeAction: this.settingsManager.getDoubleEscapeAction(),
@@ -4100,6 +4692,10 @@ export class InteractiveMode {
 					onHideThinkingBlockChange: (hidden) => {
 						this.hideThinkingBlock = hidden;
 						this.settingsManager.setHideThinkingBlock(hidden);
+						if (this.presentation) {
+							this.applyThinkingVisibility();
+							return;
+						}
 						for (const child of this.chatContainer.children) {
 							if (child instanceof AssistantMessageComponent) {
 								child.setHideThinkingBlock(hidden);
@@ -5465,6 +6061,11 @@ export class InteractiveMode {
 		const followUp = this.getAppKeyDisplay("app.message.followUp");
 		const dequeue = this.getAppKeyDisplay("app.message.dequeue");
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
+		const historyKeys = this.keybindings?.getKeys?.("app.history.open") ?? [];
+		const historyKey = historyKeys.length > 0 ? this.getAppKeyDisplay("app.history.open") : "";
+		const thinkingAction = this.presentation
+			? "Toggle thinking previews on the main screen"
+			: "Toggle thinking block visibility";
 
 		let hotkeys = `
 **Navigation**
@@ -5503,11 +6104,12 @@ export class InteractiveMode {
 | \`${cycleModelForward}\` / \`${cycleModelBackward}\` | Cycle models |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
-| \`${toggleThinking}\` | Toggle thinking block visibility |
+| \`${toggleThinking}\` | ${thinkingAction} |
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${followUp}\` | Queue follow-up message |
 | \`${dequeue}\` | Restore queued messages |
 | \`${pasteImage}\` | Paste image or text from clipboard |
+${historyKey ? `| \`${historyKey}\` | Open session history |\n` : ""}
 | \`/\` | Slash commands |
 | \`!\` | Run bash command |
 | \`!!\` | Run bash command (excluded from context) |
@@ -5725,6 +6327,7 @@ export class InteractiveMode {
 	}
 
 	stop(): void {
+		if (this.presentationFactory) this.discardHistory();
 		this.unregisterSignalHandlers();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

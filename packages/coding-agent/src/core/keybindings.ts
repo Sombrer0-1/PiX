@@ -38,6 +38,7 @@ export interface AppKeybindings {
 	"app.session.togglePath": true;
 	"app.session.toggleSort": true;
 	"app.session.rename": true;
+	"app.history.open": true;
 	"app.session.delete": true;
 	"app.session.deleteNoninvasive": true;
 	"app.models.save": true;
@@ -342,15 +343,24 @@ function loadRawConfig(path: string): Record<string, unknown> | undefined {
 export class KeybindingsManager extends TuiKeybindingsManager {
 	private configPath: string | undefined;
 
-	constructor(userBindings: KeybindingsConfig = {}, configPath?: string) {
-		super(KEYBINDINGS, userBindings);
+	constructor(userBindings: KeybindingsConfig = {}, configPath?: string, options?: { history?: boolean }) {
+		const definitions: KeybindingDefinitions = options?.history
+			? {
+					...KEYBINDINGS,
+					"app.history.open": {
+						defaultKeys: "ctrl+r",
+						description: "Open session history",
+					},
+				}
+			: KEYBINDINGS;
+		super(definitions, userBindings);
 		this.configPath = configPath;
 	}
 
-	static create(agentDir: string = getAgentDir()): KeybindingsManager {
+	static create(agentDir: string = getAgentDir(), options?: { history?: boolean }): KeybindingsManager {
 		const configPath = join(agentDir, "keybindings.json");
 		const userBindings = KeybindingsManager.loadFromFile(configPath);
-		return new KeybindingsManager(userBindings, configPath);
+		return new KeybindingsManager(userBindings, configPath, options);
 	}
 
 	reload(): void {
